@@ -11,6 +11,17 @@ from matplotlib import gridspec
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import xeofs as xe
+from pathlib import Path
+import requests
+import rioxarray as rioxr
+from tqdm import tqdm
+from core.was_compute_predictand import *
+from scipy.ndimage import gaussian_filter
+from fitter import Fitter
+from matplotlib.colors import ListedColormap, BoundaryNorm
+import matplotlib.patches as mpatches
+from datetime import timedelta
+
 
 def decode_cf(ds, time_var):
     """Decodes time dimension to CFTime standards."""
@@ -80,7 +91,7 @@ def build_iridl_url_ersst(
     )
 
     # 5) Possibly add run-average
-    runavg_part = f"T/{run_avg}/runningAverage/" if run_avg else ""
+    runavg_part = f"T/{run_avg}/runningAverage/" if run_avg is not None else ""
 
     # 6) Combine
     url = (
@@ -95,7 +106,6 @@ def build_iridl_url_ersst(
 
 
 def fix_time_coord(ds, seas):
-    # Suppose ds.T is your time coordinate (datetime64 or cftime).
     # We'll parse out just the YEAR from each original date.
     years = pd.to_datetime(ds.T.values).year  # array of integer years
 
@@ -109,7 +119,38 @@ def fix_time_coord(ds, seas):
     ds["T"] = ds["T"].astype("datetime64[ns]")
     return ds
 
+def download_file(url, local_path, force_download=False, chunk_size=8192, timeout=120):
+    local_path = Path(local_path)
 
+    # Skip download if file exists and force_download is False
+    if local_path.exists() and not force_download:
+        print(f"[SKIP] {local_path} already exists.")
+        return local_path
+
+    print(f"[DOWNLOAD] {url}")
+
+    try:
+        with requests.get(url, stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            
+            # Get total file size from response headers
+            total_size = int(r.headers.get('content-length', 0))
+
+            # Download with progress bar
+            with open(local_path, "wb") as f, tqdm(
+                total=total_size, unit="B", unit_scale=True, unit_divisor=1024
+            ) as progress:
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        progress.update(len(chunk))
+
+        print(f"[SUCCESS] Downloaded to {local_path}")
+        return local_path
+
+    except Exception as e:
+        print(f"[ERROR] Could not download {url}: {e}")
+        return None
 
 def parse_variable(variables_list):
     """Extract center and variable names from the variables list."""
@@ -187,23 +228,31 @@ def trend_data(data):
         raise RuntimeError(f"Failed to detrend data using ExtendedEOF: {e}")
         
     
-def prepare_predictand(dir_to_save_Obs, variables_obs, season, year_start, year_end, ds=True):
+def prepare_predictand(dir_to_save_Obs, variables_obs, year_start, year_end, season=None, ds=True, daily=False):
     """Prepare the predictand dataset."""
     _, variable = parse_variable(variables_obs[0])
-    season_str = "".join([calendar.month_abbr[int(month)] for month in season])
-    filepath = f'{dir_to_save_Obs}/Obs_{variable}_{year_start}_{year_end}_{season_str}.nc'
-    rainfall = xr.open_dataset(filepath)
-
-    # Create mask
-    mean_rainfall = rainfall.mean(dim="T").to_array().squeeze()
-    mask = xr.where(mean_rainfall <= 20, np.nan, 1)
-    mask = mask.where(abs(mask.Y) <= 19.5, np.nan)
-    rainfall = xr.where(mask == 1, rainfall, np.nan)
-    rainfall['T'] = pd.to_datetime(rainfall['T'].values)
-    if ds :
-        return rainfall.drop_vars("variable").squeeze().transpose( 'T', 'Y', 'X')
+    
+    if daily:
+        filepath = f'{dir_to_save_Obs}/Daily_{variable}_{year_start}_{year_end}.nc'
+        rainfall = xr.open_dataset(filepath)
+        rainfall = xr.where(rainfall<0.1, 0, rainfall)
+        rainfall['T'] = rainfall['T'].astype('datetime64[ns]')
     else:
-        return rainfall.to_array().drop_vars("variable").squeeze().rename("prcp").transpose( 'T', 'Y', 'X')
+        season_str = "".join([calendar.month_abbr[int(month)] for month in season])
+        filepath = f'{dir_to_save_Obs}/Obs_{variable}_{year_start}_{year_end}_{season_str}.nc'
+        rainfall = xr.open_dataset(filepath)
+    
+        # Create mask
+        mean_rainfall = rainfall.mean(dim="T").to_array().squeeze()
+        mask = xr.where(mean_rainfall <= 20, np.nan, 1)
+        mask = mask.where(abs(mask.Y) <= 20, np.nan)
+        rainfall = xr.where(mask == 1, rainfall, np.nan)
+        rainfall['T'] = rainfall['T'].astype('datetime64[ns]')
+        # rainfall['T'] = pd.to_datetime(rainfall['T'].values)
+    if ds :
+        return rainfall.drop_vars("variable").squeeze().transpose( 'T', 'Y', 'X').sortby("T")
+    else:
+        return rainfall.to_array().drop_vars("variable").squeeze().rename("prcp").transpose( 'T', 'Y', 'X').sortby("T")
 
 
 def load_gridded_predictor(dir_to_data, variables_list, year_start, year_end, season=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None):
@@ -542,7 +591,7 @@ def save_validation_score(dir_to_save, data, metric, model_name):
 
 
 
-def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n=6):
+def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n=6, gcm=False, agroparam=False):
 
     # 1. Provide default thresholds if none given
     if threshold is None:
@@ -554,7 +603,7 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
             threshold = 0.5
         else:
             ### To complete
-            threshold = 0.0  # or any other default you prefer
+            threshold = threshold  # or any other default you prefer
     
     # 2. Check if the given metric is in scores
     metric_key = metric  # for direct indexing
@@ -590,10 +639,10 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
     
     # 5. Sort by descending count
     best_models = dict(sorted(best_models.items(), key=lambda item: item[1], reverse=True))
-    
+
     # 6. Take the top N
     top_n_models = dict(list(best_models.items())[:top_n])
-
+  
     # Normalize a variable name by removing ".suffix", removing underscores, and lowercasing
     def normalize_var(var):
         base = var.split('.')[0]           # "DWD_21" from "DWD_21.PRCP"
@@ -602,23 +651,48 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
     
     # Collect matches in the order of the dictionary keys
     selected_vars_in_order = []
-    
-    for key in top_n_models:
-        # Key looks like "dwd21_JanIc_MarAprMay"; we take only "dwd21"
-        key_prefix = key.split('_')[0].lower()
-        
-        # Find all matching variables for this key
-        matches = [
-            var for var in center_variable 
-            if normalize_var(var) == key_prefix
-        ]
-        
-        # Extend the list by all matches (or pick just the first one, depending on your needs)
-        selected_vars_in_order.extend(matches)    
+    if gcm:
+        for key in top_n_models:
+            # Key looks like "eccc_5_JanIc_"; we take only "dwd21"
+            key_prefix = "".join([key.split('_')[0].lower(),key.split('_')[1].lower()])
+            
+            # Find all matching variables for this key
+            matches = [            
+                var for var in center_variable
+                if normalize_var(var).startswith(key_prefix)
+            ]
+            
+            # Extend the list by all matches (or pick just the first one, depending on your needs)
+            selected_vars_in_order.extend(matches)
+    elif agroparam:
+        for key in top_n_models:
+            # Key looks like "eccc_5_JanIc_"; we take only "dwd21"
+            key_prefix = key.split('_')[0][0:5].lower()
+            
+            # Find all matching variables for this key
+            matches = [            
+                var for var in center_variable
+                if normalize_var(var).startswith(key_prefix)
+            ]
+            
+            # Extend the list by all matches (or pick just the first one, depending on your needs)
+            selected_vars_in_order.extend(matches)        
+    else:
+        for key in top_n_models:
+            key_prefix = key.split('.')[0]
+            
+            # Find all matching variables for this key
+            matches = [            
+                var for var in center_variable
+                if var.startswith(key_prefix)
+            ]
+            
+            # Extend the list by all matches (or pick just the first one, depending on your needs)
+            selected_vars_in_order.extend(matches)        
     return selected_vars_in_order # selected_vars
 
 
-def plot_prob_forecasts(dir_to_save, forecast_prob, model_name):    
+def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True):    
 
     # Step 1: Extract maximum probability and category
     max_prob = forecast_prob.max(dim="probability", skipna=True)  # Maximum probability at each grid point
@@ -633,9 +707,19 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name):
     mask_an = max_category == 2  # Above Normal (AN)
     
     # Step 3: Define custom colormaps
-    BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FFF5F0', '#FB6A4A', '#67000D'])
-    NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#F7FCF5', '#74C476', '#00441B'])
-    AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#F7FBFF', '#6BAED6', '#08306B'])
+    # BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FFF5F0', '#FB6A4A', '#67000D'])
+    # NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#F7FCF5', '#74C476', '#00441B'])
+    # AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#F7FBFF', '#6BAED6', '#08306B'])
+
+    if reverse_cmap:
+        
+        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#FDAE61', '#F46D43', '#D73027']) 
+        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FEE391'])
+        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#ABDDA4', '#66C2A5', '#3288BD'])  
+    else:
+        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FDAE61', '#F46D43', '#D73027']) 
+        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FEE391'])
+        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#ABDDA4', '#66C2A5', '#3288BD'])          
     
     # Create a figure with GridSpec
     fig = plt.figure(figsize=(8, 6))
@@ -713,6 +797,136 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name):
     # For BN (Below Normal)
     cbar_ax_bn = fig.add_subplot(gs[1, 0])
     cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal')
+    cbar_bn.set_label(f'{labels[0]} (%)')
+    cbar_bn.set_ticks(ticks)
+    cbar_bn.set_ticklabels([f"{tick}" for tick in ticks])
+
+    # For NN (Near Normal)
+    cbar_ax_nn = fig.add_subplot(gs[1, 1])
+    cbar_nn = plt.colorbar(nn_plot, cax=cbar_ax_nn, orientation='horizontal')
+    cbar_nn.set_label(f'{labels[1]} (%)')
+    cbar_nn.set_ticks(ticks)
+    cbar_nn.set_ticklabels([f"{tick}" for tick in ticks])
+
+    # For AN (Above Normal)
+    cbar_ax_an = fig.add_subplot(gs[1, 2])
+    cbar_an = plt.colorbar(an_plot, cax=cbar_ax_an, orientation='horizontal')
+    cbar_an.set_label(f'{labels[2]} (%)')
+    cbar_an.set_ticks(ticks)
+    cbar_an.set_ticklabels([f"{tick}" for tick in ticks])
+    
+    # Set the title with the formatted model_name
+    # Convert model_name to string if necessary
+    if isinstance(model_name, np.ndarray):
+        model_name_str = str(model_name.item())
+    else:
+        model_name_str = str(model_name)
+    ax.set_title(f"Probabilistic Forecast - {model_name_str}", fontsize=13, pad=20)
+    
+    plt.tight_layout()
+    plt.savefig(f"{dir_to_save}/Forecast_{model_name_str}_.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name):    
+
+    # Step 1: Extract maximum probability and category
+    max_prob = forecast_prob.max(dim="probability", skipna=True)  # Maximum probability at each grid point
+    # Fill NaN values with a very low value 
+    filled_prob = forecast_prob.fillna(-9999)
+    # Compute argmax
+    max_category = filled_prob.argmax(dim="probability")
+    
+    # Step 2: Create masks for each category
+    mask_bn = max_category == 0  # Below Normal (BN)
+    mask_nn = max_category == 1  # Near Normal (NN)
+    mask_an = max_category == 2  # Above Normal (AN)
+    
+    # Step 3: Define custom colormaps
+    # BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FFF5F0', '#FB6A4A', '#67000D'])
+    # NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#F7FCF5', '#74C476', '#00441B'])
+    # AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#F7FBFF', '#6BAED6', '#08306B'])
+    
+    BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FDAE61', '#F46D43', '#D73027']) 
+    NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FFFFCC'])
+    AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#ABDDA4', '#66C2A5', '#3288BD'])    
+    
+    # Create a figure with GridSpec
+    fig = plt.figure(figsize=(8, 6))
+    gs = gridspec.GridSpec(2, 3, height_ratios=[15, 0.5])
+    
+    # Main map axis
+    ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
+    
+    # Step 4: Plot each category
+    # Multiply by 100 to convert probabilities to percentages
+    
+    # bn_data = (max_prob.where(mask_bn) * 100).values
+    # nn_data = (max_prob.where(mask_nn) * 100).values
+    # an_data = (max_prob.where(mask_an) * 100).values
+    
+    bn_data = xr.where((xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100)<45, 45,
+                       xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100).values  
+    nn_data = xr.where((xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100)<45, 45,
+                   xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100).values
+    an_data = xr.where((xr.where(max_prob.where(mask_an)>0.6,0.6,max_prob.where(mask_an))* 100)<45, 45,
+                   xr.where(max_prob.where(mask_an)>0.6,0.6,max_prob.where(mask_an))* 100).values
+     
+
+    
+    # Define the data ranges for color normalization
+    vmin = 35  # Minimum probability percentage
+    vmax = 65  # Maximum probability percentage
+    
+    # Plot BN (Below Normal)
+    if np.any(~np.isnan(bn_data)):
+        bn_plot = ax.contourf(
+            forecast_prob['X'], forecast_prob['Y'], bn_data,
+            cmap=BN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
+        )
+    else:
+        # Create a dummy mappable for BN
+        bn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=BN_cmap)
+        bn_plot.set_array([])
+
+    # Plot NN (Near Normal)
+    if np.any(~np.isnan(nn_data)):
+        nn_plot = ax.contourf(
+            forecast_prob['X'], forecast_prob['Y'], nn_data,
+            cmap=NN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
+        )
+    else:
+        # Create a dummy mappable for NN
+        nn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=NN_cmap)
+        nn_plot.set_array([])
+
+    # Plot AN (Above Normal)
+    if np.any(~np.isnan(an_data)):
+        an_plot = ax.contourf(
+            forecast_prob['X'], forecast_prob['Y'], an_data,
+            cmap=AN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
+        )
+    else:
+        # Create a dummy mappable for AN
+        an_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=AN_cmap)
+        an_plot.set_array([])
+
+    # Step 5: Add coastlines and borders
+    ax.coastlines()
+    ax.add_feature(cfeature.BORDERS, linestyle=':')
+    
+    # Step 6: Add individual colorbars with fixed ticks
+    
+    # Function to create ticks at intervals of 10 from 0 to 100
+    def create_ticks():
+        ticks = np.arange(35, 66, 5)
+        return ticks
+
+    ticks = create_ticks()
+
+    # For BN (Below Normal)
+    cbar_ax_bn = fig.add_subplot(gs[1, 0])
+    cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal')
     cbar_bn.set_label('Below-Normal (%)')
     cbar_bn.set_ticks(ticks)
     cbar_bn.set_ticklabels([f"{tick}" for tick in ticks])
@@ -742,153 +956,360 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name):
     plt.tight_layout()
     plt.savefig(f"{dir_to_save}/Forecast_{model_name_str}_.png", dpi=300, bbox_inches='tight')
     plt.show()
-
-def build_gcm_for_elm_mlp(center_variable, month_of_initialization, lead_time, dir_model, rainfall, elm=True):
     
+
+def plot_tercile(A):
+    # Step 3: Plotting
+    fig = plt.figure(figsize=(8, 6))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    
+    # Custom colormap: brown (below), light cyan (normal), green (above)
+    colors = ['#fc8d59', '#ffffbf', '#99d594']
+    cmap = ListedColormap(colors)
+    bounds = [-0.5, 0.5, 1.5, 2.5]
+    norm = BoundaryNorm(bounds, cmap.N)
+    
+    # Plot
+    lon = A['X']
+    lat = A['Y']
+    img = ax.pcolormesh(lon, lat, A.isel(T=0), cmap=cmap, norm=norm, transform=ccrs.PlateCarree())
+    
+    # Borders and coastlines
+    ax.add_feature(cfeature.BORDERS, linewidth=1)
+    ax.add_feature(cfeature.COASTLINE, linewidth=1)
+    
+    # Optional: mask ocean
+    ax.set_extent([lon.min(), lon.max(), lat.min(), lat.max()], crs=ccrs.PlateCarree())
+    
+    # Title
+    plt.title("Terciles MAP", fontsize=16, weight='bold')
+    
+    # Custom legend
+    legend_elements = [
+        mpatches.Patch(color='#99d594', label='ABOVE'),    
+        mpatches.Patch(color='#ffffbf', label='NORMAL'),
+        mpatches.Patch(color='#fc8d59', label='BELOW')
+    ]
+    plt.legend(handles=legend_elements, loc='lower left')
+    
+    plt.tight_layout()
+    plt.show()
+    
+
+
+def find_best_distribution_grid(rainfall, distribution_map=None):
+    """
+    Apply a function across the rainfall DataArray (assumed to have a 'T' dimension)
+    to determine the best-fitting distribution, returning a grid of numeric codes.
+    
+    Parameters
+    ----------
+    rainfall : xarray.DataArray
+        Precipitation data with a time dimension 'T' and additional spatial dimensions.
+    distribution_map : dict, optional
+        A mapping of distribution names to numeric codes. Defaults to:
+            {
+                'norm': 1,
+                'lognorm': 2,
+                'expon': 3,
+                'gamma': 4,
+                'weibull_min': 5
+            }
+    
+    Returns
+    -------
+    best_fit_da : xarray.DataArray
+        An array of the same spatial dimensions as rainfall with the best-fitting 
+        distribution's numeric code at each grid cell.
+    """
+    # Define default distribution_map if not provided
+    if distribution_map is None:
+        distribution_map = {
+            'norm': 1,
+            'lognorm': 2,
+            'expon': 3,
+            'gamma': 4,
+            'weibull_min': 5
+        }
+    
+    def find_best_distribution(precip_data, distribution_map):
+        """
+        Fits multiple distributions to precipitation data and returns the best-fitting 
+        distribution's numeric code.
+        """
+        # Convert input to a 1D NumPy array
+        precip_data = np.asarray(precip_data)
+        
+        # Skip if all values are NaN (e.g., ocean grid cells)
+        if np.isnan(precip_data).all():
+            return np.nan
+        
+        # Fit distributions using the provided distribution_map keys
+        f = Fitter(precip_data, distributions=list(distribution_map.keys()))
+        f.fit()
+    
+        # Get the best-fitting distribution using the sum-of-squared errors method
+        best_fit = f.get_best(method='sumsquare_error')
+        best_dist_name = list(best_fit.keys())[0]  # Get the best-fitting distribution name
+    
+        # Return the corresponding numeric code
+        return distribution_map.get(best_dist_name, np.nan)
+
+    # Apply the function along the 'T' dimension using xarray's apply_ufunc
+    best_fit_da = xr.apply_ufunc(
+        find_best_distribution, 
+        rainfall, 
+        input_core_dims=[["T"]],  # Function expects 1D array along T
+        kwargs={'distribution_map': distribution_map},
+        vectorize=True,           # Broadcast over non-core dimensions
+        dask="parallelized",      # If using dask arrays
+        output_dtypes=[float]     # Numeric code output, float to accommodate NaN
+    )
+    
+    return best_fit_da
+    
+
+################################ agroparameters compute ################
+
+onset_criteria = {
+1: {"zone_name": "Sahel200_100mm", "start_search": "05-15", "cumulative": 15, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "08-15"},
+2: {"zone_name": "Sahel400_200mm", "start_search": "05-01", "cumulative": 15, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31"},
+3: {"zone_name": "Sahel600_400mm", "start_search": "03-15", "cumulative": 20, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31"},
+4: {"zone_name": "Soudan",         "start_search": "03-15", "cumulative": 20, "number_dry_days": 10, "thrd_rain_day": 0.85, "end_search": "07-31"},
+5: {"zone_name": "Golfe_Of_Guinea","start_search": "02-01", "cumulative": 20, "number_dry_days": 10, "thrd_rain_day": 0.85, "end_search": "06-15"},
+    }
+
+onset_dryspell_criteria = {
+    1: {"zone_name": "Sahel200_100mm", "start_search": "05-15", "cumulative": 15, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "08-15", "nbjour":40},
+    2: {"zone_name": "Sahel400_200mm", "start_search": "05-01", "cumulative": 15, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31", "nbjour":40},
+    3: {"zone_name": "Sahel600_400mm", "start_search": "03-15", "cumulative": 20, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31", "nbjour":45},
+    4: {"zone_name": "Soudan",         "start_search": "03-15", "cumulative": 20, "number_dry_days": 10, "thrd_rain_day": 0.85, "end_search": "07-31", "nbjour":50},
+    5: {"zone_name": "Golfe_Of_Guinea","start_search": "02-01", "cumulative": 20, "number_dry_days": 10, "thrd_rain_day": 0.85, "end_search": "06-15", "nbjour":50},
+}
+
+cessation_criteria = {
+    1: {"zone_name": "Sahel200_100mm", "date_dry_soil":"01-01", "start_search": "09-01", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "10-05"},
+    2: {"zone_name": "Sahel400_200mm", "date_dry_soil":"01-01", "start_search": "09-01", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "11-10"},
+    3: {"zone_name": "Sahel600_400mm", "date_dry_soil":"01-01", "start_search": "09-15", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "11-15"},
+    4: {"zone_name": "Soudan", "date_dry_soil":"01-01", "start_search": "10-01", "ETP": 4.5, "Cap_ret_maxi": 70, "end_search": "11-30"},
+    5: {"zone_name": "Golfe_Of_Guinea", "date_dry_soil":"01-01", "start_search": "10-15", "ETP": 4.0, "Cap_ret_maxi": 70, "end_search": "12-01"},
+}
+
+# Default class-level criteria dictionary
+cessation_dryspell_criteria = {
+    1: {"zone_name": "Sahel200_100mm", "start_search1": "05-15", "cumulative": 15, "number_dry_days": 25,
+        "thrd_rain_day": 0.85,
+        "end_search1": "08-15",
+        "nbjour": 40,
+        "date_dry_soil": "01-01",
+        "start_search2": "09-01",
+        "ETP": 5.0,
+        "Cap_ret_maxi": 70,
+        "end_search2": "10-05"
+    },
+    2: {
+        "zone_name": "Sahel400_200mm",
+        "start_search1": "05-01",
+        "cumulative": 15,
+        "number_dry_days": 20,
+        "thrd_rain_day": 0.85,
+        "end_search1": "07-31",
+        "nbjour": 40,
+        "date_dry_soil": "01-01",
+        "start_search2": "09-01",
+        "ETP": 5.0,
+        "Cap_ret_maxi": 70,
+        "end_search2": "11-10"
+    },
+    3: {
+        "zone_name": "Sahel600_400mm",
+        "start_search1": "03-15",
+        "cumulative": 20,
+        "number_dry_days": 20,
+        "thrd_rain_day": 0.85,
+        "end_search1": "07-31",
+        "nbjour": 45,
+        "date_dry_soil": "01-01",
+        "start_search2": "09-15",
+        "ETP": 5.0,
+        "Cap_ret_maxi": 70,
+        "end_search2": "11-15"
+    },
+    4: {
+        "zone_name": "Soudan",
+        "start_search1": "03-15",
+        "cumulative": 20,
+        "number_dry_days": 10,
+        "thrd_rain_day": 0.85,
+        "end_search1": "07-31",
+        "nbjour": 50,
+        "date_dry_soil": "01-01",
+        "start_search2": "10-01",
+        "ETP": 4.5,
+        "Cap_ret_maxi": 70,
+        "end_search2": "11-30"
+    },
+    5: {
+        "zone_name": "Golfe_Of_Guinea",
+        "start_search1": "02-01",
+        "cumulative": 20,
+        "number_dry_days": 10,
+        "thrd_rain_day": 0.85,
+        "end_search1": "06-15",
+        "nbjour": 50,
+        "date_dry_soil": "01-01",
+        "start_search2": "10-15",
+        "ETP": 4.0,
+        "Cap_ret_maxi": 70,
+        "end_search2": "12-01"
+    },
+}
+
+def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, fcst_file_path, obs_hdcst, 
+obs_fcst_year, month_of_initialization, year_start, year_end, year_forecast, nb_cores=2, agrometparam="Onset"):
+    
+    mask = xr.where(~np.isnan(obs_fcst_year.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+    # create a dummy dataarray
+    t_coord = pd.date_range(start=f"{year_forecast}-01-01", end=f"{year_forecast}-12-31", freq="D")
+    
+
+    y_coords = obs_fcst_year.Y
+    x_coords = obs_fcst_year.X
+    
+    # Create a zero-filled DataArray with shape (1, Y, X)
+    dummy = xr.DataArray(
+        data=np.zeros((len(t_coord), len(y_coords), len(x_coords))),
+        coords={"T": t_coord, "Y": y_coords, "X": x_coords},
+        dims=["T", "Y", "X"]
+    )*mask
+
     abb_mont_ini = calendar.month_abbr[int(month_of_initialization)]
-    season_months = [((int(month_of_initialization) + int(l) - 1) % 12) + 1 for l in lead_time]
-    season = "".join([calendar.month_abbr[month] for month in season_months])
-    variables = center_variable[0].split(".")[1]
-    
-    all_model_hdcst = {}
-    all_model_fcst = {} 
+    dir_to_save = Path(f"{dir_to_save}/model_data")
+    os.makedirs(dir_to_save, exist_ok=True)
 
-    for i in center_variable:
-        center = i.split(".")[0].lower().replace("_", "")
-        model_file = f"{dir_model}/hindcast_{center}_{variables}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
-        model_data_ = xr.open_dataset(model_file)
-        all_model_hdcst[center] = model_data_.interp(
-                        Y=rainfall.Y,
-                        X=rainfall.X,
-                        method="nearest",
-                        kwargs={"fill_value": "extrapolate"}
-                    )
-        model_file = f"{dir_model}/forecast_{center}_{variables}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
-        model_data_ = xr.open_dataset(model_file)
-        all_model_fcst[center] = model_data_.interp(
-                        Y=rainfall.Y,
-                        X=rainfall.X,
-                        method="nearest",
-                        kwargs={"fill_value": "extrapolate"}
-                    )  
+    # process the hindcast datasets
+    saved_hindcast_paths = {}
+
+    for i in hdcst_file_path.keys():
+        save_path = f"{dir_to_save}/hindcast_{i}_{agrometparam}_{abb_mont_ini}Ic.nc"
         
-    # Extract the datasets and keys
-    hindcast_det_list = list(all_model_hdcst.values()) 
-    forecast_det_list = list(all_model_fcst.values())
-    predictor_names = list(all_model_hdcst.keys())    
-    obs = rainfall.expand_dims({'M':[0]},axis=1)
-    mask = xr.where(~np.isnan(rainfall.isel(T=0)), 1, np.nan).drop_vars('T').squeeze()
-    mask.name = None
-    
-    if elm:
-        # Concatenate along a new dimension ('M') and assign coordinates
-        all_model_hdcst = (
-            xr.concat(hindcast_det_list, dim='M')
-            .assign_coords({'M': predictor_names})  
-            .rename({'T': 'S'})                    
-            .transpose('S', 'M', 'Y', 'X')         
-        )*mask
+        if not os.path.exists(save_path):
+            hdcst = xr.open_dataset(hdcst_file_path[i])
+            if 'number' in hdcst.dims:
+                hdcst = hdcst.mean(dim="number")
+            hdcst = hdcst.to_array().drop_vars("variable").squeeze()
+            obs_hdcst_sel = obs_hdcst.sel(T=slice(str(year_start), str(year_end)))
+            obs_hdcst_interp = obs_hdcst_sel.interp(Y=hdcst.Y, X=hdcst.X, 
+                                                    method="linear", 
+                                                    kwargs={"fill_value": "extrapolate"})
+            ds1_aligned, ds2_aligned = xr.align(hdcst, obs_hdcst_interp, join='outer')
+            filled_ds = ds1_aligned.fillna(ds2_aligned)
+            ds_filled = filled_ds.copy()
+            agpm_model = agmParamModel.compute(daily_data=ds_filled.sortby("T"), nb_cores=nb_cores)
+            ds_processed = agpm_model.to_dataset(name=agrometparam)
+            ds_processed.to_netcdf(save_path)
+        else:
+            print(f"[SKIP] {save_path} already exists.")
+        saved_hindcast_paths[i] = save_path
         
-        all_model_fcst = (
-            xr.concat(forecast_det_list, dim='M')
-            .assign_coords({'M': predictor_names})  
-            .rename({'T': 'S'})                    
-            .transpose('S', 'M', 'Y', 'X')         
-        )
-    else:
-        # Concatenate along a new dimension ('M') and assign coordinates
-        all_model_hdcst = (
-            xr.concat(hindcast_det_list, dim='M')
-            .assign_coords({'M': predictor_names})             
-            .transpose('T', 'M', 'Y', 'X')         
-        )*mask
+    # process the forecasts datasets
+    saved_forecast_paths = {}
+
+    for i in fcst_file_path.keys():
+        save_path = f"{dir_to_save}/forecast_{i}_{agrometparam}_{abb_mont_ini}Ic.nc"
         
-        all_model_fcst = (
-            xr.concat(forecast_det_list, dim='M')
-            .assign_coords({'M': predictor_names})                     
-            .transpose('T', 'M', 'Y', 'X')         
-        )*mask
-    return all_model_hdcst.to_array().drop('variable').squeeze('variable'), all_model_fcst.to_array().drop('variable').squeeze('variable'), obs
+        if not os.path.exists(save_path):
+            fcst = xr.open_dataset(fcst_file_path[i])
+            if 'number' in fcst.dims:
+                fcst = fcst.mean(dim="number")
+            fcst = fcst.to_array().drop_vars("variable").squeeze()
+            obs_fcst_sel = obs_fcst_year.sortby("T").sel(T=str(year_forecast))
+            obs_fcst_interp = obs_fcst_sel.interp(Y=fcst.Y, X=fcst.X, 
+                                                  method="linear", 
+                                                  kwargs={"fill_value": "extrapolate"})
+            ds1_aligned, ds2_aligned = xr.align(fcst, obs_fcst_interp, join='outer')
+            filled_fcst = ds1_aligned.fillna(ds2_aligned)
+            ds_filled = filled_fcst.copy()
+            ds_filled = ds_filled.sortby("T")
+
+            dummy = dummy.interp(Y=fcst.Y, X=fcst.X, 
+                                                    method="linear", 
+                                                    kwargs={"fill_value": "extrapolate"})
+            ds1_aligned, ds2_aligned = xr.align(ds_filled, dummy, join='outer')      
+            
+            filled_fcst_ = ds1_aligned.fillna(ds2_aligned)
+            ds_filled = filled_fcst_.copy()
+            ds_filled = ds_filled.sortby("T")
+
+            agpm_model = agmParamModel.compute(daily_data=ds_filled, nb_cores=nb_cores)
+            ds_processed = agpm_model.to_dataset(name=agrometparam)
+            ds_processed.to_netcdf(save_path)
+        else:
+            print(f"[SKIP] {save_path} already exists.")
+        saved_forecast_paths[i] = save_path
+
+    return saved_hindcast_paths, saved_forecast_paths
 
 
-def build_MLP_ELM_mme_datasets(rainfall, hdcsted=None, fcsted=None, gcm=True, ELM=False, dir_to_save_model=None, best_models=None, year_start=None, year_end=None, model=True, month_of_initialization=None, lead_time=None, year_forecast=None):
-    all_model_hdcst = {}
-    all_model_fcst = {}
-    if gcm:
-        for i in best_models:
-            hdcst = load_gridded_predictor(dir_to_save_model, i, year_start, year_end, model=True, month_of_initialization=month_of_initialization, lead_time=lead_time, year_forecast=None)
-            all_model_hdcst[i] = hdcst.interp(
-                            Y=rainfall.Y,
-                            X=rainfall.X,
-                            method="linear",
-                            kwargs={"fill_value": "extrapolate"}
-                        )
-            fcst = load_gridded_predictor(dir_to_save_model, i, year_start, year_end, model=True, month_of_initialization=month_of_initialization, lead_time=lead_time, year_forecast=year_forecast)
-            all_model_fcst[i] = fcst.interp(
-                            Y=rainfall.Y,
-                            X=rainfall.X,
-                            method="linear",
-                            kwargs={"fill_value": "extrapolate"}
-                        )
-    else:
-        for i in dict_models.keys():
-            all_model_hdcst[i] = hdcsted[i].interp(
-                            Y=rainfall.Y,
-                            X=rainfall.X,
-                            method="nearest",
-                            kwargs={"fill_value": "extrapolate"}
-                        )
-            all_model_fcst[i] = fcsted[i].interp(
-                            Y=rainfall.Y,
-                            X=rainfall.X,
-                            method="nearest",
-                            kwargs={"fill_value": "extrapolate"}
-                        )    
-    
-    # Extract the datasets and keys
-    hindcast_det_list = list(all_model_hdcst.values()) 
-    forecast_det_list = list(all_model_fcst.values())
-    predictor_names = list(all_model_hdcst.keys())    
-
-    mask = xr.where(~np.isnan(rainfall.isel(T=0)), 1, np.nan).drop_vars('T').squeeze()
-    mask.name = None
-    
-    if ELM:
-        # Concatenate along a new dimension ('M') and assign coordinates
-        all_model_hdcst = (
-            xr.concat(hindcast_det_list, dim='M')
-            .assign_coords({'M': predictor_names})  
-            .rename({'T': 'S'})                    
-            .transpose('S', 'M', 'Y', 'X')         
-        )*mask
-        
-        all_model_fcst = (
-            xr.concat(forecast_det_list, dim='M')
-            .assign_coords({'M': predictor_names})  
-            .rename({'T': 'S'})                    
-            .transpose('S', 'M', 'Y', 'X')         
-        )
-        obs = rainfall.expand_dims({'M':[0]},axis=1)
-    else:
-        # Concatenate along a new dimension ('M') and assign coordinates
-        all_model_hdcst = (
-            xr.concat(hindcast_det_list, dim='M')
-            .assign_coords({'M': predictor_names})             
-            .transpose('T', 'M', 'Y', 'X')         
-        )*mask
-        
-        all_model_fcst = (
-            xr.concat(forecast_det_list, dim='M')
-            .assign_coords({'M': predictor_names})                     
-            .transpose('T', 'M', 'Y', 'X')         
-        )*mask
-        obs = rainfall.expand_dims({'M':[0]},axis=1)
-    return all_model_hdcst, all_model_fcst, obs
+# def plot_date(A):
+#     plot = A.plot(cbar_kwargs={'label': 'Date'})
+#     cbar = plot.colorbar
+#     ticks = cbar.get_ticks()
+#     tick_labels = [(datetime.datetime(2024, 1, 1) + timedelta(days=int(tick))).strftime('%d-%b') for tick in ticks]
+#     cbar.set_ticks(ticks)
+#     cbar.set_ticklabels(tick_labels)
+#     # plt.title("Onset Date in Calendar Format")
+#     plt.tight_layout()
+#     plt.show()
 
 
+def plot_date(A):
+    """
+    Plots 'A' on a map, interpreting the data values as
+    offsets from 2024-01-01. The colorbar ticks are then
+    converted to calendar dates.
+    """
 
+    # 1. Create a figure and axis with a map projection
+    fig, ax = plt.subplots(
+        figsize=(8, 6),
+        subplot_kw=dict(projection=ccrs.PlateCarree())
+    )
 
+    # 2. Plot the DataArray with a horizontal colorbar
+    plt_obj = A.plot(
+        ax=ax,
+        x="X",
+        y="Y",
+        transform=ccrs.PlateCarree(),
+        cbar_kwargs={
+            'label': 'Date',
+            'orientation': 'horizontal',
+            'pad': 0.01,
+            'shrink': 1,   
+            'aspect': 25     
+        }
+    )
 
+    # 3. Extract the colorbar and update tick labels
+    cbar = plt_obj.colorbar
+    ticks = cbar.get_ticks()
+    tick_labels = [
+        (datetime.datetime(2024, 1, 1) + timedelta(days=int(tick))).strftime('%d-%b')
+        for tick in ticks
+    ]
+    cbar.set_ticks(ticks)
+    cbar.set_ticklabels(tick_labels)
+
+    # 4. Add map features
+    ax.coastlines()
+    ax.add_feature(cfeature.BORDERS, linestyle=':')
+    ax.add_feature(cfeature.LAND, edgecolor='black')
+    ax.add_feature(cfeature.OCEAN)
+
+    plt.tight_layout()
+    plt.show()
 
 
 # import matplotlib.pyplot as plt
@@ -911,3 +1332,4 @@ def build_MLP_ELM_mme_datasets(rainfall, hdcsted=None, fcsted=None, gcm=True, EL
 # # Enfin on trace
 # data.plot(cmap=cmap, norm=norm)
 # plt.show()
+

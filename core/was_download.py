@@ -10,7 +10,9 @@ import io
 import pandas as pd
 from pathlib import Path
 import xarray as xr
-from datetime import timedelta, date, datetime
+from datetime import timedelta
+from datetime import date
+from datetime import datetime
 import os
 from dask.diagnostics import ProgressBar
 import cdsapi
@@ -20,8 +22,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import requests
+from tqdm import tqdm
 from core.utils import *
-
+import rioxarray as rioxr
 
 # Suppress warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -37,17 +41,31 @@ class WAS_Download:
         self,
         centre={
             "ECMWF_51": "ecmwf",
-            "UKMO_602": "ukmo",
+            # "UKMO_602": "ukmo",
             "UKMO_603": "ukmo",
             "METEOFRANCE_8": "meteo_france",
             "DWD_21": "dwd",
-            "DWD_2": "dwd",
+            # "DWD_2": "dwd",
             "CMCC_35": "cmcc",
-            "CMCC_3": "cmcc",
+            # "CMCC_3": "cmcc",
             "NCEP_2": "ncep",
             "JMA_3": "jma",
-            "ECCC_2": "eccc",
-            "ECCC_3": "eccc",
+            "ECCC_4": "eccc",
+            "ECCC_5": "eccc",
+            # "CFSV2": "CFS",
+            # "CMC1": "cmc1",
+            # "CMC2": "cmc2",
+            # "GFDL": "gfdl",
+            # "NASA": "nasa",
+            # "NCAR_CCSM4": "ncar",
+            # "NMME" : "nmme"
+            "CFSV2_1": "cfsv2",
+            "CMC1_1": "cmc1",
+            "CMC2_1": "cmc2",
+            "GFDL_1": "gfdl",
+            "NASA_1": "nasa",
+            "NCAR_CCSM4_1": "ncar_ccsm4",
+            "NMME_1" : "nmme"
         },
         variables_1={
             "PRCP": "total_precipitation",
@@ -92,7 +110,7 @@ class WAS_Download:
 
     def ReanalysisName(
         self,
-        centre={"ERA5": "reanalysis ERA5"},
+        centre={"ERA5": "reanalysis ERA5", "NOAA": "NOAA ERSST"},
         variables_1={
             "PRCP": "total_precipitation",
             "TEMP": "2m_temperature",
@@ -371,6 +389,143 @@ class WAS_Download:
                     combined_ds.to_netcdf(output_path)
                     print(f"Download finished, combined dataset for {cent} {k} to {output_path}")
 
+    # def download_nmme_txt_with_progress(self, url, file_path, chunk_size=1024):
+    #     file_path = Path(file_path)
+    #     response = requests.get(url, stream=True)
+    #     total_size = int(response.headers.get('content-length', 0))
+        
+    #     with open(file_path, "wb") as f, tqdm(
+    #         total=total_size, unit="B", unit_scale=True, desc=file_path.name
+    #     ) as progress:
+    #         for data in response.iter_content(chunk_size):
+    #             progress.update(len(data))
+    #             f.write(data)
+
+    def download_nmme_txt_with_progress(self, url, file_path, chunk_size=1024):   
+        # Check if the URL exists using a HEAD request
+        try:
+            head = requests.head(url)
+            if head.status_code != 200:
+                print(f"URL returned status code {head.status_code}. Skipping download.")
+                return
+        except Exception as e:
+            print(f"Error checking URL: {e}. Skipping download.")
+            return
+    
+        response = requests.get(url, stream=True)
+        total_size = int(response.headers.get('content-length', 0))
+        
+        with open(file_path, "wb") as f, tqdm(
+            total=total_size, unit="B", unit_scale=True, desc=file_path.name
+        ) as progress:
+            for data in response.iter_content(chunk_size):
+                progress.update(len(data))
+                f.write(data)
+
+    
+    def days_in_month(self, year, month):
+        a = calendar.monthrange(year, month)[1]
+        return a
+         
+    def parse_cpt_data_optimized(self, file_path):
+        from datetime import datetime
+        
+        times = []
+        times_start = []
+        data_list = []
+        lons = None
+        lats = None
+        days_in_month_values = []
+    
+        # Read all lines into memory once
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+    
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith('cpt:field'):
+                # Parse metadata (e.g., time)
+                while i < len(lines) and lines[i].startswith('cpt:'):
+                    if 'cpt:T=' in lines[i]:
+                        t_str = lines[i].split('cpt:T=')[1].split()[0]
+                        year, pot_months = t_str.split('-')
+                        if '/' in pot_months:
+                            start_str, end_str = pot_months.split("/")
+                            start_month = int(start_str)
+                            end_month = int(end_str[0:2])
+                            if start_month <= end_month:
+                                months = list(range(start_month, end_month + 1))
+                            else:
+                                # Wrap around: from start_month to December, then January to end_month
+                                months = list(range(start_month, 13)) + list(range(1, end_month + 1))
+                            month = months[1]
+                            days_in_mon = self.days_in_month(int(year), months[0]) + self.days_in_month(int(year), months[1]) + self.days_in_month(int(year), months[2])
+                        else:
+                            month = int(pot_months[0:2])
+                            days_in_mon = self.days_in_month(int(year), month)
+                        
+                        days_in_month_values.append(days_in_mon)
+                        times.append(datetime(int(year), int(month), 1))
+                        
+                        #### Retrieve init start
+                        start_str = lines[i].split('cpt:S=')[1].split()[0]
+                        yearstart, monthstart, daystart = start_str.split('-')
+                        times_start.append(datetime(int(yearstart), int(monthstart), 1))
+                    i += 1
+                # Parse longitudes (assumed to be the next line)
+                if i < len(lines):
+                    lons = np.array([float(x) for x in lines[i].split()])
+                    i += 1
+                # Read the next 181 lines as a data block
+                if i + 181 <= len(lines):
+                    # Join the 181 lines into a single string
+                    data_block = '\n'.join(lines[i:i + 181])
+                    # Parse the block into a 2D array using np.loadtxt
+                    data_array = np.loadtxt(io.StringIO(data_block), dtype=float)
+                    if data_array.shape[1] == 361:  # 1 latitude + 360 longitudes
+                        # Extract latitudes only once (assuming they’re consistent)
+                        if lats is None:
+                            lats = data_array[:, 0]
+                        # Extract data (excluding latitude column)
+                        data = data_array[:, 1:]
+                        # Replace missing values (e.g., -999.0) with NaN
+                        data[data == -999.0] = np.nan
+                        data_list.append(data)
+                        i += 181
+                    else:
+                        raise ValueError("Unexpected number of columns in data block")
+                else:
+                    break
+            else:
+                i += 1
+                
+
+        # Stack data into a 3D array (time, latitude, longitude)
+        data_3d = np.stack(data_list, axis=0)
+    
+        # Create an xarray DataArray for convenient analysis
+        da = xr.DataArray(
+            data_3d,
+            dims=['T', 'Y', 'X'],
+            coords={
+                'T': times,
+                'Y': lats,
+                'X': lons
+            },
+            # attrs={
+            #     'units': 'mm/day',
+            #     'long_name': 'precipitation'
+            # }
+        )
+
+        days_in_month_da = xr.DataArray(
+            days_in_month_values,
+            dims=['T'],
+            coords={'T': da['T']}
+        ) 
+        return da, days_in_month_da, times_start
+    
     def WAS_Download_Models(
         self,
         dir_to_save,
@@ -410,17 +565,31 @@ class WAS_Download:
 
         centre = {
             "ECMWF_51": "ecmwf",
-            "UKMO_602": "ukmo",
+            # "UKMO_602": "ukmo",
             "UKMO_603": "ukmo",
             "METEOFRANCE_8": "meteo_france",
             "DWD_21": "dwd",
-            "DWD_2": "dwd",
+            # "DWD_2": "dwd",
             "CMCC_35": "cmcc",
-            "CMCC_3": "cmcc",
+            # "CMCC_3": "cmcc",
             "NCEP_2": "ncep",
             "JMA_3": "jma",
-            "ECCC_2": "eccc",
-            "ECCC_3": "eccc",
+            "ECCC_4": "eccc",
+            "ECCC_5": "eccc",
+            # "CFSV2": "cfsv2",
+            # "CMC1": "cmc1",
+            # "CMC2": "cmc2",
+            # "GFDL": "gfdl",
+            # "NASA": "nasa",
+            # "NCAR_CCSM4": "ncar_ccsm4",
+            # "NMME" : "nmme"
+            "CFSV2_1": "cfsv2",
+            "CMC1_1": "cmc1",
+            "CMC2_1": "cmc2",
+            "GFDL_1": "gfdl",
+            "NASA_1": "nasa",
+            "NCAR_CCSM4_1": "ncar_ccsm4",
+            "NMME_1" : "nmme"
         }
 
         variables_1 = {
@@ -447,19 +616,36 @@ class WAS_Download:
 
         system = {
             "ECMWF_51": "51",
-            "UKMO_602": "602",
+            # "UKMO_602": "602",
             "UKMO_603": "603",
             "METEOFRANCE_8": "8",
             "DWD_21": "21",
-            "DWD_2": "2",
+            # "DWD_2": "2",
             "CMCC_35": "35",
-            "CMCC_3": "3",
+            # "CMCC_3": "3",
             "NCEP_2": "2",
             "JMA_3": "3",
-            "ECCC_2": "2",
-            "ECCC_3": "3",
-        }
+            "ECCC_4": "4",
+            "ECCC_5": "5",
+            # "CFSV2": "1",
+            # "CMC1": "1",
+            # "CMC2": "1",
+            # "GFDL": "1",
+            # "NASA": "1",
+            # "NCAR_CCSM4": "1",
+            # "NMME" : "1"
+            "CFSV2_1": "1",
+            "CMC1_1": "1",
+            "CMC2_1": "1",
+            "GFDL_1": "1",
+            "NASA_1": "1",
+            "NCAR_CCSM4_1": "1",
+            "NMME_1" : "1"
 
+        }
+        
+        nmme = ["cfsv2", "cmc1", "cmc2", "gfdl",  "nasa", "ncar_ccsm4", "nmme"]
+        
         selected_centre = [centre[k] for k in center]
         selected_system = [system[k] for k in center]
         selected_var = [k for k in variables]
@@ -471,102 +657,194 @@ class WAS_Download:
         season_months = [((int(month_of_initialization) + int(l) - 1) % 12) + 1 for l in lead_time]
         season = "".join([calendar.month_abbr[month] for month in season_months])
         
-        # abb_mont_ini = calendar.month_abbr[int(month_of_initialization)]
-        # season = "".join(
-        #     [
-        #         calendar.month_abbr[int(i) + int(month_of_initialization)]
-        #         for i in lead_time
-        #     ]
-        # )
-
+        
+        store_file_path = {}
         for cent, syst, k in zip(selected_centre, selected_system, selected_var):
             file_prefix = "forecast" if year_forecast else "hindcast"
-            file_path = f"{dir_to_save}/{file_prefix}_{cent.replace('_', '')}{syst}_{k}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
 
-            if not force_download and os.path.exists(file_path):
-                print(f"{file_path} already exists. Skipping download.")
-            else:
-                
-                try:
-                    if k in variables_2:
-                        press_level = k.split("_")[1]
-                        dataset = "seasonal-monthly-pressure-levels"
-                        request = {
-                            "originating_centre": cent,
-                            "system": syst,
-                            "variable": variables_2[k],
-                            "pressure_level": press_level,
-                            "product_type": ["monthly_mean"],
-                            "year": years,
-                            "month": month_of_initialization,
-                            "leadtime_month": lead_time,
-                            "data_format": "netcdf",
-                            "area": area,
-                        }
-                    else:
-                        dataset = "seasonal-monthly-single-levels"
-                        request = {
-                            "originating_centre": cent,
-                            "system": syst,
-                            "variable": variables_1[k],
-                            "product_type": ["monthly_mean"],
-                            "year": years,
-                            "month": month_of_initialization,
-                            "leadtime_month": lead_time,
-                            "data_format": "netcdf",
-                            "area": area,
-                        }
-    
-                    client = cdsapi.Client()
-                    client.retrieve(dataset, request).download(file_path)
-                    print(f"Downloaded: {file_path}")
+            if cent in nmme: #### Reconsider an option to download other variable than PRCP, TEMP, and SST from IRIDL "code already available"      
 
-    
-                    # Load the NetCDF file and apply area selection if specified
-                    ds = xr.open_dataset(file_path)
-        
-                    if k in ["TMIN","TEMP","TMAX","SST"]:
-                        ds = ds - 273.15
-                        ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds 
-                        ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
-                        if "indexing_time" in ds.coords: 
-                            ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
-                        else:
-                            ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
-                    if k =="PRCP":
-                        ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
-                        ds = (1000*30*24*60*60*ds).sum(dim="forecastMonth").isel(latitude=slice(None, None, -1))
-                        if "indexing_time" in ds.coords: 
-                            ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
-                        else:
-                            ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
-                    if k in ["UGRD10","VGRD10"]:
-                        ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
-                        ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
-                        if "indexing_time" in ds.coords: 
-                            ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
-                        else:
-                            ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
-                    if k not in ["TMIN","TEMP","TMAX","SST","UGRD10","VGRD10", "PRCP"]:
-                        ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
-                        ds = ds.drop_vars("pressure_level").squeeze().mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
-                        if "indexing_time" in ds.coords: 
-                            ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
-                        else:
-                            ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
-        
-                    os.remove(file_path)
-                    print(f"Deleted not process file: {file_path}")
+                file_path = f"{dir_to_save}/{file_prefix}_{cent.replace('_', '')}{syst}_{k}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
+                init_str = f"{abb_mont_ini}ic"
+                tag = "fcst" if year_forecast else "hcst"
+                k = "precip" if k=="PRCP" else k
+                k = "tmp2m" if k=="TEMP" else k
+                k = "sst" if k=="SST" else k
+                if not force_download and os.path.exists(file_path):
+                    print(f"{file_path} already exists. Skipping download.")
+                    store_file_path[f"{cent}_{syst}"] = file_path                   
+                else:
+                    # Choose base URL depending on forecast/hindcast and temporal resolution.
+                    if len(lead_time) == 3:
+                        # Build lead time string using min and max lead time values.
+                        lead_str = f"{season_months[0]}-{season_months[-1]}"
                         
-                    ds = ds.rename({"lon":"X","lat":"Y","time":"T"})    
-                    output_path = f"{dir_to_save}/{file_prefix}_{cent.replace('_', '')}{syst}_{k}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
-                    
-                    # Save the combined dataset for the center-variable combination
-                    ds.to_netcdf(output_path)
-                    print(f"Download finished, combined dataset for {cent} {syst} {k} to {output_path}")
-                    ds.close()
-                except Exception as e:
-                    print(f"Failed to download data for {k}: {e}")                
+                        if year_forecast:
+                            base_url = "https://ftp.cpc.ncep.noaa.gov/International/nmme/seasonal_nmme_forecast_in_cpt_format/"
+                            year_range = f"{year_forecast}-{year_forecast}"
+                        else:
+                            base_url = "https://ftp.cpc.ncep.noaa.gov/International/nmme/seasonal_nmme_hindcast_in_cpt_format/"
+                            year_range = f"{1991}-{2020}"
+                        file_name = f"{cent}_{k}_{tag}_{init_str}_{lead_str}_{year_range}.txt"
+                        full_url = base_url + file_name
+                        file_txt_path = dir_to_save / file_name
+                        if os.path.exists(file_txt_path):
+                            da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path)
+                        else:
+                            self.download_nmme_txt_with_progress(full_url, file_txt_path)
+                            da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path)
+
+                        if k == "precip":
+                            da = da * number_day
+                        da = da.assign_coords(T=times_start)
+                        if year_forecast:
+                            da = da.sel(T=str(year_forecast))
+                        else:
+                            da = da.sel(T=slice(str(year_start_hindcast),str(year_end_hindcast)))
+                        ds = da.to_dataset(name=k)
+                        ds = ds.isel(Y=slice(None, None, -1))
+                        ds = ds.assign_coords(X=((ds.X + 180) % 360 - 180))
+                        ds = ds.sortby("X")
+                        ds = ds.sel(X=slice(area[1],area[3]),Y=slice(area[2], area[0])).transpose('T', 'Y', 'X') 
+                        ds.to_netcdf(file_path)
+                        print(f"Download finished for {cent} {syst} {k} to {file_path}")
+                        ds.close()
+                        store_file_path[f"{cent}_{syst}"] = file_path
+                        
+                    else:
+                        if year_forecast:
+                            base_url = "https://ftp.cpc.ncep.noaa.gov/International/nmme/monthly_nmme_forecast_in_cpt_format/"
+                            year_range = f"{year_forecast}"
+                        else:
+                            base_url = "https://ftp.cpc.ncep.noaa.gov/International/nmme/monthly_nmme_hindcast_in_cpt_format/"
+                            year_range = f"{1991}"
+                        all_da = []
+                        for i in season_months:
+                            file_name = f"{cent}_{k}_{tag}_{init_str}_{i}_{year_range}.txt"
+                            full_url = base_url + file_name
+                            file_txt_path = dir_to_save / file_name
+                            
+                            if os.path.exists(file_txt_path):
+                                da_, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path)
+                            else:
+                                self.download_nmme_txt_with_progress(full_url, file_txt_path)
+                                da_, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path)
+                        
+                            if k == "precip":
+                                da_ = da_ * number_day
+                                                        
+                            
+                            all_da.append(da_)
+                        da = xr.concat(all_da, dim="T").sortby("T")
+                       
+                        if k == "precip":
+                            da = da.resample(T="YE").sum()
+                        else:
+                            da = da.resample(T="YE").mean()
+                        da = da.assign_coords(T=times_start)    
+   
+                        if year_forecast:
+                            da = da.sel(T=str(year_forecast))
+                        else:
+                            da = da.sel(T=slice(str(year_start_hindcast),str(year_end_hindcast)))
+                        ds = da.to_dataset(name=k)
+                        ds = ds.isel(Y=slice(None, None, -1))
+                        ds = ds.assign_coords(X=((ds.X + 180) % 360 - 180))
+                        ds = ds.sortby("X")
+                        ds = ds.sel(X=slice(area[1],area[3]),Y=slice(area[2], area[0])).transpose('T', 'Y', 'X') 
+                        ds.to_netcdf(file_path)
+                        print(f"Download finished for {cent} {syst} {k} to {file_path}")
+                        ds.close()
+                        store_file_path[f"{cent}_{syst}"] = file_path                          
+            else:
+                file_path = f"{dir_to_save}/{file_prefix}_{cent.replace('_', '')}{syst}_{k}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
+                if not force_download and os.path.exists(file_path):
+                    print(f"{file_path} already exists. Skipping download.")
+                    store_file_path[f"{cent}_{syst}"] = file_path
+                else:                
+                    try:
+                        if k in variables_2:
+                            press_level = k.split("_")[1]
+                            dataset = "seasonal-monthly-pressure-levels"
+                            request = {
+                                "originating_centre": cent,
+                                "system": syst,
+                                "variable": variables_2[k],
+                                "pressure_level": press_level,
+                                "product_type": ["monthly_mean"],
+                                "year": years,
+                                "month": month_of_initialization,
+                                "leadtime_month": lead_time,
+                                "data_format": "netcdf",
+                                "area": area,
+                            }
+                        else:
+                            dataset = "seasonal-monthly-single-levels"
+                            request = {
+                                "originating_centre": cent,
+                                "system": syst,
+                                "variable": variables_1[k],
+                                "product_type": ["monthly_mean"],
+                                "year": years,
+                                "month": month_of_initialization,
+                                "leadtime_month": lead_time,
+                                "data_format": "netcdf",
+                                "area": area,
+                            }
+        
+                        client = cdsapi.Client()
+                        client.retrieve(dataset, request).download(file_path)
+                        print(f"Downloaded: {file_path}")
+    
+        
+                        # Load the NetCDF file and apply area selection if specified
+                        ds = xr.open_dataset(file_path)
+            
+                        if k in ["TMIN","TEMP","TMAX","SST"]:
+                            ds = ds - 273.15
+                            ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds 
+                            ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            if "indexing_time" in ds.coords: 
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
+                            else:
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
+                        if k =="PRCP":
+                            ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
+                            ds = (1000*30*24*60*60*ds).sum(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            if "indexing_time" in ds.coords: 
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
+                            else:
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
+                        if k in ["UGRD10","VGRD10"]:
+                            ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
+                            ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            if "indexing_time" in ds.coords: 
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
+                            else:
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
+                        if k not in ["TMIN","TEMP","TMAX","SST","UGRD10","VGRD10", "PRCP"]:
+                            ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
+                            ds = ds.drop_vars("pressure_level").squeeze().mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            if "indexing_time" in ds.coords: 
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
+                            else:
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
+            
+                        os.remove(file_path)
+                        print(f"Deleted not process file: {file_path}")
+                            
+                        ds = ds.rename({"lon":"X","lat":"Y","time":"T"})    
+                        output_path = f"{dir_to_save}/{file_prefix}_{cent.replace('_', '')}{syst}_{k}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
+                        
+                        # Save the combined dataset for the center-variable combination
+                        ds.to_netcdf(output_path)
+                        print(f"Download finished, combined dataset for {cent} {syst} {k} to {output_path}")
+                        ds.close()
+                        store_file_path[f"{cent}_{syst}"] = file_path
+                    except Exception as e:
+                        print(f"Failed to download data for {k}: {e}")
+
+        return store_file_path
 
 
     def WAS_Download_AgroIndicators_daily(
@@ -709,35 +987,35 @@ class WAS_Download:
             years = [str(year_forecast)]
             file_prefix = "forecast"
     
-        # 2. Build your standard dictionaries for center/system/variables
+        # 2. Build standard dictionaries for center/system/variables
         centre = {
             "ECMWF_51": "ecmwf",
-            "UKMO_602": "ukmo",
+            # "UKMO_602": "ukmo",
             "UKMO_603": "ukmo",
             "METEOFRANCE_8": "meteo_france",
             "DWD_21": "dwd",
-            "DWD_2": "dwd",
+            # "DWD_2": "dwd",
             "CMCC_35": "cmcc",
-            "CMCC_3": "cmcc",
+            # "CMCC_3": "cmcc",
             "NCEP_2": "ncep",
             "JMA_3": "jma",
-            "ECCC_2": "eccc",
-            "ECCC_3": "eccc",
+            "ECCC_4": "eccc",
+            "ECCC_5": "eccc",
         }
     
         system = {
             "ECMWF_51": "51",
-            "UKMO_602": "602",
+            # "UKMO_602": "602",
             "UKMO_603": "603",
             "METEOFRANCE_8": "8",
             "DWD_21": "21",
-            "DWD_2": "2",
+            # "DWD_2": "2",
             "CMCC_35": "35",
-            "CMCC_3": "3",
+            # "CMCC_3": "3",
             "NCEP_2": "2",
             "JMA_3": "3",
-            "ECCC_2": "2",
-            "ECCC_3": "3",
+            "ECCC_4": "4",
+            "ECCC_5": "5",
         }
     
         variables_1 = {
@@ -760,11 +1038,23 @@ class WAS_Download:
             "VGRD_925":  "v_component_of_wind",
             "VGRD_850":  "v_component_of_wind",
         }
+
+        ### Particularity for day of initialization NCEP and JMA
+        init_day_dict_jma = {
+            "01":"16", "02":"10", "03":"01", "04":"11", "05":"16", "06":"15",
+            "07":"15", "08":"14", "09":"13", "10":"13", "11":"12", "12":"12"
+        }
+
+        init_day_dict_ncep = {
+            "01":"01", "02":"05", "03":"01", "04":"01", "05":"01", "06":"05",
+            "07":"05", "08":"04", "09":"03", "10":"03", "11":"02", "12":"02"
+        }
+        
     
         # 3. Ensure the output directory exists
         dir_to_save = Path(dir_to_save)
         dir_to_save.mkdir(parents=True, exist_ok=True)
-    
+        store_file_path = {}
         # 4. Loop over each center-variable combination
         for cv in center_variable:
             # Example: "ECMWF_51.PRCP"
@@ -796,8 +1086,14 @@ class WAS_Download:
     
             if not force_download and output_file.exists():
                 print(f"{output_file} already exists. Skipping download.")
+                store_file_path[f"{cent}{syst}"] = output_file
                 continue
-    
+
+            if cent == "jma":
+                day_of_initialization = init_day_dict_jma[month_of_initialization]
+            if cent == "ncep":
+                day_of_initialization = init_day_dict_ncep[month_of_initialization]
+                    
             # 5. Prepare the request for 'seasonal-original-single-levels'
             dataset = "seasonal-original-single-levels"
             request = {
@@ -872,7 +1168,8 @@ class WAS_Download:
                 ds.to_netcdf(output_file)
                 ds.close()
                 print(f"Saved processed data to: {output_file}")
-    
+                store_file_path[f"{cent}{syst}"] = output_file
+        
             except Exception as e:
                 print(f"Error reading or processing {temp_file}: {e}")
     
@@ -881,7 +1178,8 @@ class WAS_Download:
                 if temp_file.exists():
                     os.remove(temp_file)
                     print(f"Deleted temp file: {temp_file}")
-
+        return store_file_path
+        
     def WAS_Download_AgroIndicators(
         self,
         dir_to_save,
@@ -1047,35 +1345,6 @@ class WAS_Download:
             else:
                 print(f"No data downloaded for {var} in {season_str}.")
     
-                
-            # if all_years_datasets:
-            #     combined_ds = xr.concat(all_years_datasets, dim="time")
-
-            #     # Temperature -> Celsius (if needed), then annual stats
-            #     if var in ["AGRO.TMIN", "AGRO.TEMP", "AGRO.TMAX"]:
-            #         combined_ds = combined_ds - 273.15
-            #         # annual mean
-            #         combined_ds = combined_ds.resample(time="YE").mean()
-            #         # Optionally adjust the final time coordinate to e.g. "YYYY-MM-01"
-            #         # Keeping original logic from your snippet:
-            #         #  combined_ds["time"] = [...some expression...]
-            #     else:
-            #         # For precipitation, you might want a sum
-            #         # or something else. We'll show sum as an example
-            #         combined_ds = combined_ds.resample(time="YE").sum()
-            #         # Optionally rename final times:
-            #         #  combined_ds["time"] = [...]
-
-            #     # Rename dims to X, Y, T
-            #     combined_ds = combined_ds.rename({"lon": "X", "lat": "Y", "time": "T"})
-            #     # Flip lat if needed
-            #     combined_ds = combined_ds.isel(Y=slice(None, None, -1))
-
-            #     # Save combined
-            #     combined_ds.to_netcdf(output_path)
-            #     print(f"Saved final dataset for {var} to: {output_path}")
-            # else:
-            #     print(f"No data found for {var}. Skipping.")
 
     # -------------------------------------------------------------------------
     # Helper for Reanalysis cross-year post-processing (optional)
@@ -1106,30 +1375,7 @@ class WAS_Download:
 
         return ds
 
-    def _postprocess_reanalysis_ersst(self, ds, var_name):
-        # """ERSST-specific postprocessing"""
-        # """Post-process reanalysis data with enhanced longitude handling"""
-        # # 1. Convert longitude from 0-360 to -180-180
-        # if 'X' in ds.coords:
-        #     # Shift coordinates and data
-        #     ds = ds.assign_coords(X=((ds.X + 180) % 360) - 180)
-            
-        #     # Sort data by new longitude values
-        #     ds = ds.sortby('X')
-            
-        #     # Roll data to maintain spatial continuity
-        #     ds = ds.roll(X=len(ds.X)//2, roll_coords=False)
-        
-        # # Flip latitude and rename dimensions
-        # if "Y" in ds.coords:
-        #     ds = ds.sortby('Y', ascending=True)
-        
-        # # Convert units if needed
-        # if var_name == "SST" and 'units' in ds[var_name].attrs:
-        #     if ds[var_name].units == 'K':
-        #         ds[var_name] = ds[var_name] - 273.15  # Kelvin to Celsius
-        #         ds[var_name].attrs['units'] = '°C'
-        
+    def _postprocess_reanalysis_ersst(self, ds, var_name):       
         # Drop unnecessary variables
         ds = ds.drop_vars('zlev').squeeze()
         keep_vars = [var_name, 'T', 'X', 'Y']
@@ -1137,7 +1383,7 @@ class WAS_Download:
         return ds.drop_vars(drop_vars, errors="ignore")
 
     def _aggregate_crossyear(self, ds, season_months, var_name):
-        """
+        """s
         Group ds by a custom 'season_year' coordinate so that all months
         in 'season_months' belong to one group that may cross Dec→Jan.
     
@@ -1270,7 +1516,7 @@ class WAS_Download:
                     ds = ds.rename({
                             'sst': 'SST',  # Rename variable to match expected name
                         })
-                                                                                           
+                                                                                                               
                     # 6) Post-process
                     ds = self._postprocess_reanalysis_ersst(ds, v)
                     ds['T'] = ds['T'].astype('datetime64[ns]')                   
@@ -1431,32 +1677,181 @@ class WAS_Download:
                 print(f"No data found for {c}/{v}.")
 
 
-            # # Combine + final post-processing
-            # if combined_datasets:
-            #     dsC = xr.concat(combined_datasets, dim="time")
+    def WAS_Download_CHIRPSv3(
+        self,
+        dir_to_save,
+        variables,
+        year_start,
+        year_end,
+        area=None,
+        season_months=["03", "04", "05"],
+        force_download=False        
+    ):
+        """
+        Download CHIRPS v3.0 monthly precipitation for a specified cross-year season
+        from year_start to year_end, optionally clipped to 'area',
+        and aggregate them into a single NetCDF file.
+        """
+        dir_to_save = Path(dir_to_save)
+        dir_to_save.mkdir(parents=True, exist_ok=True)
+        season_months = [int(m) for m in season_months]
+        variables = variables
+        # Example: "MAM"
+        season_str = "".join([calendar.month_abbr[m] for m in season_months])
+        pivot = season_months[0]
 
-            #     # Example annual aggregator:
-            #     if v in ["TMIN", "TEMP", "TMAX", "SST"]:
-            #         # Kelvin -> Celsius
-            #         dsC = dsC - 273.15
-                
-            #         dsC = dsC.resample(time="YE").mean()
-            #     elif v == "PRCP":
-            #         # e.g. sum precipitation
-            #         dsC = 90 * 1000 * dsC.resample(time="YE").sum()
-            #     else:
-            #         dsC = dsC.resample(time="YE").mean()
+        out_nc = dir_to_save / f"Obs_PRCP_{year_start}_{year_end}_{season_str}.nc"
+        if out_nc.exists() and not force_download:
+            print(f"[INFO] {out_nc} already exists. Skipping.")
+            return
 
-            #     # Optionally rename final time
-            #     # dsC["time"] = [f"{yyyy}-??-??" for yyyy in dsC["time"].dt.year]
+        # We'll store monthly DataArrays here
+        all_data_arrays = []
 
-            #     dsC = dsC.rename({"time": "T"})
-            #     dsC.to_netcdf(out_file)
-            #     print(f"Saved final reanalysis file: {out_file}")
-            # else:
-            #     print(f"No data found for {c}/{v} in {season_str}.")
+        # Loop over years
+        for year in range(year_start, year_end + 1):
+            # Base-year months (>= pivot)
+            base_months = [m for m in season_months if m >= pivot]
+            # Next-year months (< pivot)
+            next_months = [m for m in season_months if m < pivot]
+
+            # Part A: Base-year months
+            for m in base_months:
+                da = self._fetch_chirps_monthly(
+                    year=year,
+                    month=m,
+                    dir_to_save=dir_to_save,
+                    force_download=force_download,
+                    area=area
+                )
+                if da is not None:
+                    all_data_arrays.append(da)
+
+            # Part B: Next-year months
+            if next_months and (year < year_end + 1):
+                year_next = year + 1
+                for m in next_months:
+                    da = self._fetch_chirps_monthly(
+                        year=year_next,
+                        month=m,
+                        dir_to_save=dir_to_save,
+                        force_download=force_download,
+                        area=area
+                    )
+                    if da is not None:
+                        all_data_arrays.append(da)
+
+        if len(all_data_arrays) == 0:
+            print("[WARNING] No CHIRPS data arrays were opened/downloaded.")
+            return
+
+        # Concatenate along time
+        ds_all = xr.concat(all_data_arrays, dim="time").to_dataset(name="precip")
+
+        # Aggregate across the cross-year season (summing monthly precipitation)
+        ds_season = self._aggregate_chirps(ds_all, season_months)
+
+        # Rename dims if desired
+        if "x" in ds_season.dims:
+            ds_season = ds_season.rename({"x": "X"})
+        if "y" in ds_season.dims:
+            ds_season = ds_season.rename({"y": "Y"})
+        if "time" in ds_season.dims:
+            ds_season = ds_season.rename({"time": "T"})
+        # Write to NetCDF
+        ds_season.to_netcdf(out_nc)
+        print(f"[INFO] Saved seasonal CHIRPS data to {out_nc}")
+        # Delete individual monthly TIF files
+        for tif_file in dir_to_save.glob("chirps-v3.0.*.tif"):
+            try:
+                os.remove(tif_file)
+                print(f"[CLEANUP] Deleted {tif_file}")
+            except Exception as e:
+                print(f"[ERROR] Could not delete {tif_file}: {e}")
 
 
+
+    def _fetch_chirps_monthly(self, year, month, dir_to_save, force_download, area):
+        """
+        Construct the CHIRPS v3.0 monthly TIF URL for (year, month), 
+        download if needed, open as xarray, and optionally clip to 'area'.
+        
+        File format is: chirps-v3.0.YYYY.MM.tif
+        """
+        base_url = "https://data.chc.ucsb.edu/products/CHIRPS/v3.0/monthly/africa/tifs"
+        fname = f"chirps-v3.0.{year}.{month:02d}.tif"
+        url = f"{base_url}/{fname}"
+
+        local_path = Path(dir_to_save) / fname
+        download_file(url, local_path, force_download=force_download, chunk_size=8192, timeout=120)
+        
+        # # Download if needed
+        # if (not local_path.exists()) or force_download:
+        #     print(f"[DOWNLOAD] {url}")
+        #     try:
+        #         with requests.get(url, stream=True, timeout=120) as r:
+        #             r.raise_for_status()
+        #             with open(local_path, "wb") as f:
+        #                 for chunk in r.iter_content(chunk_size=8192):
+        #                     f.write(chunk)
+        #     except Exception as e:
+        #         print(f"[ERROR] Could not download {url}: {e}")
+        #         return None
+        # else:
+        #     print(f"[SKIP] {fname} is already present. (Use force_download=True to overwrite)")
+
+        # Open as xarray via rioxarray
+        try:
+            da = rioxr.open_rasterio(local_path, masked=True).squeeze()
+            time_coord = pd.to_datetime(f"{year}-{month:02d}-01")
+            da = da.expand_dims(time=[time_coord])
+            da.name = "precip"
+
+            # If area is provided, clip
+            if area and len(area) == 4:
+                north, west, south, east = area
+                da = da.rio.clip_box(
+                    minx=west,
+                    miny=south,
+                    maxx=east,
+                    maxy=north
+                )
+
+            return da
+
+        except Exception as e:
+            print(f"[ERROR] Could not open/parse {local_path}: {e}")
+            return None
+
+    def _aggregate_chirps(self, ds, season_months):
+        """
+        Sum monthly precipitation across the cross-year season.
+        """
+        if "time" not in ds.coords:
+            raise ValueError("Dataset must have a 'time' dimension.")
+
+        pivot = season_months[0]
+        # Label each time with 'season_year'
+        season_year = ds["time"].dt.year.where(ds["time"].dt.month >= pivot,
+                                               ds["time"].dt.year - 1)
+        ds = ds.assign_coords(season_year=season_year)
+
+        # Keep only the months we want
+        ds = ds.where(ds["time"].dt.month.isin(season_months), drop=True)
+
+        # Sum across the months for precipitation
+        ds_out = ds.groupby("season_year").sum("time", skipna=True)
+
+        # Rename season_year -> time
+        ds_out = ds_out.rename({"season_year": "time"})
+
+        # Optionally make the new time coordinate more descriptive:
+        new_times = []
+        for sy in ds_out.coords["time"].values:
+            new_times.append(f"{sy}-{pivot:02d}-01")
+        ds_out = ds_out.assign_coords(time=pd.to_datetime(new_times))
+
+        return ds_out
 
 
 ####

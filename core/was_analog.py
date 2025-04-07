@@ -27,6 +27,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from scipy.stats import pearsonr
 from scipy import stats
+from scipy.stats import gamma, lognorm
 
 # Deep Learning Libraries
 # import tensorflow as tf
@@ -35,21 +36,32 @@ from scipy import stats
 # EOF Analysis Library
 import xeofs
 
+# verif library
+import xskillscore as xs
+
 import matplotlib.pyplot as plt
 from matplotlib import colors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.colors import ListedColormap, BoundaryNorm
 
+from core.utils import *
+
 class WAS_Analog:
     
-    def __init__(self, dir_to_save, year_start, best_prcp_models=None, month_of_initialization=None,
-                  lead_time=None, ensemble_mean = "mean", clim_year_start=None, clim_year_end=None,
-                  define_extent = None, index_compute = None, some_grid_size = (None, None)
+    def __init__(self, dir_to_save, year_start, year_forecast, reanalysis_name, model_name, method_analog ="som", 
+                 best_prcp_models=None, month_of_initialization=None,
+                 lead_time=None, ensemble_mean = "mean", clim_year_start=None, clim_year_end=None,
+                 define_extent = None, index_compute = None, some_grid_size = (None, None), some_learning_rate = 0.5,
+                 some_neighborhood_function = 'gaussian', some_sigma=1.0, dist_method="gamma"
                 ):
         
         self.dir_to_save = dir_to_save
         self.year_start = year_start
+        self.year_forecast = year_forecast
+        self.reanalysis_name = reanalysis_name
+        self.model_name = model_name
+        self.method_analog = method_analog
         self.month_of_initialization = month_of_initialization
         self.lead_time = lead_time
         self.ensemble_mean = ensemble_mean
@@ -59,7 +71,11 @@ class WAS_Analog:
         self.define_extent = define_extent
         self.index_compute = index_compute
         self.some_grid_size = some_grid_size
-
+        self.some_learning_rate = some_learning_rate
+        self.some_neighborhood_function=some_neighborhood_function
+        self.some_sigma=some_sigma
+        self.dist_method=dist_method
+    
     def calc_index(self, indices, sst):
     
         sst_indices_name = {
@@ -77,6 +93,10 @@ class WAS_Analog:
             "SETIO": ("Southeastern Tropical Indian Ocean (SETIO)", 90, 110, -10, 0),
             "DMI": ("WTIO - SETIO", None, None, None, None),
             "MB": ("Mediterranean Basin", 0, 50, 30, 42),
+            "M1":  ("M1", -50, 5, -50, -25),
+            "M2":  ("M2", -75, -10, 25, 50),
+            "M3":  ("M3", -175, -125, 25, 50),
+            "M4":  ("M4", -175, -125, -50, -25),
         }
         
         predictor = {}
@@ -95,10 +115,17 @@ class WAS_Analog:
         data_vars = {key: ds.rename(key) for key, ds in selected_indices.items()}
         indices_dataset = xr.Dataset(data_vars)
         return indices_dataset
+
+    def _postprocess_ersst(self, ds, var_name):       
+        # Drop unnecessary variables
+        ds = ds.drop_vars('zlev').squeeze()
+        keep_vars = [var_name, 'T', 'X', 'Y']
+        drop_vars = [v for v in ds.variables if v not in keep_vars]
+        return ds.drop_vars(drop_vars, errors="ignore")
+
     
     def download_sst_reanalysis(
         self,
-        center='ERA5',
         area=[60, -180, -60, 180],
         force_download=False
     ):
@@ -112,16 +139,18 @@ class WAS_Analog:
             area (list): Bounding box as [North, West, South, East] for clipping.
             force_download (bool): If True, forces download even if file exists.
         """
-        year_end = datetime.now().year
-        
+        year_end = self.year_forecast #datetime.now().year        
+        center_variable=self.reanalysis_name
+        center = center_variable.split(".")[0]
+        v = center_variable.split(".")[1]
         # Define variable mapping
         variables_1 = {
             "SST": "sea_surface_temperature",
         }
     
-        # Validate center
-        if center not in ["ERA5"]:
-            raise ValueError(f"Unsupported center '{center}'. Supported centers are 'ERA5'.")
+        # # Validate center
+        # if center not in ["ERA5"]:
+        #     raise ValueError(f"Unsupported center '{center}'. Supported centers are 'ERA5'.")
     
         # Define dataset based on center
         if center == "ERA5":
@@ -146,79 +175,115 @@ class WAS_Analog:
             combined_ds = xr.open_dataset(combined_output_path)
             return combined_ds
         else:
-            combined_datasets = []
-            client = cdsapi.Client()  # Initialize once outside the loop for efficiency
-    
-            for year in range(self.year_start, year_end + 1):
-                yearly_file_path = dir_to_save / f"{center}_SST_{year}.nc"
-    
-                if not force_download and yearly_file_path.exists():
-                    print(f"{yearly_file_path} already exists. Loading existing file.")
-                    try:
-                        ds = xr.open_dataset(yearly_file_path).load()
-                        # Rename coordinates if necessary
-                        if 'latitude' in ds.coords and 'longitude' in ds.coords:
-                            ds = ds.rename({"latitude": "Y", "longitude": "X", "valid_time": "T"})
-                        combined_datasets.append(ds)
-                        continue
-                    except Exception as e:
-                        print(f"Failed to load existing file {yearly_file_path}: {e}")
-                        # If loading fails, attempt to re-download
-    
+            if center_variable == "NOAA.SST":
                 try:
-                    request = {
-                        "product_type": "monthly_averaged_reanalysis",
-                        "variable": variable,
-                        "year": str(year),
-                        "month": months,  # Request all months at once
-                        "time": "00:00",
-                        "format": "netcdf",
-                        "area": area,
-                    }
+                    # Build IRIDL URL using bounding box [N, W, S, E]
+                    url = build_iridl_url_ersst(
+                        year_start=self.year_start,
+                        year_end=year_end,
+                        bbox=area,     # e.g. [10, -15, -5, 15]
+                        run_avg=None,
+                        month_start="Jan",
+                        month_end="Dec"
+                    )
+                    print(f"Using IRIDL URL: {url}")
     
-                    print(f"Downloading SST for {year} from {center}...")
-                    client.retrieve(dataset, request).download(str(yearly_file_path))
+                    # 2) Open dataset with manual processing
+                    ds = xr.open_dataset(url, decode_times=False)
+                    ds = decode_cf(ds, "T").rename({"T":"time"}).convert_calendar("proleptic_gregorian", align_on="year").rename({"time":"T"})
+                    ds = ds.assign_coords(T=ds.T - pd.Timedelta(days=15))
+                    ds = ds.rename({
+                        'sst': 'SST',  # Rename variable to match expected name
+                    })
+                                                                                       
+                    # 6) Post-process
+                    ds = self._postprocess_ersst(ds, v)
+                    ds['T'] = ds['T'].astype('datetime64[ns]')                   
+                
+                    # 7) Final formatting
+                    # ds_agg = ds.where(ds.T.dt.month == int(seas[1]), drop=True)
+                    # ds_agg = fix_time_coord(ds_agg, seas)
+                    ds = ds.rename({
+                        'SST': 'sst',  # Rename variable to match expected name
+                        })
+                    # 8) Save
+                    ds.to_netcdf(combined_output_path)
+                    # print(f"Saved NOAA ERSST data to {combined_output_path}")
+                    return ds
                 except Exception as e:
-                    print(f"Failed to download SST for {year}: {e}")
-                    continue
-    
-                try:
-                    with xr.open_dataset(yearly_file_path) as ds:
-                        # Rename coordinates for consistency
-                        if 'latitude' in ds.coords and 'longitude' in ds.coords:
-                            ds = ds.rename({"latitude": "Y", "longitude": "X", "valid_time": "T"})
-                        ds = ds.load()
-                        combined_datasets.append(ds)
-                except Exception as e:
-                    print(f"Failed to process {yearly_file_path}: {e}")
-                    continue
-    
-            if combined_datasets:
-                print("Concatenating yearly datasets...")
-                combined_ds = xr.concat(combined_datasets, dim="T")
-                combined_ds = combined_ds.drop_vars(["number", "expver"]).squeeze()
-                # combined_ds = combined_ds.rename({"lon": "X", "lat": "Y", "valid_time": "T"})
-                combined_ds = combined_ds - 273.15
-                combined_ds = combined_ds.isel(Y=slice(None, None, -1))
-                combined_ds.to_netcdf(combined_output_path)
-                print(f"Download finished. Combined SST dataset saved to {combined_output_path}")
-    
-                # Optionally, remove individual yearly files
-                for year in range(self.year_start, year_end + 1):
-                    single_file_path = dir_to_save / f"{center}_SST_{year}.nc"
-                    if single_file_path.exists():
-                        os.remove(single_file_path)
-                        print(f"Deleted yearly file: {single_file_path}")
-                return combined_ds
+                    print(f"Failed to download: {str(e)}")
             else:
-                print("No datasets were combined. Please check if downloads were successful.")
+
+                combined_datasets = []
+                client = cdsapi.Client()  # Initialize once outside the loop for efficiency
+        
+                for year in range(self.year_start, year_end + 1):
+                    yearly_file_path = dir_to_save / f"{center}_SST_{year}.nc"
+        
+                    if not force_download and yearly_file_path.exists():
+                        print(f"{yearly_file_path} already exists. Loading existing file.")
+                        try:
+                            ds = xr.open_dataset(yearly_file_path).load()
+                            # Rename coordinates if necessary
+                            if 'latitude' in ds.coords and 'longitude' in ds.coords:
+                                ds = ds.rename({"latitude": "Y", "longitude": "X", "valid_time": "T"})
+                            combined_datasets.append(ds)
+                            continue
+                        except Exception as e:
+                            print(f"Failed to load existing file {yearly_file_path}: {e}")
+                            # If loading fails, attempt to re-download
+        
+                    try:
+                        request = {
+                            "product_type": "monthly_averaged_reanalysis",
+                            "variable": variable,
+                            "year": str(year),
+                            "month": months,  # Request all months at once
+                            "time": "00:00",
+                            "format": "netcdf",
+                            "area": area,
+                        }
+        
+                        print(f"Downloading SST for {year} from {center}...")
+                        client.retrieve(dataset, request).download(str(yearly_file_path))
+                    except Exception as e:
+                        print(f"Failed to download SST for {year}: {e}")
+                        continue
+        
+                    try:
+                        with xr.open_dataset(yearly_file_path) as ds:
+                            # Rename coordinates for consistency
+                            if 'latitude' in ds.coords and 'longitude' in ds.coords:
+                                ds = ds.rename({"latitude": "Y", "longitude": "X", "valid_time": "T"})
+                            ds = ds.load()
+                            combined_datasets.append(ds)
+                    except Exception as e:
+                        print(f"Failed to process {yearly_file_path}: {e}")
+                        continue
+        
+                if combined_datasets:
+                    print("Concatenating yearly datasets...")
+                    combined_ds = xr.concat(combined_datasets, dim="T")
+                    combined_ds = combined_ds.drop_vars(["number", "expver"]).squeeze()
+                    # combined_ds = combined_ds.rename({"lon": "X", "lat": "Y", "valid_time": "T"})
+                    combined_ds = combined_ds - 273.15
+                    combined_ds = combined_ds.isel(Y=slice(None, None, -1))
+                    combined_ds.to_netcdf(combined_output_path)
+                    print(f"Download finished. Combined SST dataset saved to {combined_output_path}")
+        
+                    # Optionally, remove individual yearly files
+                    for year in range(self.year_start, year_end + 1):
+                        single_file_path = dir_to_save / f"{center}_SST_{year}.nc"
+                        if single_file_path.exists():
+                            os.remove(single_file_path)
+                            print(f"Deleted yearly file: {single_file_path}")
+                    return combined_ds
+                else:
+                    print("No datasets were combined. Please check if downloads were successful.")
 
     def download_models(self,
-            center_variable,
             area=[60, -180, -60, 180],
-            force_download=False,
-            year_start_forecast=None,
-            year_end_forecast=None,
+            force_download=False
         ):
         """
         Download Sea Surface Temperature (SST) seasonal forecast forecast data for specified center-variable combinations,
@@ -233,6 +298,7 @@ class WAS_Analog:
             ensemble_mean (str, optional): It can be 'median', 'mean', or None. Defaults to None.
             force_download (bool): If True, forces download even if file exists.
         """
+        center_variable=[self.model_name]
         # 1. Set Current Date and Initialization Month
         if self.month_of_initialization is None:
             current_date = datetime.now() - relativedelta(months=1)
@@ -255,12 +321,10 @@ class WAS_Analog:
             print(f"Using provided lead times: {lead_time}")
         
         # 3. Set Forecast Years to Current Year if Not Provided
-        if year_start_forecast is None:
-            year_start_forecast = datetime.now().year
-            print(f"year_start_forecast not provided. Using current year: {year_start_forecast}")
-        if year_end_forecast is None:
-            year_end_forecast = datetime.now().year
-            print(f"year_end_forecast not provided. Using current year: {year_end_forecast}")
+        if self.year_forecast is None:
+            self.year_forecast = datetime.now().year
+            print(f"year_forecast not provided. Using current year: {self.year_forecast}")
+
     
         # 4. Define Variable Mapping (Only SST)
         variables_1 = {
@@ -363,7 +427,7 @@ class WAS_Analog:
                     "system": syst,
                     "variable": variables_1[k],
                     "product_type": ["monthly_mean"],
-                    "year": [str(year) for year in range(year_start_forecast - 1, year_end_forecast + 1)],
+                    "year": [str(year) for year in range(self.year_forecast, self.year_forecast + 1)],
                     "month": [str(month_of_initialization).zfill(2)],
                     "leadtime_month": lead_time,
                     "format": "netcdf",  # Corrected from 'data_format' to 'format'
@@ -461,26 +525,21 @@ class WAS_Analog:
             lead_time = self.lead_time            
             
         sst_hist = self.download_sst_reanalysis(
-            center="ERA5",
+            # center_variable=self.reanalysis_name,
             area=[60, -180, -60, 180],
             force_download=False
-            # year_start=self.year_start
         )
 
+        if self.month_of_initialization is None:
+            current_date = datetime.now() - relativedelta(months=1)
+            month_of_initialization = current_date.month 
+        else:
+            month_of_initialization = self.month_of_initialization
+       
         sst_for = self.download_models(
-            center_variable=["ECMWF_51.SST",
-                             # "METEOFRANCE_8.SST",
-                             # "DWD_21.SST",
-                             # "CMCC_35.SST",
-                             # "NCEP_2.SST",
-                             # "ECCC_2.SST",
-                             # "ECCC_3.SST",
-                             # "UKMO_602.SST"
-                            ],
+            # center_variable=[self.model_name],
             area=[60, -180, -60, 180],
-            force_download=False,
-            year_start_forecast=None,
-            year_end_forecast=None
+            force_download=False
         )
         sst_for_ = sst_for.interp(
             X=sst_hist.coords['X'],
@@ -489,26 +548,101 @@ class WAS_Analog:
         )
         # Extract the base time
         base_time = pd.Timestamp(sst_for_['T'].values[-1])
-
+    
         # Create new times by adding forecast months
         new_times = [base_time + pd.DateOffset(months=int(m)) for m in sst_for_['forecastMonth'].values]
-
+        
         # Assign the new 'time' coordinate
         sst_for_ = sst_for_.assign_coords(forecastMonth=("forecastMonth", new_times))
 
         sst_for_ = sst_for_.drop_vars('T').squeeze().rename({'forecastMonth':'T'})
-        
+
+        # sst_hist = sst_hist.sel(T=slice(f"{self.year_start}-01",f"{self.year_forecast}-{(month_of_initialization):02}"))
+    
+        sst_hist = sst_hist.sel(T=slice(f"{self.year_start}-01",f"{base_time.year}-{base_time.month:02d}"))
+
         concatenated_ds = xr.concat([sst_hist, sst_for_], dim='T')
-
+    
         concatenated_ds_st = self.standardize_timeseries(concatenated_ds)
-
         
-        concatenated_ds_st = concatenated_ds_st.rolling(T=3, center=False, min_periods=3).mean().isel(T=slice(np.max(lead_time),None))
-
-        new_time = pd.DatetimeIndex([pd.Timestamp(t) + pd.DateOffset(months=12 - np.max(lead_time)) for t in concatenated_ds_st['T'].to_numpy()])
+        concatenated_ds_st = concatenated_ds_st.rolling(T=3, center=False, min_periods=3).mean()
+    
+        first_year = concatenated_ds_st.T.dt.year[0].item()
+        last_month = concatenated_ds_st.T.dt.month[-1].item()+1
+        start_date = pd.to_datetime(f"{first_year}-{last_month:02d}")
+        concatenated_ds_st = concatenated_ds_st.sel(T=slice(start_date,None))
+        new_time = pd.DatetimeIndex([pd.to_datetime(f"{concatenated_ds_st.T.dt.year[0].item()+1}-01-01") + pd.DateOffset(months=t) for t in range(0,len(concatenated_ds_st['T'].to_numpy()))])
 
         ds_shifted = concatenated_ds_st.assign_coords(T=new_time)
         return concatenated_ds_st.to_array().drop_vars(['variable']).squeeze(), ds_shifted.to_array().drop_vars(['variable']).squeeze()
+
+
+    def Corr_Based(self, predictant, ddd, itrain, ireference_year):
+
+        if self.define_extent is not None:
+            lon_min, lon_max, lat_min, lat_max = self.define_extent
+            ddd = ddd.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
+            
+        predictant['T'] = predictant['T'].astype('datetime64[ns]')
+        # Get the unique years from the dataset's 'T' dimension
+        predictant_ = xr.concat([predictant.isel(T=itrain), predictant.isel(T=ireference_year)], dim="T")
+        # Extract years
+        unique_years = np.unique(predictant_['T'].dt.year)  
+        sst_ireference_year = ddd.sel(T=str(ireference_year))
+        sim_tmp = []
+        for i in unique_years[unique_years!=ireference_year]:
+            tmp = ddd.sel(T=str(i))
+            tmp['T'] = sst_ireference_year['T']
+            correlation = xr.corr(tmp, sst_ireference_year, dim="T")
+            sim_tmp.append(correlation)
+        similar = xr.concat(sim_tmp, dim='T')
+        similar = similar.assign_coords(T=unique_years[unique_years!=ireference_year])
+        similar = xr.where(similar > 0.7, 1, 0).sum(dim=["X","Y"])
+        similar = similar.sortby(similar, ascending=False)
+        # Select the first 3 entries
+        top_3 = similar.isel(T=slice(3))
+        similar_years = top_3['T'].to_numpy()
+        return similar_years
+
+    def Pca_Based(self, predictant, ddd, itrain, ireference_year):
+        if self.define_extent is not None:
+            lon_min, lon_max, lat_min, lat_max = self.define_extent
+            ddd = ddd.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
+
+        predictor_ = ddd.fillna(0)
+        predictor_detrend = sig.detrend(predictor_, axis=0)
+        ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
+        
+        eof = xe.single.EOF(n_modes=10)
+        eof.fit(utils_detrend(ddd.fillna(ddd.mean(dim="T", skipna=True))), dim="T")
+        scores = eof.scores()
+
+        predictant['T'] = predictant['T'].astype('datetime64[ns]')
+        # Get the unique years from the dataset's 'T' dimension
+        predictant_ = xr.concat([predictant.isel(T=itrain), predictant.isel(T=ireference_year)], dim="T")
+        # Extract years
+        unique_years = np.unique(scores['T'].dt.year)          
+        sst_ref = scores.sel(T=str(ireference_year))
+        sst_ref = sst_ref.stack(score=('mode', 'T'))
+        
+        sim_tmp = []
+        for i in unique_years[unique_years!=ireference_year]:
+            tmp = scores.sel(T=str(i))
+            tmp = tmp.stack(score=('mode', 'T'))
+            sst_ref['score'] = tmp['score']
+            correlation = xr.corr(tmp, sst_ref, dim="score")
+            # print(correlation)
+            sim_tmp.append(correlation)
+        similar = xr.concat(sim_tmp, dim='T')
+        similar = similar.assign_coords(T=unique_years[unique_years!=reference_year])
+        similar = similar.sortby(similar, ascending=False)
+        
+        # Select the first 3 entries
+        top_3 = similar.isel(T=slice(3))
+        similar_years = top_3['T'].to_numpy()
+        return similar_years
+        
+        
 
     def SOM(self, predictant, ddd, itrain, ireference_year):
         
@@ -568,15 +702,18 @@ class WAS_Analog:
                 som_grid_size = self.some_grid_size
             
             input_len = sst_scaled.shape[1]  # Number of features per year (12 * lat * lon)
+            learning_rate = self.some_learning_rate
+            neighborhood_function = self.some_neighborhood_function
+            some_sigma = self.some_sigma
             
             # Initialize the SOM
             som = MiniSom(
                          x=som_grid_size[0], 
                          y=som_grid_size[1], 
                          input_len=input_len, 
-                         sigma=1.0, 
-                         learning_rate=0.5, 
-                         neighborhood_function='gaussian', 
+                         sigma=some_sigma, 
+                         learning_rate=learning_rate, 
+                         neighborhood_function=neighborhood_function, 
                          random_seed=42
                          )
             
@@ -585,7 +722,7 @@ class WAS_Analog:
             
             # print("Training SOM...")
             # Train the SOM with 1000 iterations (adjust as needed)
-            som.train_random(data=sst_scaled, num_iteration=1000)
+            som.train_random(data=sst_scaled, num_iteration=2000)
             # print("SOM training completed.")
             # Map each year to its Best Matching Unit (BMU)
             bmu_indices = np.array([som.winner(x) for x in sst_scaled])
@@ -722,25 +859,95 @@ class WAS_Analog:
     @staticmethod
     def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
         """
-        Calculates the tercile probabilities of a prediction based on Student's t-distribution.
+        Student's t-based method
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
 
-        Parameters
-        ----------
-        best_guess : array-like
-            Predicted values.
-        error_variance : array-like
-            Variance of prediction error.
-        first_tercile : float
-            First tercile value.
-        second_tercile : float
-            Second tercile value.
-        dof : int
-            Degrees of freedom for Student's t-distribution.
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            # Transform thresholds
+            first_t = (first_tercile - best_guess) / error_std
+            second_t = (second_tercile - best_guess) / error_std
 
-        Returns
-        -------
-        array
-            Probabilities for each tercile category.
+            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
+            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
+            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
+
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2):
+        """
+        Gamma-based method
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time), dtype=float)
+
+        # If any input is NaN, fill with NaN
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+
+        # Convert inputs to arrays
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        T1 = np.asarray(T1, dtype=float)
+        T2 = np.asarray(T2, dtype=float)
+
+        alpha = (best_guess**2) / error_variance
+        theta = error_variance / best_guess
+    
+        # Compute CDF at T1, T2
+        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
+        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
+    
+        pred_prob[0, :] = cdf_t1
+        pred_prob[1, :] = cdf_t2 - cdf_t1
+        pred_prob[2, :] = 1.0 - cdf_t2
+
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        """
+        Non-parametric method (require historical errors)
+        """
+        # best_guess: shape (n_time,)
+        # error_samples: shape (n_time,)
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+
+        for t in range(n_time):
+            if np.isnan(best_guess[t]):
+                continue
+
+            # Empirical distribution = best_guess[t] + error_samples[:, t] ---- to see in deep again
+            dist = best_guess[t] + error_samples#[:, t]
+            dist = dist[np.isfinite(dist)]  # remove NaNs
+
+            if len(dist) == 0:
+                continue
+
+            # Probability(X < T1)
+            p_below = np.mean(dist < first_tercile)
+            # Probability(T1 <= X < T2)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            # Probability(X >= T2)
+            p_above = 1.0 - (p_below + p_between)
+
+            pred_prob[0, t] = p_below
+            pred_prob[1, t] = p_between
+            pred_prob[2, t] = p_above
+
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+        """
+        Normal-based method using the Gaussian CDF.
         """
         n_time = len(best_guess)
         pred_prob = np.empty((3, n_time))
@@ -749,57 +956,257 @@ class WAS_Analog:
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
-            first_t = (first_tercile - best_guess) / error_std
-            second_t = (second_tercile - best_guess) / error_std
-            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
+            pred_prob[0, :] = stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std) - \
+                              stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std)
+            
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
+        """
+        Lognormal-based method.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        
+        # If any input is NaN, fill with NaN
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        
+        # Moment matching for lognormal distribution:
+        # Given mean (m) and variance (v), we have:
+        # sigma = sqrt(ln(1 + v/m^2)) and mu = ln(m) - sigma^2/2.
+        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
+        mu = np.log(best_guess) - sigma**2 / 2
+        
+        # Use the lognormal CDF from scipy:
+        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - \
+                          lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
+        
         return pred_prob
         
     def compute_model(self, predictant, ddd,  itrain, itest):
 
-        dddd = self.SOM(predictant, ddd, itrain, itest)
-        predictant['T'] = predictant['T'].astype('datetime64[ns]')
-        sim_obs = []
-        
-        for i in np.array([str(i) for i in dddd]):
-            tmp = predictant.sel(T=i)
-            sim_obs.append(tmp)
+        if self.method_analog == "som":
+            
+            dddd = self.SOM(predictant, ddd, itrain, itest)
+            predictant['T'] = predictant['T'].astype('datetime64[ns]')
+            sim_obs = []
+            
+            for i in np.array([str(i) for i in dddd]):
+                tmp = predictant.sel(T=i)
+                sim_obs.append(tmp)
+            hindcast_det = xr.concat(sim_obs,dim="T").mean(dim="T").expand_dims({'T': predictant.isel(T=itest)['T'].values}) 
+            
+        elif self.method_analog == "cor_based":
 
-        hindcast_det = xr.concat(sim_obs,dim="T").mean(dim="T").expand_dims({'T': predictant.isel(T=itest)['T'].values})      
-        
+            dddd = self.Corr_Based(predictant, ddd, itrain, itest)
+            predictant['T'] = predictant['T'].astype('datetime64[ns]')
+            
+            sim_obs = []
+            for i in np.array([str(i) for i in dddd]):
+                tmp = predictant.sel(T=i)
+                sim_obs.append(tmp)
+            hindcast_det = xr.concat(sim_obs,dim="T").mean(dim="T").expand_dims({'T': predictant.isel(T=itest)['T'].values})  
+            
+        elif self.method_analog == "pca_based":
+
+            dddd = self.Pca_Based(predictant, ddd, itrain, itest)
+            predictant['T'] = predictant['T'].astype('datetime64[ns]')
+            
+            sim_obs = []
+            for i in np.array([str(i) for i in dddd]):
+                tmp = predictant.sel(T=i)
+                sim_obs.append(tmp)
+            hindcast_det = xr.concat(sim_obs,dim="T").mean(dim="T").expand_dims({'T': predictant.isel(T=itest)['T'].values}) 
+
+        else:
+            raise ValueError(f"Invalid analog method: {self.method_analog}. Choose 'som', 'pca_based', or 'cor_based'.")
         return hindcast_det
 
-    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
+    # def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
 
+    #     index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+    #     index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        
+    #     rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+    #     terciles = rainfall_for_tercile.quantile([0.333, 0.667], dim='T')
+    #     error_variance = (Predictant - hindcast_det).var(dim='T')
+    #     dof = len(Predictant.get_index("T")) - 2
+        
+    #     hindcast_prob = xr.apply_ufunc(
+    #         self.calculate_tercile_probabilities,
+    #         hindcast_det,
+    #         error_variance,
+    #         terciles.isel(quantile=0).drop_vars('quantile'),
+    #         terciles.isel(quantile=1).drop_vars('quantile'),
+    #         input_core_dims=[('T',), (), (), ()],
+    #         vectorize=True,
+    #         kwargs={'dof': dof},
+    #         dask='parallelized',
+    #         output_core_dims=[('probability', 'T')],
+    #         output_dtypes=['float'],
+    #         dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
+    #     )
+        
+    #     hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+    #     return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+    def compute_prob(self, 
+                     Predictant, 
+                     clim_year_start, 
+                     clim_year_end, 
+                     hindcast_det):
+        """
+        Compute tercile probabilities using either 't', 'gamma', 'normal', 'lognormal', or 'nonparam'.
+
+        Parameters:
+        -----------
+        Predictant : xarray.DataArray
+            Observed data array with dimensions (T, Y, X)
+        clim_year_start : int
+            Start year for climatology
+        clim_year_end : int
+            End year for climatology
+        hindcast_det : xarray.DataArray
+            Deterministic forecast (same shape as Predictant, minus M dimension)
+        method : str, default = "gamma"
+            Method to use for calculating tercile probabilities:
+            - "t"
+            - "gamma"
+            - "normal"
+            - "lognormal"
+            - "nonparam"
+        error_samples : xarray.DataArray or None
+            Only required for non-parametric method, shape (ensemble, T, Y, X) or something similar.
+
+        Returns:
+        --------
+        hindcast_prob : xarray.DataArray
+            Probability for each tercile category (PB, PN, PA)
+            with dimensions (probability=3, T, Y, X).
+        """
+        
+        # Select climatology slice
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        
+
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.333, 0.667], dim='T')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        dof = 1
-        
-        hindcast_prob = xr.apply_ufunc(
-            self.calculate_tercile_probabilities,
-            hindcast_det,
-            error_variance,
-            terciles.isel(quantile=0).drop_vars('quantile'),
-            terciles.isel(quantile=1).drop_vars('quantile'),
-            input_core_dims=[('T',), (), (), ()],
-            vectorize=True,
-            kwargs={'dof': dof},
-            dask='parallelized',
-            output_core_dims=[('probability', 'T')],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
-        )
-        
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+
+        # We'll pass these thresholds to the methods
+        T1 = terciles.isel(quantile=0).drop_vars('quantile')
+        T2 = terciles.isel(quantile=1).drop_vars('quantile')
+
+        # ---- CHOOSE THE CALC FUNCTION & ARGUMENTS BASED ON 'method' ----
+        if self.dist_method == "t":
+            
+            # Degrees of freedom (only used by 't' methids)
+            dof = len(Predictant.get_index("T")) - 2
+            
+            calc_func = self.calculate_tercile_probabilities
+            error_variance = (Predictant - hindcast_det).var(dim='T')
+            
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+            )
+
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            error_variance = (Predictant - hindcast_det).var(dim='T')
+            
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                # kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            error_variance = (Predictant - hindcast_det).var(dim='T')
+            
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            error_variance = (Predictant - hindcast_det).var(dim='T')
+            
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = (Predictant - hindcast_det)
+            
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_samples,
+                T1,
+                T2,
+                input_core_dims=[('T',), ('T',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True, 
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
+            )
+
+        else:
+            raise ValueError(f"Invalid method: {method}. Choose 't', 'gamma', 'normal', 'lognormal', or 'nonparam'.")
+
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-    
-    def forecast(self, predictant, clim_year_start, clim_year_end, hindcast_det):
+        
+    def forecast(self, predictant, clim_year_start, clim_year_end, hindcast_det, forecast_year):
         # Set environment variables for reproducibility
         os.environ['PYTHONHASHSEED'] = '42'
         os.environ['OMP_NUM_THREADS'] = '1'  # Limit OpenMP threads
@@ -808,212 +1215,375 @@ class WAS_Analog:
         reference_year = int(np.unique(predictant.isel(T=-1)['T'].dt.year)) + 1
         
         predictant['T'] = predictant['T'].astype('datetime64[ns]')
+
+        # Extract years
+        unique_years = np.append(np.unique(predictant['T'].dt.year), reference_year)
         
         _, ddd = self.download_and_process()
 
-        if self.index_compute is not None:
-            indices_dataset = self.calc_index(self.index_compute, ddd)
-                        
-            # Extract years
-            unique_years = np.append(np.unique(predictant['T'].dt.year), reference_year) 
-                                    
-            # List to hold flattened data for each year
-            yearly_data = []
-            
-            # Loop through each unique year
-            for year in unique_years:
-                # print("Processing year:", year)
+        if self.method_analog == "som":         
+
+            if self.index_compute is not None:
+                indices_dataset = self.calc_index(self.index_compute, ddd) 
+                                        
+                # List to hold flattened data for each year
+                yearly_data = []
                 
-                # Temporary list to hold data for all variables in this particular year
-                index_data_list = []
+                # Loop through each unique year
+                for year in unique_years:
+                    # print("Processing year:", year)
+                    
+                    # Temporary list to hold data for all variables in this particular year
+                    index_data_list = []
+                    
+                    # For each data variable, extract and reshape data for this year
+                    for var_name in indices_dataset.data_vars:
+                        # print("  Variable:", var_name)
+                        yearly_sst = indices_dataset.sel(T=str(year))[var_name].to_numpy().reshape(12, -1)
+                        index_data_list.append(yearly_sst)
+                    
+                    # Stack all variables for the year vertically, then flatten
+                    index_data_array = np.vstack(index_data_list)
+                    flattened_array = index_data_array.flatten()
+                    
+                    # Append the flattened array for this year to yearly_data
+                    yearly_data.append(flattened_array)
                 
-                # For each data variable, extract and reshape data for this year
-                for var_name in indices_dataset.data_vars:
-                    # print("  Variable:", var_name)
-                    yearly_sst = indices_dataset.sel(T=str(year))[var_name].to_numpy().reshape(12, -1)
-                    index_data_list.append(yearly_sst)
+                # Convert the list of yearly arrays into a 2D NumPy array: (num_years, data_points_per_year)
+                sst_yearly_flat = np.array(yearly_data)
                 
-                # Stack all variables for the year vertically, then flatten
-                index_data_array = np.vstack(index_data_list)
-                flattened_array = index_data_array.flatten()
+                # Adjust the list of years to match the length of data we have
+                years_complete = unique_years[:len(sst_yearly_flat)]
                 
-                # Append the flattened array for this year to yearly_data
-                yearly_data.append(flattened_array)
-            
-            # Convert the list of yearly arrays into a 2D NumPy array: (num_years, data_points_per_year)
-            sst_yearly_flat = np.array(yearly_data)
-            
-            # Adjust the list of years to match the length of data we have
-            years_complete = unique_years[:len(sst_yearly_flat)]
-            
-            # Handle missing values by filtering out rows (years) that contain NaNs
-            valid_idx = ~np.isnan(sst_yearly_flat).any(axis=1)
-            sst_yearly_flat = sst_yearly_flat[valid_idx]
-            years_complete = years_complete[valid_idx]
-            
-            # Final scaled data (modify this part as needed if you plan on applying a scaler)
-            sst_scaled = sst_yearly_flat
-            
-            # Define SOM parameters
-            if set(self.some_grid_size) == {None}:
-                som_grid_size = (2, 4)  # 10x10 grid
+                # Handle missing values by filtering out rows (years) that contain NaNs
+                valid_idx = ~np.isnan(sst_yearly_flat).any(axis=1)
+                sst_yearly_flat = sst_yearly_flat[valid_idx]
+                years_complete = years_complete[valid_idx]
+                
+                # Final scaled data (modify this part as needed if you plan on applying a scaler)
+                sst_scaled = sst_yearly_flat
+                
+                # Define SOM parameters
+                # n = int(np.sqrt(5*np.sqrt(sst_scaled.shape[1]))) - 2
+                if set(self.some_grid_size) == {None}:
+                    som_grid_size = (2, 4)  # 10x10 grid
+                else:
+                    som_grid_size = self.some_grid_size
+                
+                input_len = sst_scaled.shape[1]  # Number of features per year (12 * lat * lon)
+                learning_rate = self.some_learning_rate
+                neighborhood_function = self.some_neighborhood_function
+                some_sigma = self.some_sigma
+                
+                # Initialize the SOM
+                som = MiniSom(
+                             x=som_grid_size[0], 
+                             y=som_grid_size[1], 
+                             input_len=input_len, 
+                             sigma=some_sigma, 
+                             learning_rate=learning_rate, 
+                             neighborhood_function=neighborhood_function, 
+                             random_seed=42
+                             )
+                
+                # Initialize the weights
+                som.random_weights_init(sst_scaled)
+                
+                # print("Training SOM...")
+                # Train the SOM with 1000 iterations (adjust as needed)
+                som.train_random(data=sst_scaled, num_iteration=2000)
+                # print("SOM training completed.")
+                # Map each year to its Best Matching Unit (BMU)
+                bmu_indices = np.array([som.winner(x) for x in sst_scaled])
+                bmu_x = bmu_indices[:, 0]
+                bmu_y = bmu_indices[:, 1]
+                
+                # Create a DataFrame for easy plotting
+                bmu_df = pd.DataFrame({
+                    'Year': years_complete,
+                    'BMU_X': bmu_x,
+                    'BMU_Y': bmu_y
+                })
+                            
+                # Check if the reference year is in the dataset
+                if reference_year not in years_complete:
+                    print(f"Reference year {reference_year} is not present in the dataset.")
+                else:
+                    # Find the index of the reference year
+                    ref_index = np.where(years_complete == reference_year)[0][0]
+                    
+                    # Get the BMU of the reference year
+                    ref_bmu = bmu_indices[ref_index]
+                
+                    
+                    # Find all years mapped to the same BMU
+                    similar_years = years_complete[(bmu_x == ref_bmu[0]) & (bmu_y == ref_bmu[1])]
+                    similar_years = similar_years[similar_years != reference_year]
             else:
-                som_grid_size = self.some_grid_size
                 
-            input_len = sst_scaled.shape[1]  # Number of features per year (12 * lat * lon)
-            
-            # Initialize the SOM
-            som = MiniSom(
-                         x=som_grid_size[0], 
-                         y=som_grid_size[1], 
-                         input_len=input_len, 
-                         sigma=1.0, 
-                         learning_rate=0.5, 
-                         neighborhood_function='gaussian', 
-                         random_seed=42
-                         )
-            
-            # Initialize the weights
-            som.random_weights_init(sst_scaled)
-            
-            # print("Training SOM...")
-            # Train the SOM with 1000 iterations (adjust as needed)
-            som.train_random(data=sst_scaled, num_iteration=1000)
-            # print("SOM training completed.")
-            # Map each year to its Best Matching Unit (BMU)
-            bmu_indices = np.array([som.winner(x) for x in sst_scaled])
-            bmu_x = bmu_indices[:, 0]
-            bmu_y = bmu_indices[:, 1]
-            
-            # Create a DataFrame for easy plotting
-            bmu_df = pd.DataFrame({
-                'Year': years_complete,
-                'BMU_X': bmu_x,
-                'BMU_Y': bmu_y
-            })
-                        
-            # Check if the reference year is in the dataset
-            if reference_year not in years_complete:
-                print(f"Reference year {reference_year} is not present in the dataset.")
-            else:
-                # Find the index of the reference year
-                ref_index = np.where(years_complete == reference_year)[0][0]
+                if self.define_extent is not None:
+                    lon_min, lon_max, lat_min, lat_max = self.define_extent
+                    ddd = ddd.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
                 
-                # Get the BMU of the reference year
-                ref_bmu = bmu_indices[ref_index]
-            
+                # -------------------- 6a. Parallel Data Preparation with Dask -------------------- #
+                dddd = ddd.fillna(0)
                 
-                # Find all years mapped to the same BMU
-                similar_years = years_complete[(bmu_x == ref_bmu[0]) & (bmu_y == ref_bmu[1])]
-                similar_years = similar_years[similar_years != reference_year]
-        else:
+                # Convert Xarray DataArray to Dask Array
+                # Adjust chunk sizes based on HPC resources and data dimensions
+                sst_dask = dddd#.chunk({'T': 12, 'Y': 100, 'X': 100})  # Assuming 12 months per year
+                
+                # Extract years
+                unique_years_dask = np.unique(predictant['T'].dt.year)
+                            
+                # Flatten spatial dimensions and prepare data for SOM
+                yearly_data_dask = []
+                
+                for year in unique_years_dask:
+                    yearly_sst = sst_dask.sel(T=str(year))
+                    
+                    # Check for complete 12 months
+                    if len(yearly_sst['T'].dt.month) == 12:
+                        monthly_flat = yearly_sst.to_numpy().reshape(12, -1)
+                        yearly_flat = monthly_flat.flatten()
+                        yearly_data_dask.append(yearly_flat)
+                    else:
+                        print(f"Year {year} is incomplete and will be skipped.")
+                
+                # Convert to NumPy array
+                sst_yearly_flat_dask = np.array(yearly_data_dask)
+                years_complete_dask = unique_years_dask[:len(sst_yearly_flat_dask)]
+                
+                
+                # Handle missing values by removing any years with NaNs
+                valid_idx = ~np.isnan(sst_yearly_flat_dask).any(axis=1)
+                sst_yearly_flat_dask = sst_yearly_flat_dask[valid_idx]
+                years_complete_dask = years_complete_dask[valid_idx]
+                sst_scaled_dask = sst_yearly_flat_dask 
+                
+                # Initialize SOMoclu
+                if set(self.some_grid_size) == {None}:
+                    n_rows, n_columns = (3, 3)  # 10x10 grid
+                else:
+                    n_rows, n_columns = self.some_grid_size
+                
+                somoclu_instance = somoclu.Somoclu(n_columns, n_rows, data=sst_scaled_dask)
+                
+                # Train SOM
+                somoclu_instance.train()
+                
+                # Get BMUs
+                bmus = somoclu_instance.bmus  # Shape: (num_samples, 2)
+                
+                # Map BMUs to years
+                bmu_x_dask = bmus[:, 0]
+                bmu_y_dask = bmus[:, 1]
+                
+                # Create DataFrame
+                bmu_df_dask = pd.DataFrame({
+                    'Year': years_complete_dask,
+                    'BMU_X': bmu_x_dask,
+                    'BMU_Y': bmu_y_dask
+                })
+                           
+                # Identify similar years 
+                if reference_year not in bmu_df_dask['Year'].values:
+                    print(f"Reference year {reference_year} is not present in the dataset.")
+                else:
+                    ref_bmu_dask = bmu_df_dask.loc[bmu_df_dask['Year'] == reference_year, ['BMU_X', 'BMU_Y']].values[0]
+                    similar_years_dask = bmu_df_dask[
+                        (bmu_df_dask['BMU_X'] == ref_bmu_dask[0]) & 
+                        (bmu_df_dask['BMU_Y'] == ref_bmu_dask[1])
+                    ]['Year'].values            
+                similar_years = similar_years_dask[similar_years_dask != reference_year]    
+                
+        elif self.method_analog == "cor_based":
             
             if self.define_extent is not None:
                 lon_min, lon_max, lat_min, lat_max = self.define_extent
                 ddd = ddd.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
-            
-            # -------------------- 6a. Parallel Data Preparation with Dask -------------------- #
-            dddd = ddd.fillna(0)
-            
-            # Convert Xarray DataArray to Dask Array
-            # Adjust chunk sizes based on HPC resources and data dimensions
-            sst_dask = dddd#.chunk({'T': 12, 'Y': 100, 'X': 100})  # Assuming 12 months per year
-            
-            # Extract years
-            unique_years_dask = np.unique(predictant['T'].dt.year)
-                        
-            # Flatten spatial dimensions and prepare data for SOM
-            yearly_data_dask = []
-            
-            for year in unique_years_dask:
-                yearly_sst = sst_dask.sel(T=str(year))
                 
-                # Check for complete 12 months
-                if len(yearly_sst['T'].dt.month) == 12:
-                    monthly_flat = yearly_sst.to_numpy().reshape(12, -1)
-                    yearly_flat = monthly_flat.flatten()
-                    yearly_data_dask.append(yearly_flat)
-                else:
-                    print(f"Year {year} is incomplete and will be skipped.")
+            sst_ireference_year = ddd.sel(T=str(reference_year))
+            sim_tmp = []
+            for i in unique_years[unique_years!=reference_year]:
+                tmp = ddd.sel(T=str(i))
+                tmp['T'] = sst_ireference_year['T']
+                correlation = xr.corr(tmp, sst_ireference_year, dim="T")
+                sim_tmp.append(correlation)
+            similar = xr.concat(sim_tmp, dim='T')
+            similar = similar.assign_coords(T=unique_years[unique_years!=reference_year])
+            similar = xr.where(similar > 0.7, 1, 0).sum(dim=["X","Y"])
+            similar = similar.sortby(similar, ascending=False)
+            # Select the first 3 entries
+            top_3 = similar.isel(T=slice(3))
+            similar_years = top_3['T'].to_numpy()
             
-            # Convert to NumPy array
-            sst_yearly_flat_dask = np.array(yearly_data_dask)
-            years_complete_dask = unique_years_dask[:len(sst_yearly_flat_dask)]
+        elif self.method_analog == "pca_based":
             
+            if self.define_extent is not None:
+                lon_min, lon_max, lat_min, lat_max = self.define_extent
+                ddd = ddd.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
+
+            predictor_ = ddd.fillna(0)
+            predictor_detrend = sig.detrend(predictor_, axis=0)
+            ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
+            eof = xe.single.EOF(n_modes=10)
+            eof.fit(utils_detrend(ddd.fillna(ddd.mean(dim="T", skipna=True))), dim="T")
+            scores = eof.scores()
+            sst_ref = scores.sel(T=str(reference_year))
+            sst_ref = sst_ref.stack(score=('mode', 'T'))
             
-            # Handle missing values by removing any years with NaNs
-            valid_idx = ~np.isnan(sst_yearly_flat_dask).any(axis=1)
-            sst_yearly_flat_dask = sst_yearly_flat_dask[valid_idx]
-            years_complete_dask = years_complete_dask[valid_idx]
-            sst_scaled_dask = sst_yearly_flat_dask 
-            
-            # Initialize SOMoclu
-            if set(self.some_grid_size) == {None}:
-                n_rows, n_columns = (3, 3)  # 10x10 grid
-            else:
-                n_rows, n_columns = self.some_grid_size
-            
-            somoclu_instance = somoclu.Somoclu(n_columns, n_rows, data=sst_scaled_dask)
-            
-            # Train SOM
-            somoclu_instance.train()
-            
-            # Get BMUs
-            bmus = somoclu_instance.bmus  # Shape: (num_samples, 2)
-            
-            # Map BMUs to years
-            bmu_x_dask = bmus[:, 0]
-            bmu_y_dask = bmus[:, 1]
-            
-            # Create DataFrame
-            bmu_df_dask = pd.DataFrame({
-                'Year': years_complete_dask,
-                'BMU_X': bmu_x_dask,
-                'BMU_Y': bmu_y_dask
-            })
-                       
-            # Identify similar years 
-            if reference_year not in bmu_df_dask['Year'].values:
-                print(f"Reference year {reference_year} is not present in the dataset.")
-            else:
-                ref_bmu_dask = bmu_df_dask.loc[bmu_df_dask['Year'] == reference_year, ['BMU_X', 'BMU_Y']].values[0]
-                similar_years_dask = bmu_df_dask[
-                    (bmu_df_dask['BMU_X'] == ref_bmu_dask[0]) & 
-                    (bmu_df_dask['BMU_Y'] == ref_bmu_dask[1])
-                ]['Year'].values
-                
-            print(similar_years_dask) 
-            
-            similar_years = similar_years_dask[similar_years_dask != reference_year]            
+            sim_tmp = []
+            for i in unique_years[unique_years!=reference_year]:
+                tmp = scores.sel(T=str(i))
+                tmp = tmp.stack(score=('mode', 'T'))
+                sst_ref['score'] = tmp['score']
+                correlation = xr.corr(tmp, sst_ref, dim="score")
+                # print(correlation)
+                sim_tmp.append(correlation)
+            similar = xr.concat(sim_tmp, dim='T')
+            similar = similar.assign_coords(T=unique_years[unique_years!=reference_year])
+            similar = similar.sortby(similar, ascending=False)
+            # Select the first 3 entries
+            top_3 = similar.isel(T=slice(3))
+            similar_years = top_3['T'].to_numpy()
+        else:
+            raise ValueError(f"Invalid analog method: {self.method_analog}. Choose 'som', 'pca_based', or 'cor_based'.")
           
         sim_obs = []
         for i in np.array([str(i) for i in similar_years]):
             tmp = predictant.sel(T=i)
             sim_obs.append(tmp)
+            
         forecast_det = xr.concat(sim_obs,dim="T").mean(dim="T").expand_dims({'T': [predictant.isel(T=-1)['T'].values]})
 
+        T_value_1 = predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
+        new_T_value = np.datetime64(f"{forecast_year}-{month_1:02d}-{1:02d}")
+        
+        forecast_det = forecast_det.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        forecast_det['T'] = forecast_det['T'].astype('datetime64[ns]')
+        
         index_start = predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end = predictant.get_index("T").get_loc(str(clim_year_end)).stop
         
         rainfall_for_tercile = predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.333, 0.667], dim='T')
-        error_variance = (predictant - hindcast_det).var(dim='T')
-        dof = 1
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+
+        # We'll pass these thresholds to the methods
+        T1 = terciles.isel(quantile=0).drop_vars('quantile')
+        T2 = terciles.isel(quantile=1).drop_vars('quantile')
+
+        if self.dist_method == "t":
+            
+            # Degrees of freedom (only used by 't' methids)
+            dof = len(predictant.get_index("T")) - 2
+            calc_func = self.calculate_tercile_probabilities
+            error_variance = (predictant - hindcast_det).var(dim='T')
+            
+            forecast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+            )
+
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            error_variance = (predictant - hindcast_det).var(dim='T')
+            
+            forecast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                # kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            error_variance = (predictant - hindcast_det).var(dim='T')
+            
+            forecast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            error_variance = (predictant - hindcast_det).var(dim='T')
+            
+            forecast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = (predictant - hindcast_det)
+            error_samples = error_samples.rename({'T':'S'})
+            forecast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_det,
+                error_samples,
+                T1,
+                T2,
+                input_core_dims=[('T',), ('S',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True, 
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
+            )
+        else:
+            raise ValueError(f"Invalid method: {method}. Choose 't', 'gamma', 'normal', 'lognormal', or 'nonparam'.")        
         
-        forecast_prob = xr.apply_ufunc(
-            self.calculate_tercile_probabilities,
-            forecast_det,
-            error_variance,
-            terciles.isel(quantile=0).drop_vars('quantile'),
-            terciles.isel(quantile=1).drop_vars('quantile'),
-            input_core_dims=[('T',), (), (), ()],
-            vectorize=True,
-            kwargs={'dof': dof},
-            dask='parallelized',
-            output_core_dims=[('probability', 'T')],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
-        )
+        # forecast_prob = xr.apply_ufunc(
+        #     self.calculate_tercile_probabilities,
+        #     forecast_det,
+        #     error_variance,
+        #     terciles.isel(quantile=0).drop_vars('quantile'),
+        #     terciles.isel(quantile=1).drop_vars('quantile'),
+        #     input_core_dims=[('T',), (), (), ()],
+        #     vectorize=True,
+        #     kwargs={'dof': dof},
+        #     dask='parallelized',
+        #     output_core_dims=[('probability', 'T')],
+        #     output_dtypes=['float'],
+        #     dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
+        # )
         
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         
@@ -1021,7 +1591,7 @@ class WAS_Analog:
         os.environ.pop('PYTHONHASHSEED', None)
         os.environ.pop('OMP_NUM_THREADS', None)  
         
-        return ddd, similar_years, forecast_det, forecast_prob.drop_vars('T').squeeze().transpose('probability', 'Y', 'X')
+        return ddd, similar_years, forecast_det, forecast_prob.transpose('probability', 'T', 'Y', 'X')
 
 
     def composite_plot(self, predictant, clim_year_start, clim_year_end, hindcast_det, plot_predictor=True):
@@ -1029,8 +1599,9 @@ class WAS_Analog:
         clim_slice = slice(str(clim_year_start), str(clim_year_end))
         clim_mean = predictant.sel(T=clim_slice).mean(dim='T')
         
-        ddd, similar_years, result_, _ = self.forecast(predictant, clim_year_start, clim_year_end, hindcast_det)
-        
+        ddd, similar_years, result_, _ = self.forecast(predictant, clim_year_start, clim_year_end, hindcast_det, 1984)
+        result_ = result_.drop_vars('T').squeeze()
+         
         reference_year = int(np.unique(ddd.isel(T=-1)['T'].dt.year))
         
         sim_all = []
@@ -1125,13 +1696,13 @@ class WAS_Analog:
             # plt.show()
 
             # Define the custom colormap
-            colors_list = ["red", "grey", "blue"]  # Define color segments
-            bounds = [0, 80, 120, 200]  # Define boundaries for the categories
+            colors_list = ['#d7191c','#fdae61','#ffffbf', '#a6d96a', '#1a9641']  # Define color segments 
+            bounds = [0, 50, 90, 110, 150, 200]  # Define boundaries for the categories
             cmap = ListedColormap(colors_list)
             norm = BoundaryNorm(bounds, cmap.N)
             
-            # Assuming 'dataset' contains your data
-            data_var = pred_rain.sel(Y=slice(None,17))
+            #---------- Better way to mask using rainfall mean after----------------
+            data_var = pred_rain.sel(Y=slice(None,19.5))
             
             # Number of time steps
             n_times = len(data_var['T'])
@@ -1167,12 +1738,19 @@ class WAS_Analog:
             
             # Add colorbar and adjust layout
 
-            cbar = fig.colorbar(im, ax=axes[:n_times], orientation="horizontal", shrink=0.5, pad=0.5, aspect=40)
+            cbar = fig.colorbar(im, ax=axes[:n_times],
+                                orientation="horizontal", 
+                                fraction=0.05,
+                                # shrink=0.5, 
+                                pad=0.1, 
+                                # aspect=40
+                               )
             cbar.set_label('')
-            cbar.set_ticks([40, 100, 160])  # Set ticks at middle of each range
-            cbar.ax.set_xticklabels(['0-80 (Dry)', '80-120 (Normal)', '>120 (Excess)'])  # Custom labels for each range
+            cbar.set_ticks([0, 50, 90, 110, 150, 200])  # Set ticks at middle of each range
+            # cbar.ax.set_xticklabels(['0','0-90 (Dry)', '90','(Normal)','110', '>110 (Excess)','200'])  # Custom labels for each range
+            cbar.ax.set_xticklabels(['0','50', '90','110', '150','200'])  # Custom labels for each range
             
-            fig.suptitle("Ratio to Normal Precipitation [%]", fontsize=16)
+            fig.suptitle("Ratio to Normal Precipitation [%]", fontsize=14)
 
             plt.tight_layout()
             fig.subplots_adjust(top=0.9, bottom=0.15)
@@ -1181,60 +1759,6 @@ class WAS_Analog:
         return similar_years
 
     def plot_indices():
-        
         pass
 
 
-# import matplotlib.pyplot as plt
-# import numpy as np
-# from matplotlib.patches import Ellipse
-
-# # Sample data (replace with your actual data)
-# x = np.array([-300, -250, -200, -100, 0, 100, 200, 300, 400, 500, 600, 700])
-# y = np.array([-1.5, -1.2, -1.0, -0.8, 0.0, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
-# years = np.array([1981, 1983, 1990, 2000, 2005, 2010, 2015, 2020, 2024, 2023, 2022, 2019])
-
-# # Categories
-# dry_spi = (y < -0.5)  # Example condition for Dry EEA SPI
-# wet_spi = (y > 0.5)   # Example condition for Wet EEA SPI
-# forecast_year = (years == 2024)
-
-# # Marker styles
-# colors = np.where(dry_spi, 'lightcoral', np.where(wet_spi, 'cornflowerblue', 'gray'))
-# sizes = np.where(forecast_year, 200, 100)  # Make sizes the same length as x and y
-# edgecolors = ['green' if year == 2024 else 'black' for year in years]
-
-# # Create the plot
-# fig, ax = plt.subplots(figsize=(10, 8))
-# scatter = ax.scatter(x, y, c=colors, edgecolors=edgecolors, s=sizes, zorder=3)
-
-# # Add ellipses (example: for highlighting data clusters)
-# ellipse = Ellipse((-200, -1), 300, 2, alpha=0.2, color='lightcoral')
-# ax.add_patch(ellipse)
-
-# # Annotate data points
-# for i, year in enumerate(years):
-#     ax.text(x[i], y[i], str(year), fontsize=8, ha='center', va='center')
-
-# # Add vertical lines
-# ax.axvline(x=0, color='black', linestyle='-', linewidth=1)
-# ax.axvline(x=200, color='black', linestyle='-', linewidth=1)
-
-# # Add labels and title
-# ax.set_xlabel("OND ERA5 Indo-Warm Pool Heating Gradient [Wm-2]", fontsize=12)
-# ax.set_ylabel("OND Eastern Horn SPI [ZS]", fontsize=12)
-# ax.set_title("OND SPI vs Indo-Warm Pool Heating Gradient", fontsize=14)
-
-# # Add legend
-# legend_elements = [
-#     plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightcoral', markersize=10, label='Dry EEA SPI'),
-#     plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='cornflowerblue', markersize=10, label='Wet EEA SPI'),
-#     plt.Line2D([0], [0], marker='o', color='black', markersize=10, label='1981-2023'),
-#     plt.Line2D([0], [0], marker='o', color='green', markersize=10, label='2024 Forecast')
-# ]
-# ax.legend(handles=legend_elements, loc='upper left', fontsize=10)
-
-# # Grid and layout adjustments
-# ax.grid(True, zorder=0)
-# plt.tight_layout()
-# plt.show()

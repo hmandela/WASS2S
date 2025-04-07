@@ -3,6 +3,9 @@ import xarray as xr
 from scipy import stats
 from scipy import signal as sig
 from scipy.stats import gamma
+from scipy import stats
+from scipy.stats import norm
+from scipy.stats import lognorm
 import matplotlib.pyplot as plt
 import xeofs as xe
 from core.utils import *
@@ -417,7 +420,7 @@ class WAS_CCA_:
 
 
 class WAS_CCA:
-    def __init__(self, n_modes=5, n_pca_modes=10, standardize=False, use_coslat=True, use_pca=True):
+    def __init__(self, n_modes=5, n_pca_modes=10, standardize=False, use_coslat=True, use_pca=True, dist_method="gamma"):
         """
         Initialize the WAS_CCA class with specified parameters.
 
@@ -429,12 +432,14 @@ class WAS_CCA:
         - use_pca: Whether to perform PCA before CCA.
         - detrend: Whether to apply detrending to the data.
         """
+        
         self.n_modes = n_modes
         self.n_pca_modes = n_pca_modes
         self.standardize = standardize
         self.use_coslat = use_coslat
         self.use_pca = use_pca
-        # self.detrend = detrend
+        self.dist_method = dist_method
+
         self.cca = xe.cross.CCA(
             n_modes=self.n_modes,
             standardize=self.standardize,
@@ -602,15 +607,18 @@ class WAS_CCA:
 
         return hindcast
 
+    # --------------------------------------------------------------------------
+    #  Probability Calculation Methods
+    # --------------------------------------------------------------------------
     @staticmethod
     def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
         """
-        Calculates the probability of each tercile category.
+        Student's t-based method.
         """
         n_time = len(best_guess)
         pred_prob = np.empty((3, n_time))
 
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+        if np.all(np.isnan(best_guess)):
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
@@ -624,73 +632,216 @@ class WAS_CCA:
         return pred_prob
 
     @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof):
-
+    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2):
+        """
+        Gamma-based method.
+        """
         n_time = len(best_guess)
         pred_prob = np.empty((3, n_time), dtype=float)
-    
-        # If all best_guess are NaN, just fill everything with NaN
+
         if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
             pred_prob[:] = np.nan
             return pred_prob
-    
-        # Convert inputs to arrays (in case they're lists)
+
         best_guess = np.asarray(best_guess, dtype=float)
         error_variance = np.asarray(error_variance, dtype=float)
         T1 = np.asarray(T1, dtype=float)
         T2 = np.asarray(T2, dtype=float)
-    
-        # Calculate shape (alpha) and scale (theta) for the Gamma distribution
-        # alpha = (mean^2) / variance
-        # theta = variance / mean
+
         alpha = (best_guess**2) / error_variance
         theta = error_variance / best_guess
-    
-        # Compute CDF at T1, T2 (no loop over n_time)
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)  # P(X < T1)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)  # P(X < T2)
-    
-        # Fill out the probabilities
+
+        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
+        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
         pred_prob[0, :] = cdf_t1
         pred_prob[1, :] = cdf_t2 - cdf_t1
         pred_prob[2, :] = 1.0 - cdf_t2
+        return pred_prob
 
-        dof=dof
-    
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        """
+        Non-parametric method (requires historical errors).
+        """
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+
+        for t in range(n_time):
+            if np.isnan(best_guess[t]):
+                continue
+
+            dist = best_guess[t] + error_samples  
+            dist = dist[np.isfinite(dist)]  
+            if len(dist) == 0:
+                continue
+
+            p_below   = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above   = 1.0 - (p_below + p_between)
+
+            pred_prob[0, t] = p_below
+            pred_prob[1, t] = p_between
+            pred_prob[2, t] = p_above
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+        """
+        Normal-based method using the Gaussian CDF.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std) - \
+                              stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
+        """
+        Lognormal-based method.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+
+        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
+        mu = np.log(best_guess) - sigma**2 / 2
+        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - \
+                          lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
         return pred_prob
     
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
         """
-        Computes tercile category probabilities for hindcasts over a climatological period.
-        """
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        Compute tercile probabilities using self.dist_method.
 
+        Parameters
+        ----------
+        Predictant : xarray.DataArray (T, Y, X)
+            Observed data.
+        clim_year_start : int
+        clim_year_end : int
+            The start and end years for the climatology.
+        hindcast_det : xarray.DataArray
+            Deterministic forecast with dims (output=2, T, Y, X).
+
+        Returns
+        -------
+        hindcast_prob : xarray.DataArray
+            dims (probability=3, T, Y, X) => [PB, PN, PA].
+        """
+        # 1) Identify climatology slice
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.333, 0.667], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
         error_variance = (Predictant - hindcast_det).var(dim='T')
 
-        # Calculate degrees of freedom
-        dof = len(Predictant.get_index("T")) - 1 - (self.n_modes + 1)
+        T1 = terciles.isel(quantile=0).drop_vars('quantile')
+        T2 = terciles.isel(quantile=1).drop_vars('quantile')
 
-        # Compute probabilities using xr.apply_ufunc
-        hindcast_prob = xr.apply_ufunc(
-            self.calculate_tercile_probabilities_gamma,
-            hindcast_det,#.sel(output="prediction").drop_vars("output").squeeze(),
-            error_variance,
-            terciles.isel(quantile=0).drop_vars('quantile'),
-            terciles.isel(quantile=1).drop_vars('quantile'),
-            input_core_dims=[('T',), (), (), ()],
-            vectorize=True,
-            kwargs={'dof': dof},
-            dask='parallelized',
-            output_core_dims=[('probability', 'T')],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
-        )
+        # 2) Distinguish distribution method
+        if self.dist_method == "t":
+            dof = len(Predictant.get_index("T")) - 2
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+            )
 
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = (Predictant - hindcast_det)
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_samples,
+                T1,
+                T2,
+                input_core_dims=[('T',), ('T',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}. "
+                             "Must be one of ['t','gamma','normal','lognormal','nonparam'].")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB','PN','PA']))
+        return hindcast_prob.transpose('probability','T','Y','X')
+
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year):
         mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
@@ -725,29 +876,125 @@ class WAS_CCA:
        
         result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end) 
         
-        index_start = Predictant_.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant_.get_index("T").get_loc(str(clim_year_end)).stop
+        # 2) Compute thresholds T1, T2 from climatology
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.333, 0.667], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        T1 = terciles.isel(quantile=0).drop_vars('quantile')
+        T2 = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
-        dof = len(Predictant_.get_index("T")) - 1 - (self.n_modes + 1)
+
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
+        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
+        forecast_expanded = result_.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        forecast_expanded['T'] = forecast_expanded['T'].astype('datetime64[ns]')
         
-        hindcast_prob = xr.apply_ufunc(
-            self.calculate_tercile_probabilities_gamma,
-            result_,#.expand_dims({'T':1}),
-            error_variance,
-            terciles.isel(quantile=0).drop_vars('quantile'),
-            terciles.isel(quantile=1).drop_vars('quantile'),
-            input_core_dims=[('T',), (), (), ()],
-            vectorize=True,
-            kwargs={'dof': dof},
-            dask='parallelized',
-            output_core_dims=[('probability','T',)],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
-        )
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA'])) 
-        return result_*mask, hindcast_prob.drop_vars('T').squeeze().transpose('probability', 'Y', 'X')*mask
+        
+        # # Expand single prediction to T=1 so probability methods can handle it
+        # forecast_expanded = result_.expand_dims(
+        #     T=[pd.Timestamp(Predictor_for_year.coords['T'].values).to_pydatetime()]
+        # )
+
+        # 3) Tercile probabilities
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            dof = len(Predictant.get_index("T")) - 2
+
+
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_expanded,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+            )
+
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_expanded,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}}
+            )
+
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_expanded,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}}
+            )
+
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_expanded,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}}
+            )
+
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = Predictant - hindcast_det
+            error_samples = error_samples.rename({'T':'S'})
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('S',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB','PN','PA']))
+        hindcast_prob_out = hindcast_prob.transpose('probability','T','Y','X') #.drop_vars('T').squeeze()
+
+        # Return [error, prediction] plus tercile probabilities
+        return forecast_expanded, hindcast_prob_out  
         
 
     def plot_cca_results(self, X=None, Y=None, n_modes=None, clim_year_start=None, clim_year_end=None):
