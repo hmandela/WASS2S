@@ -1,13 +1,14 @@
 # WAS_S2S: West Africa and the Sahel Seasonal to Subseasonal Forecasting Tool
 
-![Modules in WAS_S2S](utilities/modules.png)
+![Modules in WAS_S2S](./modules.png)
 
 **WAS_S2S** is a comprehensive tool developed to enhance the accuracy and reproducibility of seasonal forecasts in West Africa and the Sahel.
 This initiative aligns with the World Meteorological Organization's (WMO) guidelines for objective, operational, and scientifically rigorous seasonal forecasting methods.
 
 
 ## Overview
-
+The WAS_S2S tool is designed to facilitate the generation of seasonal forecasts using various statistical and machine learning methods. 
+It provides a user-friendly jupyter-lab interface for data preparation, model training, and evaluation, making it accessible to both novice and experienced users.
 
 ## 🚀 Features
 
