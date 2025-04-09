@@ -47,6 +47,9 @@ conda activate WASS2S
 pip install wass2s
 ```
 
+4. Download notebooks for simulation
+git clone https://github.com/hmandela/WASS2S_notebooks.git
+
 ## ⚙️ Usage
 
 Comprehensive usage guidelines, including data preparation, model configuration, and execution steps, are available in the [WAS_S2S Training Documentation](https://hmandela.github.io/WAS_S2S_Training/).
