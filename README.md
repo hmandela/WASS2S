@@ -72,7 +72,7 @@ For questions or support, please open a [Github issue](https://github.com/hmande
 - ... and many more!
 
 ## 🙌 Acknowledgments
-I would like to express my sincere gratitude to all the participants of the **action-training on the new generation of seasonal forecasts in West Africa and the Sahel**.  
+I would like to express my sincere gratitude to all the participants of the **job-training on the new generation of seasonal forecasts in West Africa and the Sahel**.  
 Your valuable feedback has significantly contributed to the improvement of this tool. I look forward to continuing to receive your insights and, where possible, your contributions.  
 **A seed has been planted within you—now, let’s grow it together.**
 
