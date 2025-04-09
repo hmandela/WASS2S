@@ -72,9 +72,11 @@ For questions or support, please open a [Github issue](https://github.com/hmande
 - ... and many more!
 
 ## 🙌 Acknowledgments
-I would like to express my gratitude to the participants of the action-training on the new generation of seasonal forecasts in West Africa and the Sahel. Your feedback has greatly contributed to the improvement of this tool. I hope to continue receiving your insights and, if possible, your contributions. A seed has been planted within you… now, let’s grow it together.
+I would like to express my sincere gratitude to all the participants of the **action-training on the new generation of seasonal forecasts in West Africa and the Sahel**.  
+Your valuable feedback has significantly contributed to the improvement of this tool. I look forward to continuing to receive your insights and, where possible, your contributions.  
+**A seed has been planted within you—now, let’s grow it together.**
 
-We extend our gratitude to the AICCRA project for supporting the development and to Dr Abdou ALI Head of AGRHYMET RCC-WAS Climate-Water-Meteorology Department.
+We also extend our heartfelt thanks to the **AICCRA project** for supporting this development, and to **Dr. Abdou ALI**, Head of the **Climate-Water-Meteorology Department at AGRHYMET RCC-WAS**, for his guidance and support.
 ---
 
 📖 For more detailed information, tutorials, and support, please visit the [WAS_S2S Training Documentation](https://hmandela.github.io/WAS_S2S_Training/).
