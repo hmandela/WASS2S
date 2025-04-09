@@ -17,8 +17,35 @@ It helps forecaster to download data, build models, verify the models, and forec
 - 🤖 **Exploration of AI and Machine Learning**: Investigates the use of advanced technologies to further improve forecasting accuracy.
 
 ## 📥 Installation
+1.  Download and Install miniconda
 
-To install and set up the `WAS_S2S` tool, please follow the detailed instructions provided in the [WAS_S2S Training Documentation](https://hmandela.github.io/WAS_S2S_Training/).
+-   For Windows, download the executable [here](https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe)
+
+-   For Linux (Ubuntu), in the terminal run:
+
+    ``` bash
+    sudo apt-get update
+    sudo apt-get upgrade
+    sudo apt-get install wget
+    wget -c -r https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh --no-check-certificate
+    bash Miniconda3-latest-Linux-x86_64.sh
+    ```
+2. Create an environment and activate
+- For Windows: download yaml [here](https://github.com/hmandela/WASS2S/blob/main/WAS_S2S_windows.yml) and run
+```bash
+conda env create -f WAS_S2S_windows.yml
+conda activate WASS2S
+```
+- For Linux: download yaml [here](https://github.com/hmandela/WASS2S/blob/main/WAS_S2S_linux.yml) and run
+```bash
+conda env create -f WAS_S2S_linux.yml
+conda activate WASS2S
+```
+
+3. Install wass2s
+```bash
+pip install wass2s
+```
 
 ## ⚙️ Usage
 
@@ -30,7 +57,7 @@ We welcome contributions from the community to enhance the `WAS_S2S` tool. Pleas
 
 ## 📜 License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [GPL-3 License](https://github.com/hmandela/WASS2S/blob/main/LICENSE.txt).
 
 ## Contact
 
@@ -47,7 +74,7 @@ For questions or support, please open a [Github issue](https://github.com/hmande
 ## 🙌 Acknowledgments
 I would like to express my gratitude to the participants of the action-training on the new generation of seasonal forecasts in West Africa and the Sahel. Your feedback has greatly contributed to the improvement of this tool. I hope to continue receiving your insights and, if possible, your contributions. A seed has been planted within you… now, let’s grow it together.
 
-We extend our gratitude to the AICCRA project for supporting the development and to Dr Abdou ALI Head of AGRHYMET RCC-WAS Climate-Water-Meteorlogy Department.
+We extend our gratitude to the AICCRA project for supporting the development and to Dr Abdou ALI Head of AGRHYMET RCC-WAS Climate-Water-Meteorology Department.
 ---
 
 📖 For more detailed information, tutorials, and support, please visit the [WAS_S2S Training Documentation](https://hmandela.github.io/WAS_S2S_Training/).
