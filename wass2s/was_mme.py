@@ -189,28 +189,30 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
             )
     
     elif agroparam:
-        target_prefixes = [m.split('.')[0].replace('_', '').lower() for m in best_models]
+        target_prefixes = [model.split('.')[0].replace('_','').lower() for model in best_models]
         scores_organized = {
-            m.split('.')[0].replace('_', '').lower(): da for key, da in scores[score_metric].items() 
-            for m in best_models if any(key.startswith(prefix) for prefix in target_prefixes)
-        }
-        for prefix in target_prefixes:
-            fic_hd = next(f for f in list(hdcsted.values()) if prefix in f)
-            hdcst = xr.open_dataset(fic_hd).to_array().drop_vars("variable").squeeze("variable")
+            model.split('.')[0].replace('_','').lower(): da for key, da in scores['GROC'].items() 
+            for model in best_models if any(key.startswith(prefix) for prefix in target_prefixes)
+                        }
+        for i in target_prefixes:
+            fic = [f for f in list(hdcsted.values()) if i[0:5] in f][0]        
+            hdcst = xr.open_dataset(fic).to_array().drop_vars("variable").squeeze("variable")
             hdcst = hdcst.interp(
-                Y=rainfall.Y, X=rainfall.X, method="linear", 
-                kwargs={"fill_value": "extrapolate"}
-            )
-            all_model_hdcst[prefix] = myfill(hdcst, rainfall)
-            
-            fic_fc = next(f for f in list(fcsted.values()) if prefix in f)
-            fcst = xr.open_dataset(fic_fc).to_array().drop_vars("variable").squeeze("variable")
+                            Y=rainfall.Y,
+                            X=rainfall.X,
+                            method="linear",
+                            kwargs={"fill_value": "extrapolate"}
+                        )
+            all_model_hdcst[i] = myfill(hdcst, rainfall)
+            fic = [f for f in list(fcsted.values()) if i[0:5]  in f][0]
+            fcst = xr.open_dataset(fic).to_array().drop_vars("variable").squeeze("variable")
             fcst = fcst.interp(
-                Y=rainfall.Y, X=rainfall.X, method="linear", 
-                kwargs={"fill_value": "extrapolate"}
-            )
-            all_model_fcst[prefix] = myfill(fcst, rainfall)
-    
+                            Y=rainfall.Y,
+                            X=rainfall.X,
+                            method="linear",
+                            kwargs={"fill_value": "extrapolate"}
+                        )
+            all_model_fcst[i] = myfill(fcst, rainfall)
     else:
         target_prefixes = [m.replace(m.split('.')[1], '') for m in best_models]
         scores_organized = {
