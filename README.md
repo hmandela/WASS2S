@@ -48,7 +48,9 @@ pip install wass2s
 ```
 
 4. Download notebooks for simulation
+```bash
 git clone https://github.com/hmandela/WASS2S_notebooks.git
+```
 
 ## ⚙️ Usage
 
