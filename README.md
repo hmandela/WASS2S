@@ -51,6 +51,38 @@ pip install wass2s
 ```bash
 git clone https://github.com/hmandela/WASS2S_notebooks.git
 ```
+5. Create CDS API key and use it to download NMME and C3S models data from the Climate Data Store (CDS) and IRI Data Library.
+
+-   Create an account with Copernicus by signing up [here](https://cds.climate.copernicus.eu/datasets)
+
+-   Once you successfully create an account, kindly log in to your Copernicus account and click on your name at the top right corner of the page. Note your "UID" and "Personal Access Token key". 
+
+
+-  Configure .cdsapirc file.
+
+In your activated terminal, kindly initiate the Python interpreter by entering the command python3. Subsequently, carefully copy and paste the below code, ensuring to replace "Personal Access Token" with yours.
+
+```python
+import os
+
+config_data = '''url: https://cds.climate.copernicus.eu/api
+key: Personal Access Token
+verify: 0
+'''
+
+path_to_home = "/".join([os.path.expanduser('~'),".cdsapirc"])
+
+if not os.path.exists(path_to_home):
+    with open(path_to_home, 'w') as file:
+        file.write(config_data)
+        
+print("Configuration file created successfully!")
+```
+### Upgrade wass2s
+If you want to upgrade wass2s to a newer version, use the following command:
+```bash
+pip install --upgrade wass2s
+```
 
 ## ⚙️ Usage
 
