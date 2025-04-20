@@ -28,6 +28,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from scipy.stats import pearsonr
 from scipy import stats
 from scipy.stats import gamma, lognorm
+import scipy.signal as sig
 
 # Deep Learning Libraries
 # import tensorflow as tf
@@ -168,7 +169,7 @@ class WAS_Analog:
         season = "".join([calendar.month_abbr[int(month)] for month in months])
     
         # Define combined output file path
-        combined_output_path = dir_to_save / f"{center}_SST_{self.year_start}_{year_end}_{season}.nc"
+        combined_output_path = dir_to_save / f"{center}_SST_{self.month_of_initialization}_{self.year_start}_{year_end}_{season}.nc"
     
         if not force_download and combined_output_path.exists():
             print(f"{combined_output_path} already exists. Skipping download.")
@@ -271,7 +272,7 @@ class WAS_Analog:
                     combined_ds.to_netcdf(combined_output_path)
                     print(f"Download finished. Combined SST dataset saved to {combined_output_path}")
         
-                    # Optionally, remove individual yearly files
+                    # remove individual yearly files
                     for year in range(self.year_start, year_end + 1):
                         single_file_path = dir_to_save / f"{center}_SST_{year}.nc"
                         if single_file_path.exists():
@@ -584,24 +585,29 @@ class WAS_Analog:
             ddd = ddd.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
             
         predictant['T'] = predictant['T'].astype('datetime64[ns]')
+        reference_year = np.unique(predictant['T'].dt.year)[ireference_year][0]
+        sst_ireference_year = ddd.sel(T=str(reference_year))
+        
         # Get the unique years from the dataset's 'T' dimension
         predictant_ = xr.concat([predictant.isel(T=itrain), predictant.isel(T=ireference_year)], dim="T")
-        # Extract years
-        unique_years = np.unique(predictant_['T'].dt.year)  
-        sst_ireference_year = ddd.sel(T=str(ireference_year))
+
+        # Extract train years
+        unique_years = np.unique(predictant.isel(T=itrain)['T'].dt.year)
+
         sim_tmp = []
-        for i in unique_years[unique_years!=ireference_year]:
+        for i in unique_years:
             tmp = ddd.sel(T=str(i))
             tmp['T'] = sst_ireference_year['T']
             correlation = xr.corr(tmp, sst_ireference_year, dim="T")
             sim_tmp.append(correlation)
         similar = xr.concat(sim_tmp, dim='T')
-        similar = similar.assign_coords(T=unique_years[unique_years!=ireference_year])
+        similar = similar.assign_coords(T=unique_years)
         similar = xr.where(similar > 0.7, 1, 0).sum(dim=["X","Y"])
         similar = similar.sortby(similar, ascending=False)
         # Select the first 3 entries
         top_3 = similar.isel(T=slice(3))
         similar_years = top_3['T'].to_numpy()
+        print(f"similar years for {reference_year} are {similar_years}")
         return similar_years
 
     def Pca_Based(self, predictant, ddd, itrain, ireference_year):
@@ -614,19 +620,22 @@ class WAS_Analog:
         ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
         
         eof = xe.single.EOF(n_modes=10)
-        eof.fit(utils_detrend(ddd.fillna(ddd.mean(dim="T", skipna=True))), dim="T")
+        eof.fit(ddd.fillna(ddd.mean(dim="T", skipna=True)), dim="T")
         scores = eof.scores()
 
         predictant['T'] = predictant['T'].astype('datetime64[ns]')
-        # Get the unique years from the dataset's 'T' dimension
-        predictant_ = xr.concat([predictant.isel(T=itrain), predictant.isel(T=ireference_year)], dim="T")
-        # Extract years
-        unique_years = np.unique(scores['T'].dt.year)          
-        sst_ref = scores.sel(T=str(ireference_year))
+        reference_year = np.unique(predictant['T'].dt.year)[ireference_year][0]
+        sst_ref = scores.sel(T=str(reference_year))
         sst_ref = sst_ref.stack(score=('mode', 'T'))
+
+        # Get the unique years from the dataset's 'T' dimension
+        # predictant_ = xr.concat([predictant.isel(T=itrain), predictant.isel(T=ireference_year)], dim="T")
+
+        # Extract train years
+        unique_years = np.unique(predictant.isel(T=itrain)['T'].dt.year) 
         
         sim_tmp = []
-        for i in unique_years[unique_years!=ireference_year]:
+        for i in unique_years:
             tmp = scores.sel(T=str(i))
             tmp = tmp.stack(score=('mode', 'T'))
             sst_ref['score'] = tmp['score']
@@ -634,12 +643,13 @@ class WAS_Analog:
             # print(correlation)
             sim_tmp.append(correlation)
         similar = xr.concat(sim_tmp, dim='T')
-        similar = similar.assign_coords(T=unique_years[unique_years!=reference_year])
+        similar = similar.assign_coords(T=unique_years)
         similar = similar.sortby(similar, ascending=False)
         
         # Select the first 3 entries
         top_3 = similar.isel(T=slice(3))
         similar_years = top_3['T'].to_numpy()
+        print(f"similar years for {reference_year} are {similar_years}")
         return similar_years
         
         
@@ -1427,7 +1437,7 @@ class WAS_Analog:
             predictor_detrend = sig.detrend(predictor_, axis=0)
             ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
             eof = xe.single.EOF(n_modes=10)
-            eof.fit(utils_detrend(ddd.fillna(ddd.mean(dim="T", skipna=True))), dim="T")
+            eof.fit(ddd.fillna(ddd.mean(dim="T", skipna=True)), dim="T")
             scores = eof.scores()
             sst_ref = scores.sel(T=str(reference_year))
             sst_ref = sst_ref.stack(score=('mode', 'T'))
@@ -1626,6 +1636,11 @@ class WAS_Analog:
         sim_all.append(sim__)
         sim_all = xr.concat(sim_all, dim="output").assign_coords(output=('output', ['forecast year','composite analog']))
 
+        if self.define_extent is not None:
+            lon_min, lon_max, lat_min, lat_max = self.define_extent
+            sim_all = sim_all.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
+        else:
+            sim_all = sim_all.sel(X=slice(-180, 180), Y=slice(-45, 45))
         pred_rain = xr.concat(pred_rain, dim='T')
         
         if plot_predictor:

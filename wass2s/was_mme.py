@@ -313,7 +313,6 @@ def myfill(all_model_fcst, obs):
 
 
 
-    
 
 class WAS_mme_Weighted:
     def __init__(self, equal_weighted=False, dist_method="gamma", metric="GROC", threshold=0.5):
@@ -343,12 +342,12 @@ class WAS_mme_Weighted:
         elif self.metric.lower() in ['pearson', 'groc']:
             return xr.where(
                 score_array <= self.threshold,
-                0,
-                xr.where(
-                    score_array <= 0.6,
-                    0.6,
-                    xr.where(score_array <= 0.8, 0.8, 1)
-                )
+                0, 1
+               # xr.where(
+               #     score_array <= 0.6,
+               #     0.6,
+               #     xr.where(score_array <= 0.8, 0.8, 1)
+               # )
             )
 
         else:
@@ -899,16 +898,21 @@ class WAS_Min2009_ProbWeighted:
             )
             # Apply weighting rules: below threshold set to 0; between threshold and 0.6 -> 0.6; 
             # between 0.6 and 0.8 -> 0.8; above 0.8 -> 1.
+
+            # score_array = xr.where(
+            #    score_array <= threshold,
+            #     0,
+            #     xr.where(
+            #         score_array <= 0.6,
+            #         0.6,
+            #        xr.where(score_array <= 0.8, 0.8, 1)
+            #     )
+            # )
+
             score_array = xr.where(
                 score_array <= threshold,
-                0,
-                xr.where(
-                    score_array <= 0.6,
-                    0.6,
-                    xr.where(score_array <= 0.8, 0.8, 1)
-                )
+                0,1
             )
-
             # Interpolate hindcast and forecast data for the model to the rainfall grid
             hindcast_data = hdcst.sel(M=model_name).interp(
                 Y=rainfall.Y,

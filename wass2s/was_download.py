@@ -41,11 +41,11 @@ class WAS_Download:
         self,
         centre={
             "ECMWF_51": "ecmwf",
-            # "UKMO_602": "ukmo",
+            "UKMO_604": "ukmo",
             "UKMO_603": "ukmo",
             "METEOFRANCE_8": "meteo_france",
-            "DWD_21": "dwd",
-            # "DWD_2": "dwd",
+            "DWD_21": "dwd", # month of initialization available for forecast are Jan to Mar
+            "DWD_22": "dwd", # month of initialization available for forecast are Apr to __ 
             "CMCC_35": "cmcc",
             # "CMCC_3": "cmcc",
             "NCEP_2": "ncep",
@@ -73,6 +73,9 @@ class WAS_Download:
             "UGRD10": "10m_u_component_of_wind",
             "VGRD10": "10m_v_component_of_wind",
             "SST": "sea_surface_temperature",
+            "SLP": "mean_sea_level_pressure",
+            "DSWR": "surface_solar_radiation_downwards",
+            "DLWR": "surface_thermal_radiation_downwards",
         },
         variables_2={
             "HUSS_1000": "specific_humidity",
@@ -117,6 +120,9 @@ class WAS_Download:
             "UGRD10": "10m_u_component_of_wind",
             "VGRD10": "10m_v_component_of_wind",
             "SST": "sea_surface_temperature",
+            "SLP": "mean_sea_level_pressure",
+            "DSWR": "surface_solar_radiation_downwards",
+            "DLWR": "surface_thermal_radiation_downwards",
         },
         variables_2={
             "HUSS_1000": "specific_humidity",
@@ -565,11 +571,11 @@ class WAS_Download:
 
         centre = {
             "ECMWF_51": "ecmwf",
-            # "UKMO_602": "ukmo",
-            "UKMO_603": "ukmo",
+            "UKMO_604": "ukmo", # month of initialization available for forecast are Apr to __
+            "UKMO_603": "ukmo", # month of initialization available for forecast are Jan to Mar
             "METEOFRANCE_8": "meteo_france",
-            "DWD_21": "dwd",
-            # "DWD_2": "dwd",
+            "DWD_21": "dwd", # month of initialization available for forecast are Jan to Mar
+            "DWD_22": "dwd", # month of initialization available for forecast are Apr to __ 
             "CMCC_35": "cmcc",
             # "CMCC_3": "cmcc",
             "NCEP_2": "ncep",
@@ -600,6 +606,9 @@ class WAS_Download:
             "UGRD10": "10m_u_component_of_wind",
             "VGRD10": "10m_v_component_of_wind",
             "SST": "sea_surface_temperature",
+            "SLP": "mean_sea_level_pressure",
+            "DSWR": "surface_solar_radiation_downwards",
+            "DLWR": "surface_thermal_radiation_downwards",
         }
 
         variables_2 = {
@@ -616,10 +625,11 @@ class WAS_Download:
 
         system = {
             "ECMWF_51": "51",
-            # "UKMO_602": "602",
+            "UKMO_604": "604",
             "UKMO_603": "603",
             "METEOFRANCE_8": "8",
             "DWD_21": "21",
+            "DWD_22": "22",
             # "DWD_2": "2",
             "CMCC_35": "35",
             # "CMCC_3": "3",
@@ -815,14 +825,25 @@ class WAS_Download:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
                             else:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
-                        if k in ["UGRD10","VGRD10"]:
+
+                        if k == "SLP":
+                            ds = ds/100
+                            ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds 
+                            ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            if "indexing_time" in ds.coords: 
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
+                            else:
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
+
+                        if k in ["UGRD10","VGRD10","DSWR","DLWR"]:
                             ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
                             ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
                             if "indexing_time" in ds.coords: 
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
                             else:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
-                        if k not in ["TMIN","TEMP","TMAX","SST","UGRD10","VGRD10", "PRCP"]:
+
+                        if k not in ["TMIN","TEMP","TMAX","SST","UGRD10","VGRD10", "PRCP","SLP","DSWR","DLWR"]:
                             ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
                             ds = ds.drop_vars("pressure_level").squeeze().mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
                             if "indexing_time" in ds.coords: 
@@ -990,10 +1011,11 @@ class WAS_Download:
         # 2. Build standard dictionaries for center/system/variables
         centre = {
             "ECMWF_51": "ecmwf",
-            # "UKMO_602": "ukmo",
-            "UKMO_603": "ukmo",
+            "UKMO_604": "ukmo", # month of initialization available for forecast are Apr to __
+            "UKMO_603": "ukmo", # month of initialization available for forecast are Jan to Mar
             "METEOFRANCE_8": "meteo_france",
             "DWD_21": "dwd",
+            "DWD_22": "dwd",
             # "DWD_2": "dwd",
             "CMCC_35": "cmcc",
             # "CMCC_3": "cmcc",
@@ -1005,10 +1027,11 @@ class WAS_Download:
     
         system = {
             "ECMWF_51": "51",
-            # "UKMO_602": "602",
+            "UKMO_604": "604",
             "UKMO_603": "603",
             "METEOFRANCE_8": "8",
             "DWD_21": "21",
+            "DWD_22": "22",
             # "DWD_2": "2",
             "CMCC_35": "35",
             # "CMCC_3": "3",
@@ -1026,6 +1049,9 @@ class WAS_Download:
             "UGRD10":"10m_u_component_of_wind",
             "VGRD10":"10m_v_component_of_wind",
             "SST":   "sea_surface_temperature",
+            "SLP": "mean_sea_level_pressure",
+            "DSWR": "surface_solar_radiation_downwards",
+            "DLWR": "surface_thermal_radiation_downwards",
         }
         variables_2 = {
             "HUSS_1000": "specific_humidity",
@@ -1089,9 +1115,9 @@ class WAS_Download:
                 store_file_path[f"{cent}{syst}"] = output_file
                 continue
 
-            if cent == "jma":
+            if cent == "jma" and year_forecast is None:
                 day_of_initialization = init_day_dict_jma[month_of_initialization]
-            if cent == "ncep":
+            if cent == "ncep" and year_forecast is None:
                 day_of_initialization = init_day_dict_ncep[month_of_initialization]
                     
             # 5. Prepare the request for 'seasonal-original-single-levels'
@@ -1121,8 +1147,12 @@ class WAS_Download:
                 print(f"Failed to download data for {cv}: {e}")
                 continue
     
-            # 7. (Optional) Post-process with xarray
+            # 7. Post-process with xarray
             try:
+                ##########################################################
+                # Take in account level pressure for some variables in this part
+                ##########################################################
+                 
                 ds = xr.open_dataset(temp_file)
                 time = (ds['forecast_reference_time'] + ds['forecast_period']).data
                 ds = ds.assign_coords(time=(('forecast_reference_time', 'forecast_period'), time))
@@ -1155,8 +1185,12 @@ class WAS_Download:
                         differences['time'] = yearly_ds['time'].isel(time=slice(1,None))
                         tampon.append(differences)
                     ds = xr.concat(tampon, dim="time")*1000
-    
-                # Finally, rename the coords to X, Y, T to match your style
+
+                    ##########################################################
+                    # Include after the processing of SLP, DSWR, DLWR,
+                    ##########################################################
+
+                # Finally, rename the coords to X, Y, T to match my style
                 if "longitude" in ds.coords:
                     ds = ds.rename({"longitude": "X"})
                 if "latitude" in ds.coords:
@@ -1415,9 +1449,9 @@ class WAS_Download:
     
         # 3) Decide mean or sum based on var_name 
 
-        if any(x in var_name for x in ["TEMP","TMIN","TMAX","SST"]):
+        if any(x in var_name for x in ["TEMP","TMIN","TMAX","SST","SLP"]):
             ds_out = ds.groupby("season_year").mean("time")
-        elif "PRCP" in var_name:
+        elif any(x in var_name for x in ["PRCP","DSWR","DLWR"]):
             ds_out = ds.groupby("season_year").sum("time")
         else:
             ds_out = ds.groupby("season_year").mean("time")
@@ -1463,6 +1497,10 @@ class WAS_Download:
             "UGRD10": "10m_u_component_of_wind",
             "VGRD10": "10m_v_component_of_wind",
             "SST": "sea_surface_temperature",
+            "SLP": "mean_sea_level_pressure",
+            "DSWR": "surface_solar_radiation_downwards",
+            "DLWR": "surface_thermal_radiation_downwards",
+
         }
         # Pressure-level monthly means
         variables_2 = {
@@ -1664,8 +1702,16 @@ class WAS_Download:
                 )
                 
                 if v == "PRCP":
-                    dsC = 90*1000*dsC
-                    
+                    nbjour = len(season_months)*30
+                    dsC = nbjour*1000*dsC  # !!!!! Convert to mm/month
+                
+                if v in ["DSWR", "DLWR"]:
+                    nbjour = len(season_months)*30
+                    dsC = (dsC * 30)/(nbjour*86400)  # Convert to W/m2
+
+                if v == "SLP":
+                    dsC = dsC / 100  # Convert to hPa(mb)
+
                 dsC["time"] = [f"{year}-{seas[1]}-01" for year in dsC["time"].astype(str).values]
                 dsC["time"] = dsC["time"].astype("datetime64[ns]")
                 dsC = dsC.rename({"time": "T"})
