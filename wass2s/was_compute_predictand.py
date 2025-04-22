@@ -378,7 +378,13 @@ class WAS_compute_onset:
         years = np.unique(daily_data['T'].dt.year.to_numpy())
 
         # Choose a date to store results
-        zone_id_to_use = int(np.max(unique_zone))
+        if unique_zone.size == 0:
+            raise ValueError("No valid zones found in the mask.")
+            zone_id_to_use = 2
+        else:
+            # Use zone in low latitude
+            zone_id_to_use = int(np.max(unique_zone))
+        
         T_from_here = daily_data.sel(T=[f"{str(i)}-{self.criteria[zone_id_to_use]['start_search']}" for i in years])
 
         # Prepare chunk sizes
