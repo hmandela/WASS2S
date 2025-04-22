@@ -379,7 +379,7 @@ class WAS_compute_onset:
 
         # Choose a date to store results
         if unique_zone.size == 0:
-            raise ValueError("No valid zones found in the mask.")
+            print("No valid zones found in the mask. choose a default zone. this happens for cabo verde")
             zone_id_to_use = 2
         else:
             # Use zone in low latitude
