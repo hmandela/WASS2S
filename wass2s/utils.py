@@ -1311,6 +1311,46 @@ def plot_date(A):
     plt.tight_layout()
     plt.show()
 
+def verify_station_network(df_filtered, extent, map_name="Rain-gauge network"):
+    """
+    Verify the station network by plotting the locations of the stations
+    on a map.
+    """
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    lat_row = df_filtered.loc[df_filtered["STATION"] == "LAT"].squeeze()
+    lon_row = df_filtered.loc[df_filtered["STATION"] == "LON"].squeeze()
+
+    station_names = df_filtered.columns[1:]                      # skip the STATION header
+    lats = lat_row[1:].astype(float).values
+    lons = lon_row[1:].astype(float).values
+    # Create a Basemap instance
+    proj = ccrs.PlateCarree() 
+    fig = plt.figure(figsize=(10, 8))
+    ax  = plt.axes(projection=proj)
+ 
+    # West-Africa extent
+    ax.set_extent([extent[1], extent[3], extent[2], extent[0]], crs=proj)
+
+    # Basemap layers
+    ax.add_feature(cfeature.LAND,      facecolor="cornsilk")
+    ax.add_feature(cfeature.OCEAN,     facecolor="lightblue")
+    ax.add_feature(cfeature.BORDERS,   linewidth=0.6)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
+    ax.add_feature(cfeature.LAKES,     alpha=0.4)
+
+    ax.scatter(lons, lats,
+            s=30, marker="o", facecolor="red", edgecolor="black",
+            transform=proj, zorder=5)
+
+    # label each point
+    for lon, lat, name in zip(lons, lats, station_names):
+        ax.text(lon + 0.3, lat + 0.3, name,
+                fontsize=6, transform=proj)
+
+    ax.set_title(map_name, fontsize=14)
+    plt.tight_layout()
+    plt.show()
 
 # import matplotlib.pyplot as plt
 # import matplotlib.colors as colors

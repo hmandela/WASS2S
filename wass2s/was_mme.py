@@ -191,7 +191,7 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
     elif agroparam:
         target_prefixes = [model.split('.')[0].replace('_','').lower() for model in best_models]
         scores_organized = {
-            model.split('.')[0].replace('_','').lower(): da for key, da in scores['GROC'].items() 
+            model.split('.')[0].replace('_','').lower(): da for key, da in scores[score_metric].items() 
             for model in best_models if any(key.startswith(prefix) for prefix in target_prefixes)
                         }
         for i in target_prefixes:
