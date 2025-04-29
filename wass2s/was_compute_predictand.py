@@ -148,7 +148,7 @@ class WAS_compute_onset:
         return day_of_year_value
 
     def rainf_zone(self, daily_data):
-        annual_rainfall = daily_data.resample(T="YE").sum(skipna=False).mean(dim='T')
+        annual_rainfall = daily_data.resample(T="YE").sum(skipna=True).mean(dim='T')
         mask_5 = annual_rainfall.where(abs(annual_rainfall.Y) <= 8, np.nan)
         mask_5 = xr.where(np.isnan(mask_5), np.nan, 5) 
         mask_4 = xr.where(
@@ -376,7 +376,7 @@ class WAS_compute_onset:
         #     Y=mask_char.coords['Y'])
 
         mask_char = self.rainf_zone(daily_data)
-        
+        mm = mask_char.plot()
         # Get unique zone IDs
         unique_zone = np.unique(mask_char.to_numpy())
         unique_zone = unique_zone[~np.isnan(unique_zone)]
@@ -586,7 +586,7 @@ class WAS_compute_onset_dry_spell:
         return final_df
 
     def rainf_zone(self, daily_data):
-        annual_rainfall = daily_data.resample(T="YE").sum(skipna=False).mean(dim='T')
+        annual_rainfall = daily_data.resample(T="YE").sum(skipna=True).mean(dim='T')
         mask_5 = annual_rainfall.where(abs(annual_rainfall.Y) <= 8, np.nan)
         mask_5 = xr.where(np.isnan(mask_5), np.nan, 5) 
         mask_4 = xr.where(
@@ -1248,7 +1248,7 @@ class WAS_compute_cessation:
         return df_final
 
     def rainf_zone(self, daily_data):
-        annual_rainfall = daily_data.resample(T="YE").sum(skipna=False).mean(dim='T')
+        annual_rainfall = daily_data.resample(T="YE").sum(skipna=True).mean(dim='T')
         mask_5 = annual_rainfall.where(abs(annual_rainfall.Y) <= 8, np.nan)
         mask_5 = xr.where(np.isnan(mask_5), np.nan, 5) 
         mask_4 = xr.where(
@@ -1566,7 +1566,7 @@ class WAS_compute_cessation_dry_spell:
         return final_df
 
     def rainf_zone(self, daily_data):
-        annual_rainfall = daily_data.resample(T="YE").sum(skipna=False).mean(dim='T')
+        annual_rainfall = daily_data.resample(T="YE").sum(skipna=True).mean(dim='T')
         mask_5 = annual_rainfall.where(abs(annual_rainfall.Y) <= 8, np.nan)
         mask_5 = xr.where(np.isnan(mask_5), np.nan, 5) 
         mask_4 = xr.where(
