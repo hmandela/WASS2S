@@ -18,6 +18,7 @@ class WAS_compute_onset:
 
     # Default class-level criteria dictionary
     default_criteria = {
+        0: {"zone_name": "Sahel100_0mm", "start_search": "06-01", "cumulative": 10, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "08-30"},       
         1: {"zone_name": "Sahel200_100mm", "start_search": "05-15", "cumulative": 15, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "08-15"},
         2: {"zone_name": "Sahel400_200mm", "start_search": "05-01", "cumulative": 15, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31"},
         3: {"zone_name": "Sahel600_400mm", "start_search": "03-15", "cumulative": 20, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31"},
@@ -121,6 +122,8 @@ class WAS_compute_onset:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:
+                return 0
             else:
                 return 4
 
@@ -169,7 +172,11 @@ class WAS_compute_onset:
             (annual_rainfall < 200) & (annual_rainfall >= 100),
             1,np.nan 
             )
-        return mask_5.fillna(mask_4).fillna(mask_3).fillna(mask_2).fillna(mask_1)
+        mask_0 = xr.where(
+            (annual_rainfall < 100) & (annual_rainfall >= 0),
+            0,np.nan 
+            )
+        return mask_5.fillna(mask_4).fillna(mask_3).fillna(mask_2).fillna(mask_1).fillna(mask_0)
         
     def onset_function(self, x, idebut, cumul, nbsec, jour_pluvieux, irch_fin):
         """
@@ -379,8 +386,7 @@ class WAS_compute_onset:
 
         # Choose a date to store results
         if unique_zone.size == 0:
-            print("No valid zones found in the mask. choose a default zone. this happens for cabo verde")
-            zone_id_to_use = 2
+            raise ValueError("No valid zones found in the mask.")
         else:
             # Use zone in low latitude
             zone_id_to_use = int(np.max(unique_zone))
@@ -463,6 +469,7 @@ class WAS_compute_onset_dry_spell:
 
     # Default class-level criteria dictionary
     default_criteria = {
+        0: {"zone_name": "Sahel100_0mm", "start_search": "06-01", "cumulative": 10, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "08-30", "nbjour":40},
         1: {"zone_name": "Sahel200_100mm", "start_search": "05-15", "cumulative": 15, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "08-15", "nbjour":40},
         2: {"zone_name": "Sahel400_200mm", "start_search": "05-01", "cumulative": 15, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31", "nbjour":40},
         3: {"zone_name": "Sahel600_400mm", "start_search": "03-15", "cumulative": 20, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31", "nbjour":45},
@@ -567,6 +574,8 @@ class WAS_compute_onset_dry_spell:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:
+                return 0
             else:
                 return 4
 
@@ -601,7 +610,12 @@ class WAS_compute_onset_dry_spell:
             (annual_rainfall < 200) & (annual_rainfall >= 100),
             1,np.nan 
             )
-        return mask_5.fillna(mask_4).fillna(mask_3).fillna(mask_2).fillna(mask_1)
+        mask_0 = xr.where(
+            (annual_rainfall < 100) & (annual_rainfall >= 0),
+            0,np.nan 
+            )
+        # Fill NaN values with the next available value
+        return mask_5.fillna(mask_4).fillna(mask_3).fillna(mask_2).fillna(mask_1).fillna(mask_0)
 
     def dry_spell_onset_function(self, x, idebut, cumul, nbsec, jour_pluvieux, irch_fin, nbjour):
         """
@@ -1002,6 +1016,7 @@ class WAS_compute_cessation:
 
     # Default class-level criteria dictionary
     default_criteria = {
+        0: {"zone_name": "Sahel100_0mm", "date_dry_soil":"01-01", "start_search": "09-01", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "09-30"},
         1: {"zone_name": "Sahel200_100mm", "date_dry_soil":"01-01", "start_search": "09-01", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "10-05", },
         2: {"zone_name": "Sahel400_200mm", "date_dry_soil":"01-01", "start_search": "09-01", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "11-10"},
         3: {"zone_name": "Sahel600_400mm", "date_dry_soil":"01-01", "start_search": "09-15", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "11-15"},
@@ -1117,7 +1132,9 @@ class WAS_compute_cessation:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
-            else:
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:
+                return 0
+            else:           
                 return 4
 
         final_df["zonename"] = final_df.groupby("STATION", group_keys=False).apply(
@@ -1255,7 +1272,12 @@ class WAS_compute_cessation:
             (annual_rainfall < 200) & (annual_rainfall >= 100),
             1,np.nan 
             )
-        return mask_5.fillna(mask_4).fillna(mask_3).fillna(mask_2).fillna(mask_1)
+        mask_0 = xr.where(
+            (annual_rainfall < 100) & (annual_rainfall >= 0),
+            0,
+            np.nan 
+            )
+        return mask_5.fillna(mask_4).fillna(mask_3).fillna(mask_2).fillna(mask_1).fillna(mask_0)
         
     def compute(self, daily_data, nb_cores):
         """
@@ -1351,6 +1373,20 @@ class WAS_compute_cessation_dry_spell:
 
     # Default class-level criteria dictionary
     default_criteria = {
+        0: {
+            "zone_name": "Sahel100_0mm",
+            "start_search1": "05-01",
+            "cumulative": 10,
+            "number_dry_days": 25,
+            "thrd_rain_day": 0.85,
+            "end_search1": "08-15",
+            "nbjour": 40,
+            "date_dry_soil": "01-01",
+            "start_search2": "09-01",
+            "ETP": 5.0,
+            "Cap_ret_maxi": 70,
+            "end_search2": "09-30"
+        },
         1: {
             "zone_name": "Sahel200_100mm",
             "start_search1": "05-15",
@@ -1518,6 +1554,8 @@ class WAS_compute_cessation_dry_spell:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:    
+                return 0
             else:
                 return 4
 
@@ -1552,7 +1590,12 @@ class WAS_compute_cessation_dry_spell:
             (annual_rainfall < 200) & (annual_rainfall >= 100),
             1,np.nan 
             )
-        return mask_5.fillna(mask_4).fillna(mask_3).fillna(mask_2).fillna(mask_1)
+        mask_0 = xr.where(
+            (annual_rainfall < 100) & (annual_rainfall >= 0),
+            0,
+            np.nan 
+            )
+        return mask_5.fillna(mask_4).fillna(mask_3).fillna(mask_2).fillna(mask_1).fillna(mask_0)
 
     
     def dry_spell_cessation_function(self,
@@ -2084,6 +2127,8 @@ class WAS_count_dry_spells:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:
+                return 0
             else:
                 return 4
 
@@ -2601,6 +2646,8 @@ class WAS_count_wet_spells:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:
+                return 0
             else:
                 return 4
 
