@@ -651,33 +651,7 @@ class WAS_Merging:
         2) **Kriging** of the residuals (observation - NN_prediction) to spatially interpolate
            the remaining error structure under the assumption that these residuals are 
            stationary and exhibit spatial autocorrelation.
-    
-        **Theoretical Rationale**:
-        --------------------------
-        - **Neural Network Step**:
-          We use a Multi-Layer Perceptron (MLP) to learn non-linear mappings from model estimates
-          (e.g., from a climate or weather model) to station observations. The NN effectively
-          captures large-scale, non-linear bias patterns that linear methods may miss.
-    
-        - **Kriging (Geostatistics) Step**:
-          After removing the large-scale bias via NN, the residual field often still contains
-          spatially correlated local biases or errors. We assume these residuals follow a
-          stationary random field. Ordinary Kriging then interpolates these residuals across
-          the domain, leveraging a semi-variogram fitted to station residuals. By adding the
-          kriged residual field back to the NN predictions, we account for both large-scale
-          and local spatial biases.
-    
-        **Procedure**:
-          1. Transform station data (df_seas) and gridded estimates (estim) into a standardized
-             space if needed (optional).
-          2. For each time slice:
-             a. Align station and grid data, dropping NaNs.
-             b. Train a Neural Network model (MLPRegressor) on (X=NN_inputs, y=station_obs).
-             c. Compute station residuals = (station_obs - nn_prediction).
-             d. Fit a variogram to station residuals, then perform Ordinary Kriging on the
-                entire domain.
-             e. Combine (NN grid prediction) + (kriged residuals) for final bias-adjusted field.
-    
+        
         Parameters
         ----------
         missing_value : float, optional
@@ -699,8 +673,6 @@ class WAS_Merging:
         -----
         - The hyperparameter search for the MLP uses GridSearchCV with MSE-based scoring.
         - Kriging assumes the residuals are reasonably stationary and spatially correlated.
-        - Negative predictions are clamped to zero, assuming a non-negative variable
-          (e.g., precipitation).
         """
     
         df = self.df  # Station data (already loaded)
@@ -851,6 +823,28 @@ class WAS_Merging:
         missing_value: float = -999.0,
         do_cross_validation: bool = False
     ) -> (xr.DataArray, pd.DataFrame or None):
+
+        """
+        Apply multiplicative bias correction to gridded predictions using ground observations.
+
+        This method performs bias adjustment for each time step by comparing standardized observations
+        and model estimates, interpolating residuals using kriging, and applying a multiplicative correction
+        across the spatial domain.
+
+        Parameters
+        ----------
+        missing_value : float, optional
+            Value used to represent missing data in the input observational CSV, by default -999.0.
+        do_cross_validation : bool, optional
+            If True, perform Leave-One-Out Cross-Validation to estimate kriging performance, by default False.
+
+        Returns
+        -------
+        xr.DataArray
+            The bias-corrected spatial dataset over time (with dimensions: T, Y, X), masked over valid areas.
+        pd.DataFrame or None
+            DataFrame containing LOOCV RMSE per time step, or None if cross-validation was not performed.
+        """
 
         df = self.df # pd.read_csv(self.input_csv_path, sep="\t")
         df_seas = self.transform_cpt(self.df,  missing_value=missing_value)  

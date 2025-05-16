@@ -173,7 +173,7 @@ class WAS_compute_onset:
             1,np.nan 
             )
         mask_0 = xr.where(
-            (annual_rainfall < 100) & (annual_rainfall >= 0),
+            (annual_rainfall < 100) & (annual_rainfall >= 75),
             0,np.nan 
             )
         return mask_5.fillna(mask_4).fillna(mask_3).fillna(mask_2).fillna(mask_1).fillna(mask_0)
@@ -375,8 +375,9 @@ class WAS_compute_onset:
         #     X=mask_char.coords['X'],
         #     Y=mask_char.coords['Y'])
 
+        # mask_ = xr.where(daily_data.resample(T="YE").sum(skipna=True).mean(dim='T') < 75, np.nan, 1)
+        
         mask_char = self.rainf_zone(daily_data)
-        mm = mask_char.plot()
         # Get unique zone IDs
         unique_zone = np.unique(mask_char.to_numpy())
         unique_zone = unique_zone[~np.isnan(unique_zone)]
@@ -574,7 +575,7 @@ class WAS_compute_onset_dry_spell:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
-            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 75:
                 return 0
             else:
                 return 4
@@ -611,7 +612,7 @@ class WAS_compute_onset_dry_spell:
             1,np.nan 
             )
         mask_0 = xr.where(
-            (annual_rainfall < 100) & (annual_rainfall >= 0),
+            (annual_rainfall < 100) & (annual_rainfall >= 75),
             0,np.nan 
             )
         # Fill NaN values with the next available value
@@ -1132,7 +1133,7 @@ class WAS_compute_cessation:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
-            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 75:
                 return 0
             else:           
                 return 4
@@ -1273,7 +1274,7 @@ class WAS_compute_cessation:
             1,np.nan 
             )
         mask_0 = xr.where(
-            (annual_rainfall < 100) & (annual_rainfall >= 0),
+            (annual_rainfall < 100) & (annual_rainfall >= 75),
             0,
             np.nan 
             )
@@ -1554,7 +1555,7 @@ class WAS_compute_cessation_dry_spell:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
-            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:    
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 75:    
                 return 0
             else:
                 return 4
@@ -1591,7 +1592,7 @@ class WAS_compute_cessation_dry_spell:
             1,np.nan 
             )
         mask_0 = xr.where(
-            (annual_rainfall < 100) & (annual_rainfall >= 0),
+            (annual_rainfall < 100) & (annual_rainfall >= 75),
             0,
             np.nan 
             )
@@ -2127,7 +2128,7 @@ class WAS_count_dry_spells:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
-            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 75:
                 return 0
             else:
                 return 4
@@ -2646,7 +2647,7 @@ class WAS_count_wet_spells:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
-            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 0:
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 75:
                 return 0
             else:
                 return 4
@@ -2928,6 +2929,8 @@ class WAS_count_rainy_days:
                 return 2
             elif 200 >= row["MEAN_ANNUAL_RAINFALL"] > 100:
                 return 1
+            elif 100 >= row["MEAN_ANNUAL_RAINFALL"] > 75:
+                return 0
             else:
                 return 4
 

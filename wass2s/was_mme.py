@@ -153,10 +153,60 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
                              score_metric='GROC'):
     """
     Process hindcast and forecast datasets for a multi-model ensemble.
-    
-    The 'score_metric' parameter determines which metric (e.g., 'Pearson', 
-    'MAE', or 'GROC') is used to organize the scores.
+
+    This function loads, interpolates, and concatenates hindcast and forecast datasets from various sources 
+    (GCMs, agroparameters, or others) to prepare them for a multi-model ensemble. It supports different score 
+    metrics and configurations for probabilistic or deterministic outputs.
+
+    Parameters
+    ----------
+    rainfall : xarray.DataArray
+        Observed rainfall data used for interpolation and masking.
+    hdcsted : dict, optional
+        Dictionary of hindcast datasets for different models.
+    fcsted : dict, optional
+        Dictionary of forecast datasets for different models.
+    gcm : bool, optional
+        If True, process data as GCM data. Default is True.
+    agroparam : bool, optional
+        If True, process data as agroparameter data. Default is False.
+    Prob : bool, optional
+        If True, process data as probabilistic forecasts. Default is False.
+    ELM_ELR : bool, optional
+        If True, use ELM_ELR configuration for dimension renaming. Default is False.
+    dir_to_save_model : str, optional
+        Directory path to load model data.
+    best_models : list, optional
+        List of model names to include in the ensemble.
+    scores : dict, optional
+        Dictionary containing model scores, with the key specified by `score_metric`.
+    year_start : int, optional
+        Starting year for the data range.
+    year_end : int, optional
+        Ending year for the data range.
+    model : bool, optional
+        If True, treat data as model-based. Default is True.
+    month_of_initialization : int, optional
+        Month when the forecast is initialized.
+    lead_time : int, optional
+        Forecast lead time in months.
+    year_forecast : int, optional
+        Year for which the forecast is generated.
+    score_metric : str, optional
+        Metric used to organize scores (e.g., 'Pearson', 'MAE', 'GROC'). Default is 'GROC'.
+
+    Returns
+    -------
+    all_model_hdcst : xarray.DataArray
+        Concatenated hindcast data across models.
+    all_model_fcst : xarray.DataArray
+        Concatenated forecast data across models.
+    obs : xarray.DataArray
+        Observed rainfall data expanded with a model dimension and masked.
+    scores_organized : dict
+        Dictionary of organized scores for selected models.
     """
+
     all_model_hdcst = {}
     all_model_fcst = {}
     
@@ -289,6 +339,26 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
 
 
 def myfill(all_model_fcst, obs):
+
+    """
+    Fill missing values in forecast data using random samples from observations.
+
+    This function fills NaN values in the forecast data by randomly sampling values from the observed 
+    rainfall data along the time dimension.
+
+    Parameters
+    ----------
+    all_model_fcst : xarray.DataArray
+        Forecast data with dimensions (T, M, Y, X) containing possible NaN values.
+    obs : xarray.DataArray
+        Observed rainfall data with dimensions (T, Y, X) used for filling NaNs.
+
+    Returns
+    -------
+    da_filled_random : xarray.DataArray
+        Forecast data with NaN values filled using random samples from observations.
+    """
+
     # Suppose all_model_hdcst has dimensions: T, M, Y, X
     da = all_model_fcst
     
@@ -315,6 +385,25 @@ def myfill(all_model_fcst, obs):
 
 
 class WAS_mme_Weighted:
+    """
+    Weighted Multi-Model Ensemble (MME) for climate forecasting.
+
+    This class implements a weighted ensemble approach for combining multiple climate models, 
+    supporting both equal weighting and score-based weighting. It also provides methods for 
+    computing tercile probabilities using various statistical distributions.
+
+    Parameters
+    ----------
+    equal_weighted : bool, optional
+        If True, use equal weights for all models; otherwise, use score-based weights. Default is False.
+    dist_method : str, optional
+        Statistical distribution for probability calculations ('t', 'gamma', 'normal', 'lognormal', 
+        'weibull_min', 'nonparam'). Default is 'gamma'.
+    metric : str, optional
+        Performance metric for weighting ('MAE', 'Pearson', 'GROC'). Default is 'GROC'.
+    threshold : float, optional
+        Threshold for score transformation. Default is 0.5.
+    """
     def __init__(self, equal_weighted=False, dist_method="gamma", metric="GROC", threshold=0.5):
         """
         Parameters:
@@ -330,8 +419,20 @@ class WAS_mme_Weighted:
 
     def transform_score(self, score_array):
         """
-        Apply a fixed masking to the score_array based on the chosen metric and threshold.
+        Transform score array based on the chosen metric and threshold.
 
+        For 'MAE', scores below the threshold are set to 1, others to 0. For 'Pearson' or 'GROC', 
+        scores above the threshold are set to 1, others to 0.
+
+        Parameters
+        ----------
+        score_array : xarray.DataArray
+            Score array to transform.
+
+        Returns
+        -------
+        transformed_score : xarray.DataArray
+            Transformed score array with binary weights.
         """
         if self.metric.lower() == 'mae':
             return xr.where(
@@ -355,19 +456,34 @@ class WAS_mme_Weighted:
             return score_array
 
     def compute(self, rainfall, hdcst, fcst, scores, complete=False):
+
         """
-        Compute weighted forecasts/hindcasts using model scores.
-        
-        Parameters:
-            rainfall: xarray DataArray with rainfall observations.
-            hdcst: xarray DataArray with hindcast forecasts; assumed to have a model coordinate 'M'.
-            fcst: xarray DataArray with forecasts; assumed to have a model coordinate 'M'.
-            scores: Dictionary with model names as keys and corresponding score arrays as values.
-            complete (bool): If True, grid cells missing weighted data are filled with unweighted averages.
-        
-        Returns:
-            Tuple of weighted hindcast and forecast DataArrays (with spatial masking applied).
+        Compute weighted hindcast and forecast using model scores.
+
+        This method calculates weighted averages of hindcast and forecast data based on model scores. 
+        If `complete` is True, missing values are filled with unweighted averages.
+
+        Parameters
+        ----------
+        rainfall : xarray.DataArray
+            Observed rainfall data with dimensions (T, Y, X, M).
+        hdcst : xarray.DataArray
+            Hindcast data with dimensions (T, M, Y, X).
+        fcst : xarray.DataArray
+            Forecast data with dimensions (T, M, Y, X).
+        scores : dict
+            Dictionary mapping model names to score arrays.
+        complete : bool, optional
+            If True, fill missing values with unweighted averages. Default is False.
+
+        Returns
+        -------
+        hindcast_det : xarray.DataArray
+            Weighted hindcast data with dimensions (T, Y, X).
+        forecast_det : xarray.DataArray
+            Weighted forecast data with dimensions (T, Y, X).
         """
+
         # Adjust time coordinates as needed.
         year = fcst.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
         T_value_1 = rainfall.isel(T=0).coords['T'].values
@@ -601,9 +717,28 @@ class WAS_mme_Weighted:
 
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
         """
-        Compute tercile probabilities for the hindcast using the chosen distribution method.
-        Predictant is an xarray DataArray with dims (T, Y, X).
+        Compute tercile probabilities for hindcast data.
+
+        Calculates tercile probabilities based on the specified distribution method, using 
+        climatological terciles derived from the predictand data.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
         """
+
         if "M" in Predictant.coords:
             Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
         mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
@@ -843,25 +978,51 @@ class WAS_mme_Weighted:
 
 
 class WAS_Min2009_ProbWeighted:
+    """
+    Probability-Weighted Multi-Model Ensemble based on Min et al. (2009).
+
+    Implements a specific weighting scheme for combining multiple climate models, 
+    where weights are derived from model scores with a threshold-based transformation.
+
+    Parameters
+    ----------
+    None
+    """
     def __init__(self):
         # Initialize any required attributes here
         pass
 
     def compute(self, rainfall, hdcst, fcst, scores, threshold=0.5, complete=False):
         """
-        Compute the weighted ensemble estimates for hindcast and forecast datasets.
-        
-        Parameters:
-          rainfall  : xarray.DataArray containing observed rainfall data.
-          hdcst     : xarray.DataArray with hindcast data having a 'M' (model) dimension.
-          fcst      : xarray.DataArray with forecast data having a 'M' (model) dimension.
-          scores    : Dictionary mapping model names to score arrays.
-          threshold : Lower threshold below which the score is set to 0.
-          complete  : If True, fill missing values with unweighted ensemble averages.
-        
-        Returns:
-          A tuple of (hindcast_weighted, forecast_weighted), each multiplied by the spatial mask.
+        Compute probability-weighted ensemble estimates for hindcast and forecast datasets.
+
+        Applies a weighting scheme where scores below the threshold are set to 0, and others to 1. 
+        Optionally fills missing values with unweighted averages.
+
+        Parameters
+        ----------
+        rainfall : xarray.DataArray
+            Observed rainfall data with dimensions (T, Y, X, M).
+        hdcst : xarray.DataArray
+            Hindcast data with dimensions (T, M, Y, X).
+        fcst : xarray.DataArray
+            Forecast data with dimensions (T, M, Y, X).
+        scores : dict
+            Dictionary mapping model names to score arrays.
+        threshold : float, optional
+            Threshold below which scores are set to 0. Default is 0.5.
+        complete : bool, optional
+            If True, fill missing values with unweighted averages. Default is False.
+
+        Returns
+        -------
+        hindcast_weighted : xarray.DataArray
+            Weighted hindcast ensemble with dimensions (T, Y, X).
+        forecast_weighted : xarray.DataArray
+            Weighted forecast ensemble with dimensions (T, Y, X).
         """
+        
+        
         # --- Adjust time coordinates ---
         # Extract the year from the forecast's T coordinate (assuming epoch conversion)
         year = fcst.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
@@ -976,11 +1137,27 @@ class WAS_Min2009_ProbWeighted:
 # ---------------------------------------------------
 class WAS_mme_GA:
     """
-    Genetic Algorithm for multi-model ensemble weighting.
-    
-    Each chromosome = [w1, w2, ..., wM] for M models.
-    GA searches for the best set of weights that minimize MSE vs. observations.
-    Weights are nonnegative and sum to 1.
+    Genetic Algorithm-based Multi-Model Ensemble Weighting.
+
+    Uses a Genetic Algorithm to optimize weights for combining multiple climate models, 
+    minimizing the mean squared error (MSE) against observations. Supports tercile probability 
+    calculations.
+
+    Parameters
+    ----------
+    population_size : int, optional
+        Number of individuals in the GA population. Default is 20.
+    max_iter : int, optional
+        Maximum number of generations for the GA. Default is 50.
+    crossover_rate : float, optional
+        Probability of performing crossover. Default is 0.7.
+    mutation_rate : float, optional
+        Probability of mutating a gene. Default is 0.01.
+    random_state : int, optional
+        Seed for random number generation. Default is 42.
+    dist_method : str, optional
+        Distribution method for probability calculations ('t', 'gamma', 'nonparam', 
+        'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
     """
 
     def __init__(self,
@@ -991,24 +1168,22 @@ class WAS_mme_GA:
                  random_state=42,
                  dist_method="gamma"):
         """
-        Constructor for the GA-based ensemble.
+        Initialize the GA population with random weight vectors.
+
+        Each weight vector is normalized to sum to 1.
 
         Parameters
         ----------
-        population_size : int
-            Number of individuals in the GA population.
-        max_iter : int
-            Maximum number of generations for the GA.
-        crossover_rate : float
-            Probability of performing crossover on selected parents.
-        mutation_rate : float
-            Probability of mutating a gene in a chromosome.
-        random_state : int
-            Seed for reproducibility.
-        dist_method : str
-            Distribution method for tercile probability calculations.
-            Options: 't', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'.
+        n_models : int
+            Number of models in the ensemble.
+
+        Returns
+        -------
+        population : list of np.ndarray
+            List of normalized weight vectors.
         """
+        
+        
         self.population_size = population_size
         self.max_iter = max_iter
         self.crossover_rate = crossover_rate
@@ -1029,8 +1204,19 @@ class WAS_mme_GA:
     # ---------------------------------------------------
     def _initialize_population(self, n_models):
         """
-        Initialize population of weight vectors, each length = n_models.
-        We start them as random values in [0,1], then normalize so sum=1.
+        Initialize the GA population with random weight vectors.
+
+        Each weight vector is normalized to sum to 1.
+
+        Parameters
+        ----------
+        n_models : int
+            Number of models in the ensemble.
+
+        Returns
+        -------
+        population : list of np.ndarray
+            List of normalized weight vectors.
         """
         population = []
         for _ in range(self.population_size):
@@ -1041,10 +1227,23 @@ class WAS_mme_GA:
 
     def _fitness_function(self, weights, X, y):
         """
-        Negative MSE of the ensemble:
-            y_pred = sum_j weights[j] * X[:, j]
-        We assume y is (n_samples,) or (n_samples,1).
+        Compute the negative MSE of the ensemble.
+
+        Parameters
+        ----------
+        weights : np.ndarray
+            Weight vector for the models.
+        X : np.ndarray
+            Predictor data with shape (n_samples, n_models).
+        y : np.ndarray
+            Observed data with shape (n_samples,) or (n_samples, 1).
+
+        Returns
+        -------
+        fitness : float
+            Negative mean squared error (GA maximizes fitness).
         """
+
         if y.ndim == 2 and y.shape[1] == 1:
             y = y.ravel()
 
@@ -1054,7 +1253,19 @@ class WAS_mme_GA:
 
     def _selection(self, population, fitnesses):
         """
-        Roulette Wheel Selection (fitness proportional).
+        Perform roulette wheel selection based on fitness.
+
+        Parameters
+        ----------
+        population : list of np.ndarray
+            List of weight vectors.
+        fitnesses : list of float
+            Fitness values for each individual.
+
+        Returns
+        -------
+        selected : np.ndarray
+            Selected weight vector.
         """
         total_fit = sum(fitnesses)
         pick = random.uniform(0, total_fit)
@@ -1067,7 +1278,19 @@ class WAS_mme_GA:
 
     def _crossover(self, parent1, parent2):
         """
-        Single-point crossover for weighting vectors.
+        Perform single-point crossover on two parent weight vectors.
+
+        Parameters
+        ----------
+        parent1 : np.ndarray
+            First parent weight vector.
+        parent2 : np.ndarray
+            Second parent weight vector.
+
+        Returns
+        -------
+        child1, child2 : tuple of np.ndarray
+            Two child weight vectors.
         """
         if random.random() < self.crossover_rate:
             point = random.randint(1, len(parent1) - 1)
@@ -1081,6 +1304,17 @@ class WAS_mme_GA:
         """
         Mutation: each weight can be perturbed slightly.
         Then clip negatives to 0 and renormalize to sum=1.
+        Mutate a weight vector with Gaussian noise and normalize.
+
+        Parameters
+        ----------
+        chromosome : np.ndarray
+            Weight vector to mutate.
+
+        Returns
+        -------
+        mutated : np.ndarray
+            Mutated and normalized weight vector.
         """
         for i in range(len(chromosome)):
             if random.random() < self.mutation_rate:
@@ -1101,6 +1335,21 @@ class WAS_mme_GA:
         """
         Run the GA to find best ensemble weights for M models.
         X shape: (n_samples, n_models). y shape: (n_samples,).
+        Run the Genetic Algorithm to find optimal ensemble weights.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Predictor data with shape (n_samples, n_models).
+        y : np.ndarray
+            Observed data with shape (n_samples,).
+
+        Returns
+        -------
+        best_chrom : np.ndarray
+            Best weight vector found.
+        best_fit : float
+            Best fitness value (negative MSE).
         """
         n_models = X.shape[1]
         population = self._initialize_population(n_models)
@@ -1137,6 +1386,19 @@ class WAS_mme_GA:
         """
         Weighted sum across models:
            y_pred[i] = sum_j( weights[j] * X[i,j] )
+        Compute weighted sum of model predictions.
+
+        Parameters
+        ----------
+        weights : np.ndarray
+            Weight vector for the models.
+        X : np.ndarray
+            Predictor data with shape (n_samples, n_models) or (n_models,).
+
+        Returns
+        -------
+        y_pred : np.ndarray
+            Weighted predictions.
         """
         if X.ndim == 1:
             # Single sample => dot product
@@ -1149,17 +1411,23 @@ class WAS_mme_GA:
     # ---------------------------------------------------
     def compute_model(self, X_train, y_train, X_test, y_test):
         """
-        Train the GA on (X_train, y_train). Then predict on (X_test).
+        Train the GA and predict on test data.
 
-        We assume:
-          - X_train: (T, Y, X, M) => stacked => (samples, M)
-          - y_train: (T, Y, X) => stacked => (samples,)
-          - X_test:  (T, Y, X, M) => stacked => (samples, M)
-          - y_test:  (T, Y, X) => stacked => (samples,)
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, Y, X, M).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, Y, X, M).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
 
         Returns
         -------
-        predicted_da : xarray.DataArray with shape (T, Y, X).
+        predicted_da : xarray.DataArray
+            Predictions with dimensions (T, Y, X).
         """
         # 1) Extract coordinates from X_test
         time = X_test['T']
@@ -1335,10 +1603,23 @@ class WAS_mme_GA:
     # ---------------------------------------------------
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
         """
-        Compute tercile probabilities for the given 'hindcast_det' using
-        the distribution specified by self.dist_method.
-        
-        This method is basically the same as in your original code.
+        Compute tercile probabilities for hindcast data using the GA-optimized weights.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
         """
         if "M" in Predictant.coords:
             Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
@@ -1467,11 +1748,31 @@ class WAS_mme_GA:
     def forecast(self, Predictant, clim_year_start, clim_year_end,
                  hindcast_det, hindcast_det_cross, Predictor_for_year):
         """
-         1) Standardize input data.
-         2) (Re)fit the GA if not already fitted.
-         3) Predict for the new year using ensemble weights.
-         4) Reverse-standardize the forecast.
-         5) Compute tercile probabilities.
+        Forecast for a target year and compute tercile probabilities.
+
+        Standardizes data, fits the GA, predicts for the target year, and computes probabilities.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Historical predictand data with dimensions (T, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, Y, X, M).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, Y, X, M).
+
+        Returns
+        -------
+        result_da : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probability forecast with dimensions (probability, T, Y, X).
         """
         mask = xr.where(~np.isnan(Predictant.isel(T=0, M=0)), 1, np.nan) \
                  .drop_vars(['T','M']).squeeze().to_numpy()
@@ -1677,7 +1978,7 @@ class BMA:
         error_metric="rmse"
     ):
         """
-        Basic Bayesian Model Averaging (BMA) class, supporting either RMSE- or MAE-based priors.
+        Bayesian Model Averaging (BMA) class, supporting either RMSE- or MAE-based priors.
 
         Parameters
         ----------
@@ -2444,6 +2745,18 @@ class WAS_mme_BMA:
 
 
 class WAS_mme_ELR:
+    """
+    Extended Logistic Regression (ELR) for Multi-Model Ensemble (MME) forecasting derived from xcast package.
+
+    This class implements an Extended Logistic Regression for probabilistic forecasting,
+    directly computing tercile probabilities without requiring separate probability calculations.
+
+    Parameters
+    ----------
+    elm_kwargs : dict, optional
+        Keyword arguments to pass to the xcast ELR model. If None, an empty dictionary is used.
+        Default is None.
+    """
     def __init__(self, elm_kwargs=None):
         if elm_kwargs is None:
             self.elm_kwargs = {}
@@ -2451,6 +2764,27 @@ class WAS_mme_ELR:
             self.elm_kwargs = elm_kwargs     
 
     def compute_model(self, X_train, y_train, X_test):
+        """
+        Compute probabilistic hindcast using the ELR model.
+
+        Fits the ELR model on training data and predicts tercile probabilities for the test data.
+        Applies regridding and drymasking to ensure data consistency.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_ : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
+        """
         
         X_train = xc.regrid(X_train,y_train.X,y_train.Y)
         X_test = xc.regrid(X_test,y_train.X,y_train.Y)
@@ -2469,6 +2803,32 @@ class WAS_mme_ELR:
         return result_.transpose('probability', 'T', 'Y', 'X')
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, Predictor_for_year):
+        """
+        Generate probabilistic forecast for a target year using the ELR model.
+
+        Fits the ELR model on hindcast data and predicts tercile probabilities for the target year.
+        Applies regridding and drymasking to ensure data consistency.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period (not used in this method).
+        clim_year_end : int or str
+            End year of the climatology period (not used in this method).
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data with dimensions (T, M, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
+        """
+
         clim_year_end = clim_year_end
         clim_year_start = clim_year_start
         hindcast_det = xc.regrid(hindcast_det,Predictant.X,Predictant.Y)
@@ -2489,9 +2849,34 @@ class WAS_mme_ELR:
         return hindcast_prob.transpose('probability', 'T', 'Y', 'X').load()
 
 class NonHomogeneousGaussianRegression:
+    """
+    Placeholder for Non-Homogeneous Gaussian Regression model.
+
+    This class is not implemented in the provided code and serves as a placeholder for future development.
+
+    Parameters
+    ----------
+    None
+    """
     pass
     
 class WAS_mme_ELM:
+    """
+    Extreme Learning Machine (ELM) for Multi-Model Ensemble (MME) forecasting derived from xcast.
+
+    This class implements an Extreme Learning Machine model for deterministic forecasting,
+    with optional tercile probability calculations using various statistical distributions.
+
+    Parameters
+    ----------
+    elm_kwargs : dict, optional
+        Keyword arguments to pass to the xcast ELM model. If None, default parameters are used:
+        {'regularization': 10, 'hidden_layer_size': 5, 'activation': 'lin', 'preprocessing': 'none', 'n_estimators': 5}.
+        Default is None.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
+        Default is 'gamma'.
+    """
     def __init__(self, elm_kwargs=None, dist_method="gamma"):
         if elm_kwargs is None:
             self.elm_kwargs = {
@@ -2507,6 +2892,26 @@ class WAS_mme_ELM:
         self.dist_method = dist_method         
 
     def compute_model(self, X_train, y_train, X_test):
+        """
+        Compute deterministic hindcast using the ELM model.
+
+        Fits the ELM model on training data and predicts deterministic values for the test data.
+        Applies regridding and drymasking to ensure data consistency.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_ : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
+        """
 
         X_train = xc.regrid(X_train,y_train.X,y_train.Y)
         X_test = xc.regrid(X_test,y_train.X,y_train.Y)
@@ -2663,8 +3068,27 @@ class WAS_mme_ELM:
 
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
         """
-        Compute tercile probabilities for the hindcast using the chosen distribution method.
-        Predictant is an xarray DataArray with dims (T, Y, X).
+        Compute tercile probabilities for hindcast data.
+
+        Calculates probabilities for below-normal, normal, and above-normal categories using
+        the specified distribution method, based on climatological terciles.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
         """
         if "M" in Predictant.coords:
             Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
@@ -2780,6 +3204,35 @@ class WAS_mme_ELM:
         return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross_val, Predictor_for_year):
+        """
+        Generate deterministic and probabilistic forecast for a target year using the ELM model.
+
+        Fits the ELM model on hindcast data, predicts deterministic values for the target year,
+        and computes tercile probabilities. Applies regridding, drymasking, and standardization.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross_val : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_ : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
+        """
 
         hindcast_det = xc.regrid(hindcast_det,Predictant.X,Predictant.Y)
         Predictor_for_year = xc.regrid(Predictor_for_year,Predictant.X,Predictant.Y)
@@ -2920,457 +3373,37 @@ class WAS_mme_ELM:
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_ * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
-
-class WAS_mme_EPOELM:
-    def __init__(self, elm_kwargs=None, dist_method="gamma"):
-        if elm_kwargs is None:
-            self.elm_kwargs = {
-                'regularization': 10,
-                'hidden_layer_size': 5,
-                'activation': 'lin',  # 'sigm', 'tanh', 'lin', 'leaky', 'relu', 'softplus'],
-                'preprocessing': 'none',  # 'minmax', 'std', 'none' ],
-                'n_estimators': 5,
-                            }
-        else:
-            self.elm_kwargs = elm_kwargs
-            
-        self.dist_method = dist_method         
-
-    def compute_model(self, X_train, y_train, X_test):
-
-        X_train = xc.regrid(X_train,y_train.X,y_train.Y)
-        X_test = xc.regrid(X_test,y_train.X,y_train.Y)
-        
-        # X_train = X_train.fillna(0)
-        # y_train = y_train.fillna(0)
-        drymask = xc.drymask(
-            y_train, dry_threshold=10, quantile_threshold=0.2
-                        )
-        X_train = X_train*drymask
-        X_test = X_test*drymask
-        
-        model = xc.EPOELM(**self.elm_kwargs) 
-        model.fit(X_train, y_train)
-        result_ = model.predict(X_test)
-        return result_.rename({'S':'T'}).transpose('T', 'M', 'Y', 'X').drop_vars('M').squeeze()
-
-    # ------------------ Probability Calculation Methods ------------------
-    @staticmethod
-    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Student's t-based method
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            # Transform thresholds
-            first_t = (first_tercile - best_guess) / error_std
-            second_t = (second_tercile - best_guess) / error_std
-
-            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-
-        return pred_prob
-        
-    @staticmethod
-    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best guess values.
-        error_variance : array-like
-            Variance associated with forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-            
-        Returns
-        -------
-        pred_prob : np.ndarray
-            A 3 x n_time array with probabilities for being below the first tercile,
-            between the first and second tercile, and above the second tercile.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-    
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
-            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
-        """Gamma-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=float)
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        best_guess = np.asarray(best_guess, dtype=float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        T1 = np.asarray(T1, dtype=float)
-        T2 = np.asarray(T2, dtype=float)
-        alpha = (best_guess**2) / error_variance
-        theta = error_variance / best_guess
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
-        pred_prob[0, :] = cdf_t1
-        pred_prob[1, :] = cdf_t2 - cdf_t1
-        pred_prob[2, :] = 1.0 - cdf_t2
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
-        """Normal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
-        """Lognormal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-        mu = np.log(best_guess) - sigma**2 / 2
-        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
-        return pred_prob
-
-    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
-        """
-        Compute tercile probabilities for the hindcast using the chosen distribution method.
-        Predictant is an xarray DataArray with dims (T, Y, X).
-        """
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-
-        # Ensure Predictant is (T, Y, X)
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('T',), (), ()],
-                output_core_dims=[('probability', 'T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross_val, Predictor_for_year):
-
-        hindcast_det = xc.regrid(hindcast_det,Predictant.X,Predictant.Y)
-        Predictor_for_year = xc.regrid(Predictor_for_year,Predictant.X,Predictant.Y)
-
-        drymask = xc.drymask(
-            Predictant, dry_threshold=10, quantile_threshold=0.2
-                        )
-        hindcast_det_ = hindcast_det*drymask
-        Predictor_for_year = Predictor_for_year*drymask
-        
-        # hindcast_det_ = hindcast_det.fillna(0)
-        # Predictant_ = Predictant.fillna(0)
-        # Predictor_for_year_ = Predictor_for_year.fillna(0)
-        
-        model = xc.EPOELM(**self.elm_kwargs) 
-        model.fit(hindcast_det_, Predictant)
-        result_ = model.predict(Predictor_for_year)
-        result_ = result_.rename({'S':'T'}).transpose('T', 'M', 'Y', 'X').drop_vars('M').squeeze('M').load()
-
-        year = Predictor_for_year.coords['S'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        result_ = result_.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        result_['T'] = result_['T'].astype('datetime64[ns]')
-
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-
-
-        # Compute tercile probabilities on the predictions
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross_val).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross_val
-            error_samples = error_samples.rename({'T':'S'})
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('S',), (), ()],
-                output_core_dims=[('probability','T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return result_ * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X') #.drop_vars('T').squeeze()
-
-        
-    
+          
 class WAS_mme_MLP:
+    """
+    Multi-Layer Perceptron (MLP) for Multi-Model Ensemble (MME) forecasting.
+
+    This class implements a Multi-Layer Perceptron model using scikit-learn's MLPRegressor
+    for deterministic forecasting, with optional tercile probability calculations using
+    various statistical distributions.
+
+    Parameters
+    ----------
+    hidden_layer_sizes : tuple, optional
+        Sizes of the hidden layers in the MLP (e.g., (10, 5)). Default is (10, 5).
+    activation : str, optional
+        Activation function for the hidden layers ('identity', 'logistic', 'tanh', 'relu').
+        Default is 'relu'.
+    solver : str, optional
+        Optimization algorithm ('lbfgs', 'sgd', 'adam'). Default is 'adam'.
+    max_iter : int, optional
+        Maximum number of iterations for the solver. Default is 200.
+    alpha : float, optional
+        L2 regularization parameter. Default is 0.01.
+    random_state : int, optional
+        Seed for random number generation for reproducibility. Default is 42.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
+        Default is 'gamma'.
+    """
     def __init__(self, hidden_layer_sizes=(10, 5), activation='relu', solver='adam',
                  max_iter=200, alpha=0.01, random_state=42, dist_method="gamma"):
-        """
-        Single-model implementation using MLPRegressor.
-        
-        Parameters:
-          - hidden_layer_sizes: tuple, sizes of hidden layers.
-          - activation: string, activation function.
-          - solver: string, optimizer to use.
-          - max_iter: int, maximum iterations.
-          - alpha: float, regularization parameter.
-          - random_state: int, seed for reproducibility.
-          - dist_method: string, method for tercile probability calculations.
-                        Options: 't', 'gamma', 'nonparam', 'normal', 'lognormal'.
-        """
+
         self.hidden_layer_sizes = hidden_layer_sizes
         self.activation = activation
         self.solver = solver
@@ -3382,9 +3415,26 @@ class WAS_mme_MLP:
 
     def compute_model(self, X_train, y_train, X_test, y_test):
         """
-        Fit the MLPRegressor on the training data and predict on X_test.
-        The input data are expected to be xarray DataArrays with dimensions that include 'T', 'Y', 'X'
-        (and optionally 'M'). The predictions are reshaped back to (T, Y, X).
+        Compute deterministic hindcast using the MLP model.
+
+        Fits the MLPRegressor on training data and predicts deterministic values for the test data.
+        Handles data stacking and NaN removal.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
         """
         # Initialize MLPRegressor
         self.mlp = MLPRegressor(hidden_layer_sizes=self.hidden_layer_sizes,
@@ -3704,14 +3754,33 @@ class WAS_mme_MLP:
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
         """
-        Forecast method that uses a single MLP model to predict for a new year.
-        Steps:
-         - Standardize the predictor for the target year using hindcast climatology.
-         - Fit the MLP (if not already fitted) on standardized hindcast data.
-         - Predict for the target year.
-         - Reconstruct predictions into original (T, Y, X) shape.
-         - Reverse the standardization.
-         - Compute tercile probabilities using the chosen distribution.
+        Generate deterministic and probabilistic forecast for a target year using the MLP model.
+
+        Fits the MLPRegressor on standardized hindcast data, predicts deterministic values for the target year,
+        reverses standardization, and computes tercile probabilities.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_da : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
         """
         # if "M" in Predictant.coords:
         #     Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
@@ -4429,19 +4498,31 @@ class WAS_mme_GradientBoosting:
 
 
 class WAS_mme_XGBoosting:
+    """
+    XGBoost-based Multi-Model Ensemble (MME) forecasting.
+
+    This class implements a single-model forecasting approach using XGBoost's XGBRegressor
+    for deterministic predictions, with optional tercile probability calculations using
+    various statistical distributions.
+
+    Parameters
+    ----------
+    n_estimators : int, optional
+        Number of boosting rounds. Default is 100.
+    learning_rate : float, optional
+        Learning rate for boosting. Default is 0.1.
+    max_depth : int, optional
+        Maximum tree depth for base learners. Default is 3.
+    random_state : int, optional
+        Seed for random number generation for reproducibility. Default is 42.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations
+        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
+        Default is 'gamma'.
+    """
     def __init__(self, n_estimators=100, learning_rate=0.1, max_depth=3,
                  random_state=42, dist_method="gamma"):
-        """
-        Single-model implementation using XGBRegressor.
-        
-        Parameters:
-         - n_estimators: int, number of boosting rounds.
-         - learning_rate: float, learning rate.
-         - max_depth: int, maximum tree depth.
-         - random_state: int, seed for reproducibility.
-         - dist_method: string, method for tercile probability calculations.
-                        Options: 't', 'gamma', 'nonparam', 'normal', 'lognormal'.
-        """
+
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
         self.max_depth = max_depth
@@ -4452,9 +4533,26 @@ class WAS_mme_XGBoosting:
 
     def compute_model(self, X_train, y_train, X_test, y_test):
         """
-        Fit the XGBRegressor on the training data and predict on X_test.
-        The input data are expected to be xarray DataArrays with dimensions that include 'T', 'Y', 'X'
-        (and optionally 'M'). Predictions are reshaped back into (T, Y, X).
+        Compute deterministic hindcast using the XGBoost model.
+
+        Fits the XGBRegressor on training data and predicts deterministic values for the test data.
+        Handles data stacking and NaN removal to ensure robust predictions.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
         """
         # Initialize the XGBRegressor
         self.xgb = XGBRegressor(n_estimators=self.n_estimators,
@@ -4710,6 +4808,28 @@ class WAS_mme_XGBoosting:
 
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
         """
+        Compute tercile probabilities for hindcast data.
+
+        Calculates probabilities for below-normal, normal, and above-normal categories using
+        the specified distribution method, based on climatological terciles.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
+        """        """
         Compute tercile probabilities using the chosen distribution method.
         Predictant is expected to be an xarray DataArray with dims (T, Y, X).
         """
@@ -4847,14 +4967,33 @@ class WAS_mme_XGBoosting:
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
                  hindcast_det_cross, Predictor_for_year):
         """
-        Forecast method using a single XGBoost model.
-        Steps:
-         - Standardize the predictor for the target year using hindcast climatology.
-         - Fit the XGBoost model on standardized hindcast data.
-         - Predict for the target year.
-         - Reconstruct predictions into original (T, Y, X) shape.
-         - Reverse the standardization.
-         - Compute tercile probabilities using the chosen distribution.
+        Generate deterministic and probabilistic forecast for a target year using the XGBoost model.
+
+        Fits the XGBRegressor on standardized hindcast data, predicts deterministic values for the target year,
+        reverses standardization, and computes tercile probabilities.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_da : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
         """
         # if "M" in Predictant.coords:
         #     Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
@@ -5038,17 +5177,28 @@ class WAS_mme_XGBoosting:
 
 
 class WAS_mme_AdaBoost:
+    """
+    AdaBoost-based Multi-Model Ensemble (MME) forecasting.
+
+    This class implements a single-model forecasting approach using scikit-learn's AdaBoostRegressor
+    for deterministic predictions, with optional tercile probability calculations using
+    various statistical distributions.
+
+    Parameters
+    ----------
+    n_estimators : int, optional
+        Number of boosting iterations. Default is 50.
+    learning_rate : float, optional
+        Learning rate for boosting. Default is 0.1.
+    random_state : int, optional
+        Seed for random number generation for reproducibility. Default is 42.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations
+        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
+        Default is 'gamma'.
+    """
     def __init__(self, n_estimators=50, learning_rate=0.1, random_state=42, dist_method="gamma"):
-        """
-        Single-model implementation using AdaBoostRegressor.
-        
-        Parameters:
-          - n_estimators: int, the number of boosting iterations.
-          - learning_rate: float, the learning rate.
-          - random_state: int, seed for reproducibility.
-          - dist_method: string, method for tercile probability calculations.
-                        Options: 't', 'gamma', 'nonparam', 'normal', 'lognormal'.
-        """
+
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
         self.random_state = random_state
@@ -5058,9 +5208,26 @@ class WAS_mme_AdaBoost:
 
     def compute_model(self, X_train, y_train, X_test, y_test):
         """
-        Fit the AdaBoostRegressor on the training data and predict on X_test.
-        The input data (xarray DataArrays) must include dimensions 'T', 'Y', 'X'
-        (and optionally 'M'). Predictions are reshaped back to (T, Y, X).
+        Compute deterministic hindcast using the AdaBoost model.
+
+        Fits the AdaBoostRegressor on training data and predicts deterministic values for the test data.
+        Handles data stacking and NaN removal to ensure robust predictions.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
         """
         # Initialize the AdaBoostRegressor
         self.adaboost = AdaBoostRegressor(n_estimators=self.n_estimators,
@@ -5378,15 +5545,33 @@ class WAS_mme_AdaBoost:
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
                  hindcast_det_cross, Predictor_for_year):
         """
-        Forecast method using a single XGBoost model.
-        
-        Steps:
-         - Standardize the predictor for the target year using hindcast climatology.
-         - Fit the XGBoost model on the standardized hindcast data.
-         - Predict for the target year.
-         - Reconstruct predictions into the original (T, Y, X) shape.
-         - Reverse the standardization.
-         - Compute tercile probabilities using the chosen distribution.
+        Generate deterministic and probabilistic forecast for a target year using the AdaBoost model.
+
+        Fits the AdaBoostRegressor on standardized hindcast data, predicts deterministic values for the target year,
+        reverses standardization, and computes tercile probabilities.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_da : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
         """
         # Create a land mask from the first time step
         # if "M" in Predictant.coords:
@@ -5572,19 +5757,31 @@ class WAS_mme_AdaBoost:
 
 
 class WAS_mme_LGBM_Boosting:
+    """
+    LightGBM-based Multi-Model Ensemble (MME) forecasting.
+
+    This class implements a single-model forecasting approach using LightGBM's LGBMRegressor
+    for deterministic predictions, with optional tercile probability calculations using
+    various statistical distributions.
+
+    Parameters
+    ----------
+    n_estimators : int, optional
+        Number of boosting iterations. Default is 100.
+    learning_rate : float, optional
+        Learning rate for boosting. Default is 0.1.
+    max_depth : int, optional
+        Maximum tree depth (-1 for no limit). Default is -1.
+    random_state : int, optional
+        Seed for random number generation for reproducibility. Default is 42.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations
+        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
+        Default is 'gamma'.
+    """
     def __init__(self, n_estimators=100, learning_rate=0.1, max_depth=-1,
                  random_state=42, dist_method="gamma"):
-        """
-        Single-model implementation using LGBMRegressor.
-        
-        Parameters:
-          - n_estimators: int, number of boosting iterations.
-          - learning_rate: float, learning rate.
-          - max_depth: int, maximum tree depth (set -1 for no limit).
-          - random_state: int, seed for reproducibility.
-          - dist_method: string, method for tercile probability calculations.
-                        Options: 't', 'gamma', 'nonparam', 'normal', 'lognormal'.
-        """
+
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
         self.max_depth = max_depth
@@ -5595,9 +5792,26 @@ class WAS_mme_LGBM_Boosting:
 
     def compute_model(self, X_train, y_train, X_test, y_test):
         """
-        Fit the LGBMRegressor on the training data and predict on X_test.
-        Input data (xarray DataArrays) should include dimensions 'T', 'Y', 'X'
-        (and optionally 'M'). The predictions are reshaped back into (T, Y, X).
+        Compute deterministic hindcast using the LightGBM model.
+
+        Fits the LGBMRegressor on training data and predicts deterministic values for the test data.
+        Handles data stacking and NaN removal to ensure robust predictions.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
         """
         # Initialize LGBMRegressor
         self.lgbm = LGBMRegressor(n_estimators=self.n_estimators,
@@ -5893,15 +6107,33 @@ class WAS_mme_LGBM_Boosting:
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
                  hindcast_det_cross, Predictor_for_year):
         """
-        Forecast method using a single XGBoost model.
-        
-        Steps:
-         - Standardize the predictor for the target year using hindcast climatology.
-         - Fit the XGBoost model on standardized hindcast data.
-         - Predict for the target year.
-         - Reconstruct predictions into the original (T, Y, X) shape.
-         - Reverse the standardization.
-         - Compute tercile probabilities using the chosen distribution.
+        Generate deterministic and probabilistic forecast for a target year using the LightGBM model.
+
+        Fits the LGBMRegressor on standardized hindcast data, predicts deterministic values for the target year,
+        reverses standardization, and computes tercile probabilities.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_da : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
         """
         # # Create a mask from the first time step (excluding NaNs)
         # if "M" in Predictant.coords:
@@ -6086,6 +6318,33 @@ class WAS_mme_LGBM_Boosting:
 
     
 class WAS_mme_Stack_MLP_RF:
+    """
+    Stacking ensemble with MLP and Random Forest for Multi-Model Ensemble (MME) forecasting.
+
+    This class implements a stacking ensemble using MLPRegressor and RandomForestRegressor as base models,
+    with a LinearRegression meta-model, for deterministic forecasting and optional tercile probability calculations.
+
+    Parameters
+    ----------
+    hidden_layer_sizes : tuple, optional
+        Sizes of the hidden layers for the MLP base model (e.g., (10, 5)). Default is (10, 5).
+    activation : str, optional
+        Activation function for the MLP ('identity', 'logistic', 'tanh', 'relu'). Default is 'relu'.
+    max_iter : int, optional
+        Maximum number of iterations for the MLP solver. Default is 200.
+    solver : str, optional
+        Optimization algorithm for the MLP ('lbfgs', 'sgd', 'adam'). Default is 'adam'.
+    random_state : int, optional
+        Seed for random number generation for reproducibility. Default is 42.
+    alpha : float, optional
+        L2 regularization parameter for the MLP. Default is 0.01.
+    n_estimators : int, optional
+        Number of trees in the Random Forest base model. Default is 100.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations
+        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
+        Default is 'gamma'.
+    """
     def __init__(self, 
                  hidden_layer_sizes=(10, 5),
                  activation='relu',
@@ -6105,6 +6364,29 @@ class WAS_mme_Stack_MLP_RF:
         self.dist_method = dist_method
 
     def compute_model(self, X_train, y_train, X_test, y_test):
+        """
+        Compute deterministic hindcast using the stacking ensemble of MLP and Random Forest.
+
+        Fits the stacking ensemble (MLP and Random Forest base models with a LinearRegression meta-model)
+        on training data and predicts deterministic values for the test data.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
+        """
+
         # Initialize the base models (MLP and Random Forest)
         self.base_models = [
             ('mlp', MLPRegressor(
@@ -6635,6 +6917,35 @@ class WAS_mme_Stack_MLP_RF:
 
 
 class WAS_mme_Stack_Lasso_RF_MLP:
+    """
+    Stacking ensemble with Lasso and Random Forest base models, and MLP meta-model for Multi-Model Ensemble (MME) forecasting.
+
+    This class implements a stacking ensemble using Lasso and RandomForestRegressor as base models,
+    with an MLPRegressor meta-model, for deterministic forecasting and optional tercile probability calculations.
+
+    Parameters
+    ----------
+    lasso_alpha : float, optional
+        Regularization strength for the Lasso base model. Default is 0.01.
+    n_estimators : int, optional
+        Number of trees in the Random Forest base model. Default is 100.
+    mlp_hidden_layer_sizes : tuple, optional
+        Sizes of the hidden layers for the MLP meta-model (e.g., (10, 5)). Default is (10, 5).
+    mlp_activation : str, optional
+        Activation function for the MLP ('identity', 'logistic', 'tanh', 'relu'). Default is 'relu'.
+    mlp_solver : str, optional
+        Optimization algorithm for the MLP ('lbfgs', 'sgd', 'adam'). Default is 'adam'.
+    mlp_max_iter : int, optional
+        Maximum number of iterations for the MLP solver. Default is 200.
+    mlp_alpha : float, optional
+        L2 regularization parameter for the MLP. Default is 0.01.
+    random_state : int, optional
+        Seed for random number generation for reproducibility. Default is 42.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations
+        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
+        Default is 'gamma'.
+    """
     def __init__(self, 
                  lasso_alpha=0.01, 
                  n_estimators=100, 
@@ -6664,6 +6975,28 @@ class WAS_mme_Stack_Lasso_RF_MLP:
         self.stacking_model = None
 
     def compute_model(self, X_train, y_train, X_test, y_test):
+        """
+        Compute deterministic hindcast using the stacking ensemble of Lasso and Random Forest with an MLP meta-model.
+
+        Fits the stacking ensemble (Lasso and Random Forest base models with an MLPRegressor meta-model)
+        on training data and predicts deterministic values for the test data.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
+        """
         # Define base models: Lasso and RandomForestRegressor
         self.base_models = [
             ('lasso', Lasso(alpha=self.lasso_alpha, random_state=self.random_state)),
@@ -6998,8 +7331,34 @@ class WAS_mme_Stack_Lasso_RF_MLP:
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
         """
-        Forecast method: standardize the predictor, fit the stacking model,
-        make predictions for a new year, reverse standardization, and compute tercile probabilities.
+        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
+
+        Fits the stacking ensemble (Lasso and Random Forest base models with an MLPRegressor meta-model)
+        on standardized hindcast data, predicts deterministic values for the target year,
+        reverses standardization, and computes tercile probabilities.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_da : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
         """
         if "M" in Predictant.coords:
             Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
@@ -7182,6 +7541,34 @@ class WAS_mme_Stack_Lasso_RF_MLP:
 
 
 class WAS_mme_Stack_MLP_Ada_Ridge:
+    """
+    Stacking ensemble with MLP and AdaBoost base models, and Ridge meta-model for Multi-Model Ensemble (MME) forecasting.
+
+    This class implements a stacking ensemble using MLPRegressor and AdaBoostRegressor as base models,
+    with a Ridge meta-model, for deterministic forecasting and optional tercile probability calculations.
+
+    Parameters
+    ----------
+    hidden_layer_sizes : tuple, optional
+        Sizes of the hidden layers for the MLP base model (e.g., (10, 5)). Default is (10, 5).
+    activation : str, optional
+        Activation function for the MLP ('identity', 'logistic', 'tanh', 'relu'). Default is 'relu'.
+    max_iter : int, optional
+        Maximum number of iterations for the MLP solver. Default is 200.
+    solver : str, optional
+        Optimization algorithm for the MLP ('lbfgs', 'sgd', 'adam'). Default is 'adam'.
+    mlp_alpha : float, optional
+        L2 regularization parameter for the MLP. Default is 0.01.
+    n_estimators_adaboost : int, optional
+        Number of boosting iterations for AdaBoost. Default is 50.
+    ridge_alpha : float, optional
+        Regularization strength for the Ridge meta-model. Default is 1.0.
+    random_state : int, optional
+        Seed for random number generation for reproducibility. Default is 42.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations
+        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
+    """
     def __init__(self, 
                  hidden_layer_sizes=(10, 5), 
                  activation='relu', 
@@ -7192,17 +7579,7 @@ class WAS_mme_Stack_MLP_Ada_Ridge:
                  ridge_alpha=1.0, 
                  random_state=42,
                  dist_method="gamma"):
-        """
-        Base models: MLPRegressor and AdaBoostRegressor.
-        Meta-model: Ridge.
-        
-        Parameters:
-         - hidden_layer_sizes, activation, max_iter, solver, mlp_alpha: for MLPRegressor.
-         - n_estimators_adaboost: for AdaBoostRegressor.
-         - ridge_alpha: for Ridge.
-         - random_state: seed for reproducibility.
-         - dist_method: distribution method for tercile probability calculations. Options: 't','gamma','nonparam','normal','lognormal'.
-        """
+
         self.hidden_layer_sizes = hidden_layer_sizes
         self.activation = activation
         self.max_iter = max_iter
@@ -7219,11 +7596,26 @@ class WAS_mme_Stack_MLP_Ada_Ridge:
 
     def compute_model(self, X_train, y_train, X_test, y_test):
         """
-        Fit the stacking ensemble using:
-         - Base models: MLPRegressor and AdaBoostRegressor.
-         - Meta-model: Ridge.
-        Data is flattened and NaN rows are excluded for training.
-        Predictions are then reshaped back to (T, Y, X).
+        Compute deterministic hindcast using the stacking ensemble of MLP and AdaBoost with a Ridge meta-model.
+
+        Fits the stacking ensemble (MLP and AdaBoost base models with a Ridge meta-model)
+        on training data and predicts deterministic values for the test data.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
         """
         # Define base models
         self.base_models = [
@@ -7563,13 +7955,34 @@ class WAS_mme_Stack_MLP_Ada_Ridge:
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
         """
-        Forecast method:
-         - Standardizes the predictor for the target year.
-         - Fits the stacking ensemble on standardized hindcast and predictant data.
-         - Predicts for the target year.
-         - Reconstructs the prediction to its original (T, Y, X) shape.
-         - Reverses the standardization.
-         - Computes tercile probabilities using the chosen distribution.
+        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
+
+        Fits the stacking ensemble (MLP and AdaBoost base models with a Ridge meta-model)
+        on standardized hindcast data, predicts deterministic values for the target year,
+        reverses standardization, and computes tercile probabilities.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_da : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
         """
         mask = xr.where(~np.isnan(Predictant.isel(T=0, M=0)), 1, np.nan).drop_vars(['T','M']).squeeze()
         mask.name = None
@@ -7757,6 +8170,30 @@ class WAS_mme_Stack_MLP_Ada_Ridge:
 
 
 class WAS_mme_Stack_RF_GB_Ridge:
+    """
+    Stacking ensemble with Random Forest and Gradient Boosting base models, and Ridge meta-model for Multi-Model Ensemble (MME) forecasting.
+
+    This class implements a stacking ensemble using RandomForestRegressor and GradientBoostingRegressor as base models,
+    with a Ridge meta-model, for deterministic forecasting and optional tercile probability calculations.
+
+    Parameters
+    ----------
+    n_estimators_rf : int, optional
+        Number of trees in the Random Forest base model. Default is 100.
+    max_depth_rf : int or None, optional
+        Maximum depth for Random Forest trees (None for no limit). Default is None.
+    n_estimators_gb : int, optional
+        Number of boosting iterations for Gradient Boosting. Default is 100.
+    learning_rate_gb : float, optional
+        Learning rate for Gradient Boosting. Default is 0.1.
+    ridge_alpha : float, optional
+        Regularization strength for the Ridge meta-model. Default is 1.0.
+    random_state : int, optional
+        Seed for random number generation for reproducibility. Default is 42.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations
+        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
+    """
     def __init__(self, 
                  n_estimators_rf=100, 
                  max_depth_rf=None,
@@ -7765,21 +8202,7 @@ class WAS_mme_Stack_RF_GB_Ridge:
                  ridge_alpha=1.0,
                  random_state=42,
                  dist_method="gamma"):
-        """
-        Stacking ensemble with:
-          - Base models: RandomForestRegressor and GradientBoostingRegressor.
-          - Meta-model: Ridge.
-          
-        Parameters:
-          n_estimators_rf: int, number of trees for RandomForestRegressor.
-          max_depth_rf: int or None, maximum tree depth for RandomForestRegressor.
-          n_estimators_gb: int, number of boosting iterations for GradientBoostingRegressor.
-          learning_rate_gb: float, learning rate for GradientBoostingRegressor.
-          ridge_alpha: float, regularization strength for Ridge.
-          random_state: int, for reproducibility.
-          dist_method: str, distribution method for tercile probability calculations.
-                      Options: 't', 'gamma', 'nonparam', 'normal', 'lognormal'.
-        """
+
         self.n_estimators_rf = n_estimators_rf
         self.max_depth_rf = max_depth_rf
         self.n_estimators_gb = n_estimators_gb
@@ -7794,9 +8217,26 @@ class WAS_mme_Stack_RF_GB_Ridge:
 
     def compute_model(self, X_train, y_train, X_test, y_test):
         """
-        Fit the stacking ensemble on the training data and predict on X_test.
-        Data (xarray DataArrays) are flattened and rows with NaNs are excluded for training.
-        Predictions are reshaped back into the original (T, Y, X) format.
+        Compute deterministic hindcast using the stacking ensemble of Random Forest and Gradient Boosting with a Ridge meta-model.
+
+        Fits the stacking ensemble (Random Forest and Gradient Boosting base models with a Ridge meta-model)
+        on training data and predicts deterministic values for the test data.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
         """
         # Define base models:
         self.base_models = [
@@ -8130,13 +8570,34 @@ class WAS_mme_Stack_RF_GB_Ridge:
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
         """
-        Forecast method that:
-          - Standardizes the target-year predictor using hindcast statistics.
-          - Fits the stacking ensemble on standardized hindcast and predictant data.
-          - Predicts for the target year.
-          - Reconstructs the prediction to the original (T, Y, X) shape.
-          - Reverses the standardization.
-          - Computes tercile probabilities using the chosen distribution.
+        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
+
+        Fits the stacking ensemble (Random Forest and Gradient Boosting base models with a Ridge meta-model)
+        on standardized hindcast data, predicts deterministic values for the target year,
+        reverses standardization, and computes tercile probabilities.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_da : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
         """
         mask = xr.where(~np.isnan(Predictant.isel(T=0, M=0)), 1, np.nan)\
                 .drop_vars(['T', 'M']).squeeze()
@@ -8327,6 +8788,28 @@ class WAS_mme_Stack_RF_GB_Ridge:
 
 
 class WAS_mme_Stack_KNN_Tree_SVR:
+    """
+    Stacking ensemble with K-Nearest Neighbors and Decision Tree base models, and SVR meta-model for Multi-Model Ensemble (MME) forecasting.
+
+    This class implements a stacking ensemble using KNeighborsRegressor and DecisionTreeRegressor as base models,
+    with an SVR meta-model, for deterministic forecasting and optional tercile probability calculations.
+
+    Parameters
+    ----------
+    n_neighbors : int, optional
+        Number of neighbors for K-Nearest Neighbors. Default is 5.
+    tree_max_depth : int or None, optional
+        Maximum depth for the Decision Tree (None for no limit). Default is None.
+    svr_C : float, optional
+        Regularization parameter for SVR. Default is 1.0.
+    svr_kernel : str, optional
+        Kernel type for SVR ('linear', 'poly', 'rbf', 'sigmoid'). Default is 'rbf'.
+    random_state : int, optional
+        Seed for random number generation for reproducibility. Default is 42.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations
+        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
+    """
     def __init__(self, 
                  n_neighbors=5,
                  tree_max_depth=None,
@@ -8334,20 +8817,7 @@ class WAS_mme_Stack_KNN_Tree_SVR:
                  svr_kernel='rbf',
                  random_state=42,
                  dist_method="gamma"):
-        """
-        Stacking ensemble with:
-          Base models: KNeighborsRegressor and DecisionTreeRegressor.
-          Meta-model: SVR.
-        
-        Parameters:
-          - n_neighbors: int, number of neighbors for KNN.
-          - tree_max_depth: int or None, maximum depth for the Decision Tree.
-          - svr_C: float, regularization parameter for SVR.
-          - svr_kernel: string, kernel to use for SVR.
-          - random_state: int, for reproducibility.
-          - dist_method: string, one of ['t', 'gamma', 'nonparam', 'normal', 'lognormal'] to select
-                         the probability calculation method.
-        """
+
         self.n_neighbors = n_neighbors
         self.tree_max_depth = tree_max_depth
         self.svr_C = svr_C
@@ -8361,9 +8831,26 @@ class WAS_mme_Stack_KNN_Tree_SVR:
 
     def compute_model(self, X_train, y_train, X_test, y_test):
         """
-        Fits the stacking ensemble on the training data and predicts on X_test.
-        Data is assumed to be provided as xarray DataArrays with dimensions that include
-        'T', 'Y', 'X' (and optionally 'M').
+        Compute deterministic hindcast using the stacking ensemble of KNN and Decision Tree with an SVR meta-model.
+
+        Fits the stacking ensemble (KNeighborsRegressor and DecisionTreeRegressor base models with an SVR meta-model)
+        on training data and predicts deterministic values for the test data.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
         """
         # Define base models:
         self.base_models = [
@@ -8695,13 +9182,34 @@ class WAS_mme_Stack_KNN_Tree_SVR:
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
         """
-        Forecast method:
-          - Standardizes the target-year predictor using hindcast statistics.
-          - Fits the stacking ensemble on standardized hindcast and predictant data.
-          - Predicts for the target year.
-          - Reconstructs the prediction to its original (T, Y, X) shape.
-          - Reverses the standardization.
-          - Computes tercile probabilities using the chosen distribution.
+        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
+
+        Fits the stacking ensemble (KNN and Decision Tree base models with an SVR meta-model)
+        on standardized hindcast data, predicts deterministic values for the target year,
+        reverses standardization, and computes tercile probabilities.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+
+        Returns
+        -------
+        result_da : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
         """
         mask = xr.where(~np.isnan(Predictant.isel(T=0, M=0)), 1, np.nan)\
                 .drop_vars(['T', 'M']).squeeze()
@@ -8882,6 +9390,26 @@ class WAS_mme_Stack_KNN_Tree_SVR:
         return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
 class WAS_mme_StackXGboost_Ml:
+    """
+    Stacking ensemble with XGBoost base model and Linear Regression meta-model for Multi-Model Ensemble (MME) forecasting.
+
+    This class implements a stacking ensemble using XGBRegressor as the base model,
+    with a LinearRegression meta-model, for deterministic forecasting and optional tercile probability calculations.
+
+    Parameters
+    ----------
+    n_estimators : int, optional
+        Number of gradient boosted trees in XGBoost. Default is 100.
+    max_depth : int, optional
+        Maximum depth of each tree in XGBoost. Default is 3.
+    learning_rate : float, optional
+        Boosting learning rate for XGBoost. Default is 0.1.
+    random_state : int, optional
+        Seed for random number generation for reproducibility. Default is 42.
+    dist_method : str, optional
+        Distribution method for tercile probability calculations
+        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
+    """
     def __init__(
         self,
         n_estimators=100,
@@ -8890,23 +9418,7 @@ class WAS_mme_StackXGboost_Ml:
         random_state=42,
         dist_method="gamma"
     ):
-        """
-        Initializes the stacking model with XGBoost as the base model
-        and Linear Regression as the meta-model.
-        
-        Parameters
-        ----------
-        n_estimators : int
-            Number of gradient boosted trees in XGBoost.
-        max_depth : int
-            Maximum depth of each tree in XGBoost.
-        learning_rate : float
-            Boosting learning rate (xgb’s “eta”).
-        random_state : int
-            Random seed for reproducibility.
-        dist_method : str
-            Distribution method to use for probability calculations.
-        """
+
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.learning_rate = learning_rate

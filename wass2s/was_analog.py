@@ -49,6 +49,87 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 from wass2s.utils import *
 
 class WAS_Analog:
+    """
+    Analog-based forecasting toolkit for seasonal climate applications.
+
+    This class orchestrates the end-to-end workflow required to build
+    **analog ensembles** for Sea-Surface Temperature (SST) predictors and
+    to translate them into deterministic and probabilistic rainfall
+    forecasts over West Africa (or any user-defined domain).  Three
+    alternative analog-selection strategies are supported:
+
+    - **Self-Organising Maps** (`method_analog="som"`, default)  
+    - **Correlation ranking** (`"cor_based"`)  
+    - **Principal-Component (EOF) similarity** (`"pca_based"`)
+
+    In addition, the class encapsulates data acquisition (reanalysis +
+    seasonal hindcasts), preprocessing, EOF/SOM training, tercile-based
+    probability generation with multiple distributional options
+    (Student-t, Gamma, Gaussian, Log-normal, non-parametric), and a set of
+    convenient visualisation helpers.
+
+    Parameters:
+    -----------
+    dir_to_save : str
+        Directory path to save downloaded and processed data files.
+    year_start : int
+        Starting year for historical data.
+    year_forecast : int
+        Target forecast year.
+    reanalysis_name : str
+        Name of the reanalysis dataset (e.g., "ERA5.SST" or "NOAA.SST").
+    model_name : str
+        Name of the forecast model (e.g., "ECMWF_51.SST").
+    method_analog : str, optional
+        Analog method to use ("som", "cor_based", or "pca_based"). Default is "som".
+    best_prcp_models : list, optional
+        List of best precipitation models to consider.
+    month_of_initialization : int, optional
+        Month of initialization for forecasts. If None, uses current month.
+    lead_time : list, optional
+        List of lead times in months. If None, defaults to [1, 2, 3, 4, 5].
+    ensemble_mean : str, optional
+        Method for ensemble mean ("mean" or "median"). Default is "mean".
+    clim_year_start : int, optional
+        Start year for climatology period.
+    clim_year_end : int, optional
+        End year for climatology period.
+    define_extent : tuple, optional
+        Bounding box as (lon_min, lon_max, lat_min, lat_max) for regional analysis.
+    index_compute : list, optional
+        List of climate indices to compute.
+    some_grid_size : tuple, optional
+        Grid size for SOM (rows, columns). Default is (None, None) which uses automatic sizing.
+    some_learning_rate : float, optional
+        Learning rate for SOM training. Default is 0.5.
+    some_neighborhood_function : str, optional
+        Neighborhood function for SOM ("gaussian", "mexican_hat", etc.). Default is "gaussian".
+    some_sigma : float, optional
+        Initial neighborhood radius for SOM. Default is 1.0.
+    dist_method : str, optional
+        Method for probability calculation ("gamma", "t", "normal", "lognormal", "nonparam").
+        Default is "gamma".
+    
+    Methods:
+    --------
+    download_sst_reanalysis():
+        Downloads sea surface temperature reanalysis data.
+    download_models():
+        Downloads seasonal forecast model data.
+    standardize_timeseries():
+        Standardizes time series data.
+    calc_index():
+        Calculates climate indices from SST data.
+    compute_model():
+        Computes analog forecasts.
+    compute_prob():
+        Computes tercile probabilities from forecasts.
+    forecast():
+        Generates forecasts for a target year.
+    composite_plot():
+        Creates composite plots of forecast results.
+    """
+
     
     def __init__(self, dir_to_save, year_start, year_forecast, reanalysis_name, model_name, method_analog ="som", 
                  best_prcp_models=None, month_of_initialization=None,
@@ -78,6 +159,24 @@ class WAS_Analog:
         self.dist_method=dist_method
     
     def calc_index(self, indices, sst):
+        """
+        Calculate climate indices from SST data.
+
+        Computes specified climate indices (e.g., NINO34, DMI) from SST data by averaging over predefined regions
+        or computing differences for derived indices.
+
+        Parameters
+        ----------
+        indices : list
+            List of climate indices to compute (e.g., ['NINO34', 'DMI']).
+        sst : xarray.DataArray
+            SST data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        indices_dataset : xarray.Dataset
+            Dataset containing computed climate indices as variables.
+        """
     
         sst_indices_name = {
             "NINO34": ("Nino3.4", -170, -120, -5, 5),
@@ -117,7 +216,25 @@ class WAS_Analog:
         indices_dataset = xr.Dataset(data_vars)
         return indices_dataset
 
-    def _postprocess_ersst(self, ds, var_name):       
+    def _postprocess_ersst(self, ds, var_name): 
+
+        """
+        Post-process ERSST dataset.
+
+        Drops unnecessary variables and ensures consistent variable names and coordinates.
+
+        Parameters
+        ----------
+        ds : xarray.Dataset
+            Input ERSST dataset.
+        var_name : str
+            Name of the variable to keep (e.g., 'sst').
+
+        Returns
+        -------
+        ds : xarray.Dataset
+            Processed dataset with specified variable and coordinates.
+        """
         # Drop unnecessary variables
         ds = ds.drop_vars('zlev').squeeze()
         keep_vars = [var_name, 'T', 'X', 'Y']
@@ -131,14 +248,22 @@ class WAS_Analog:
         force_download=False
     ):
         """
-        Download Sea Surface Temperature (SST) reanalysis data for specified years and all months.
-    
-        Parameters:
-            dir_to_save (str): Directory to save the downloaded files.
-            center (str): Reanalysis center (e.g., "ERA5"). Default is "ERA5".
-            year_end (int): End year for the data to download.
-            area (list): Bounding box as [North, West, South, East] for clipping.
-            force_download (bool): If True, forces download even if file exists.
+        Download Sea Surface Temperature (SST) reanalysis data.
+
+        Downloads SST data from the specified reanalysis dataset for the given years and spatial area, 
+        handling both NOAA ERSST and ERA5 datasets.
+
+        Parameters
+        ----------
+        area : list, optional
+            Bounding box as [North, West, South, East]. Default is [60, -180, -60, 180].
+        force_download : bool, optional
+            If True, forces re-download even if file exists. Default is False.
+
+        Returns
+        -------
+        combined_ds : xarray.Dataset
+            Combined SST dataset for the specified years.
         """
         year_end = self.year_forecast #datetime.now().year        
         center_variable=self.reanalysis_name
@@ -287,17 +412,21 @@ class WAS_Analog:
             force_download=False
         ):
         """
-        Download Sea Surface Temperature (SST) seasonal forecast forecast data for specified center-variable combinations,
-        initialization month (current month), lead times, and years.
-    
-        Parameters:
-            dir_to_save (str): Directory to save the downloaded files.
-            center_variable (list): List of center-variable identifiers (e.g., ["ECMWF_51.SST"]).
-            year_start_hindcast (int): Start year for forecast data.
-            year_end_hindcast (int): End year for forecast data.
-            area (list): Bounding box as [North, West, South, East] for clipping.
-            ensemble_mean (str, optional): It can be 'median', 'mean', or None. Defaults to None.
-            force_download (bool): If True, forces download even if file exists.
+        Download SST seasonal forecast data.
+
+        Downloads forecast data for specified models, initialization month, lead times, and spatial area.
+
+        Parameters
+        ----------
+        area : list, optional
+            Bounding box as [North, West, South, East]. Default is [60, -180, -60, 180].
+        force_download : bool, optional
+            If True, forces re-download even if file exists. Default is False.
+
+        Returns
+        -------
+        ds_centers : xarray.Dataset
+            Combined forecast dataset across models.
         """
         center_variable=[self.model_name]
         # 1. Set Current Date and Initialization Month
@@ -520,6 +649,23 @@ class WAS_Analog:
         return  ds
 
     def download_and_process(self, center_variable=None):
+        """
+        Download and process SST data for reanalysis and forecast.
+
+        Combines reanalysis and forecast SST data, standardizes, and applies a rolling mean.
+
+        Parameters
+        ----------
+        center_variable : str, optional
+            Center-variable identifier (e.g., 'ECMWF_51.SST'). Default is None (uses class attributes).
+
+        Returns
+        -------
+        concatenated_ds_st : xarray.DataArray
+            Standardized and processed SST data.
+        ds_shifted : xarray.DataArray
+            Time-shifted version of the processed SST data.
+        """
         if self.lead_time is None:
             lead_time = [1, 2, 3, 4, 5]
         else:
@@ -579,7 +725,27 @@ class WAS_Analog:
 
 
     def Corr_Based(self, predictant, ddd, itrain, ireference_year):
+        """
+        Identify similar years using correlation-based analog method.
 
+        Finds years with high spatial correlation to the reference year's SST data.
+
+        Parameters
+        ----------
+        predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X).
+        ddd : xarray.DataArray
+            SST predictor data with dimensions (T, Y, X).
+        itrain : list
+            Indices of training years.
+        ireference_year : list
+            Indices of the reference year.
+
+        Returns
+        -------
+        similar_years : np.ndarray
+            Array of years similar to the reference year.
+        """
         if self.define_extent is not None:
             lon_min, lon_max, lat_min, lat_max = self.define_extent
             ddd = ddd.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
@@ -611,6 +777,27 @@ class WAS_Analog:
         return similar_years
 
     def Pca_Based(self, predictant, ddd, itrain, ireference_year):
+        """
+        Identify similar years using PCA-based analog method.
+
+        Uses EOF analysis to compute principal components and finds years with similar scores to the reference year.
+
+        Parameters
+        ----------
+        predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X).
+        ddd : xarray.DataArray
+            SST predictor data with dimensions (T, Y, X).
+        itrain : list
+            Indices of training years.
+        ireference_year : list
+            Indices of the reference year.
+
+        Returns
+        -------
+        similar_years : np.ndarray
+            Array of years similar to the reference year.
+        """
         if self.define_extent is not None:
             lon_min, lon_max, lat_min, lat_max = self.define_extent
             ddd = ddd.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
@@ -655,7 +842,27 @@ class WAS_Analog:
         
 
     def SOM(self, predictant, ddd, itrain, ireference_year):
-        
+        """
+        Identify similar years using Self-Organizing Maps (SOM).
+
+        Trains a SOM on SST data or climate indices and finds years mapped to the same Best Matching Unit (BMU) as the reference year.
+
+        Parameters
+        ----------
+        predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X).
+        ddd : xarray.DataArray
+            SST predictor data with dimensions (T, Y, X).
+        itrain : list
+            Indices of training years.
+        ireference_year : list
+            Indices of the reference year.
+
+        Returns
+        -------
+        similar_years : np.ndarray
+            Array of years similar to the reference year.
+        """        
         predictant['T'] = predictant['T'].astype('datetime64[ns]')
 
         if self.index_compute is not None:
@@ -1605,7 +1812,29 @@ class WAS_Analog:
 
 
     def composite_plot(self, predictant, clim_year_start, clim_year_end, hindcast_det, plot_predictor=True):
+        """
+        Create composite plots of predictors or predictands.
 
+        Plots SST composites for the forecast year and similar years, or precipitation ratios relative to climatology.
+
+        Parameters
+        ----------
+        predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X).
+        clim_year_start : int or str
+            Start year for climatology period.
+        clim_year_end : int or str
+            End year for climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data with dimensions (T, Y, X).
+        plot_predictor : bool, optional
+            If True, plot SST predictors; otherwise, plot precipitation ratios. Default is True.
+
+        Returns
+        -------
+        similar_years : np.ndarray
+            Array of similar years used in the composite.
+        """
         clim_slice = slice(str(clim_year_start), str(clim_year_end))
         clim_mean = predictant.sel(T=clim_slice).mean(dim='T')
         

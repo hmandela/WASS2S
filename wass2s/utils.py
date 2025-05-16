@@ -1072,7 +1072,7 @@ def find_best_distribution_grid(rainfall, distribution_map=None):
 ################################ agroparameters compute ################
 
 onset_criteria = {
-0: {"zone_name": "Sahel100_0mm", "start_search": "06-01", "cumulative": 10, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "08-30"},
+0: {"zone_name": "Sahel100_0mm", "start_search": "06-01", "cumulative": 15, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "09-01"},
 1: {"zone_name": "Sahel200_100mm", "start_search": "05-15", "cumulative": 15, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "08-15"},
 2: {"zone_name": "Sahel400_200mm", "start_search": "05-01", "cumulative": 15, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31"},
 3: {"zone_name": "Sahel600_400mm", "start_search": "03-15", "cumulative": 20, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31"},
@@ -1081,7 +1081,7 @@ onset_criteria = {
     }
 
 onset_dryspell_criteria = {
-    0: {"zone_name": "Sahel100_0mm", "start_search": "06-01", "cumulative": 10, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "08-15", "nbjour":35},
+    0: {"zone_name": "Sahel100_0mm", "start_search": "06-01", "cumulative": 15, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "09-01", "nbjour":30},
     1: {"zone_name": "Sahel200_100mm", "start_search": "05-15", "cumulative": 15, "number_dry_days": 25, "thrd_rain_day": 0.85, "end_search": "08-15", "nbjour":40},
     2: {"zone_name": "Sahel400_200mm", "start_search": "05-01", "cumulative": 15, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31", "nbjour":40},
     3: {"zone_name": "Sahel600_400mm", "start_search": "03-15", "cumulative": 20, "number_dry_days": 20, "thrd_rain_day": 0.85, "end_search": "07-31", "nbjour":45},
@@ -1090,7 +1090,7 @@ onset_dryspell_criteria = {
 }
 
 cessation_criteria = {
-    0: {"zone_name": "Sahel100_0mm", "date_dry_soil":"01-01", "start_search": "09-01", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "09-30"},
+    0: {"zone_name": "Sahel100_0mm", "date_dry_soil":"01-01", "start_search": "09-15", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "10-05"},
     1: {"zone_name": "Sahel200_100mm", "date_dry_soil":"01-01", "start_search": "09-01", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "10-05"},
     2: {"zone_name": "Sahel400_200mm", "date_dry_soil":"01-01", "start_search": "09-01", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "11-10"},
     3: {"zone_name": "Sahel600_400mm", "date_dry_soil":"01-01", "start_search": "09-15", "ETP": 5.0, "Cap_ret_maxi": 70, "end_search": "11-15"},
@@ -1100,15 +1100,15 @@ cessation_criteria = {
 
 # Default class-level criteria dictionary
 cessation_dryspell_criteria = {
-    0: {"zone_name": "Sahel100_0mm", "start_search1": "06-01", "cumulative": 10, "number_dry_days": 25,
+    0: {"zone_name": "Sahel100_0mm", "start_search1": "06-01", "cumulative": 15, "number_dry_days": 25,
         "thrd_rain_day": 0.85,
-        "end_search1": "08-15",
-        "nbjour": 35,
+        "end_search1": "09-01",
+        "nbjour": 30,
         "date_dry_soil": "01-01",
-        "start_search2": "09-01",
+        "start_search2": "09-15",
         "ETP": 5.0,
         "Cap_ret_maxi": 70,
-        "end_search2": "09-30"
+        "end_search2": "10-05"
     },
     1: {"zone_name": "Sahel200_100mm", "start_search1": "05-15", "cumulative": 15, "number_dry_days": 25,
         "thrd_rain_day": 0.85,

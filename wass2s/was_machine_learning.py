@@ -4939,19 +4939,17 @@ class WAS_LogisticRegression_Model:
     then predicting the class probabilities for new data. 
     """
 
-    def __init__(self, nb_cores=1, dist_method="gamma"):
+    def __init__(self, nb_cores=1):
         """
         Parameters
         ----------
         nb_cores : int, optional
             Number of CPU cores to use for Dask parallelization (default = 1).
-        dist_method : str, optional
-            A distribution method placeholder, similar to WAS_SVR class, 
-            though not directly used in logistic regression (default = "gamma").
+
         """
         # Store the number of cores and a distribution method attribute (the latter might be used in future expansions)
         self.nb_cores = nb_cores
-        self.dist_method = dist_method
+
 
     @staticmethod
     def classify(y, index_start, index_end):
