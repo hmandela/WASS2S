@@ -3,7 +3,7 @@ import os
 
 setup(
     name="wass2s",
-    version="0.1.11",
+    version="0.1.12",
     author="HOUNGNIBO C. M. Mandela",
     author_email="hmandelahmadiba@gmail.com",
     description="A Python package for seasonal climate forecast.",
@@ -35,7 +35,7 @@ setup(
         "lightgbm",
         "pymc",
         "arviz",
-        "jupyterlab",
+        "jupyterlab"
     ],
     python_requires=">=3.11",
     license="GPL-3.0",
