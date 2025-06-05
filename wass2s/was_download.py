@@ -40,10 +40,12 @@ class WAS_Download:
     def ModelsName(
         self,
         centre={
+            "BOM_2": "bom",
             "ECMWF_51": "ecmwf",
             "UKMO_604": "ukmo",
             "UKMO_603": "ukmo",
             "METEOFRANCE_8": "meteo_france",
+            "METEOFRANCE_9": "meteo_france",
             "DWD_21": "dwd", # month of initialization available for forecast are Jan to Mar
             "DWD_22": "dwd", # month of initialization available for forecast are Apr to __ 
             "CMCC_35": "cmcc",
@@ -76,6 +78,7 @@ class WAS_Download:
             "SLP": "mean_sea_level_pressure",
             "DSWR": "surface_solar_radiation_downwards",
             "DLWR": "surface_thermal_radiation_downwards",
+            "NOLR": "top_thermal_radiation",
         },
         variables_2={
             "HUSS_1000": "specific_humidity",
@@ -123,6 +126,7 @@ class WAS_Download:
             "SLP": "mean_sea_level_pressure",
             "DSWR": "surface_solar_radiation_downwards",
             "DLWR": "surface_thermal_radiation_downwards",
+            "NOLR": "top_thermal_radiation",
         },
         variables_2={
             "HUSS_1000": "specific_humidity",
@@ -163,8 +167,15 @@ class WAS_Download:
             "AGRO.TMAX": ("2m_temperature", "24_hour_maximum"),
             "AGRO.TEMP": ("2m_temperature", "24_hour_mean"),
             "AGRO.TMIN": ("2m_temperature", "24_hour_minimum"),
+            "AGRO.TMIN": ("2m_temperature", "24_hour_minimum"),
+            "AGRO.DSWR": ("solar_radiation_flux", None),
+            "AGRO.ETP": ("reference_evapotranspiration", None),
+            "AGRO.WFF": ("10m_wind_speed", "24_hour_mean"),
+            "AGRO.HUMAX": ("2m_relative_humidity_derived", "24_hour_maximum"),
+            "AGRO.HUMIN": ("2m_relative_humidity_derived", "24_hour_minimum"),
         },
     ):
+        # 1 W m-2 = 0.0864 MJ m-2 day-1
         """
         Generate a dictionary for agro-meteorological observation variables.
 
@@ -175,225 +186,6 @@ class WAS_Download:
             dict: A dictionary mapping agro variables to their corresponding full names.
         """
         return variables
-
-    def WAS_Download_AgroIndicators_(
-        self,
-        dir_to_save,
-        variables,
-        year_start,
-        year_end,
-        area,
-        seas=["01", "02", "03"],
-        force_download=False,
-    ):
-        """
-        Download agro-meteorological indicators for specified variables, years, and months.
-
-        Parameters:
-            dir_to_save (str): Directory to save the downloaded files.
-            variables (list): List of shorthand variables to download (e.g., ["AGRO.PRCP", "AGRO.TMAX"]).
-            year_start (int): Start year for the data to download.
-            year_end (int): End year for the data to download.
-            area (list): Bounding box as [North, West, South, East] for clipping.
-            seas (list): List of month strings representing the season (e.g., ["01", "02", "03"]- for JanFebMar).
-            force_download (bool): If True, forces download even if file exists.
-        """
-        dir_to_save = Path(dir_to_save)
-        os.makedirs(dir_to_save, exist_ok=True)
-        days = [f"{day:02}" for day in range(1, 32)]
-        version = "1_1"
-        variable_mapping = {
-            "AGRO.PRCP": ("precipitation_flux", None),
-            "AGRO.TMAX": ("2m_temperature", "24_hour_maximum"),
-            "AGRO.TEMP": ("2m_temperature", "24_hour_mean"),
-            "AGRO.TMIN": ("2m_temperature", "24_hour_minimum"),
-        }
-        months = [f"{int(m) - 0:02}" for m in seas]
-        season = "".join([calendar.month_abbr[int(month)] for month in months])
-
-        for var in variables:
-            if var not in variable_mapping:
-                print(f"Unknown variable: {var}. Skipping.")
-                continue
-            combined_datasets = []
-            cds_variable, statistic = variable_mapping[var]
-            output_path = dir_to_save / f"Obs_{var.split('.')[1]}_{year_start}_{year_end}_{season}.nc"
-            if not force_download and os.path.exists(output_path):
-                print(f"{output_path} already exists. Skipping download.") 
-            else:            
-                for year in range(year_start, year_end + 1):
-                    zip_file_path = dir_to_save / f"Obs_{var.split('.')[1]}_{year}_{season}.zip"
-                
-                    dataset = "sis-agrometeorological-indicators"
-                    request = {
-                        "variable": cds_variable,
-                        "year": str(year),
-                        "month": months,
-                        "day": days,
-                        "version": version,
-                        "area": area,
-                    }
-                    if statistic:
-                        request["statistic"] = [statistic]
-                    try:
-                        client = cdsapi.Client()
-                        print(f"Downloading {cds_variable} ({statistic}) data for {year} and season {season}...")
-                        client.retrieve(dataset, request).download(str(zip_file_path))
-                        print(f"Downloaded: {zip_file_path}")
-                    except Exception as e:
-                        print(f"Failed to download {cds_variable} ({statistic}) data for {year}: {e}")
-                        continue
-
-                    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-                        for netcdf_file_name in zip_ref.namelist():
-                            with zip_ref.open(netcdf_file_name) as file:
-                                ds = xr.open_dataset(io.BytesIO(file.read()))
-                                combined_datasets.append(ds)
-                                
-                    os.remove(zip_file_path)
-                    print(f"Deleted ZIP file: {zip_file_path}")
-
-            if combined_datasets:
-                combined_ds = xr.concat(combined_datasets,dim="time")
-                if var in ["AGRO.TMIN", "AGRO.TEMP", "AGRO.TMAX"]:
-                    combined_ds = combined_ds - 273.15
-                    combined_ds = combined_ds.resample(time="YE").mean()
-                    combined_ds["time"] = [f"{year}-{months[1]}-01" for year in combined_ds["time"].dt.year.astype(str).values]
-                else:
-                    combined_ds = combined_ds.resample(time="YE").sum()
-                    combined_ds["time"] = [f"{year}-{months[1]}-01" for year in combined_ds["time"].dt.year.astype(str).values]
-                combined_ds = combined_ds.rename({"lon": "X", "lat": "Y", "time": "T"})
-                combined_ds = combined_ds.isel(Y=slice(None, None, -1))
-                # output_path = dir_to_save / f"Obs_{var.split('.')[1]}_{year_start}_{year_end}_{season}.nc"
-                combined_ds.to_netcdf(output_path)
-                print(f"File downloaded and combined dataset for {var} is saved to {output_path}")
-
-    def WAS_Download_Reanalysis_(
-        self,
-        dir_to_save,
-        center_variable,
-        year_start,
-        year_end,
-        area,
-        seas=["01", "02", "03"],
-        force_download=False,
-    ):
-        """
-        Download reanalysis data for specified center-variable combinations, years, and months.
-
-        Parameters:
-            dir_to_save (str): Directory to save the downloaded files.
-            center_variable (list): List of center-variable identifiers (e.g., ["ERA5.PRCP", "MERRA2.TEMP"]).
-            year_start (int): Start year for the data to download.
-            year_end (int): End year for the data to download.
-            area (list): Bounding box as [North, West, South, East] for clipping.
-            seas (list): List of month strings representing the season (e.g., ["01", "02", "03"] for JanFebMar).
-            force_download (bool): If True, forces download even if file exists.
-        """
-        center = [item.split(".")[0] for item in center_variable]
-        variables = [item.split(".")[1] for item in center_variable]
-        centre = {"ERA5": "ERA5", "MERRA2": "MERRA2"}
-        variables_1 = {
-            "PRCP": "total_precipitation",
-            "TEMP": "2m_temperature",
-            "TMAX": "maximum_2m_temperature_in_the_last_24_hours",
-            "TMIN": "minimum_2m_temperature_in_the_last_24_hours",
-            "UGRD10": "10m_u_component_of_wind",
-            "VGRD10": "v_component_of_wind",
-            "SST": "sea_surface_temperature",
-        }
-        variables_2 = {
-            "HUSS_1000": "specific_humidity",
-            "HUSS_925": "specific_humidity",
-            "HUSS_850": "specific_humidity",
-            "UGRD_1000": "u_component_of_wind",
-            "UGRD_925": "u_component_of_wind",
-            "UGRD_850": "u_component_of_wind",
-            "VGRD_1000": "v_component_of_wind",
-            "VGRD_925": "v_component_of_wind",
-            "VGRD_850": "v_component_of_wind",
-        }
-        selected_centre = [centre[k] for k in center]
-        selected_var = [k for k in variables]
-        dir_to_save = Path(dir_to_save)
-        os.makedirs(dir_to_save, exist_ok=True)
-        months = [f"{int(m) - 0:02}" for m in seas]
-        season = "".join([calendar.month_abbr[int(month)] for month in months])
-
-        for cent, k in zip(selected_centre, selected_var):
-            output_path = dir_to_save / f"{cent}_{k}_{year_start}_{year_end}_{season}.nc"
-            if not force_download and os.path.exists(output_path):
-                print(f"{output_path} already exists. Skipping download.") 
-            else:
-                combined_datasets = []
-                for year in range(year_start, year_end + 1):
-                    file_path = f"{dir_to_save}/{cent}_{k}_{year}_{season}.nc"
-                    try:
-                        if k in variables_2:
-                            press_level = k.split("_")[1]
-                            dataset = "reanalysis-era5-pressure-levels-monthly-means"
-                            request = {
-                                "product_type": ["monthly_averaged_reanalysis"],
-                                "variable": variables_2[k],
-                                "pressure_level": press_level,
-                                "year": str(year),
-                                "month": months,
-                                "time": ["00:00"],
-                                "data_format": "netcdf",
-                                "download_format": "unarchived",
-                                "area": area,
-                            }
-                        else:
-                            dataset = "reanalysis-era5-single-levels-monthly-means"
-                            request = {
-                                "product_type": ["monthly_averaged_reanalysis"],
-                                "variable": variables_1[k],
-                                "year": str(year),
-                                "month": months,
-                                "time": ["00:00"],
-                                "data_format": "netcdf",
-                                "download_format": "unarchived",
-                                "area": area,
-                            }
-                        client = cdsapi.Client()
-                        print(f"Downloading {cent} {k} for year {year}...")
-                        client.retrieve(dataset, request).download(file_path)
-                    except Exception as e:
-                        print(f"Failed to download data for {cent} and {k} in year {year}: {e}")
-                        continue
-                    with xr.open_dataset(file_path) as ds: #ds = xr.open_dataset(file_path)
-                        if len(ds.coords) > 4 and k not in ["TMIN", "TEMP", "TMAX", "SST", "PRCP", "UGRD10", "VGRD10"]:
-                            ds = ds.drop_vars(["number", "expver", "pressure_level"]).squeeze()
-                            ds = ds.isel(latitude=slice(None, None, -1))
-                            # ds = ds.assign_coords(valid_time=pd.to_datetime(ds.valid_time.astype(str), format='%Y%m%d'))
-                            ds = ds.assign_coords(valid_time=pd.to_datetime(ds.valid_time.astype(str)))
-                            ds = ds.rename({"latitude": "lat", "longitude": "lon", "valid_time": "time"})
-                        elif len(ds.coords) > 4:
-                            ds = ds.drop_vars(["number", "expver"]).squeeze()
-                            ds = ds.isel(latitude=slice(None, None, -1))
-                            # ds = ds.assign_coords(valid_time=pd.to_datetime(ds.valid_time.astype(str), format='%Y%m%d'))
-                            ds = ds.assign_coords(valid_time=pd.to_datetime(ds.valid_time.astype(str)))
-                            ds = ds.rename({"latitude": "lat", "longitude": "lon", "valid_time": "time"})
-                        ds = ds.load()
-                        combined_datasets.append(ds)
-                    os.remove(file_path)
-                    print(f"Deleted yearly file: {file_path}")
-    
-                if combined_datasets:
-                    combined_ds = xr.concat(combined_datasets, dim="time")
-                    if k in ["TMIN", "TEMP", "TMAX", "SST"]:
-                        combined_ds = combined_ds - 273.15
-                        combined_ds = combined_ds.resample(time="YE").mean()
-                        combined_ds["time"] = [f"{year}-{months[1]}-01" for year in combined_ds["time"].dt.year.astype(str).values]
-                    elif k == "PRCP":
-                        combined_ds = 90 * 1000 * combined_ds.resample(time="YE").sum()
-                        combined_ds["time"] = [f"{year}-{months[1]}-01" for year in combined_ds["time"].dt.year.astype(str).values]
-                    else:
-                        combined_ds = combined_ds.resample(time="YE").mean()
-                        combined_ds["time"] = [f"{year}-{months[1]}-01" for year in combined_ds["time"].dt.year.astype(str).values]
-                    combined_ds = combined_ds.rename({"lon": "X", "lat": "Y", "time": "T"})
-                    combined_ds.to_netcdf(output_path)
-                    print(f"Download finished, combined dataset for {cent} {k} to {output_path}")
 
     # def download_nmme_txt_with_progress(self, url, file_path, chunk_size=1024):
     #     file_path = Path(file_path)
@@ -570,10 +362,12 @@ class WAS_Download:
         variables = [item.split(".")[1] for item in center_variable]
 
         centre = {
+            "BOM_2": "bom",
             "ECMWF_51": "ecmwf",
             "UKMO_604": "ukmo", # month of initialization available for forecast are Apr to __
             "UKMO_603": "ukmo", # month of initialization available for forecast are Jan to Mar
             "METEOFRANCE_8": "meteo_france",
+            "METEOFRANCE_9": "meteo_france", 
             "DWD_21": "dwd", # month of initialization available for forecast are Jan to Mar
             "DWD_22": "dwd", # month of initialization available for forecast are Apr to __ 
             "CMCC_35": "cmcc",
@@ -609,6 +403,7 @@ class WAS_Download:
             "SLP": "mean_sea_level_pressure",
             "DSWR": "surface_solar_radiation_downwards",
             "DLWR": "surface_thermal_radiation_downwards",
+            "NOLR": "top_thermal_radiation",
         }
 
         variables_2 = {
@@ -624,10 +419,12 @@ class WAS_Download:
         }
 
         system = {
+            "BOM_2": "2",
             "ECMWF_51": "51",
             "UKMO_604": "604",
             "UKMO_603": "603",
             "METEOFRANCE_8": "8",
+            "METEOFRANCE_9": "9",
             "DWD_21": "21",
             "DWD_22": "22",
             # "DWD_2": "2",
@@ -835,7 +632,7 @@ class WAS_Download:
                             else:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
 
-                        if k in ["UGRD10","VGRD10","DSWR","DLWR"]:
+                        if k in ["UGRD10","VGRD10"]:
                             ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
                             ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
                             if "indexing_time" in ds.coords: 
@@ -843,7 +640,15 @@ class WAS_Download:
                             else:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
 
-                        if k not in ["TMIN","TEMP","TMAX","SST","UGRD10","VGRD10", "PRCP","SLP","DSWR","DLWR"]:
+                        if k in ["DSWR","DLWR", "NOLR"]:
+                            ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
+                            ds = ds.sum(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            if "indexing_time" in ds.coords: 
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
+                            else:
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
+
+                        if k not in ["TMIN","TEMP","TMAX","SST","UGRD10","VGRD10", "PRCP","SLP","DSWR","DLWR","NOLR"]:
                             ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
                             ds = ds.drop_vars("pressure_level").squeeze().mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
                             if "indexing_time" in ds.coords: 
@@ -892,7 +697,7 @@ class WAS_Download:
         os.makedirs(dir_to_save, exist_ok=True)
         days = [f"{day:02}" for day in range(1, 32)]
         months = [f"{month:02}" for month in range(1, 13)]
-        version = "1_1"
+        version = "2_0"
     
         # Updated variable mapping with statistic
         variable_mapping = {
@@ -900,6 +705,11 @@ class WAS_Download:
             "AGRO.TMAX": ("2m_temperature", "24_hour_maximum"),
             "AGRO.TEMP": ("2m_temperature", "24_hour_mean"),
             "AGRO.TMIN": ("2m_temperature", "24_hour_minimum"),
+            "AGRO.DSWR": ("solar_radiation_flux", None),
+            "AGRO.ETP": ("reference_evapotranspiration", None),
+            "AGRO.WFF": ("10m_wind_speed", "24_hour_mean"),
+            "AGRO.HUMAX": ("2m_relative_humidity_derived", "24_hour_maximum"),
+            "AGRO.HUMIN": ("2m_relative_humidity_derived", "24_hour_minimum")
         }
     
         for var in variables:
@@ -956,6 +766,9 @@ class WAS_Download:
                     # Convert temperature data from Kelvin to Celsius if needed
                     if var in ["AGRO.TMIN", "AGRO.TEMP", "AGRO.TMAX"]:
                         combined_ds = combined_ds - 273.15  # Convert from Kelvin to Celsius
+                    # Convert solar radiation from J/m^2/day to W/m^2
+                    if var in "AGRO.DSWR":
+                        combined_ds = combined_ds / 86400  # Convert from J/m^2 to W/m^2
     
                     # Rename dimensions and save to NetCDF
                     combined_ds = combined_ds.rename({"lon": "X", "lat": "Y", "time": "T"})
@@ -1010,10 +823,12 @@ class WAS_Download:
     
         # 2. Build standard dictionaries for center/system/variables
         centre = {
+            "BOM_2": "bom",
             "ECMWF_51": "ecmwf",
             "UKMO_604": "ukmo", # month of initialization available for forecast are Apr to __
             "UKMO_603": "ukmo", # month of initialization available for forecast are Jan to Mar
             "METEOFRANCE_8": "meteo_france",
+            "METEOFRANCE_9": "meteo_france",
             "DWD_21": "dwd",
             "DWD_22": "dwd",
             # "DWD_2": "dwd",
@@ -1026,10 +841,12 @@ class WAS_Download:
         }
     
         system = {
+            "BOM_2": "2",
             "ECMWF_51": "51",
             "UKMO_604": "604",
             "UKMO_603": "603",
             "METEOFRANCE_8": "8",
+            "METEOFRANCE_9": "9",
             "DWD_21": "21",
             "DWD_22": "22",
             # "DWD_2": "2",
@@ -1044,6 +861,7 @@ class WAS_Download:
         variables_1 = {
             "PRCP":  "total_precipitation",
             "TEMP":  "2m_temperature",
+            "TDEW": "2m_dewpoint_temperature",
             "TMAX":  "maximum_2m_temperature_in_the_last_24_hours",
             "TMIN":  "minimum_2m_temperature_in_the_last_24_hours",
             "UGRD10":"10m_u_component_of_wind",
@@ -1052,6 +870,8 @@ class WAS_Download:
             "SLP": "mean_sea_level_pressure",
             "DSWR": "surface_solar_radiation_downwards",
             "DLWR": "surface_thermal_radiation_downwards",
+            "NOLR": "top_net_thermal_radiation",
+            
         }
         variables_2 = {
             "HUSS_1000": "specific_humidity",
@@ -1164,12 +984,14 @@ class WAS_Download:
                 if ensemble_mean in ["mean", "median"] and "number" in ds.dims:
                     ds = getattr(ds, ensemble_mean)(dim="number")
     
-                # For example, flip latitude if needed
+                # Flip latitude
                 if "latitude" in ds.coords:
                     ds = ds.isel(latitude=slice(None, None, -1))
 
                 if v in ["TMIN","TEMP","TMAX","SST"]:
                     ds = ds - 273.15
+                if v =="SLP":
+                    ds = ds / 100
                 if v =="PRCP":
                     ds['time'] = ds['time'].to_index()
                     years = ds['time'].dt.year
@@ -1186,9 +1008,21 @@ class WAS_Download:
                         tampon.append(differences)
                     ds = xr.concat(tampon, dim="time")*1000
 
-                    ##########################################################
-                    # Include after the processing of SLP, DSWR, DLWR,
-                    ##########################################################
+                if v in ["DSWR","DLWR","OLR"]:
+                    ds['time'] = ds['time'].to_index()
+                    years = ds['time'].dt.year
+                    tampon = []
+                    for year in np.unique(years):
+                        
+                        # Select the data for the specific year
+                        yearly_ds = ds.sel(time=ds['time'].dt.year == year)
+                        
+                        # Calculate differences for the year
+                        differences = [yearly_ds.isel(time=i) - yearly_ds.isel(time=i-1) for i in range(1, len(yearly_ds['time']))]
+                        differences = xr.concat(differences, dim="time")
+                        differences['time'] = yearly_ds['time'].isel(time=slice(1,None))
+                        tampon.append(differences)
+                    ds = xr.concat(tampon, dim="time")/(24*60*60)
 
                 # Finally, rename the coords to X, Y, T to match my style
                 if "longitude" in ds.coords:
@@ -1242,9 +1076,14 @@ class WAS_Download:
             "AGRO.TMAX": ("2m_temperature", "24_hour_maximum"),
             "AGRO.TEMP": ("2m_temperature", "24_hour_mean"),
             "AGRO.TMIN": ("2m_temperature", "24_hour_minimum"),
+            "AGRO.DSWR": ("solar_radiation_flux", None),
+            "AGRO.ETP": ("reference_evapotranspiration", None),
+            "AGRO.WFF": ("10m_wind_speed", "24_hour_mean"),
+            "AGRO.HUMAX": ("2m_relative_humidity_derived", "24_hour_maximum"),
+            "AGRO.HUMIN": ("2m_relative_humidity_derived", "24_hour_minimum"),
         }
 
-        version = "1_1"
+        version = "2_0"
         days = [f"{day:02d}" for day in range(1, 32)]
 
         # Build a season string for naming (e.g., NDJ)
@@ -1353,6 +1192,10 @@ class WAS_Download:
                 # If it's temperature, subtract 273.15 (Kelvin → Celsius)
                 if var in ["AGRO.TMIN", "AGRO.TEMP", "AGRO.TMAX"]:
                     combined_ds = combined_ds - 273.15
+
+                # If it's solar radiation, convert from J/m^2/day to W/m^2
+                if var == "AGRO.DSWR":
+                    combined_ds = combined_ds / 86400  # 1 J/day = 86400 s = 1 W/s
     
                 # Now do custom aggregator for NDJ or any cross-year months
                 combined_ds = self._aggregate_crossyear(
@@ -1386,7 +1229,7 @@ class WAS_Download:
     def _postprocess_reanalysis(self, ds, var_name):
         """
         Drop extra coords, rename dims, flip lat, etc.
-        Adjust as needed for your MERRA2 or ERA5 quirks.
+        Adjust as needed for ERA5 quirks.
         """
         # Drop some known extraneous coords
         drop_list = []
@@ -1417,7 +1260,7 @@ class WAS_Download:
         return ds.drop_vars(drop_vars, errors="ignore")
 
     def _aggregate_crossyear(self, ds, season_months, var_name):
-        """s
+        """
         Group ds by a custom 'season_year' coordinate so that all months
         in 'season_months' belong to one group that may cross Dec→Jan.
     
@@ -1451,7 +1294,8 @@ class WAS_Download:
 
         if any(x in var_name for x in ["TEMP","TMIN","TMAX","SST","SLP"]):
             ds_out = ds.groupby("season_year").mean("time")
-        elif any(x in var_name for x in ["PRCP","DSWR","DLWR"]):
+        elif any(x in var_name for x in ["PRCP","DSWR","DLWR","NOLR"]):
+            # For precipitation and radiation, we sum over time
             ds_out = ds.groupby("season_year").sum("time")
         else:
             ds_out = ds.groupby("season_year").mean("time")
@@ -1500,6 +1344,7 @@ class WAS_Download:
             "SLP": "mean_sea_level_pressure",
             "DSWR": "surface_solar_radiation_downwards",
             "DLWR": "surface_thermal_radiation_downwards",
+            "NOLR": "top_net_thermal_radiation",
 
         }
         # Pressure-level monthly means
@@ -1702,12 +1547,12 @@ class WAS_Download:
                 )
                 
                 if v == "PRCP":
-                    nbjour = len(season_months)*30
-                    dsC = nbjour*1000*dsC  # !!!!! Convert to mm/month
+                    # nbjour = len(season_months)*30
+                    dsC = 1000*dsC  # !!!!! Convert to mm/month
                 
-                if v in ["DSWR", "DLWR"]:
+                if v in ["DSWR", "DLWR","NOLR"]:
                     nbjour = len(season_months)*30
-                    dsC = (dsC * 30)/(nbjour*86400)  # Convert to W/m2
+                    dsC = dsC/(nbjour*86400)  # Convert to W/m2
 
                 if v == "SLP":
                     dsC = dsC / 100  # Convert to hPa(mb)
@@ -1721,7 +1566,6 @@ class WAS_Download:
                 print(f"Saved final reanalysis file: {out_file}")
             else:
                 print(f"No data found for {c}/{v}.")
-
 
     def WAS_Download_CHIRPSv3(
         self,
