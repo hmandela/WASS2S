@@ -9,6 +9,8 @@ import matplotlib.colors as mcolors
 import matplotlib.cm as cm
 from matplotlib.patches import Rectangle
 from matplotlib import gridspec
+from matplotlib.offsetbox import  (OffsetImage, AnnotationBbox)
+import matplotlib.image as image
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import xeofs as xe
@@ -432,6 +434,7 @@ def prepare_predictand(dir_to_save_Obs, variables_obs, year_start, year_end, sea
         If True, return dataset without converting to array (default is True).
     daily : bool, optional
         If True, load daily data; otherwise, load seasonal data (default is False).
+    param : Indicate parameter name
 
     Returns
     -------
@@ -911,7 +914,7 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
 
 
 
-def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True):
+def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, logo=None, logo_size=0.5):
     """
     Plot probabilistic forecasts with tercile categories.
 
@@ -927,6 +930,10 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
         Labels for the tercile categories (default is ["Below-Normal", "Near-Normal", "Above-Normal"]).
     reverse_cmap : bool, optional
         If True, reverse the colormap order for categories (default is True).
+    logo : str, optional
+        Path to the logo image to be added to the plot (default is None).
+    logo_size : float, optional
+        Size of the logo image in the plot (default is 0.5).    
 
     Notes
     -----
@@ -974,6 +981,17 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     # nn_data = (max_prob.where(mask_nn) * 100).values
     # an_data = (max_prob.where(mask_an) * 100).values
     
+    # Apply the condition to ensure minimum value of 45% for each category
+    # and a maximum of 60% for BN, NN, and AN
+    # Ensure that the values are at least 45% and at most 60% for each category
+    # and convert to percentage
+    # bn_data = xr.where((max_prob.where(mask_bn) * 100) < 45, 45,
+    #                    xr.where(max_prob.where(mask_bn) * 100 > 60, 60, max_prob.where(mask_bn) * 100)).values
+    # nn_data = xr.where((max_prob.where(mask_nn) * 100) < 45, 45,
+    #                    xr.where(max_prob.where(mask_nn) * 100 > 60, 60, max_prob.where(mask_nn) * 100)).values
+    # an_data = xr.where((max_prob.where(mask_an) * 100) < 45, 45,
+    #                    xr.where(max_prob.where(mask_an) * 100 > 60, 60, max_prob.where(mask_an) * 100)).values    
+    
     bn_data = xr.where((xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100)<45, 45,
                        xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100).values  
     nn_data = xr.where((xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100)<45, 45,
@@ -983,7 +1001,10 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
      
 
     
-    # Define the data ranges for color normalization
+    # Define the data ranges for color normalization  
+    # vmin and vmax are set to 35% and 65% respectively for all categories
+    # This ensures that the color mapping is consistent across all plots 
+     
     vmin = 35  # Minimum probability percentage
     vmax = 65  # Maximum probability percentage
 
@@ -1060,10 +1081,19 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
         model_name_str = str(model_name.item())
     else:
         model_name_str = str(model_name)
-    ax.set_title(f"Probabilistic Forecast - {model_name_str}", fontsize=13, pad=20)
-    
+    ax.set_title(f"{model_name_str}", fontsize=13, pad=20)
+    # Step 7: Add logo if provided
+    if logo_path is not None:
+        im = image.imread(logo)
+        # add logo
+        addLogo = OffsetImage(im, zoom=logo_size)
+        # addLogo.image.axes = ax
+        addLogo.set_offset('lower right')
+        ab = AnnotationBbox(addLogo, (1.1, -0.1), frameon=False, xycoords='axes fraction', boxcoords="axes fraction")
+        ax.add_artist(ab)   
+    # Step 8: Adjust layout and save the plot
     plt.tight_layout()
-    plt.savefig(f"{dir_to_save}/Forecast_{model_name_str}_.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{dir_to_save}/{model_name_str.replace(" ", "_")}.png", dpi=300, bbox_inches='tight')
     plt.show()
     
 
@@ -1191,7 +1221,7 @@ def plot_tercile(A):
 
 def find_best_distribution_grid(rainfall, distribution_map=None):
     """
-    Determine the best-fitting distribution for rainfall data at each grid cell.
+    Determine the best-fitting distribution for variables data at each grid cell.
 
     Parameters
     ----------

@@ -198,19 +198,13 @@ class WAS_Cross_Validator:
             return xr.where(hindcast_det<0, 0, hindcast_det)*mask, xr.where(hindcast_prob<0, 0, hindcast_prob)*mask
 
         elif isinstance(model, WAS_Analog):
-            import os
-            os.environ['PYTHONHASHSEED'] = '42'
-            os.environ['OMP_NUM_THREADS'] = '1'
 
-            _, ddd = model.download_and_process()
 
             print("Cross-validation ongoing")
-            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(np.unique(ddd['T'].dt.year)[:-1], self.nb_omit), total=n_splits), start=1):
-                pred_det = model.compute_model(Predictant, ddd, train_index, test_index)
+            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(np.unique(Predictant['T'].dt.year), self.nb_omit), total=n_splits), start=1):
+                pred_det = model.compute_model(Predictant, train_index, test_index)
                 hindcast_det.append(pred_det)
 
-            os.environ.pop('PYTHONHASHSEED', None)
-            os.environ.pop('OMP_NUM_THREADS', None)
 
             hindcast_det = xr.concat(hindcast_det, dim="T")
             hindcast_det['T'] = Predictant['T']

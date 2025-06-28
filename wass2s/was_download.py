@@ -1,3 +1,4 @@
+from __future__ import annotations
 import logging
 import os
 import cdsapi
@@ -26,6 +27,9 @@ import requests
 from tqdm import tqdm
 from wass2s.utils import *
 import rioxarray as rioxr
+import datetime as dt
+from typing import List, Tuple, Sequence, Optional
+
 
 # Suppress warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -618,6 +622,7 @@ class WAS_Download:
                         if k =="PRCP":
                             ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
                             ds = (1000*30*24*60*60*ds).sum(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            ds = ds.where(lambda x: x >= 0, other=0)
                             if "indexing_time" in ds.coords: 
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
                             else:
@@ -672,34 +677,72 @@ class WAS_Download:
 
         return store_file_path
 
-
     def WAS_Download_AgroIndicators_daily(
-        self,
-        dir_to_save,
-        variables,
-        year_start,
-        year_end,
-        area,
-        force_download=False,
-    ):
+            self,
+            dir_to_save,
+            variables,
+            year_start,
+            year_end,
+            area,
+            force_download=False,
+            max_retries=3,
+            retry_delay=5,
+        ):
         """
-        Download daily agro-meteorological indicators for specified variables and years.
-    
-        Parameters:
-            dir_to_save (str): Directory to save the downloaded files.
-            variables (list): List of shorthand variables to download (e.g., ["AGRO.PRCP", "AGRO.TMAX"]).
-            year_start (int): Start year for the data to download.
-            year_end (int): End year for the data to download.
-            area (list): Bounding box as [North, West, South, East] for clipping.
-            force_download (bool): If True, forces download even if file exists.
+        Download daily agro-meteorological indicators from the Copernicus Data Store (CDS)
+        for specified variables and years, with retries for failed downloads.
+
+        Parameters
+        ----------
+        dir_to_save : str or pathlib.Path
+            Directory path where the downloaded NetCDF files will be saved.
+            The directory will be created if it does not exist.
+        variables : list of str
+            List of variable shorthand names to download. Valid options are:
+            ["AGRO.PRCP", "AGRO.TMAX", "AGRO.TEMP", "AGRO.TMIN", "AGRO.DSWR",
+            "AGRO.ETP", "AGRO.WFF", "AGRO.HUMAX", "AGRO.HUMIN"].
+            Each variable corresponds to a CDS variable and optional statistic
+            (e.g., "AGRO.PRCP" maps to "precipitation_flux").
+        year_start : int
+            Start year for the data to download (inclusive).
+        year_end : int
+            End year for the data to download (inclusive).
+        area : list of float
+            Bounding box for spatial subsetting in the format [North, West, South, East].
+            Example: [50, -10, 40, 10] for a region in Europe.
+        force_download : bool, optional
+            If True, forces download even if the output file exists. Default is False.
+        max_retries : int, optional
+            Maximum number of retry attempts for failed downloads. Default is 3.
+        retry_delay : int, optional
+            Seconds to wait between retry attempts. Default is 5.
+
+        Returns
+        -------
+        None
+            The function saves NetCDF files to `dir_to_save` but does not return a value.
+            Output files are named as `Daily_<variable>_<year_start>_<year_end>.nc`.
+
+        Notes
+        -----
+        - The function downloads data from the CDS dataset "sis-agrometeorological-indicators".
+        - Data is downloaded year-by-year as ZIP files containing NetCDF files, which are
+        extracted, concatenated, and saved as a single NetCDF file per variable.
+        - Temperature variables ("AGRO.TMIN", "AGRO.TEMP", "AGRO.TMAX") are converted
+        from Kelvin to Celsius.
+        - Solar radiation ("AGRO.DSWR") is converted from J/m^2/day to W/m^2.
+        - Coordinates are renamed to "X" (longitude), "Y" (latitude), and "T" (time),
+        with latitude flipped to ascending order.
+        - The function requires a valid CDS API key configured in `~/.cdsapirc`.
+        - Downloads are skipped for a variable if any year's data fails to download
+        after `max_retries` attempts to ensure data completeness.
         """
         dir_to_save = Path(dir_to_save)
-        os.makedirs(dir_to_save, exist_ok=True)
+        dir_to_save.mkdir(parents=True, exist_ok=True)
         days = [f"{day:02}" for day in range(1, 32)]
         months = [f"{month:02}" for month in range(1, 13)]
         version = "2_0"
-    
-        # Updated variable mapping with statistic
+
         variable_mapping = {
             "AGRO.PRCP": ("precipitation_flux", None),
             "AGRO.TMAX": ("2m_temperature", "24_hour_maximum"),
@@ -711,70 +754,100 @@ class WAS_Download:
             "AGRO.HUMAX": ("2m_relative_humidity_derived", "24_hour_maximum"),
             "AGRO.HUMIN": ("2m_relative_humidity_derived", "24_hour_minimum")
         }
-    
+
         for var in variables:
             if var not in variable_mapping:
                 print(f"Unknown variable: {var}. Skipping.")
                 continue
-    
+
             cds_variable, statistic = variable_mapping[var]
             output_path = dir_to_save / f"Daily_{var.split('.')[1]}_{year_start}_{year_end}.nc"
-    
-            if not force_download and os.path.exists(output_path):
-                print(f"{output_path} already exists. Skipping download.") 
-            else:
-                combined_datasets = []
-                for year in range(year_start, year_end + 1):
-                    zip_file_path = dir_to_save / f"Daily_{var.split('.')[1]}_{year}.zip"
-                
-                    dataset = "sis-agrometeorological-indicators"
-                    request = {
-                        "variable": cds_variable,
-                        "year": str(year),
-                        "month": months,
-                        "day": days,
-                        "version": version,
-                        "area": area,
-                    }
-    
-                    # Include the statistic parameter if specified
-                    if statistic:
-                        request["statistic"] = [statistic]
-    
+
+            if not force_download and output_path.exists():
+                print(f"{output_path} already exists. Skipping download.")
+                continue
+
+            combined_datasets = []
+            all_years_downloaded = True
+
+            for year in range(year_start, year_end + 1):
+                zip_file_path = dir_to_save / f"Daily_{var.split('.')[1]}_{year}.zip"
+                success = False
+                retries = 0
+
+                while retries < max_retries and not success:
                     try:
                         client = cdsapi.Client()
-                        print(f"Downloading {cds_variable} ({statistic}) data for {year}...")
+                        dataset = "sis-agrometeorological-indicators"
+                        request = {
+                            "variable": cds_variable,
+                            "year": str(year),
+                            "month": months,
+                            "day": days,
+                            "version": version,
+                            "area": area,
+                        }
+                        if statistic:
+                            request["statistic"] = [statistic]
+
+                        print(f"Attempt {retries + 1}/{max_retries}: Downloading {cds_variable} ({statistic}) data for {year}...")
                         client.retrieve(dataset, request).download(str(zip_file_path))
                         print(f"Downloaded: {zip_file_path}")
+                        success = True
+
                     except Exception as e:
-                        print(f"Failed to download {cds_variable} ({statistic}) data for {year}: {e}")
-                        continue
-    
-                    # Extract NetCDF files from the ZIP archive
+                        retries += 1
+                        print(f"Attempt {retries}/{max_retries} failed for {cds_variable} ({statistic}) data for {year}: {e}")
+                        if retries < max_retries:
+                            print(f"Retrying after {retry_delay} seconds...")
+                            time.sleep(retry_delay)
+                        if zip_file_path.exists():
+                            os.remove(zip_file_path)
+                            print(f"Deleted incomplete ZIP file: {zip_file_path}")
+
+                if not success:
+                    print(f"Failed to download {cds_variable} ({statistic}) data for {year} after {max_retries} attempts.")
+                    all_years_downloaded = False
+                    continue
+
+                try:
                     with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
                         for netcdf_file_name in zip_ref.namelist():
                             with zip_ref.open(netcdf_file_name) as file:
                                 ds = xr.open_dataset(io.BytesIO(file.read()))
                                 combined_datasets.append(ds)
-    
+                except Exception as e:
+                    print(f"Failed to extract/process {zip_file_path}: {e}")
+                    all_years_downloaded = False
+                    if zip_file_path.exists():
+                        os.remove(zip_file_path)
+                        print(f"Deleted ZIP file due to processing error: {zip_file_path}")
+                    continue
+
+                if zip_file_path.exists():
                     os.remove(zip_file_path)
                     print(f"Deleted ZIP file: {zip_file_path}")
-    
-                # Concatenate all daily datasets into a single file
-                if combined_datasets:
-                    combined_ds = xr.concat(combined_datasets, dim="time")
-                    # Convert temperature data from Kelvin to Celsius if needed
+
+            if combined_datasets and all_years_downloaded:
+                try:
+                    combined_ds = xr.concat(combined_datasets, dim="time").drop_vars('crs')
+
                     if var in ["AGRO.TMIN", "AGRO.TEMP", "AGRO.TMAX"]:
-                        combined_ds = combined_ds - 273.15  # Convert from Kelvin to Celsius
-                    # Convert solar radiation from J/m^2/day to W/m^2
-                    if var in "AGRO.DSWR":
-                        combined_ds = combined_ds / 86400  # Convert from J/m^2 to W/m^2
-    
-                    # Rename dimensions and save to NetCDF
+                        combined_ds = combined_ds - 273.15
+                    if var == "AGRO.DSWR":
+                        combined_ds = combined_ds / 86400
+
                     combined_ds = combined_ds.rename({"lon": "X", "lat": "Y", "time": "T"})
                     combined_ds = combined_ds.isel(Y=slice(None, None, -1))
+
                     combined_ds.to_netcdf(output_path)
-                    print(f"File downloaded and combined dataset for {var} is saved to {output_path}")
+                    combined_ds.close()
+                    print(f"Combined dataset for {var} saved to {output_path}")
+                except Exception as e:
+                    print(f"Failed to process or save combined dataset for {var}: {e}")
+            else:
+                print(f"Skipping save for {var} due to incomplete year downloads.")
+
 
     def WAS_Download_Models_Daily(
         self,
@@ -1006,7 +1079,7 @@ class WAS_Download:
                         differences = xr.concat(differences, dim="time")
                         differences['time'] = yearly_ds['time'].isel(time=slice(1,None))
                         tampon.append(differences)
-                    ds = xr.concat(tampon, dim="time")*1000
+                    ds = (xr.concat(tampon, dim="time") * 1000).where(lambda x: x >= 0, other=0)
 
                 if v in ["DSWR","DLWR","OLR"]:
                     ds['time'] = ds['time'].to_index()
@@ -1047,20 +1120,33 @@ class WAS_Download:
                     os.remove(temp_file)
                     print(f"Deleted temp file: {temp_file}")
         return store_file_path
-        
+
     def WAS_Download_AgroIndicators(
-        self,
-        dir_to_save,
-        variables,
-        year_start,
-        year_end,
-        area,
-        seas=["01", "02", "03"],  # e.g. NDJ = ["11","12","01"]
-        force_download=False,
-    ):
+            self,
+            dir_to_save,
+            variables,
+            year_start,
+            year_end,
+            area,
+            seas=["01", "02", "03"],  # e.g. NDJ = ["11","12","01"]
+            force_download=False,
+            max_retries=3,
+            retry_delay=5,
+        ):
         """
         Download agro-meteorological indicators for specified variables, years, and months,
-        handling cross-year seasons (e.g., NDJ).
+        handling cross-year seasons (e.g., NDJ) with retries for failed downloads.
+
+        Parameters:
+            dir_to_save (str): Directory to save the downloaded files.
+            variables (list): List of shorthand variables (e.g., ["AGRO.PRCP", "AGRO.TMAX"]).
+            year_start (int): Start year for the data.
+            year_end (int): End year for the data.
+            area (list): Bounding box as [North, West, South, East].
+            seas (list): List of months (e.g., ["11","12","01"] for NDJ).
+            force_download (bool): If True, forces download even if file exists.
+            max_retries (int): Maximum number of retry attempts for failed downloads (default: 3).
+            retry_delay (int): Seconds to wait between retry attempts (default: 5).
         """
         dir_to_save = Path(dir_to_save)
         dir_to_save.mkdir(parents=True, exist_ok=True)
@@ -1103,12 +1189,13 @@ class WAS_Download:
 
             # Output path for the combined dataset across all years
             output_path = dir_to_save / f"Obs_{var_short}_{year_start}_{year_end}_{season_str}.nc"
-            if (not force_download) and output_path.exists():
+            if not force_download and output_path.exists():
                 print(f"{output_path} already exists. Skipping download.")
                 continue
 
-            # We'll accumulate all partial datasets here
+            # Accumulate all partial datasets
             all_years_datasets = []
+            all_years_downloaded = True
 
             # Loop over each year in the requested range
             for year in range(year_start, year_end + 1):
@@ -1120,109 +1207,155 @@ class WAS_Download:
                 if base_months:
                     months_base = [month_str(m) for m in base_months]
                     zip_file_path = dir_to_save / f"Obs_{var_short}_{year}_{season_str}_partA.zip"
+                    success = False
+                    retries = 0
 
-                    request = {
-                        "variable": cds_variable,
-                        "year": str(year),
-                        "month": months_base,
-                        "day": days,
-                        "version": version,
-                        "area": area,
-                    }
-                    if statistic:
-                        request["statistic"] = [statistic]
+                    while retries < max_retries and not success:
+                        try:
+                            client = cdsapi.Client()
+                            request = {
+                                "variable": cds_variable,
+                                "year": str(year),
+                                "month": months_base,
+                                "day": days,
+                                "version": version,
+                                "area": area,
+                            }
+                            if statistic:
+                                request["statistic"] = [statistic]
 
-                    # Attempt download
-                    try:
-                        client = cdsapi.Client()
-                        print(f"Downloading {cds_variable} for {year} months={months_base}")
-                        client.retrieve("sis-agrometeorological-indicators", request).download(str(zip_file_path))
-                    except Exception as e:
-                        print(f"Failed to download {cds_variable} year={year} Part A: {e}")
+                            print(f"Attempt {retries + 1}/{max_retries}: Downloading {cds_variable} for {year} months={months_base}")
+                            client.retrieve("sis-agrometeorological-indicators", request).download(str(zip_file_path))
+                            success = True
+                        except Exception as e:
+                            retries += 1
+                            print(f"Attempt {retries}/{max_retries} failed for {cds_variable} year={year} Part A: {e}")
+                            if retries < max_retries:
+                                print(f"Retrying after {retry_delay} seconds...")
+                                time.sleep(retry_delay)
+                            if zip_file_path.exists():
+                                os.remove(zip_file_path)
+                                print(f"Deleted incomplete ZIP file: {zip_file_path}")
+
+                    if not success:
+                        print(f"Failed to download {cds_variable} year={year} Part A after {max_retries} attempts.")
+                        all_years_downloaded = False
                         continue
 
                     # Unzip each netCDF and append
-                    with zipfile.ZipFile(zip_file_path, 'r') as z:
-                        for nc_name in z.namelist():
-                            with z.open(nc_name) as f:
-                                ds = xr.open_dataset(io.BytesIO(f.read()))
-                                all_years_datasets.append(ds)
-                    os.remove(zip_file_path)
+                    try:
+                        with zipfile.ZipFile(zip_file_path, 'r') as z:
+                            for nc_name in z.namelist():
+                                with z.open(nc_name) as f:
+                                    ds = xr.open_dataset(io.BytesIO(f.read()))
+                                    all_years_datasets.append(ds)
+                        os.remove(zip_file_path)
+                        print(f"Deleted ZIP file: {zip_file_path}")
+                    except Exception as e:
+                        print(f"Failed to extract/process {zip_file_path}: {e}")
+                        all_years_downloaded = False
+                        if zip_file_path.exists():
+                            os.remove(zip_file_path)
+                            print(f"Deleted ZIP file due to processing error: {zip_file_path}")
+                        continue
 
                 # 2) Download part B (next-year months), if any and if we have a next year
-                if next_months and (year < year_end+1):
+                if next_months and (year < year_end + 1):
                     year_next = year + 1
                     months_next = [month_str(m) for m in next_months]
                     zip_file_path = dir_to_save / f"Obs_{var_short}_{year}_{season_str}_partB_{year_next}.zip"
+                    success = False
+                    retries = 0
 
-                    request = {
-                        "variable": cds_variable,
-                        "year": str(year_next),
-                        "month": months_next,
-                        "day": days,
-                        "version": version,
-                        "area": area,
-                    }
-                    if statistic:
-                        request["statistic"] = [statistic]
+                    while retries < max_retries and not success:
+                        try:
+                            client = cdsapi.Client()
+                            request = {
+                                "variable": cds_variable,
+                                "year": str(year_next),
+                                "month": months_next,
+                                "day": days,
+                                "version": version,
+                                "area": area,
+                            }
+                            if statistic:
+                                request["statistic"] = [statistic]
 
-                    # Attempt download
-                    try:
-                        client = cdsapi.Client()
-                        print(f"Downloading {cds_variable} for {year_next} months={months_next}")
-                        client.retrieve("sis-agrometeorological-indicators", request).download(str(zip_file_path))
-                    except Exception as e:
-                        print(f"Failed to download {cds_variable} year={year_next} Part B: {e}")
+                            print(f"Attempt {retries + 1}/{max_retries}: Downloading {cds_variable} for {year_next} months={months_next}")
+                            client.retrieve("sis-agrometeorological-indicators", request).download(str(zip_file_path))
+                            success = True
+                        except Exception as e:
+                            retries += 1
+                            print(f"Attempt {retries}/{max_retries} failed for {cds_variable} year={year_next} Part B: {e}")
+                            if retries < max_retries:
+                                print(f"Retrying after {retry_delay} seconds...")
+                                time.sleep(retry_delay)
+                            if zip_file_path.exists():
+                                os.remove(zip_file_path)
+                                print(f"Deleted incomplete ZIP file: {zip_file_path}")
+
+                    if not success:
+                        print(f"Failed to download {cds_variable} year={year_next} Part B after {max_retries} attempts.")
+                        all_years_downloaded = False
                         continue
 
                     # Unzip each netCDF and append
-                    with zipfile.ZipFile(zip_file_path, 'r') as z:
-                        for nc_name in z.namelist():
-                            with z.open(nc_name) as f:
-                                ds = xr.open_dataset(io.BytesIO(f.read()))
-                                all_years_datasets.append(ds)
-                    os.remove(zip_file_path)
+                    try:
+                        with zipfile.ZipFile(zip_file_path, 'r') as z:
+                            for nc_name in z.namelist():
+                                with z.open(nc_name) as f:
+                                    ds = xr.open_dataset(io.BytesIO(f.read()))
+                                    all_years_datasets.append(ds)
+                        os.remove(zip_file_path)
+                        print(f"Deleted ZIP file: {zip_file_path}")
+                    except Exception as e:
+                        print(f"Failed to extract/process {zip_file_path}: {e}")
+                        all_years_downloaded = False
+                        if zip_file_path.exists():
+                            os.remove(zip_file_path)
+                            print(f"Deleted ZIP file due to processing error: {zip_file_path}")
+                        continue
 
-            # -----------------------------------------
             # Post-process & combine all partial years
-            # -----------------------------------------
+            if all_years_datasets and all_years_downloaded:
+                try:
+                    combined_ds = xr.concat(all_years_datasets, dim="time").drop_vars('crs')
 
-            if all_years_datasets:
-                combined_ds = xr.concat(all_years_datasets, dim="time")
-                # If it's temperature, subtract 273.15 (Kelvin → Celsius)
-                if var in ["AGRO.TMIN", "AGRO.TEMP", "AGRO.TMAX"]:
-                    combined_ds = combined_ds - 273.15
+                    # Unit conversions
+                    if var in ["AGRO.TMIN", "AGRO.TEMP", "AGRO.TMAX"]:
+                        combined_ds = combined_ds - 273.15  # Kelvin to Celsius
 
-                # If it's solar radiation, convert from J/m^2/day to W/m^2
-                if var == "AGRO.DSWR":
-                    combined_ds = combined_ds / 86400  # 1 J/day = 86400 s = 1 W/s
-    
-                # Now do custom aggregator for NDJ or any cross-year months
-                combined_ds = self._aggregate_crossyear(
-                    ds=combined_ds,
-                    season_months=season_months,
-                    var_name=var
-                )
-    
-                # Finally rename dims
-                # (the aggregator function has already replaced 'time' with our 'season_year')
-                if "lon" in combined_ds.dims:
-                    combined_ds = combined_ds.rename({"lon": "X"})
-                if "lat" in combined_ds.dims:
-                    combined_ds = combined_ds.rename({"lat": "Y"})
-                # Flip lat 
-                combined_ds = combined_ds.isel(Y=slice(None, None, -1))
-                
-                combined_ds["time"] = [f"{year}-{seas[1]}-01" for year in combined_ds["time"].astype(str).values]
-                combined_ds["time"] = combined_ds["time"].astype("datetime64[ns]")
-                combined_ds = combined_ds.rename({"time": "T"}) 
-                
-                combined_ds.to_netcdf(output_path)
-                print(f"Saved final dataset for {var} to: {output_path}")
+                    # Aggregate for cross-year seasons
+                    combined_ds = self._aggregate_crossyear(
+                        ds=combined_ds,
+                        season_months=season_months,
+                        var_name=var
+                    )
+
+                    if var == "AGRO.DSWR":
+                        combined_ds = combined_ds / 86400  # J/m^2/day to W/m^2
+
+                    # Rename dimensions
+                    if "lon" in combined_ds.dims:
+                        combined_ds = combined_ds.rename({"lon": "X"})
+                    if "lat" in combined_ds.dims:
+                        combined_ds = combined_ds.rename({"lat": "Y"})
+                    combined_ds = combined_ds.isel(Y=slice(None, None, -1))
+
+                    # Adjust time coordinate
+                    combined_ds["time"] = [f"{year}-{seas[1]}-01" for year in combined_ds["time"].astype(str).values]
+                    combined_ds["time"] = combined_ds["time"].astype("datetime64[ns]")
+                    combined_ds = combined_ds.rename({"time": "T"})
+
+                    # Save to NetCDF
+                    combined_ds.to_netcdf(output_path)
+                    combined_ds.close()
+                    print(f"Saved final dataset for {var} to: {output_path}")
+                except Exception as e:
+                    print(f"Failed to process or save combined dataset for {var}: {e}")
             else:
                 print(f"No data downloaded for {var} in {season_str}.")
-    
-
+   
     # -------------------------------------------------------------------------
     # Helper for Reanalysis cross-year post-processing (optional)
     # -------------------------------------------------------------------------
@@ -1567,12 +1700,13 @@ class WAS_Download:
             else:
                 print(f"No data found for {c}/{v}.")
 
-    def WAS_Download_CHIRPSv3(
+    def WAS_Download_CHIRPSv3_Seasonal(
         self,
         dir_to_save,
         variables,
         year_start,
         year_end,
+        region="africa",
         area=None,
         season_months=["03", "04", "05"],
         force_download=False        
@@ -1581,6 +1715,17 @@ class WAS_Download:
         Download CHIRPS v3.0 monthly precipitation for a specified cross-year season
         from year_start to year_end, optionally clipped to 'area',
         and aggregate them into a single NetCDF file.
+        Parameters:
+            dir_to_save (str): Directory to save the downloaded files.
+            variables (list): List of variables to download (e.g., ["PRCP"]).
+            year_start (int): Start year for the data.
+            year_end (int): End year for the data.
+            region (str): CHIRPS region (default: "africa").
+            area (list): Bounding box as [North, West, South, East] (optional).
+            season_months (list): List of months as strings (e.g., ["03", "04", "05"]).
+            force_download (bool): If True, forces download even if file exists.
+        Returns:
+            None: Saves the aggregated seasonal data to a NetCDF file.  
         """
         dir_to_save = Path(dir_to_save)
         dir_to_save.mkdir(parents=True, exist_ok=True)
@@ -1611,6 +1756,7 @@ class WAS_Download:
                     year=year,
                     month=m,
                     dir_to_save=dir_to_save,
+                    region=region,
                     force_download=force_download,
                     area=area
                 )
@@ -1625,6 +1771,7 @@ class WAS_Download:
                         year=year_next,
                         month=m,
                         dir_to_save=dir_to_save,
+                        region=region,
                         force_download=force_download,
                         area=area
                     )
@@ -1661,14 +1808,14 @@ class WAS_Download:
 
 
 
-    def _fetch_chirps_monthly(self, year, month, dir_to_save, force_download, area):
+    def _fetch_chirps_monthly(self, year, month, dir_to_save, region, force_download, area):
         """
         Construct the CHIRPS v3.0 monthly TIF URL for (year, month), 
         download if needed, open as xarray, and optionally clip to 'area'.
         
         File format is: chirps-v3.0.YYYY.MM.tif
         """
-        base_url = "https://data.chc.ucsb.edu/products/CHIRPS/v3.0/monthly/africa/tifs"
+        base_url = f"https://data.chc.ucsb.edu/products/CHIRPS/v3.0/monthly/{region}/tifs"
         fname = f"chirps-v3.0.{year}.{month:02d}.tif"
         url = f"{base_url}/{fname}"
 
@@ -1743,8 +1890,401 @@ class WAS_Download:
 
         return ds_out
 
+    def WAS_Download_TAMSATv31_Seasonal(
+        self,
+        dir_to_save: Union[str, Path],
+        variables: Sequence[str] = ("rfe",),
+        year_start: int = 1983,
+        year_end: int = 2025,
+        area: Optional[List[float]] = None,
+        season_months: Sequence[str] = ("03", "04", "05"),
+        force_download: bool = False,
+    ) -> Path:
+        """Download and aggregate TAMSAT RFE v3.1 monthly rainfall data for a specified season.
+
+        This method retrieves monthly rainfall estimate (RFE) data from the TAMSAT v3.1 dataset,
+        optionally clips to a spatial bounding box, and aggregates the data into seasonal totals.
+        The data is sourced from the JASMIN GWS access point and saved as a NetCDF file.
+
+        Args:
+            dir_to_save (Union[str, Path]): Directory to save downloaded and processed files.
+            variables (Sequence[str], optional): NetCDF variable names to extract. Defaults to ("rfe",).
+            year_start (int, optional): First year of the season (year of the pivot month). Defaults to 1983.
+            year_end (int, optional): Last year of the season (inclusive). Defaults to 2025.
+            area (Optional[List[float]], optional): Bounding box [north, west, south, east] in degrees.
+                If None, the full spatial domain is retained. Defaults to None.
+            season_months (Sequence[str], optional): Months defining the season, e.g., ("11", "12", "01") for NDJ.
+                Defaults to ("03", "04", "05").
+            force_download (bool, optional): If True, re-download files even if they exist locally.
+                Defaults to False.
+
+        Returns:
+            Path: Path to the aggregated seasonal NetCDF file.
+
+        Raises:
+            RuntimeError: If no valid TAMSAT data is retrieved during the download process.
+            ValueError: If input parameters (e.g., years, months, or area) are invalid.
+
+        Examples:
+            >>> downloader = WAS_Download()
+            >>> path = downloader.WAS_Download_TAMSATv31_Seasonal(
+            ...     dir_to_save="data",
+            ...     year_start=2020,
+            ...     year_end=2021,
+            ...     season_months=("12", "01", "02"),
+            ...     area=[20, -20, -20, 20]
+            ... )
+            [INFO] Saved seasonal TAMSAT data → data/Obs_TAMSAT_2020_2021_DecJanFeb.nc
+        """
+        # Normalize and validate inputs
+        dir_to_save = Path(dir_to_save)
+        dir_to_save.mkdir(parents=True, exist_ok=True)
+
+        if year_start < 1983 or year_end > 2025 or year_start > year_end:
+            raise ValueError("Year range must be between 1983 and 2025, with year_start <= year_end.")
+
+        area_tuple: Optional[Tuple[float, float, float, float]] = (
+            tuple(map(float, area)) if area else None
+        )
+        season_months_int: List[int] = [int(m) for m in season_months]
+        if not all(1 <= m <= 12 for m in season_months_int):
+            raise ValueError("Season months must be valid month numbers (1-12).")
+
+        season_str = "".join(calendar.month_abbr[m] for m in season_months_int)
+        pivot = season_months_int[0]
+
+        # Define output file
+        out_nc = dir_to_save / f"Obs_TAMSAT_{year_start}_{year_end}_{season_str}.nc"
+        if out_nc.exists() and not force_download:
+            print(f"[INFO] {out_nc} already exists – skip download.")
+            return out_nc
+
+        # Gather monthly DataArrays
+        da_list: List[xr.DataArray] = []
+        for season_year in range(year_start, year_end + 1):
+            # Part A: Base-year months (>= pivot)
+            for m in (m for m in season_months_int if m >= pivot):
+                da = self._fetch_tamsat_monthly(
+                    year=season_year,
+                    month=m,
+                    dir_to_save=dir_to_save,
+                    force_download=force_download,
+                    area=area_tuple,
+                    keep_vars=variables,
+                )
+                if da is not None:
+                    da_list.append(da)
+
+            # Part B: Next-year months (< pivot)
+            if any(m < pivot for m in season_months_int) and season_year < year_end:
+                next_year = season_year + 1
+                for m in (m for m in season_months_int if m < pivot):
+                    da = self._fetch_tamsat_monthly(
+                        year=next_year,
+                        month=m,
+                        dir_to_save=dir_to_save,
+                        force_download=force_download,
+                        area=area_tuple,
+                        keep_vars=variables,
+                    )
+                    if da is not None:
+                        da_list.append(da)
+
+        if not da_list:
+            raise RuntimeError("No TAMSAT files were downloaded or opened.")
+
+        # Aggregate and save
+        ds_all = xr.concat(da_list, dim="time").to_dataset(name="precip")
+        ds_season = self._aggregate_chirps(ds_all, season_months_int)
+        ds_season = ds_season.rename({"lon": "X", "lat": "Y", "time": "T"}, errors="ignore")
+        ds_season.to_netcdf(out_nc)
+        print(f"[INFO] Saved seasonal TAMSAT data → {out_nc}")
+
+        return out_nc
+
+    def _fetch_tamsat_monthly(
+        self,
+        year: int,
+        month: int,
+        dir_to_save: Path,
+        force_download: bool,
+        area: Optional[Tuple[float, float, float, float]],
+        keep_vars: Sequence[str],
+    ) -> Optional[xr.DataArray]:
+        """Download and process a single TAMSAT v3.1 monthly NetCDF file.
+
+        This helper method retrieves a monthly NetCDF file, extracts the specified variable,
+        optionally clips to a spatial bounding box, and returns the data as an xarray DataArray.
+
+        Args:
+            year (int): Year of the data to download.
+            month (int): Month of the data to download (1-12).
+            dir_to_save (Path): Directory to save the downloaded file.
+            force_download (bool): If True, re-download the file even if it exists locally.
+            area (Optional[Tuple[float, float, float, float]]): Bounding box [north, west, south, east].
+                If None, no spatial filtering is applied.
+            keep_vars (Sequence[str]): NetCDF variable names to retain.
+
+        Returns:
+            Optional[xr.DataArray]: DataArray containing the monthly data with the variable named "precip",
+                or None if the download or file opening fails.
+        """
+        base = (
+            "https://gws-access.jasmin.ac.uk/public/tamsat/rfe/data/v3.1/"
+            "monthly/{year}/{month:02d}/rfe{year}_{month:02d}.v3.1.nc"
+        )
+        url = base.format(year=year, month=month)
+        fname = dir_to_save / url.split("/")[-1]
+
+        # Download if needed
+        if not fname.exists() or force_download:
+            try:
+                print(f"[DL ] {url}")
+                with requests.get(url, stream=True, timeout=120) as r:
+                    r.raise_for_status()
+                    with open(fname, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+            except Exception as exc:
+                print(f"[ERR] Download failed: {exc}")
+                return None
+        else:
+            print(f"[SKP] {fname.name} already present.")
+
+        # Open with xarray
+        try:
+            ds = xr.open_dataset(fname)
+            var = next(v for v in keep_vars if v in ds.data_vars)
+            da = ds[var].assign_coords(time=[pd.to_datetime(f"{year}-{month:02d}-01")]).astype("float32")
+
+            if area:
+                n, w, s, e = area
+                da = da.where(
+                    (da["lat"] <= n) & (da["lat"] >= s) & (da["lon"] >= w) & (da["lon"] <= e),
+                    drop=True,
+                )
+
+            da.name = "precip"
+            return da
+        except Exception as exc:
+            print(f"[ERR] Failed to open dataset: {exc}")
+            return None
 
 ####
+    def WAS_Download_TAMSATv31_daily(
+        self,
+        dir_to_save: Union[str, Path],
+        variables: Sequence[str] = ("rfe",),
+        year_start: int = 1983,
+        year_end: int = 2025,
+        area: Optional[List[float]] = None,
+        season_months: Sequence[str] = ("03", "04", "05"),
+        days: Optional[List[int]] = None,
+        force_download: bool = False,
+        aggregate: bool = True,
+    ) -> Optional[Path]:
+        """Download and process daily TAMSAT RFE v3.1 files for a specified season across multiple years.
+
+        This method retrieves daily rainfall estimate (RFE) data from the TAMSAT v3.1 dataset,
+        optionally filters by spatial area and specific days, and aggregates the data into
+        seasonal totals if requested. The data is sourced from the JASMIN GWS access point.
+
+        Args:
+            dir_to_save (Union[str, Path]): Directory to save downloaded and processed files.
+            variables (Sequence[str], optional): NetCDF variable names to extract. Defaults to ("rfe",).
+            year_start (int, optional): First year of the season (year of the pivot month). Defaults to 1983.
+            year_end (int, optional): Last year of the season (inclusive). Defaults to 2025.
+            area (Optional[List[float]], optional): Bounding box [north, west, south, east] in degrees.
+                If None, the full spatial domain is retained. Defaults to None.
+            season_months (Sequence[str], optional): Months defining the season, e.g., ("11", "12", "01") for NDJ.
+                Defaults to ("03", "04", "05").
+            days (Optional[List[int]], optional): Specific days of the month to download (1-based).
+                If None, all days in the season months are included. Defaults to None.
+            force_download (bool, optional): If True, re-download files even if they exist locally.
+                Defaults to False.
+            aggregate (bool, optional): If True, sum daily rainfall over each season and save as a single NetCDF file.
+                If False, retain individual daily files. Defaults to True.
+
+        Returns:
+            Optional[Path]: Path to the aggregated seasonal NetCDF file if `aggregate` is True,
+                otherwise None if `aggregate` is False or no data is retrieved.
+
+        Raises:
+            RuntimeError: If no valid TAMSAT data is retrieved during the download process.
+            ValueError: If input parameters (e.g., years, months, or area) are invalid.
+
+        Examples:
+            >>> downloader = WAS_Download()
+            >>> path = downloader.WAS_Download_TAMSATv31_daily(
+            ...     dir_to_save="data",
+            ...     year_start=2020,
+            ...     year_end=2021,
+            ...     season_months=("12", "01", "02"),
+            ...     area=[20, -20, -20, 20],
+            ...     days=[1, 15]
+            ... )
+            [INFO] Saved seasonal-total daily TAMSAT → data/Obs_TAMSAT_daily_2020_2021_DecJanFeb.nc
+        """
+        # Normalize inputs
+        dir_to_save = Path(dir_to_save)
+        dir_to_save.mkdir(parents=True, exist_ok=True)
+
+        if year_start < 1983 or year_end > 2025 or year_start > year_end:
+            raise ValueError("Year range must be between 1983 and 2025, with year_start <= year_end.")
+
+        area_tuple: Optional[Tuple[float, float, float, float]] = (
+            tuple(map(float, area)) if area else None
+        )
+        months_int: List[int] = [int(m) for m in season_months]
+        if not all(1 <= m <= 12 for m in months_int):
+            raise ValueError("Season months must be valid month numbers (1-12).")
+
+        months_abbr = "".join(calendar.month_abbr[m] for m in months_int)
+        pivot = months_int[0]
+        day_set: Optional[List[int]] = sorted({int(d) for d in days}) if days else None
+
+        # Define output file for aggregation
+        out_nc = dir_to_save / f"Obs_TAMSAT_daily_{year_start}_{year_end}_{months_abbr}.nc"
+        if aggregate and out_nc.exists() and not force_download:
+            print(f"[INFO] {out_nc} already exists – skipping download.")
+            return out_nc
+
+        # Download data for each season
+        da_all: List[xr.DataArray] = []
+        for season_year in range(year_start, year_end + 1):
+            # Part A: Months in the base season year
+            for mm in (m for m in months_int if m >= pivot):
+                da_all.extend(
+                    self._fetch_tamsat_daily_month(
+                        year=season_year,
+                        month=mm,
+                        dir_to_save=dir_to_save,
+                        keep_vars=variables,
+                        area=area_tuple,
+                        days=day_set,
+                        force_download=force_download,
+                    )
+                )
+
+            # Part B: Spill-over months in the next calendar year
+            if any(m < pivot for m in months_int) and season_year < year_end:
+                next_year = season_year + 1
+                for mm in (m for m in months_int if m < pivot):
+                    da_all.extend(
+                        self._fetch_tamsat_daily_month(
+                            year=next_year,
+                            month=mm,
+                            dir_to_save=dir_to_save,
+                            keep_vars=variables,
+                            area=area_tuple,
+                            days=day_set,
+                            force_download=force_download,
+                        )
+                    )
+
+        if not da_all:
+            raise RuntimeError("No daily TAMSAT data were retrieved.")
+
+        # Handle aggregation or return
+        if not aggregate:
+            print("[INFO] Daily files downloaded – aggregation disabled.")
+            return None
+
+        # Aggregate and save
+        ds_all = xr.concat(da_all, dim="time").to_dataset(name="precip")
+        ds_season = self._aggregate_chirps(ds_all, months_int)
+        ds_season = ds_season.rename({"lon": "X", "lat": "Y", "time": "T"}, errors="ignore")
+        ds_season.to_netcdf(out_nc)
+        print(f"[INFO] Saved seasonal-total daily TAMSAT → {out_nc}")
+
+        # Clean up daily files
+        for f in dir_to_save.glob("rfe*.v3.1.nc"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+        return out_nc
+
+    def _fetch_tamsat_daily_month(
+        self,
+        year: int,
+        month: int,
+        dir_to_save: Path,
+        keep_vars: Sequence[str],
+        area: Optional[Tuple[float, float, float, float]],
+        days: Optional[List[int]],
+        force_download: bool,
+    ) -> List[xr.DataArray]:
+        """Download and process daily TAMSAT v3.1 files for a single month.
+
+        This helper method retrieves daily NetCDF files for a specified month, filters
+        by requested variables, spatial area, and days, and returns the data as a list
+        of xarray DataArrays.
+
+        Args:
+            year (int): Year of the data to download.
+            month (int): Month of the data to download (1-12).
+            dir_to_save (Path): Directory to save downloaded files.
+            keep_vars (Sequence[str]): NetCDF variable names to retain.
+            area (Optional[Tuple[float, float, float, float]]): Bounding box [north, west, south, east].
+                If None, no spatial filtering is applied.
+            days (Optional[List[int]]): Specific days to download (1-based).
+                If None, all days in the month are included.
+            force_download (bool): If True, re-download files even if they exist locally.
+
+        Returns:
+            List[xr.DataArray]: List of DataArrays containing the downloaded and processed daily data.
+                Each DataArray represents one day's data, with the variable named "precip".
+
+        """
+        da_month: List[xr.DataArray] = []
+        last_day = calendar.monthrange(year, month)[1]
+        day_iter = [d for d in (days or range(1, last_day + 1)) if 1 <= d <= last_day]
+
+        for day in day_iter:
+            url = (
+                "https://gws-access.jasmin.ac.uk/public/tamsat/rfe/data/v3.1/"
+                f"daily/{year}/{month:02d}/rfe{year}_{month:02d}_{day:02d}.v3.1.nc"
+            )
+            fname = dir_to_save / url.split("/")[-1]
+
+            if not fname.exists() or force_download:
+                try:
+                    with requests.get(url, stream=True, timeout=120) as r:
+                        if r.status_code == 404:
+                            continue
+                        r.raise_for_status()
+                        with open(fname, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                except Exception:
+                    continue
+
+            try:
+                ds = xr.open_dataset(fname)
+                var = next(v for v in keep_vars if v in ds.data_vars)
+                da = ds[var]
+                time_val = pd.to_datetime(f"{year}-{month:02d}-{day:02d}")
+                da = da.assign_coords(time=[time_val]) if "time" in da.coords else da.expand_dims(time=[time_val])
+
+                if area:
+                    n, w, s, e = area
+                    da = da.where(
+                        (da["lat"] <= n) & (da["lat"] >= s) & (da["lon"] >= w) & (da["lon"] <= e),
+                        drop=True,
+                    )
+
+                da.name = "precip"
+                da_month.append(da)
+            except Exception:
+                continue
+
+        return da_month
+
+
+
+#####
 
 def plot_map(extent, title="Map"): # [west, east, south, north]
     """
