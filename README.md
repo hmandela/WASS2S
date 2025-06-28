@@ -84,9 +84,21 @@ If you want to upgrade wass2s to a newer version, use the following command:
 pip install --upgrade wass2s
 ```
 
+### Potential Issues
+If you encounter matplotlib errors, try the following steps:
+1.  Install the latest version of matplotlib:
+    ```bash
+    pip install matplotlib==3.7.3
+    ```
+2.  Install the latest version of cartopy:
+    ```bash
+    conda install -c conda-forge -c hallkjc01 xcast
+    ```
+If you encounter other issues during installation or usage, please refer to the [Troubleshooting Guide](https://github.com/hmandela/WASS2S/blob/main/TROUBLESHOOTING.md).
+
 ## ⚙️ Usage
 
-Comprehensive usage guidelines, including data preparation, model configuration, and execution steps, are available in the [WAS_S2S Training Documentation](https://hmandela.github.io/WAS_S2S_Training/).
+Comprehensive usage guidelines, including data preparation, model configuration, and execution steps, are available in the [WAS_S2S Training Documentation](https://wass2s-readthedocs.readthedocs.io/en/latest/index.html), [WAS_S2S Training Documentation](https://hmandela.github.io/WAS_S2S_Training/).
 
 ## 🤝 Contributing
 
