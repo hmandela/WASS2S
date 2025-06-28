@@ -28,6 +28,7 @@ from tqdm import tqdm
 from wass2s.utils import *
 import rioxarray as rioxr
 import datetime as dt
+import time
 from typing import List, Tuple, Sequence, Optional
 
 
@@ -674,7 +675,7 @@ class WAS_Download:
                         store_file_path[f"{cent}_{syst}"] = file_path
                     except Exception as e:
                         print(f"Failed to download data for {k}: {e}")
-
+            time.sleep(10)  # Sleep to avoid overwhelming the server
         return store_file_path
 
     def WAS_Download_AgroIndicators_daily(
