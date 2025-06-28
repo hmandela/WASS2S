@@ -28,7 +28,7 @@ from tqdm import tqdm
 from wass2s.utils import *
 import rioxarray as rioxr
 import datetime as dt
-import time
+import time as _time
 from typing import List, Tuple, Sequence, Optional
 
 
@@ -1119,8 +1119,8 @@ class WAS_Download:
                 if temp_file.exists():
                     os.remove(temp_file)
                     print(f"Deleted temp file: {temp_file}")
-                    
-            time.sleep(10)  # Sleep to avoid overwhelming the server
+
+            _time.sleep(10)  # Sleep to avoid overwhelming the server
         return store_file_path
 
     def WAS_Download_AgroIndicators(
