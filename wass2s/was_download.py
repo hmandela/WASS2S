@@ -675,7 +675,6 @@ class WAS_Download:
                         store_file_path[f"{cent}_{syst}"] = file_path
                     except Exception as e:
                         print(f"Failed to download data for {k}: {e}")
-            time.sleep(10)  # Sleep to avoid overwhelming the server
         return store_file_path
 
     def WAS_Download_AgroIndicators_daily(
@@ -1120,6 +1119,8 @@ class WAS_Download:
                 if temp_file.exists():
                     os.remove(temp_file)
                     print(f"Deleted temp file: {temp_file}")
+                    
+            time.sleep(10)  # Sleep to avoid overwhelming the server
         return store_file_path
 
     def WAS_Download_AgroIndicators(

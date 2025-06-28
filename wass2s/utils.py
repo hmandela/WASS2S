@@ -1625,8 +1625,8 @@ fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization,
     x_coords = obs_fcst_year.X
 
     if calendar.isleap(year_forecast):
-        dayofyear = obs_hdcst['T'].dt.dayofyear
-        daily_climatology = da.groupby(dayofyear).mean(dim='T')
+        # dayofyear = obs_hdcst['T'].dt.dayofyear
+        daily_climatology = obs_hdcst.groupby('T.dayofyear').mean(dim='T')
         data = daily_climatology.to_numpy()
         dummy = xr.DataArray(
             data=data,
@@ -1634,8 +1634,9 @@ fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization,
             dims=["T", "Y", "X"]
         ) * mask
     else:
-        da_noleap = obs_hdcst.sel(T=~((obs_hdcst['T'].dt.month == 2) & (obs_hdcst['T'].dt.day == 29)))
-        daily_climatology = da_noleap.groupby('T.dayofyear').mean(dim='T')
+        # da_noleap = obs_hdcst.sel(T=~((obs_hdcst['T'].dt.month == 2) & (obs_hdcst['T'].dt.day == 29)))
+        daily_climatology = obs_hdcst.groupby('T.dayofyear').mean(dim='T')
+        daily_climatology = daily_climatology.sel(dayofyear=~((daily_climatology['dayofyear'] == 60)))
         data = daily_climatology.to_numpy()
         dummy = xr.DataArray(
             data=data,
