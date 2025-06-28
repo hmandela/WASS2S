@@ -86,7 +86,7 @@ pip install --upgrade wass2s
 
 ### Potential Issues
 If you encounter matplotlib errors, try the following steps:
-1.  Install the latest version of matplotlib:
+1.  Install this version of matplotlib:
     ```bash
     pip install matplotlib==3.7.3
     ```
@@ -98,7 +98,7 @@ If you encounter other issues during installation or usage, please refer to the 
 
 ## ⚙️ Usage
 
-Comprehensive usage guidelines, including data preparation, model configuration, and execution steps, are available in the [WAS_S2S Training Documentation](https://wass2s-readthedocs.readthedocs.io/en/latest/index.html), [WAS_S2S Training Documentation](https://hmandela.github.io/WAS_S2S_Training/).
+Comprehensive usage guidelines, including data preparation, model configuration, and execution steps, are available in the [wass2s documentation](https://wass2s-readthedocs.readthedocs.io/en/latest/index.html), [wass2S Training Documentation](https://hmandela.github.io/WAS_S2S_Training/).
 
 ## 🤝 Contributing
 
