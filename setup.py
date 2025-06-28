@@ -3,7 +3,7 @@ import os
 
 setup(
     name="wass2s",
-    version="0.1.12",
+    version="0.1.13",
     author="HOUNGNIBO C. M. Mandela",
     author_email="hmandelahmadiba@gmail.com",
     description="A Python package for seasonal climate forecast.",
@@ -30,7 +30,6 @@ setup(
         "fitter",
         "seaborn",
         "cdsapi==0.7.4",
-        "somoclu==1.7.6",
         "h5netcdf>=1.2.0",
         "lightgbm",
         "pymc",
