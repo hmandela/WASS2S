@@ -14,7 +14,7 @@ import xarray as xr
 from datetime import timedelta
 from datetime import date
 from datetime import datetime
-import os
+import gc
 from dask.diagnostics import ProgressBar
 import cdsapi
 import netCDF4
@@ -800,7 +800,7 @@ class WAS_Download:
                         print(f"Attempt {retries}/{max_retries} failed for {cds_variable} ({statistic}) data for {year}: {e}")
                         if retries < max_retries:
                             print(f"Retrying after {retry_delay} seconds...")
-                            time.sleep(retry_delay)
+                            _time.sleep(retry_delay)
                         if zip_file_path.exists():
                             os.remove(zip_file_path)
                             print(f"Deleted incomplete ZIP file: {zip_file_path}")
@@ -960,13 +960,13 @@ class WAS_Download:
 
         ### Particularity for day of initialization NCEP and JMA
         init_day_dict_jma = {
-            "01":"16", "02":"10", "03":"12", "04":"11", "05":"16", "06":"15",
-            "07":"15", "08":"14", "09":"13", "10":"13", "11":"12", "12":"12"
+            "01":16, "02":10, "03":12, "04":11, "05":16, "06":15,
+            "07":15, "08":14, "09":13, "10":13, "11":12, "12":12
         }
 
         init_day_dict_ncep = {
-            "01":"01", "02":"05", "03":"02", "04":"01", "05":"01", "06":"05",
-            "07":"05", "08":"04", "09":"03", "10":"03", "11":"02", "12":"02"
+            "01":1, "02":5, "03":2, "04":1, "05":1, "06":5,
+            "07":5, "08":4, "09":3, "10":3, "11":2, "12":2
         }
         
     
@@ -974,6 +974,7 @@ class WAS_Download:
         dir_to_save = Path(dir_to_save)
         dir_to_save.mkdir(parents=True, exist_ok=True)
         store_file_path = {}
+        client = cdsapi.Client()        
         # 4. Loop over each center-variable combination
         for cv in center_variable:
             # Example: "ECMWF_51.PRCP"
@@ -983,13 +984,13 @@ class WAS_Download:
             # Map to the Copernicus naming
             cent = centre[c]
             syst = system[c]
-            if v in variables_1:
-                var_cds = variables_1[v]
-            elif v in variables_2:
-                var_cds = variables_2[v]
-            else:
-                print(f"Unknown variable code: {v}, skipping.")
-                continue
+            # if v in variables_1:
+            #     var_cds = variables_1[v]
+            # elif v in variables_2:
+            #     var_cds = variables_2[v]
+            # else:
+            #     print(f"Unknown variable code: {v}, skipping.")
+            #     continue
     
             # Build a single output path
             abb_mont_ini = month_abbr[int(month_of_initialization)]
@@ -1006,121 +1007,136 @@ class WAS_Download:
             if not force_download and output_file.exists():
                 print(f"{output_file} already exists. Skipping download.")
                 store_file_path[f"{cent}{syst}"] = output_file
-                continue
+            
+            else:
 
-            if cent == "jma" and year_forecast is None:
-                day_of_initialization = init_day_dict_jma[month_of_initialization]
-            if cent == "ncep" and year_forecast is None:
-                day_of_initialization = init_day_dict_ncep[month_of_initialization]
+                if cent == "jma" and year_forecast is None:
+                    day_of_initialization = init_day_dict_jma[month_of_initialization]
+                if cent == "ncep" and year_forecast is None:
+                    day_of_initialization = init_day_dict_ncep[month_of_initialization]
+
+                try:
+                    # Temporary file to download
+                    temp_file = dir_to_save / f"temp_{cent}{syst}_{v}.nc"
+
+                    if v in variables_2:
+                        press_level = v.split("_")[1]        
+                        # 5. Prepare the request for 'seasonal-original-pressure-levels'
+                        dataset = "seasonal-original-pressure-levels"
+                        request = {
+                            "originating_centre": cent,
+                            "system": syst,
+                            "variable": [variables_2[v]],
+                            "pressure_level": press_level,
+                            "year": years,  # list of strings
+                            "month": [f"{int(month_of_initialization):02}"],
+                            "day":   [f"{int(day_of_initialization):02}"],
+                            "leadtime_hour": leadtime_hour,  # e.g. ["24","48",..., "5160"]
+                            "data_format": "netcdf",
+                            "area": area,   # e.g. [90, -180, -90, 180]
+                        }
+                    else:
+                        dataset = "seasonal-original-single-levels"
+                        request = {
+                            "originating_centre": cent,
+                            "system": syst,
+                            "variable": [variables_1[v]],
+                            "year": years,  # list of strings
+                            "month": [f"{int(month_of_initialization):02}"],
+                            "day":   [f"{int(day_of_initialization):02}"],
+                            "leadtime_hour": leadtime_hour,  # e.g. ["24","48",..., "5160"]
+                            "data_format": "netcdf",
+                            "area": area,   # e.g. [90, -180, -90, 180]                    
+                        }
+                    # print(request, temp_file, dataset, cent, syst, [variables_1[v]], v, years, month_of_initialization, day_of_initialization, leadtime_hour, area)    
+                    # 6. Download from CDS
+                    print(f"Requesting data from '{dataset}' for {cv}...")
+                    client.retrieve(dataset, request).download(str(temp_file))
+                    print(f"Downloaded: {temp_file}")
+
+                    # 7. Post-process with xarray
+                    ##########################################################
+                    # Take in account level pressure for some variables in this part
+                    ##########################################################
                     
-            # 5. Prepare the request for 'seasonal-original-single-levels'
-            dataset = "seasonal-original-single-levels"
-            request = {
-                "originating_centre": cent,
-                "system": syst,
-                "variable": [var_cds],
-                "year": years,  # list of strings
-                "month": [f"{int(month_of_initialization):02}"],
-                "day":   [f"{int(day_of_initialization):02}"],
-                "leadtime_hour": leadtime_hour,  # e.g. ["24","48",..., "5160"]
-                "data_format": "netcdf",
-                "area": area,   # e.g. [90, -180, -90, 180]
-            }
-    
-            # Temporary file to download
-            temp_file = dir_to_save / f"temp_{cent}{syst}_{v}.nc"
-    
-            # 6. Download from CDS
-            client = cdsapi.Client()
-            try:
-                print(f"Requesting data from '{dataset}' for {cv}...")
-                client.retrieve(dataset, request).download(str(temp_file))
-                print(f"Downloaded: {temp_file}")
-            except Exception as e:
-                print(f"Failed to download data for {cv}: {e}")
-                continue
-    
-            # 7. Post-process with xarray
-            try:
-                ##########################################################
-                # Take in account level pressure for some variables in this part
-                ##########################################################
-                 
-                ds = xr.open_dataset(temp_file)
-                time = (ds['forecast_reference_time'] + ds['forecast_period']).data
-                ds = ds.assign_coords(time=(('forecast_reference_time', 'forecast_period'), time))
-                ds = ds.stack(time=('forecast_reference_time', 'forecast_period'))
-                ds = ds.drop_vars(['forecast_reference_time', 'forecast_period'])
-                ds = ds.rename({"valid_time":"time"})
-    
-                # If there's an ensemble dimension, apply ensemble mean/median if requested
-                if ensemble_mean in ["mean", "median"] and "number" in ds.dims:
-                    ds = getattr(ds, ensemble_mean)(dim="number")
-    
-                # Flip latitude
-                if "latitude" in ds.coords:
-                    ds = ds.isel(latitude=slice(None, None, -1))
-
-                if v in ["TMIN","TEMP","TMAX","SST"]:
-                    ds = ds - 273.15
-                if v =="SLP":
-                    ds = ds / 100
-                if v =="PRCP":
-                    ds['time'] = ds['time'].to_index()
-                    years = ds['time'].dt.year
-                    tampon = []
-                    for year in np.unique(years):
-                        
-                        # Select the data for the specific year
-                        yearly_ds = ds.sel(time=ds['time'].dt.year == year)
-                        
-                        # Calculate differences for the year
-                        differences = [yearly_ds.isel(time=i) - yearly_ds.isel(time=i-1) for i in range(1, len(yearly_ds['time']))]
-                        differences = xr.concat(differences, dim="time")
-                        differences['time'] = yearly_ds['time'].isel(time=slice(1,None))
-                        tampon.append(differences)
-                    ds = (xr.concat(tampon, dim="time") * 1000).where(lambda x: x >= 0, other=0)
-
-                if v in ["DSWR","DLWR","OLR"]:
-                    ds['time'] = ds['time'].to_index()
-                    years = ds['time'].dt.year
-                    tampon = []
-                    for year in np.unique(years):
-                        
-                        # Select the data for the specific year
-                        yearly_ds = ds.sel(time=ds['time'].dt.year == year)
-                        
-                        # Calculate differences for the year
-                        differences = [yearly_ds.isel(time=i) - yearly_ds.isel(time=i-1) for i in range(1, len(yearly_ds['time']))]
-                        differences = xr.concat(differences, dim="time")
-                        differences['time'] = yearly_ds['time'].isel(time=slice(1,None))
-                        tampon.append(differences)
-                    ds = xr.concat(tampon, dim="time")/(24*60*60)
-
-                # Finally, rename the coords to X, Y, T to match my style
-                if "longitude" in ds.coords:
-                    ds = ds.rename({"longitude": "X"})
-                if "latitude" in ds.coords:
-                    ds = ds.rename({"latitude": "Y"})
-                if "time" in ds.coords:
-                    ds = ds.rename({"time": "T"})
-    
-                # 8. Save the processed data
-                ds.to_netcdf(output_file)
-                ds.close()
-                print(f"Saved processed data to: {output_file}")
-                store_file_path[f"{cent}{syst}"] = output_file
+                    ds = xr.open_dataset(temp_file)
+                    if 'forecast_reference_time' in ds.coords:
+                        time = (ds['forecast_reference_time'] + ds['forecast_period']).data
+                        ds = ds.assign_coords(time=(('forecast_reference_time', 'forecast_period'), time))
+                        ds = ds.stack(time=('forecast_reference_time', 'forecast_period'))
+                        ds = ds.drop_vars(['forecast_reference_time', 'forecast_period'])
+                        ds = ds.rename({"valid_time":"time"})
+                    else:
+                        time = (ds['indexing_time'] + ds['forecast_period']).data
+                        ds = ds.assign_coords(time=(('indexing_time', 'forecast_period'), time))
+                        ds = ds.stack(time=('indexing_time', 'forecast_period'))
+                        ds = ds.drop_vars(['indexing_time', 'forecast_period'])
+                        ds = ds.rename({"valid_time":"time"})                    
         
-            except Exception as e:
-                print(f"Error reading or processing {temp_file}: {e}")
-    
-            finally:
-                # Remove the temporary file
-                if temp_file.exists():
+                    # If there's an ensemble dimension, apply ensemble mean/median if requested
+                    if ensemble_mean in ["mean", "median"] and "number" in ds.dims:
+                        ds = getattr(ds, ensemble_mean)(dim="number")
+        
+                    # Flip latitude
+                    if "latitude" in ds.coords:
+                        ds = ds.isel(latitude=slice(None, None, -1))
+
+                    if v in ["TMIN","TEMP","TMAX","SST"]:
+                        ds = ds - 273.15
+                    if v =="SLP":
+                        ds = ds / 100
+                    if v =="PRCP":
+                        ds['time'] = ds['time'].to_index()
+                        years_ = ds['time'].dt.year
+                        tampon = []
+                        for year_ in np.unique(years_):
+                            
+                            # Select the data for the specific year
+                            yearly_ds = ds.sel(time=ds['time'].dt.year == year_)
+                            
+                            # Calculate differences for the year
+                            differences = [yearly_ds.isel(time=i) - yearly_ds.isel(time=i-1) for i in range(1, len(yearly_ds['time']))]
+                            differences = xr.concat(differences, dim="time")
+                            differences['time'] = yearly_ds['time'].isel(time=slice(1,None))
+                            tampon.append(differences)
+                        ds = (xr.concat(tampon, dim="time") * 1000).where(lambda x: x >= 0, other=0)
+
+                    if v in ["DSWR","DLWR","OLR"]:
+                        ds['time'] = ds['time'].to_index()
+                        years_ = ds['time'].dt.year
+                        tampon = []
+                        for year_ in np.unique(years_):
+                            
+                            # Select the data for the specific year
+                            yearly_ds = ds.sel(time=ds['time'].dt.year == year_)
+                            
+                            # Calculate differences for the year
+                            differences = [yearly_ds.isel(time=i) - yearly_ds.isel(time=i-1) for i in range(1, len(yearly_ds['time']))]
+                            differences = xr.concat(differences, dim="time")
+                            differences['time'] = yearly_ds['time'].isel(time=slice(1,None))
+                            tampon.append(differences)
+                        ds = xr.concat(tampon, dim="time")/(24*60*60)
+
+                    # Finally, rename the coords to X, Y, T to match my style
+                    if "longitude" in ds.coords:
+                        ds = ds.rename({"longitude": "X"})
+                    if "latitude" in ds.coords:
+                        ds = ds.rename({"latitude": "Y"})
+                    if "time" in ds.coords:
+                        ds = ds.rename({"time": "T"})
+        
+                    # 8. Save the processed data
+                    ds.to_netcdf(output_file)
+                    print(f"Saved processed data to: {output_file}")
+                    ds.close()
+                    store_file_path[f"{cent}{syst}"] = output_file
                     os.remove(temp_file)
                     print(f"Deleted temp file: {temp_file}")
-
-            _time.sleep(10)  # Sleep to avoid overwhelming the server
+                    del request, ds        
+                    gc.collect()  
+                except Exception as e:
+                    print(f"Failed to download data for {cv}: {e}")  
+            _time.sleep(1)  # Sleep to avoid overwhelming the server
         return store_file_path
 
     def WAS_Download_AgroIndicators(
