@@ -711,7 +711,7 @@ def retrieve_several_zones_for_PCR(dir_to_data, indices_dict, variables_list, ye
     data_vars = [ds.rename(key) for key, ds in predictor.items()]
     return data_vars
 
-def retrieve_single_zone_for_PCR(dir_to_data, indices_dict, variables_list, year_start, year_end, season=None, clim_year_start=None, clim_year_end=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None):
+def retrieve_single_zone_for_PCR(dir_to_data, indices_dict, variables_list, year_start, year_end, season=None, clim_year_start=None, clim_year_end=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None, standardize=True):
     """
     Retrieve data for a single zone for Principal Component Regression (PCR) with interpolation.
 
@@ -753,9 +753,11 @@ def retrieve_single_zone_for_PCR(dir_to_data, indices_dict, variables_list, year
         season_str = "".join([calendar.month_abbr[(int(i) + int(month_of_initialization)) % 12 or 12] for i in lead_time])
         center = center.lower().replace("_", "")
         filepath_hdcst = f"{dir_to_data}/hindcast_{center}_{variable}_{abb_month_ini}Ic_{season_str}_{lead_time[0]}.nc"
+        ### A revoir
         filepath_fcst = f"{dir_to_data}/forecast_{center}_{variable}_{abb_month_ini}Ic_{season_str}_{lead_time[0]}.nc"
         data_hdcst = xr.open_dataset(filepath_hdcst).to_array().drop_vars('variable').squeeze('variable')
         data_hdcst['T'] = data_hdcst['T'].astype('datetime64[ns]')
+        ### A revoir
         data_fcst = xr.open_dataset(filepath_fcst).to_array().drop_vars('variable').squeeze('variable')
         data_fcst['T'] = data_fcst['T'].astype('datetime64[ns]')
         data = xr.concat([data_hdcst, data_fcst], dim='T')
@@ -764,11 +766,17 @@ def retrieve_single_zone_for_PCR(dir_to_data, indices_dict, variables_list, year
         filepath = f'{dir_to_data}/{center}_{variable}_{year_start}_{year_end}_{season_str}.nc'
         data = xr.open_dataset(filepath).to_array().drop_vars('variable').squeeze('variable')
         data['T'] = data['T'].astype('datetime64[ns]')
+
     new_resolution = {'Y': 1, 'X': 1}
+
+    if standardize:
+        data = standardize_timeseries(data, clim_year_start, clim_year_end)
+    else:
+        data = anomalize_timeseries(data, clim_year_start, clim_year_end)
+
     for idx, coords in indices_dict.items():
         _, lon_min, lon_max, lat_min, lat_max = coords
         var_region = data.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
-        var_region = standardize_timeseries(var_region, clim_year_start, clim_year_end)
         Y_new = xr.DataArray(np.arange(lat_min, lat_max + 1, new_resolution['Y']), dims='Y')
         X_new = xr.DataArray(np.arange(lon_min, lon_max + 1, new_resolution['X']), dims='X')
         data_vars = var_region.interp(Y=Y_new, X=X_new, method='linear')
@@ -1661,6 +1669,8 @@ fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization,
             filled_ds = ds1_aligned.fillna(ds2_aligned)
             ds_filled = filled_ds.copy()
             ds_filled = ds_filled.sortby("T")
+            if param=="PRCP":
+                ds_filled.where(ds_filled >= 0, 0)
             ds_processed = ds_filled.to_dataset(name=param)
             ds_processed.to_netcdf(save_path)
         else:
@@ -1685,6 +1695,8 @@ fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization,
             filled_fcst_ = ds1_aligned.fillna(ds2_aligned)
             ds_filled = filled_fcst_.copy()
             ds_filled = ds_filled.sortby("T")
+            if param=="PRCP":
+                ds_filled.where(ds_filled >= 0, 0)
             ds_processed = ds_filled.to_dataset(name=param)
             ds_processed.to_netcdf(save_path)
         else:
