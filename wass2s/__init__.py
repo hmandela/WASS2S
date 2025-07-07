@@ -13,4 +13,4 @@ from wass2s.was_mme import *
 from wass2s.was_pcr import *
 from wass2s.utils import *
 from wass2s.was_cross_validate import *
-from wass2s.was_transformdata import *
+# from wass2s.was_transformdata import *
