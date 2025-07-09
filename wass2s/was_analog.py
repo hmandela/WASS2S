@@ -268,7 +268,7 @@ class WAS_Analog:
         store_file_path = {}
 
         for center, var, area in zip(centers, variables, areas):
-            combined_output_path = dir_to_save / f"{center}_{var}_{self.month_of_initialization}_{self.year_start}_{year_end}_{season}.nc"
+            combined_output_path = dir_to_save / f"{center}_{var}_{self.year_start}_{year_end}_{season}.nc"
         
             if not force_download and combined_output_path.exists():
                 print(f"{combined_output_path} exists. Skipping download.")
@@ -467,6 +467,7 @@ class WAS_Analog:
                     print(f"Downloaded forecast: {forecast_file}")
 
                     ds_forecast = xr.open_dataset(forecast_file)
+
                     if var in ["TMIN", "TEMP", "TMAX", "SST"]:
                         ds_forecast = ds_forecast - 273.15
                     elif var == "PRCP":
@@ -490,14 +491,16 @@ class WAS_Analog:
                     rename_dict = {k: v for k, v in rename_dict.items() if v is not None}
                     ds_forecast = ds_forecast.rename(rename_dict)
 
+
                     if var in variables_map and any(v in var for v in ["HUSS", "UGRD", "VGRD"]):
                         ds_forecast = ds_forecast.drop_vars("pressure_level", errors="ignore").squeeze()
-
-                    ds_forecast = ds_forecast.sortby("T")
-                    ds_forecast.to_netcdf(forecast_file)
-                    print(f"Saved processed forecast to {forecast_file}")
-                    store_file_path[var] = ds_forecast
+                    
+    
                     ds_forecast.close()
+                    os.remove(str(forecast_file))
+                    ds_forecast.to_netcdf(str(forecast_file))
+                    print(f"Saved processed hindcast to {forecast_file}")
+                    store_file_path[var] = ds_forecast
 
                 except Exception as e:
                     print(f"Failed to process {var} for {cent}{syst}: {e}")
@@ -557,10 +560,12 @@ class WAS_Analog:
                         ds_hindcast = ds_hindcast.drop_vars("pressure_level", errors="ignore").squeeze()
 
                     ds_hindcast = ds_hindcast.sortby("T")
+                    ds_hindcast.close()
+                    os.remove(hindcast_file)
                     ds_hindcast.to_netcdf(hindcast_file)
                     print(f"Saved processed hindcast to {hindcast_file}")
                     store_hdcst_file_path[var] = ds_hindcast
-                    ds_hindcast.close()
+
 
                 except Exception as e:
                     print(f"Failed to process {var} for {cent}{syst}: {e}")
@@ -1309,7 +1314,7 @@ class WAS_Analog:
                     transform=ccrs.PlateCarree()
                 )
                 ax.coastlines()
-                ax.gridlines(draw_labels=True)
+                ax.gridlines(draw_labels=False)
                 ax.add_feature(cfeature.LAND, edgecolor="black")
                 ax.add_feature(cfeature.OCEAN, facecolor="lightblue")
                 ax.set_title(f"Season: {str(t)[:10]}")

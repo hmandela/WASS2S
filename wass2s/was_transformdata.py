@@ -1,6 +1,21 @@
+"""
+WAS_TransformData: Skewness Analysis and Transformation for Geospatial Time-Series
+
+This module provides the `WAS_TransformData` class to analyze skewness, apply
+transformations, fit distributions, and visualize geospatial time-series data with
+dimensions (T, Y, X) representing time, latitude, and longitude, respectively.
+
+Notes
+-----
+- Ensure Natural Earth data is available for `cartopy` mapping features.
+- The `inv_boxcox` function is manually implemented for SciPy 1.11.3 compatibility,
+  as it is not available until SciPy 1.12.0.
+"""
+
+# ── core imports ────────────────────────────────────────────────────────────────
 import xarray as xr
 import numpy as np
-from scipy.stats import skew, boxcox, inv_boxcox
+from scipy.stats import skew, boxcox
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import PowerTransformer
 from fitter import Fitter
@@ -9,20 +24,55 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.colors import ListedColormap, BoundaryNorm
+# ────────────────────────────────────────────────────────────────────────────────
+
+def inv_boxcox(y, lmbda):
+    """
+    Inverse Box-Cox transformation for SciPy 1.11.3 compatibility.
+
+    Parameters
+    ----------
+    y : array_like
+        Transformed data.
+    lmbda : float
+        Box-Cox lambda parameter.
+
+    Returns
+    -------
+    x : ndarray
+        Original data before Box-Cox transformation.
+
+    Notes
+    -----
+    Implements the inverse of the Box-Cox transformation manually
+    """
+    if abs(lmbda) < 1e-6:
+        return np.exp(y)
+    return (y * lmbda + 1) ** (1 / lmbda)
 
 class WAS_TransformData:
     """
-    A class to manage skewness analysis, data transformation, distribution fitting, and visualization
+    Manage skewness analysis, data transformation, distribution fitting, and visualization
     for geospatial time-series data.
+
+    Parameters
+    ----------
+    data : xarray.DataArray
+        Input data with dimensions (T, Y, X) for time, latitude, and longitude.
+    distribution_map : dict, optional
+        Mapping of distribution names to numeric codes. Default is:
+        {'norm': 1, 'lognorm': 2, 'expon': 3, 'gamma': 4, 'weibull_min': 5}.
+    n_clusters : int, optional
+        Number of clusters for KMeans in distribution fitting. Default is 5.
 
     Attributes
     ----------
     data : xarray.DataArray
-        Input data with dimensions 'T' (time), 'Y', 'X'.
+        Input geospatial time-series data.
     distribution_map : dict
-        Mapping of distribution names to numeric codes.
+        Mapping of distribution names to codes.
     n_clusters : int
-        Number of clusters for KMeans in distribution fitting.
+        Number of clusters for KMeans.
     transformed_data : xarray.DataArray or None
         Transformed data after applying transformations.
     transform_methods : xarray.DataArray or None
@@ -48,29 +98,19 @@ class WAS_TransformData:
         Fit distributions to data using KMeans clustering.
     plot_best_fit_map(data_array, map_dict, output_file='map.png', ...)
         Plot categorical map of distributions or skewness classes.
+
+    Raises
+    ------
+    ValueError
+        If `data` is not an xarray.DataArray or lacks required dimensions.
     """
 
     def __init__(self, data, distribution_map=None, n_clusters=5):
-
-        """
-        Initialize the WAS_TransformData class.
-
-        Parameters
-        ----------
-        data : xarray.DataArray
-            Input data with dimensions 'T', 'Y', 'X'.
-        distribution_map : dict, optional
-            Mapping of distribution names to codes. Default is:
-            {'norm': 1, 'lognorm': 2, 'expon': 3, 'gamma': 4, 'weibull_min': 5}.
-        n_clusters : int, optional
-            Number of clusters for KMeans. Default is 5.
-        """
-
         if not isinstance(data, xr.DataArray):
-            raise ValueError("data must be an xarray.DataArray")
-        if not all(dim in data.dims for dim in ['T', 'Y', 'X']):
-            raise ValueError("data must have dimensions 'T', 'Y', 'X'")
-        
+            raise ValueError("`data` must be an xarray.DataArray")
+        if not all(dim in data.dims for dim in ('T', 'Y', 'X')):
+            raise ValueError("`data` must have dimensions ('T', 'Y', 'X')")
+
         self.data = data
         self.distribution_map = distribution_map or {
             'norm': 1,
@@ -86,38 +126,83 @@ class WAS_TransformData:
         self.skewness_ds = None
         self.handle_ds = None
 
-    def detect_skewness(self):
+    @staticmethod
+    def _safe_boxcox(arr1d):
         """
-        Detect skewness in the data and classify it.
+        Apply Box-Cox transformation while handling NaNs.
+
+        Parameters
+        ----------
+        arr1d : array_like
+            1D array of data to transform.
 
         Returns
         -------
-        xarray.Dataset
-            Contains 'skewness' and 'skewness_class' ('symmetric', 'moderate_positive', etc.).
-        dict
-            Summary with counts of grid cells by skewness class.
-        """
-        def compute_skewness(precip_data):
-            precip_data = np.asarray(precip_data)
-            if np.all(np.isnan(precip_data)) or np.sum(~np.isnan(precip_data)) < 3:
-                return np.nan, 'invalid'
-            skewness = skew(precip_data, axis=0, nan_policy='omit')
-            if np.isnan(skewness):
-                skew_class = 'invalid'
-            elif -0.5 <= skewness <= 0.5:
-                skew_class = 'symmetric'
-            elif 0.5 < skewness <= 1:
-                skew_class = 'moderate_positive'
-            elif -1 <= skewness < -0.5:
-                skew_class = 'moderate_negative'
-            elif skewness > 1:
-                skew_class = 'high_positive'
-            else:
-                skew_class = 'high_negative'
-            return skewness, skew_class
+        transformed : ndarray
+            Transformed array, same shape as input, with NaNs preserved.
+        lmbda : float
+            Box-Cox lambda parameter.
 
-        result = xr.apply_ufunc(
-            compute_skewness,
+        Raises
+        ------
+        ValueError
+            If fewer than 2 non-NaN values or if data is not strictly positive.
+        """
+        out = arr1d.copy()
+        valid = ~np.isnan(arr1d)
+        if valid.sum() < 2:
+            raise ValueError("Need at least two non-NaN values for Box-Cox")
+        if not np.all(arr1d[valid] > 0):
+            raise ValueError("Box-Cox requires strictly positive data")
+        out[valid], lmbda = boxcox(arr1d[valid])
+        return out, lmbda
+
+    def detect_skewness(self):
+        """
+        Compute and classify skewness for each grid cell.
+
+        Returns
+        -------
+        skewness_ds : xarray.Dataset
+            Dataset with variables 'skewness' (float) and 'skewness_class' (str).
+            Skewness classes: 'symmetric', 'moderate_positive', 'moderate_negative',
+            'high_positive', 'high_negative', 'invalid'.
+        summary : dict
+            Dictionary with 'class_counts' mapping skewness classes to grid cell counts.
+
+        Notes
+        -----
+        Skewness is computed using `scipy.stats.skew` with `nan_policy='omit'`.
+        Classification thresholds:
+        - Symmetric: -0.5 ≤ skewness ≤ 0.5
+        - Moderate positive: 0.5 < skewness ≤ 1
+        - Moderate negative: -1 ≤ skewness < -0.5
+        - High positive: skewness > 1
+        - High negative: skewness < -1
+        - Invalid: insufficient data (< 3 non-NaN values).
+        """
+        def _compute(precip):
+            precip = np.asarray(precip)
+            valid = ~np.isnan(precip)
+            if valid.sum() < 3:
+                return np.nan, 'invalid'
+            sk = skew(precip[valid], axis=0, nan_policy='omit')
+            if np.isnan(sk):
+                cls = 'invalid'
+            elif -0.5 <= sk <= 0.5:
+                cls = 'symmetric'
+            elif 0.5 < sk <= 1:
+                cls = 'moderate_positive'
+            elif -1 <= sk < -0.5:
+                cls = 'moderate_negative'
+            elif sk > 1:
+                cls = 'high_positive'
+            else:
+                cls = 'high_negative'
+            return sk, cls
+
+        res = xr.apply_ufunc(
+            _compute,
             self.data,
             input_core_dims=[['T']],
             output_core_dims=[[], []],
@@ -126,61 +211,68 @@ class WAS_TransformData:
             output_dtypes=[float, str]
         )
 
-        self.skewness_ds = xr.Dataset({
-            'skewness': (['Y', 'X'], result[0].data),
-            'skewness_class': (['Y', 'X'], result[1].data)
-        }, coords={'Y': self.data.Y, 'X': self.data.X})
+        self.skewness_ds = xr.Dataset(
+            {
+                'skewness': (('Y', 'X'), res[0].data),
+                'skewness_class': (('Y', 'X'), res[1].data)
+            },
+            coords={'Y': self.data.Y, 'X': self.data.X}
+        )
 
-        class_counts = pd.Series(self.skewness_ds['skewness_class'].values.ravel()).value_counts().to_dict()
-        summary = {'class_counts': class_counts}
-
-        return self.skewness_ds, summary
+        counts = pd.Series(self.skewness_ds['skewness_class'].values.ravel()).value_counts().to_dict()
+        return self.skewness_ds, {'class_counts': counts}
 
     def handle_skewness(self):
         """
-        Propose methods to handle skewness based on skewness analysis.
+        Recommend transformations based on skewness and data properties.
 
         Returns
         -------
-        xarray.Dataset
-            Contains 'skewness', 'skewness_class', 'recommended_methods'.
-        dict
-            General recommendations for each skewness class.
+        handle_ds : xarray.Dataset
+            Dataset with variables 'skewness', 'skewness_class', and 'recommended_methods'
+            (semicolon-separated string of transformation methods).
+        summary : dict
+            Dictionary with 'general_recommendations' mapping skewness classes to advice.
+
+        Raises
+        ------
+        ValueError
+            If `detect_skewness` has not been called.
+
+        Notes
+        -----
+        Recommendations consider data properties (e.g., zeros, negatives) and skewness class.
+        Example methods: 'log', 'square_root', 'box_cox', 'yeo_johnson', 'clipping', 'binning'.
         """
         if self.skewness_ds is None:
-            raise ValueError("Run detect_skewness first")
+            raise ValueError("Run detect_skewness() first")
 
-        def recommend_methods(precip_data, skew_class):
-            if skew_class == 'invalid':
+        def _suggest(precip, sk_class):
+            if sk_class == 'invalid':
                 return 'none'
-            precip_data = np.asarray(precip_data)
-            valid_data = precip_data[~np.isnan(precip_data)]
-            has_zeros = np.any(valid_data == 0)
-            has_negatives = np.any(valid_data < 0)
-            all_positive = np.all(valid_data > 0)
+            precip = np.asarray(precip)
+            valid = precip[~np.isnan(precip)]
+            all_pos = np.all(valid > 0)
+            has_zeros = np.any(valid == 0)
             methods = []
-            if skew_class in ['moderate_positive', 'high_positive']:
-                if all_positive and not has_zeros:
-                    methods.extend(['log', 'square_root', 'box_cox'])
-                elif all_positive:
-                    methods.extend(['square_root', 'box_cox'])
-                methods.append('yeo_johnson')
-                methods.append('clipping')
-                methods.append('binning')
-            elif skew_class in ['moderate_negative', 'high_negative']:
-                if all_positive and not has_zeros:
-                    methods.append('reflect_log')
-                elif all_positive:
-                    methods.append('reflect_square_root')
-                methods.append('reflect_yeo_johnson')
-                methods.append('clipping')
-                methods.append('binning')
+            if sk_class in ('moderate_positive', 'high_positive'):
+                if all_pos and not has_zeros:
+                    methods += ['log', 'square_root', 'box_cox']
+                elif all_pos:
+                    methods += ['square_root', 'box_cox']
+                methods += ['yeo_johnson', 'clipping', 'binning']
+            elif sk_class in ('moderate_negative', 'high_negative'):
+                if all_pos and not has_zeros:
+                    methods += ['reflect_log']
+                elif all_pos:
+                    methods += ['reflect_square_root']
+                methods += ['reflect_yeo_johnson', 'clipping', 'binning']
             else:
                 methods.append('none')
             return ';'.join(methods)
 
         recommended = xr.apply_ufunc(
-            recommend_methods,
+            _suggest,
             self.data,
             self.skewness_ds['skewness_class'],
             input_core_dims=[['T'], []],
@@ -190,107 +282,147 @@ class WAS_TransformData:
             output_dtypes=[str]
         )
 
-        self.handle_ds = xr.Dataset({
-            'skewness': self.skewness_ds['skewness'],
-            'skewness_class': self.skewness_ds['skewness_class'],
-            'recommended_methods': (['Y', 'X'], recommended.data)
-        }, coords={'Y': self.data.Y, 'X': self.data.X})
+        self.handle_ds = xr.Dataset(
+            {
+                'skewness': self.skewness_ds['skewness'],
+                'skewness_class': self.skewness_ds['skewness_class'],
+                'recommended_methods': (('Y', 'X'), recommended.data)
+            },
+            coords={'Y': self.data.Y, 'X': self.data.X}
+        )
 
-        summary = {
-            'general_recommendations': {
-                'symmetric': 'No transformation needed.',
-                'moderate_positive': (
-                    'Consider square root or Yeo-Johnson transformations. '
-                    'Log or Box-Cox if no zeros. Clipping or binning for outliers.'
-                ),
-                'high_positive': (
-                    'Strongly consider log (if no zeros), Box-Cox (if positive), or '
-                    'Yeo-Johnson. Clipping or binning for extreme values.'
-                ),
-                'moderate_negative': (
-                    'Reflect data and apply square root or Yeo-Johnson. '
-                    'Clipping or binning for outliers.'
-                ),
-                'high_negative': (
-                    'Reflect data and apply log (if no zeros), Box-Cox, or Yeo-Johnson. '
-                    'Clipping or binning for extreme values.'
-                ),
-                'invalid': 'Insufficient data for skewness calculation.'
-            }
+        general = {
+            'symmetric': 'No transformation needed.',
+            'moderate_positive': (
+                'Consider square root or Yeo-Johnson; log or Box-Cox if no zeros; '
+                'clip or bin outliers.'
+            ),
+            'high_positive': (
+                'Strongly consider log (no zeros), Box-Cox (positive), or Yeo-Johnson; '
+                'clip or bin extremes.'
+            ),
+            'moderate_negative': (
+                'Reflect and apply square root or Yeo-Johnson; clip or bin outliers.'
+            ),
+            'high_negative': (
+                'Reflect and apply log (no zeros), Box-Cox, or Yeo-Johnson; '
+                'clip or bin extremes.'
+            ),
+            'invalid': 'Insufficient valid data for skewness calculation.'
         }
 
-        return self.handle_ds, summary
+        return self.handle_ds, {'general_recommendations': general}
 
     def apply_transformation(self, method=None):
         """
-        Apply transformations to the data based on recommendations or a specified method.
+        Apply transformations to reduce skewness in the data.
 
         Parameters
         ----------
         method : str or xarray.DataArray, optional
-            Transformation method to apply. If str, applies uniformly. If DataArray,
-            specifies method per grid cell. If None, uses first recommended method
-            from handle_skewness. Default is None.
+            Transformation method to apply. Options:
+            - None: Use first recommended method per grid cell from `handle_skewness`.
+            - str: Apply the same method to all grid cells (e.g., 'log', 'box_cox').
+            - xarray.DataArray: Specify method per grid cell with dimensions (Y, X).
+            Default is None.
 
         Returns
         -------
-        xarray.DataArray
-            Transformed data.
+        transformed_data : xarray.DataArray
+            Transformed data with same shape as input.
+
+        Raises
+        ------
+        ValueError
+            If `method` is None and `handle_skewness` has not been called.
+
+        Notes
+        -----
+        Supported methods: 'log', 'square_root', 'box_cox', 'yeo_johnson',
+        'reflect_log', 'reflect_square_root', 'reflect_yeo_johnson', 'clipping', 'binning'.
+        Transformations are skipped for invalid data or methods, with warnings printed.
         """
         if method is None and self.handle_ds is None:
-            raise ValueError("Run handle_skewness or specify a method")
-        
+            raise ValueError("Run handle_skewness() first or specify `method`")
+
         if method is None:
-            # Use first recommended method per cell
-            method = self.handle_ds['recommended_methods'].apply(
-                lambda x: x.split(';')[0] if x and x != 'none' else 'none'
+            def extract_first_method(x):
+                if isinstance(x, str) and x and x != 'none':
+                    return x.split(';')[0]
+                return 'none'
+            method = xr.apply_ufunc(
+                extract_first_method,
+                self.handle_ds['recommended_methods'],
+                vectorize=True,
+                output_dtypes=[str]
             )
 
         self.transformed_data = self.data.copy()
         self.transform_methods = method if isinstance(method, xr.DataArray) else xr.DataArray(
-            np.full((len(self.data.Y), len(self.data.X)), method),
+            np.full((self.data.sizes['Y'], self.data.sizes['X']), method),
             coords={'Y': self.data.Y, 'X': self.data.X},
-            dims=['Y', 'X']
+            dims=('Y', 'X')
         )
         self.transform_params = xr.DataArray(
-            np.empty((len(self.data.Y), len(self.data.X)), dtype=object),
+            np.empty((self.data.sizes['Y'], self.data.sizes['X']), dtype=object),
             coords={'Y': self.data.Y, 'X': self.data.X},
-            dims=['Y', 'X']
+            dims=('Y', 'X')
         )
 
-        for y in range(len(self.data.Y)):
-            for x in range(len(self.data.X)):
-                m = self.transform_methods.isel(Y=y, X=x).item()
-                if m == 'none' or np.all(np.isnan(self.data[:, y, x])):
+        for iy in range(self.data.sizes['Y']):
+            for ix in range(self.data.sizes['X']):
+                m = self.transform_methods[iy, ix].item()
+                if m == 'none' or np.all(np.isnan(self.data[:, iy, ix])):
                     continue
-                cell_data = self.data.isel(Y=y, X=x).values
-                valid_data = cell_data[~np.isnan(cell_data)]
-                
-                if m == 'log' and np.all(valid_data > 0):
-                    self.transformed_data[:, y, x] = np.log(cell_data)
+                cell = self.data[:, iy, ix].values
+                valid = cell[~np.isnan(cell)]
+                if len(valid) < 2:
+                    continue
+
+                if m == 'log':
+                    if np.any(valid <= 0):
+                        print(f"Skip log at Y={iy}, X={ix}: non-positive values")
+                        continue
+                    self.transformed_data[:, iy, ix] = np.log(cell)
                 elif m == 'square_root':
-                    self.transformed_data[:, y, x] = np.sqrt(cell_data)
-                elif m == 'box_cox' and np.all(valid_data > 0):
-                    self.transformed_data[:, y, x], lambda_param = boxcox(cell_data)
-                    self.transform_params[y, x] = {'lambda': lambda_param}
+                    if np.any(valid < 0):
+                        print(f"Skip square_root at Y={iy}, X={ix}: negative values")
+                        continue
+                    self.transformed_data[:, iy, ix] = np.sqrt(cell)
+                elif m == 'box_cox':
+                    try:
+                        transformed, lam = self._safe_boxcox(cell)
+                        self.transformed_data[:, iy, ix] = transformed
+                        self.transform_params[iy, ix] = {'lambda': lam}
+                    except ValueError as err:
+                        print(f"Skip Box-Cox at Y={iy}, X={ix}: {err}")
+                        continue
                 elif m == 'yeo_johnson':
-                    transformer = PowerTransformer(method='yeo-johnson')
-                    self.transformed_data[:, y, x] = transformer.fit_transform(
-                        cell_data.reshape(-1, 1)
-                    ).ravel()
-                    self.transform_params[y, x] = {'transformer': transformer}
-                elif m == 'reflect_log' and np.all(valid_data > 0):
-                    self.transformed_data[:, y, x] = np.log(-cell_data)
+                    pt = PowerTransformer(method='yeo-johnson')
+                    transformed = pt.fit_transform(cell.reshape(-1, 1)).ravel()
+                    self.transformed_data[:, iy, ix] = transformed
+                    self.transform_params[iy, ix] = {'transformer': pt}
+                elif m == 'reflect_log':
+                    cell_ref = -cell
+                    if np.any(cell_ref <= 0):
+                        print(f"Skip reflect_log at Y={iy}, X={ix}: non-positive values")
+                        continue
+                    self.transformed_data[:, iy, ix] = np.log(cell_ref)
                 elif m == 'reflect_square_root':
-                    self.transformed_data[:, y, x] = np.sqrt(-cell_data)
+                    cell_ref = -cell
+                    if np.any(cell_ref < 0):
+                        print(f"Skip reflect_square_root at Y={iy}, X={ix}: negative values")
+                        continue
+                    self.transformed_data[:, iy, ix] = np.sqrt(cell_ref)
                 elif m == 'reflect_yeo_johnson':
-                    transformer = PowerTransformer(method='yeo-johnson')
-                    self.transformed_data[:, y, x] = transformer.fit_transform(
-                        (-cell_data).reshape(-1, 1)
-                    ).ravel()
-                    self.transform_params[y, x] = {'transformer': transformer}
+                    pt = PowerTransformer(method='yeo-johnson')
+                    transformed = pt.fit_transform((-cell).reshape(-1, 1)).ravel()
+                    self.transformed_data[:, iy, ix] = transformed
+                    self.transform_params[iy, ix] = {'transformer': pt}
+                elif m in ('clipping', 'binning'):
+                    self.transformed_data[:, iy, ix] = cell
                 else:
-                    print(f"Warning: Skipping invalid method '{m}' at Y={y}, X={x}")
+                    print(f"Warning: unknown method '{m}' at Y={iy}, X={ix}")
 
         return self.transformed_data
 
@@ -300,44 +432,56 @@ class WAS_TransformData:
 
         Returns
         -------
-        xarray.DataArray
-            Inversely transformed data.
+        inverse_data : xarray.DataArray
+            Data in original scale with same shape as input.
+
+        Raises
+        ------
+        ValueError
+            If no transformation has been applied or required parameters are missing.
+
+        Notes
+        -----
+        Non-invertible methods ('clipping', 'binning') return unchanged data with a warning.
         """
         if self.transformed_data is None or self.transform_methods is None:
-            raise ValueError("No transformation applied. Run apply_transformation first.")
+            raise ValueError("No transformation applied. Run apply_transformation() first")
 
-        def inverse_transform_cell(data, method, params):
-            if method == 'none' or method is None or isinstance(method, float) and np.isnan(method):
-                return data
-            if method in ['clipping', 'binning']:
-                print(f"Warning: '{method}' is not invertible.")
-                return data
+        def _inv(vec, method, params):
+            if method in ('none', None) or (isinstance(method, float) and np.isnan(method)):
+                return vec
+            if method in ('clipping', 'binning'):
+                print(f"Warning: '{method}' is not invertible")
+                return vec
             if method == 'log':
-                return np.exp(data)
+                return np.exp(vec)
             if method == 'square_root':
-                return data ** 2
+                return vec ** 2
             if method == 'box_cox':
-                if params is None or 'lambda' not in params:
-                    raise ValueError("Box-Cox inversion requires 'lambda' in params")
-                return inv_boxcox(data, params['lambda'])
+                lam = params.get('lambda') if params else None
+                if lam is None:
+                    raise ValueError("Missing lambda for Box-Cox inversion")
+                return inv_boxcox(vec, lam)
             if method == 'yeo_johnson':
-                if params is None or 'transformer' not in params:
-                    raise ValueError("Yeo-Johnson inversion requires 'transformer' in params")
-                return params['transformer'].inverse_transform(data.reshape(-1, 1)).ravel()
-            if method in ['reflect_log', 'reflect_square_root', 'reflect_yeo_johnson']:
+                tr = params.get('transformer') if params else None
+                if tr is None:
+                    raise ValueError("Missing transformer for Yeo-Johnson inversion")
+                return tr.inverse_transform(vec.reshape(-1, 1)).ravel()
+            if method.startswith('reflect_'):
                 if method == 'reflect_log':
-                    temp = np.exp(data)
+                    temp = np.exp(vec)
                 elif method == 'reflect_square_root':
-                    temp = data ** 2
-                else:
-                    if params is None or 'transformer' not in params:
-                        raise ValueError("reflect_yeo_johnson requires 'transformer' in params")
-                    temp = params['transformer'].inverse_transform(data.reshape(-1, 1)).ravel()
+                    temp = vec ** 2
+                else:  # reflect_yeo_johnson
+                    tr = params.get('transformer') if params else None
+                    if tr is None:
+                        raise ValueError("Missing transformer for reflect_yeo_johnson")
+                    temp = tr.inverse_transform(vec.reshape(-1, 1)).ravel()
                 return -temp
-            raise ValueError(f"Unknown method: {method}")
+            raise ValueError(f"Unknown method '{method}'")
 
-        result = xr.apply_ufunc(
-            inverse_transform_cell,
+        return xr.apply_ufunc(
+            _inv,
             self.transformed_data,
             self.transform_methods,
             self.transform_params,
@@ -348,8 +492,6 @@ class WAS_TransformData:
             output_dtypes=[float]
         )
 
-        return result
-
     def find_best_distribution_grid(self, use_transformed=False):
         """
         Fit distributions to data using KMeans clustering.
@@ -357,46 +499,57 @@ class WAS_TransformData:
         Parameters
         ----------
         use_transformed : bool, optional
-            If True, use transformed data. Default is False (use original data).
+            If True, use transformed data; otherwise, use original data. Default is False.
 
         Returns
         -------
-        xarray.DataArray
+        dist_codes : xarray.DataArray
             Numeric codes for best-fitting distributions per grid cell.
+
+        Notes
+        -----
+        Uses `fitter.Fitter` to fit distributions (e.g., normal, lognormal) to clustered data.
+        Clusters are determined by mean values using KMeans.
         """
         data = self.transformed_data if use_transformed and self.transformed_data is not None else self.data
         dist_names = tuple(self.distribution_map.keys())
-        data_mean = data.mean(dim='T', skipna=True)
-        df = data_mean.to_dataframe(name='value').reset_index().dropna()
+        df_mean = data.mean('T', skipna=True).to_dataframe(name='value').dropna()
+        if len(df_mean) < self.n_clusters:
+            print("Warning: Insufficient data for clustering, returning NaN array")
+            return xr.DataArray(
+                np.full((self.data.sizes['Y'], self.data.sizes['X']), np.nan),
+                coords={'Y': self.data.Y, 'X': self.data.X},
+                dims=('Y', 'X')
+            )
         kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        df['cluster'] = kmeans.fit_predict(df[['value']])
-        cluster_da = df.set_index(['Y', 'X'])['cluster'].to_xarray()
+        df_mean['cluster'] = kmeans.fit_predict(df_mean[['value']])
+        clusters_da = df_mean.set_index(['Y', 'X'])['cluster'].to_xarray()
         valid_mask = ~np.isnan(data.isel(T=0))
-        cluster_da = cluster_da * xr.where(valid_mask, 1, np.nan)
-        _, cluster_da_aligned = xr.align(data, cluster_da, join='inner')
-        clusters = np.unique(cluster_da_aligned)
-        clusters = clusters[~np.isnan(clusters)].astype(int)
+        clusters_da = clusters_da * xr.where(valid_mask, 1, np.nan)
+        _, clusters_aligned = xr.align(data, clusters_da, join='inner')
         dist_codes = {}
-        for cluster in clusters:
-            cluster_data = data.where(cluster_da_aligned == cluster).to_numpy()
-            cluster_data = cluster_data[~np.isnan(cluster_data)]
-            if len(cluster_data) < 2:
-                dist_codes[cluster] = np.nan
+        for cl in np.unique(clusters_aligned):
+            if np.isnan(cl):
+                continue
+            cl = int(cl)
+            cl_data = data.where(clusters_aligned == cl).values
+            cl_data = cl_data[~np.isnan(cl_data)]
+            if cl_data.size < 2:
+                dist_codes[cl] = np.nan
                 continue
             try:
-                f = Fitter(cluster_data, distributions=dist_names, timeout=30)
-                f.fit()
-                best_dist_name = next(iter(f.get_best(method='sumsquare_error')))
-                dist_codes[cluster] = self.distribution_map[best_dist_name]
-            except (ValueError, RuntimeError):
-                dist_codes[cluster] = np.nan
-        output = xr.apply_ufunc(
+                ftr = Fitter(cl_data, distributions=dist_names, timeout=30)
+                ftr.fit()
+                best_name = next(iter(ftr.get_best(method='sumsquare_error')))
+                dist_codes[cl] = self.distribution_map[best_name]
+            except (RuntimeError, ValueError):
+                dist_codes[cl] = np.nan
+        return xr.apply_ufunc(
             lambda x: dist_codes.get(int(x), np.nan) if not np.isnan(x) else np.nan,
-            cluster_da_aligned,
+            clusters_aligned,
             vectorize=True,
             output_dtypes=[np.float32]
         )
-        return output
 
     def plot_best_fit_map(
         self,
@@ -415,9 +568,9 @@ class WAS_TransformData:
         Parameters
         ----------
         data_array : xarray.DataArray
-            Data to plot (e.g., best-fit distributions or skewness classes).
+            Data to plot (e.g., distribution codes or skewness classes) with dimensions (Y, X).
         map_dict : dict
-            Mapping of names to numeric codes (e.g., distribution_map or class_map).
+            Mapping of category names to numeric codes (e.g., distribution_map).
         output_file : str, optional
             Path to save the plot. Default is 'map.png'.
         title : str, optional
@@ -425,48 +578,55 @@ class WAS_TransformData:
         colors : list, optional
             Colors for each code. Default is ['blue', 'green', 'red', 'purple', 'orange'].
         figsize : tuple, optional
-            Figure size (width, height). Default is (10, 6).
+            Figure size (width, height) in inches. Default is (10, 6).
         extent : tuple, optional
             Map extent (lon_min, lon_max, lat_min, lat_max). Default is data bounds.
         show_plot : bool, optional
-            If True, display the plot. Default is False.
+            If True, display the plot interactively. Default is False.
 
-        Returns
-        -------
-        None
-            Saves the plot to output_file and optionally displays it.
+        Raises
+        ------
+        ValueError
+            If insufficient colors are provided for the number of categories.
+
+        Notes
+        -----
+        Uses `cartopy` for geospatial visualization with PlateCarree projection.
+        Saves the plot as a PNG file.
         """
         if colors is None:
             colors = ['blue', 'green', 'red', 'purple', 'orange']
-        code_to_name = {code: name for name, code in map_dict.items()}
-        valid_codes = np.unique(data_array.values[~np.isnan(data_array.values)])
-        valid_codes = valid_codes.astype(int)
-        if len(colors) < len(valid_codes):
-            raise ValueError(f"Need at least {len(valid_codes)} colors, got {len(colors)}")
-        cmap = ListedColormap([colors[i % len(colors)] for i in range(len(valid_codes))])
-        bounds = np.concatenate([valid_codes - 0.5, [valid_codes[-1] + 0.5]])
+        code2name = {v: k for k, v in map_dict.items()}
+        codes = np.unique(data_array.values[~np.isnan(data_array.values)]).astype(int)
+        if len(colors) < len(codes):
+            raise ValueError(f"Need at least {len(codes)} colors, got {len(colors)}")
+        cmap = ListedColormap([colors[i % len(colors)] for i in range(len(codes))])
+        bounds = np.concatenate([codes - 0.5, [codes[-1] + 0.5]])
         norm = BoundaryNorm(bounds, cmap.N)
         fig = plt.figure(figsize=figsize)
         ax = plt.axes(projection=ccrs.PlateCarree())
         if extent is None:
-            lon_min, lon_max = data_array.X.min(), data_array.X.max()
-            lat_min, lat_max = data_array.Y.min(), data_array.Y.max()
-            extent = [lon_min, lon_max, lat_min, lat_max]
+            extent = [
+                float(data_array.X.min()),
+                float(data_array.X.max()),
+                float(data_array.Y.min()),
+                float(data_array.Y.max())
+            ]
         ax.set_extent(extent, crs=ccrs.PlateCarree())
-        ax.add_feature(cfeature.COASTLINES, linewidth=0.5)
-        ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.4)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.4)
         ax.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
-        plot = data_array.plot.pcolormesh(
+        mesh = data_array.plot.pcolormesh(
             ax=ax,
             transform=ccrs.PlateCarree(),
             cmap=cmap,
             norm=norm,
             add_colorbar=False
         )
-        cbar = plt.colorbar(plot, ax=ax, ticks=valid_codes, orientation='vertical', pad=0.05)
+        cbar = plt.colorbar(mesh, ax=ax, ticks=codes, pad=0.05)
+        cbar.set_ticklabels([code2name.get(c, 'unknown') for c in codes])
         cbar.set_label('Category')
-        cbar.set_ticklabels([code_to_name.get(code, 'Unknown') for code in valid_codes])
-        plt.title(title)
+        ax.set_title(title)
         ax.set_xlabel('Longitude')
         ax.set_ylabel('Latitude')
         plt.savefig(output_file, dpi=300, bbox_inches='tight')

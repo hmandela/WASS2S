@@ -1091,7 +1091,7 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
         model_name_str = str(model_name)
     ax.set_title(f"{model_name_str}", fontsize=13, pad=20)
     # Step 7: Add logo if provided
-    if logo_path is not None:
+    if logo is not None:
         im = image.imread(logo)
         # add logo
         addLogo = OffsetImage(im, zoom=logo_size)
