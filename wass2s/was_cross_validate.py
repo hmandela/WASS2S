@@ -166,7 +166,7 @@ class WAS_Cross_Validator:
         hindcast_det = []
         hindcast_prob = []
         n_splits = len(Predictant.get_index("T"))
-        same_prob_method = [WAS_Ridge_Model, WAS_Lasso_Model, WAS_LassoLars_Model, WAS_ElasticNet_Model,
+        same_prob_method = [WAS_Ridge_Model, WAS_Lasso_Model, WAS_LassoLars_Model, WAS_ElasticNet_Model, WAS_MARS_Model,
                             WAS_LinearRegression_Model, WAS_SVR, WAS_PolynomialRegression, WAS_PoissonRegression]
         same_kind_model1 = [WAS_mme_ELM]
         same_kind_model2 = [WAS_mme_MLP, WAS_mme_GradientBoosting, WAS_mme_XGBoosting, WAS_mme_AdaBoost,
@@ -236,6 +236,78 @@ class WAS_Cross_Validator:
             hindcast_det = xr.concat(hindcast_det, dim="T")
             hindcast_det['T'] = Predictant['T']
             return hindcast_det.load()
+
+        elif isinstance(model, WAS_mme_RoebberGA):
+
+            print("Cross-validation ongoing")
+            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
+                X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
+                y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
+                pred_det = model.compute_model(X_train, y_train, X_test)
+                hindcast_det.append(pred_det)
+
+            hindcast_det = xr.concat(hindcast_det, dim="T")
+            hindcast_det['T'] = Predictant['T']
+            hindcast_det = hindcast_det
+            hindcast_prob = model.compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det)
+
+            return hindcast_det, hindcast_prob
+
+        elif isinstance(model, WAS_mme_NGR_Model):
+
+            print("Cross-validation ongoing")
+            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
+                X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
+                y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
+                pred_det = model.compute_model(X_train, y_train, X_test)
+                hindcast_det.append(pred_det)
+
+            hindcast_det = xr.concat(hindcast_det, dim="T")
+            hindcast_det['T'] = Predictant['T']
+            return hindcast_det
+
+        elif isinstance(model, WAS_mme_FlexibleNGR_Model):
+
+            print("Cross-validation ongoing")
+            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
+                X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
+                y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
+                pred_det = model.compute_model(X_train, y_train, X_test)
+                hindcast_det.append(pred_det)
+
+            hindcast_det = xr.concat(hindcast_det, dim="T")
+            hindcast_det['T'] = Predictant['T']
+            return hindcast_det
+
+        elif isinstance(model, WAS_mme_FlexibleNGR_Model):
+
+            print("Cross-validation ongoing")
+            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
+                X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
+                y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
+                pred_det = model.compute_model(X_train, y_train, X_test)
+                hindcast_det.append(pred_det)
+
+            hindcast_det = xr.concat(hindcast_det, dim="T")
+            hindcast_det['T'] = Predictant['T']
+            return hindcast_det
+
+        elif isinstance(model, WAS_mme_BMA_Sloughter):
+
+            print("Cross-validation ongoing")
+            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
+                X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
+                y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
+                pred_det = model.compute_model(X_train, y_train, X_test)
+                pred_prob = model.compute_prob(X_train, y_train, X_test)
+                hindcast_det.append(pred_det)
+                hindcast_prob.append(pred_prob)
+
+            hindcast_det = xr.concat(hindcast_det, dim="T")
+            hindcast_prob = xr.concat(hindcast_prob, dim="T")
+            hindcast_det['T'] = Predictant['T']
+            hindcast_prob['T'] = Predictant['T']
+            return hindcast_det, hindcast_prob
 
         elif any(isinstance(model, i) for i in same_kind_model2):
             mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()

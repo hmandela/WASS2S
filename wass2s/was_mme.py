@@ -7,7 +7,12 @@ import xcast as xc  #
 from scipy import stats
 from scipy.stats import norm
 from scipy.stats import lognorm
+from scipy.stats import norm, logistic, genextreme, gamma as scigamma, weibull_min, laplace, pareto
 from scipy.stats import gamma
+from scipy.optimize import minimize
+from scipy.stats import norm, gamma, lognorm, weibull_min, t
+from scipy.optimize import minimize_scalar
+from scipy.special import gamma as sp_gamma
 from sklearn.neural_network import MLPRegressor
 from sklearn.ensemble import StackingRegressor
 from sklearn.linear_model import LinearRegression
@@ -26,6 +31,7 @@ from sklearn.ensemble import AdaBoostRegressor
 import pymc as pm
 import arviz as az
 import gc
+import operator
 
 def process_datasets_for_mme_(rainfall, hdcsted=None, fcsted=None, gcm=True, agroparam=False, ELM_ELR=False, dir_to_save_model=None, best_models=None, scores=None, year_start=None, year_end=None, model=True, month_of_initialization=None, lead_time=None, year_forecast=None):
     
@@ -4729,7 +4735,6 @@ class WAS_mme_XGBoosting:
             error_std = np.sqrt(error_variance)
     
             # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
             pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
                                stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
@@ -9979,3 +9984,2189 @@ class WAS_mme_StackXGboost_Ml:
         
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+############################################ WAS Genetic Algorithm From ROBBER 2013 and 2015 ############################################
+
+NUM_GENES = 10 # As specified by Roebber (2013, 2015)
+DEFAULT_TOURNAMENT_SIZE = 3 # For tournament selection
+
+class Gene:
+    """Represents a single gene in an individual's prediction equation."""
+    # Operators as described in the paper
+    OPERATORS = {
+        'ADD': operator.add,
+        'MULTIPLY': operator.mul
+    }
+    RELATIONAL_OPERATORS = {
+        '<=': operator.le,
+        '>': operator.gt
+    }
+
+    def __init__(self, predictor_names):
+        """
+        Initialize a gene.
+
+        Parameters
+        ----------
+        predictor_names : list of str
+            Names of available predictors (e.g., ensemble members, ensemble stats, covariates).
+        """
+        self.predictor_names = predictor_names
+
+        # Initialize gene elements randomly
+        # We store names; actual values will be looked up during evaluation
+        self.v1_name = random.choice(self.predictor_names)
+        self.v2_name = random.choice(self.predictor_names)
+        self.v3_name = random.choice(self.predictor_names)
+        self.v4_name = random.choice(self.predictor_names)
+        self.v5_name = random.choice(self.predictor_names)
+
+        # Multiplicative constants in the range -1 to +1
+        self.c1 = random.uniform(-1, 1)
+        self.c2 = random.uniform(-1, 1)
+        self.c3 = random.uniform(-1, 1)
+
+        # Operators: addition or multiplication
+        self.O1 = random.choice(list(self.OPERATORS.keys()))
+        self.O2 = random.choice(list(self.OPERATORS.keys()))
+        # Relational operator: '<=' or '>'
+        self.OR = random.choice(list(self.RELATIONAL_OPERATORS.keys()))
+
+    def evaluate(self, data_row_dict):
+        """
+        Evaluates the gene's contribution for a given data row (t).
+        Corresponds to Eq. 3.83.
+
+        Parameters
+        ----------
+        data_row_dict : dict
+            A dictionary where keys are predictor names and values are their corresponding
+            normalized numerical values for a single sample. Values are expected to be in [-1, 1].
+
+        Returns
+        -------
+        float
+            The calculated value of the gene for the given data row, or 0 if the condition is false.
+        """
+        # Get the actual values for the chosen predictors from the data row dict
+        # Assume data_row_dict already contains normalized values within [-1, 1]
+        try:
+            val_v1 = data_row_dict[self.v1_name]
+            val_v2 = data_row_dict[self.v2_name]
+            val_v3 = data_row_dict[self.v3_name]
+            val_v4 = data_row_dict[self.v4_name]
+            val_v5 = data_row_dict[self.v5_name]
+        except KeyError:
+            # If a predictor chosen by the gene is not found in the current data row,
+            # this indicates an issue with data consistency or `predictor_names` list.
+            # Returning 0 effectively disables this gene for this sample.
+            return 0
+
+        # Apply operators
+        op1_func = self.OPERATORS[self.O1]
+        op2_func = self.OPERATORS[self.O2]
+        or_func = self.RELATIONAL_OPERATORS[self.OR]
+
+        # Condition for gene activation: if v4 OR v5 is true
+        if or_func(val_v4, val_v5):
+            term1 = self.c1 * val_v1
+            term2 = self.c2 * val_v2
+            term3 = self.c3 * val_v3
+            
+            result_op1 = op1_func(term1, term2)
+            result_op2 = op2_func(result_op1, term3)
+            return result_op2
+        else:
+            return 0
+
+    def mutate(self):
+        """Randomly replaces one of the 11 elements of the gene."""
+        # List of all mutable elements in a gene
+        elements_to_mutate = [
+            'v1_name', 'v2_name', 'v3_name', 'v4_name', 'v5_name',
+            'c1', 'c2', 'c3', 'O1', 'O2', 'OR'
+        ]
+        element_to_mutate = random.choice(elements_to_mutate)
+
+        if element_to_mutate in ['v1_name', 'v2_name', 'v3_name', 'v4_name', 'v5_name']:
+            # Choose a new predictor name from the available ones
+            self.__setattr__(element_to_mutate, random.choice(self.predictor_names))
+        elif element_to_mutate in ['c1', 'c2', 'c3']:
+            # Choose a new random constant in [-1, 1]
+            self.__setattr__(element_to_mutate, random.uniform(-1, 1))
+        elif element_to_mutate in ['O1', 'O2']:
+            # Choose a new operator (ADD or MULTIPLY)
+            self.__setattr__(element_to_mutate, random.choice(list(self.OPERATORS.keys())))
+        elif element_to_mutate == 'OR':
+            # Choose a new relational operator (<= or >)
+            self.__setattr__(element_to_mutate, random.choice(list(self.RELATIONAL_OPERATORS.keys())))
+
+    def copy(self):
+        """Returns a deep copy of the gene."""
+        new_gene = Gene(self.predictor_names) # Initialize with the same available predictors
+        # Copy all attributes explicitly
+        new_gene.v1_name = self.v1_name
+        new_gene.v2_name = self.v2_name
+        new_gene.v3_name = self.v3_name
+        new_gene.v4_name = self.v4_name
+        new_gene.v5_name = self.v5_name
+        new_gene.c1 = self.c1
+        new_gene.c2 = self.c2
+        new_gene.c3 = self.c3
+        new_gene.O1 = self.O1
+        new_gene.O2 = self.O2
+        new_gene.OR = self.OR
+        return new_gene
+
+
+class Individual:
+    """Represents a single prediction equation (an individual in the population)."""
+    def __init__(self, predictor_names):
+        """
+        Initializes an individual with NUM_GENES genes.
+
+        Parameters
+        ----------
+        predictor_names : list of str
+            Names of available predictors to be used by genes.
+        """
+        self.genes = [Gene(predictor_names) for _ in range(NUM_GENES)]
+        self.mse = float('inf')  # Initialize MSE (fitness) to a high value
+
+    def calculate_mse(self, training_data_rows, true_predictands_normalized):
+        """
+        Calculates the MSE for the individual's prediction.
+        Corresponds to Eq. 3.84.
+
+        Parameters
+        ----------
+        training_data_rows : list of dict
+            Each dict represents a data row, with keys being predictor names
+            and values being their normalized numerical values.
+        true_predictands_normalized : np.ndarray
+            Normalized true 'yt' values corresponding to training_data_rows.
+        """
+        n = len(training_data_rows)
+        if n == 0: # Handle empty training data
+            self.mse = float('inf')
+            return
+
+        predictions = []
+        for t in range(n):
+            row_prediction_sum_of_genes = 0
+            for gene in self.genes:
+                row_prediction_sum_of_genes += gene.evaluate(training_data_rows[t])
+            predictions.append(row_prediction_sum_of_genes)
+
+        # Compute Mean Squared Error
+        squared_errors = (true_predictands_normalized - np.array(predictions))**2
+        self.mse = np.mean(squared_errors)
+
+    def reproduce(self, mutation_rate, crossover_rate):
+        """
+        Reproduces the individual, potentially with mutation or crossover.
+        Returns a new individual (offspring).
+        """
+        # Create a new offspring individual by copying the parent's structure
+        offspring = Individual(self.genes[0].predictor_names) # Pass predictor names from parent's gene
+        offspring.genes = [gene.copy() for gene in self.genes] # Deep copy all genes
+
+        # Apply mutation
+        if random.random() < mutation_rate:
+            gene_to_mutate = random.choice(offspring.genes)
+            gene_to_mutate.mutate()
+
+        # Apply genetic crossover (intra-individual as per the paper's description)
+        if random.random() < crossover_rate and NUM_GENES >= 2: # Crossover needs at least two genes
+            gene1_idx = random.randrange(NUM_GENES)
+            gene2_idx = random.randrange(NUM_GENES)
+            while gene1_idx == gene2_idx: # Ensure different genes are selected for crossover
+                gene2_idx = random.randrange(NUM_GENES)
+
+            gene1 = offspring.genes[gene1_idx]
+            gene2 = offspring.genes[gene2_idx]
+
+            # The four underlined elements/groups from the paper:
+            # 1. (c1, v1_name, O1)
+            # 2. (c2, v2_name, O2)
+            # 3. (c3, v3_name)
+            # 4. (v4_name, OR, v5_name)
+            crossover_group = random.choice(['group1', 'group2', 'group3', 'group4'])
+
+            if crossover_group == 'group1':
+                gene1.c1, gene2.c1 = gene2.c1, gene1.c1
+                gene1.v1_name, gene2.v1_name = gene2.v1_name, gene1.v1_name
+                gene1.O1, gene2.O1 = gene2.O1, gene1.O1
+            elif crossover_group == 'group2':
+                gene1.c2, gene2.c2 = gene2.c2, gene1.c2
+                gene1.v2_name, gene2.v2_name = gene2.v2_name, gene1.v2_name
+                gene1.O2, gene2.O2 = gene2.O2, gene1.O2
+            elif crossover_group == 'group3':
+                gene1.c3, gene2.c3 = gene2.c3, gene1.c3
+                gene1.v3_name, gene2.v3_name = gene2.v3_name, gene1.v3_name
+            elif crossover_group == 'group4':
+                gene1.v4_name, gene2.v4_name = gene2.v4_name, gene1.v4_name
+                gene1.OR, gene2.OR = gene2.OR, gene1.OR
+                gene1.v5_name, gene2.v5_name = gene2.v5_name, gene1.v5_name
+        return offspring
+
+    def copy(self):
+        """Returns a deep copy of the individual."""
+        new_individual = Individual(self.genes[0].predictor_names)
+        new_individual.genes = [gene.copy() for gene in self.genes]
+        new_individual.mse = self.mse
+        return new_individual
+
+
+class WAS_mme_RoebberGA:
+    """
+    Genetic Algorithm-based Statistical Learning Method adapted from Roebber (2013, 2015).
+
+    This class evolves complex prediction equations composed of "genes" to minimize MSE.
+    It is designed to work with xarray DataArray inputs for training and prediction.
+
+    Parameters
+    ----------
+    population_size : int, optional
+        Number of individuals in the GA population. Default is 50 (increased for better convergence).
+    max_iter : int, optional
+        Maximum number of generations for the GA. Default is 100 (increased for better search).
+    crossover_rate : float, optional
+        Probability of performing crossover. Default is 0.7.
+    mutation_rate : float, optional
+        Probability of mutating a gene. Default is 0.05 (slightly increased for more exploration).
+    random_state : int, optional
+        Seed for random number generation. Default is 42.
+    dist_method : str, optional
+        Default is "gamma".
+    elite_size : int, optional
+        Number of top individuals to use for ensemble prediction to reduce overfitting. Default is 5.
+    """
+
+    def __init__(self,
+                 population_size=50,
+                 max_iter=100,
+                 crossover_rate=0.7,
+                 mutation_rate=0.05,
+                 random_state=42,
+                 dist_method="gamma",
+                 elite_size=5):
+        
+        self.population_size = population_size
+        self.max_iter = max_iter
+        self.crossover_rate = crossover_rate
+        self.mutation_rate = mutation_rate
+        self.random_state = random_state
+        self.dist_method = dist_method 
+        self.elite_size = elite_size
+
+        # Set seeds for reproducibility
+        random.seed(self.random_state)
+        np.random.seed(self.random_state)
+
+        # Best ensemble found by GA during training
+        self.best_ensemble = None
+        self.best_individual = None  # Still track the single best for reference
+        self.best_fitness = float('-inf') # Store negative MSE (maximized)
+
+        # Store normalization ranges for consistency between train/test
+        self._y_normalization_min_max = None
+        self._predictor_normalization_ranges = {} # Dict: {predictor_name: (min, max)}
+
+    def _normalize_array(self, arr):
+        """Normalize array values to the interval [-1, 1]. Handles NaNs and constant arrays."""
+        min_val = np.nanmin(arr)
+        max_val = np.nanmax(arr)
+        if max_val == min_val: # Avoid division by zero for constant arrays
+            # If all values are the same, they should map to 0 in [-1, 1] range.
+            return np.zeros_like(arr, dtype=float)
+        return 2 * ((arr - min_val) / (max_val - min_val)) - 1
+
+    def _denormalize_array(self, normalized_arr, original_min, original_max):
+        """Denormalize array values from [-1, 1] back to original range. Handles constant ranges."""
+        if original_max == original_min:
+            # If original range was constant, all denormalized values should be that constant.
+            return np.full_like(normalized_arr, original_min, dtype=float)
+        return ((normalized_arr + 1) / 2) * (original_max - original_min) + original_min
+
+    def _prepare_data_for_ga_core(self, X_da, y_da):
+        """
+        Prepares xarray DataArrays for the core GA logic:
+        - Stacks dimensions (T,Y,X) into a 'sample' dimension.
+        - Identifies predictor names from the 'M' dimension.
+        - Handles NaNs.
+        - Normalizes X and y values to [-1, 1] and stores normalization parameters.
+
+        Parameters
+        ----------
+        X_da : xarray.DataArray
+            Input predictor data (e.g., (T,Y,X,M)).
+        y_da : xarray.DataArray
+            Input predictand data (e.g., (T,Y,X)).
+
+        Returns
+        -------
+        tuple
+            (X_rows_normalized: list of dicts,
+             y_normalized: np.ndarray,
+             predictor_names: list of str,
+             nan_mask_initial: np.ndarray)
+            Returns empty lists/arrays if no valid data.
+        """
+        # 1. Get predictor names from the 'M' dimension
+        if 'M' not in X_da.dims:
+            raise ValueError("X_da must have an 'M' dimension representing predictors (e.g., models, covariates).")
+        predictor_names = X_da['M'].values.tolist()
+
+        # 2. Stack/reshape X and y (T,Y,X) -> 'sample' dimension
+        X_stacked_raw = X_da.stack(sample=('T','Y','X')).transpose('sample','M').values
+        y_stacked_raw = y_da.stack(sample=('T','Y','X')).values
+
+        # Ensure y_stacked_raw is 1D
+        if y_stacked_raw.ndim == 2 and y_stacked_raw.shape[1] == 1:
+            y_stacked_raw = y_stacked_raw.ravel()
+
+        # 3. Identify NaNs across both X and y
+        # A sample is invalid if any of its predictors or the target is NaN
+        nan_mask_initial = (np.any(~np.isfinite(X_stacked_raw), axis=1) |
+                            ~np.isfinite(y_stacked_raw))
+
+        X_clean_raw = X_stacked_raw[~nan_mask_initial]
+        y_clean_raw = y_stacked_raw[~nan_mask_initial]
+
+        if X_clean_raw.size == 0 or y_clean_raw.size == 0:
+            return [], np.array([]), predictor_names, nan_mask_initial # Return empty if no valid data
+
+        # 4. Normalize X and y
+        # Store normalization parameters for X (per predictor) and y
+        self._predictor_normalization_ranges = {}
+        X_normalized_columns = []
+        for i, pred_name in enumerate(predictor_names):
+            col_data = X_clean_raw[:, i]
+            col_min = np.nanmin(col_data)
+            col_max = np.nanmax(col_data)
+            self._predictor_normalization_ranges[pred_name] = (col_min, col_max)
+            X_normalized_columns.append(self._normalize_array(col_data))
+        
+        # Reconstruct X_clean_normalized as a list of dicts for Gene.evaluate
+        X_clean_normalized_rows = []
+        if X_normalized_columns: # Only proceed if there are valid predictors
+            X_normalized_array = np.array(X_normalized_columns).T # Transpose back to (sample, predictor)
+            for row_idx in range(X_normalized_array.shape[0]):
+                row_dict = {predictor_names[i]: X_normalized_array[row_idx, i]
+                            for i in range(len(predictor_names))}
+                X_clean_normalized_rows.append(row_dict)
+        else:
+            X_clean_normalized_rows = [] # No valid predictors means no valid rows
+
+        # Normalize y and store its original range
+        y_min_orig = np.nanmin(y_clean_raw)
+        y_max_orig = np.nanmax(y_clean_raw)
+        self._y_normalization_min_max = (y_min_orig, y_max_orig)
+        y_clean_normalized = self._normalize_array(y_clean_raw)
+
+        return X_clean_normalized_rows, y_clean_normalized, predictor_names, nan_mask_initial
+
+    def _tournament_selection(self, population, tournament_size=DEFAULT_TOURNAMENT_SIZE):
+        """
+        Selects an individual using tournament selection.
+
+        Parameters
+        ----------
+        population : list of Individual
+            The current population.
+        tournament_size : int, optional
+            Number of individuals to compete in the tournament. Default is 3.
+
+        Returns
+        -------
+        Individual
+            The winner of the tournament (lowest MSE).
+        """
+        candidates = random.sample(population, tournament_size)
+        return min(candidates, key=lambda x: x.mse)
+
+    def _run_ga_core(self, X_train_rows, y_train_normalized, predictor_names):
+        """
+        Core Genetic Algorithm logic.
+
+        Parameters
+        ----------
+        X_train_rows : list of dict
+            Normalized training predictor data (list of sample dicts).
+        y_train_normalized : np.ndarray
+            Normalized training predictand data.
+        predictor_names : list of str
+            Names of predictors available to genes.
+
+        Returns
+        -------
+        list of Individual
+            The best ensemble of prediction equations found by the GA.
+        """
+        population = []
+        # Initialize population
+        for _ in range(self.population_size):
+            individual = Individual(predictor_names)
+            individual.calculate_mse(X_train_rows, y_train_normalized)
+            population.append(individual)
+
+        # Initialize best individual and fitness
+        population.sort(key=lambda x: x.mse)
+        self.best_individual = population[0].copy()
+        self.best_fitness = -self.best_individual.mse
+
+        print(f"--- Initial Population Min MSE: {population[0].mse:.4f} ---")
+
+        for generation in range(self.max_iter):
+            # No fixed threshold; use the entire population for selection
+
+            # Sort population by MSE (lower is better)
+            population.sort(key=lambda x: x.mse)
+
+            # Update overall best individual (elitism)
+            if population[0].mse < self.best_individual.mse:
+                self.best_individual = population[0].copy()
+                self.best_fitness = -population[0].mse
+
+            # 2. Reproduction: Create the next generation
+            new_population = []
+            # Elitism: Carry over the top elite individual
+            new_population.append(self.best_individual.copy())
+
+            # Fill the rest of the new population using tournament selection for parents
+            while len(new_population) < self.population_size:
+                # Select parent using tournament selection
+                parent = self._tournament_selection(population)
+                
+                # Create offspring
+                offspring = parent.reproduce(self.mutation_rate, self.crossover_rate)
+                new_population.append(offspring)
+
+            # Update population
+            population = new_population
+
+            # Calculate MSE for the new population
+            for individual in population:
+                individual.calculate_mse(X_train_rows, y_train_normalized)
+            
+            # Track current generation's best for logging
+            current_gen_best_mse = min([ind.mse for ind in population])
+            print(f"Generation {generation + 1} Best MSE: {current_gen_best_mse:.4f} (Overall Best: {self.best_individual.mse:.4f})")
+
+            # Stopping criterion (e.g., very low MSE reached)
+            if self.best_individual.mse < 0.001:
+                print(f"Stopping criterion met: Overall Best MSE {self.best_individual.mse:.4f}")
+                break
+        
+        # At end, sort final population and select top elite_size for ensemble
+        population.sort(key=lambda x: x.mse)
+        self.best_ensemble = [ind.copy() for ind in population[:self.elite_size]]
+        print(f"--- GA training finished. Overall Best MSE: {self.best_individual.mse:.4f} ---")
+        return self.best_ensemble
+
+    def compute_model(self, X_train, y_train, X_test, y_test=None):
+        """
+        Trains the Roebber GA model and makes predictions on test data using xarray DataArrays.
+        Uses ensemble mean from top individuals for prediction to improve robustness.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, Y, X, M).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, Y, X, M).
+        y_test : xarray.DataArray, optional
+            Test predictand data. Not directly used for prediction, but included for API compatibility. Default is None.
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Predictions with dimensions (T, Y, X), denormalized to original y_train range.
+        """
+        # Ensure y_train is consistently 1D if it has a singleton last dimension
+        if y_train.ndim == 3: # Wait, for (T,Y,X), ndim=3
+            pass
+        if y_train.ndim == 4 and y_train.shape[-1] == 1:
+            y_train = y_train.squeeze(dim=y_train.dims[-1])
+
+
+        # 1. Prepare training data for GA core
+        X_train_rows, y_train_normalized, predictor_names, train_nan_mask = \
+            self._prepare_data_for_ga_core(X_train, y_train)
+
+        if not X_train_rows:
+            print("No valid training data after NaN removal. Cannot train model. Returning NaNs for predictions.")
+            # Return NaN-filled DataArray
+            return xr.DataArray(
+                data=np.full(X_test.shape[:-1], np.nan), # Shape (T,Y,X)
+                coords={'T': X_test['T'], 'Y': X_test['Y'], 'X': X_test['X']},
+                dims=['T','Y','X']
+            )
+
+        # 2. Run GA on training data
+        trained_best_ensemble = self._run_ga_core(X_train_rows, y_train_normalized, predictor_names)
+        
+        if not trained_best_ensemble:
+            print("GA training failed to find suitable individuals. Returning NaNs for predictions.")
+            return xr.DataArray(
+                data=np.full(X_test.shape[:-1], np.nan),
+                coords={'T': X_test['T'], 'Y': X_test['Y'], 'X': X_test['X']},
+                dims=['T','Y','X']
+            )
+
+        # 3. Prepare test data for prediction
+        # Stack X_test (T, Y, X, M) -> (sample, M)
+        X_test_stacked_raw = X_test.stack(sample=('T','Y','X')).transpose('sample','M').values
+        
+        # Identify NaNs in test predictors
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked_raw), axis=1)
+        X_test_clean_raw = X_test_stacked_raw[~test_nan_mask]
+
+        # Normalize test data using training ranges, with clipping to [-1,1] to prevent extrapolation
+        X_test_normalized_columns = []
+        if X_test_clean_raw.size > 0:
+            for i, pred_name in enumerate(predictor_names):
+                original_min, original_max = self._predictor_normalization_ranges.get(pred_name, (0, 0))
+                
+                col_data = X_test_clean_raw[:, i]
+                if original_max == original_min:
+                    normalized_col = np.zeros_like(col_data, dtype=float)
+                else:
+                    normalized_col = 2 * ((col_data - original_min) / (original_max - original_min)) - 1
+                    normalized_col = np.clip(normalized_col, -1, 1)  # Clip to prevent extrapolation
+                X_test_normalized_columns.append(normalized_col)
+        
+        X_test_rows = []
+        if X_test_normalized_columns:
+            X_test_normalized_array = np.array(X_test_normalized_columns).T
+            for row_idx in range(X_test_normalized_array.shape[0]):
+                row_dict = {predictor_names[i]: X_test_normalized_array[row_idx, i]
+                            for i in range(len(predictor_names))}
+                X_test_rows.append(row_dict)
+
+        # 4. Make predictions using the best ensemble (mean of top individuals)
+        predicted_values_normalized = []
+        if X_test_rows:
+            for t_data_row in X_test_rows:
+                ensemble_predictions = []
+                for individual in trained_best_ensemble:
+                    row_prediction = 0
+                    for gene in individual.genes:
+                        row_prediction += gene.evaluate(t_data_row)
+                    ensemble_predictions.append(row_prediction)
+                mean_prediction = np.mean(ensemble_predictions)
+                predicted_values_normalized.append(mean_prediction)
+        else:
+            predicted_values_normalized = np.array([])
+
+        predicted_values_normalized = np.array(predicted_values_normalized)
+
+        # 5. Denormalize predictions
+        if self._y_normalization_min_max:
+            y_min_orig, y_max_orig = self._y_normalization_min_max
+            predicted_values_denormalized_clean = self._denormalize_array(
+                predicted_values_normalized,
+                y_min_orig,
+                y_max_orig
+            )
+        else:
+            predicted_values_denormalized_clean = np.full_like(predicted_values_normalized, np.nan)
+
+
+        # 6. Reshape back to (T, Y, X)
+        n_time = X_test['T'].size
+        n_lat = X_test['Y'].size
+        n_lon = X_test['X'].size
+        
+        full_predictions_stacked = np.full(X_test_stacked_raw.shape[0], np.nan)
+        if len(predicted_values_denormalized_clean) > 0:
+            full_predictions_stacked[~test_nan_mask] = predicted_values_denormalized_clean
+
+        predictions_reshaped = full_predictions_stacked.reshape(n_time, n_lat, n_lon)
+
+        predicted_da = xr.DataArray(
+            data=predictions_reshaped,
+            coords={'T': X_test['T'], 'Y': X_test['Y'], 'X': X_test['X']},
+            dims=['T','Y','X']
+        )
+        return predicted_da
+
+    # ------------------ Probability Calculation Methods ------------------
+    @staticmethod
+    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Student's t-based method
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            # Transform thresholds
+            first_t = (first_tercile - best_guess) / error_std
+            second_t = (second_tercile - best_guess) / error_std
+
+            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
+            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
+            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
+
+        return pred_prob
+    @staticmethod
+    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
+
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+    
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+    
+            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
+            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
+                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
+    
+        return pred_prob
+        
+    @staticmethod
+    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
+        """Gamma-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time), dtype=float)
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        T1 = np.asarray(T1, dtype=float)
+        T2 = np.asarray(T2, dtype=float)
+        alpha = (best_guess**2) / error_variance
+        theta = error_variance / best_guess
+        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
+        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
+        pred_prob[0, :] = cdf_t1
+        pred_prob[1, :] = cdf_t2 - cdf_t1
+        pred_prob[2, :] = 1.0 - cdf_t2
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        """Non-parametric method using historical error samples."""
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+        for t in range(n_time):
+            if np.isnan(best_guess[t]):
+                continue
+            dist = best_guess[t] + error_samples
+            dist = dist[np.isfinite(dist)]
+            if len(dist) == 0:
+                continue
+            p_below = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above = 1.0 - (p_below + p_between)
+            pred_prob[0, t] = p_below
+            pred_prob[1, t] = p_between
+            pred_prob[2, t] = p_above
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+        """Normal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
+        """Lognormal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
+        mu = np.log(best_guess) - sigma**2 / 2
+        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
+        return pred_prob
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
+        """
+        Compute tercile probabilities for hindcast data.
+
+        Calculates probabilities for below-normal, normal, and above-normal categories using
+        the specified distribution method, based on climatological terciles.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data with dimensions (T, Y, X).
+
+        Returns
+        -------
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X), where probability
+            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
+        """        """
+        Compute tercile probabilities using the chosen distribution method.
+        Predictant is expected to be an xarray DataArray with dims (T, Y, X).
+        """
+        
+        if "M" in Predictant.coords:
+            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+        
+        # Ensure Predictant is (T, Y, X)
+        Predictant = Predictant.transpose('T', 'Y', 'X')
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant - hindcast_det).var(dim='T')
+        dof = len(Predictant.get_index("T")) - 2
+        
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+            
+            
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = (Predictant - hindcast_det)  
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('T',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+        
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 hindcast_det_cross, Predictor_for_year):
+        
+        result_da = self.compute_model(hindcast_det, Predictant, Predictor_for_year)
+
+        if "M" in Predictant.coords:
+            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+        
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
+        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
+        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        result_da['T'] = result_da['T'].astype('datetime64[ns]')
+        
+        # Compute tercile probabilities on predictions
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant.get_index("T")) - 2
+        
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+            
+            
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = Predictant - hindcast_det_cross
+            error_samples = error_samples.rename({'T':'S'})
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('S',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+        
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return result_da, hindcast_prob.transpose('probability', 'T','Y', 'X')
+
+########################################################### NonHomogenous Regression Models #############################################################
+
+class NGR:
+    """
+    Nonhomogeneous Gaussian Regression (NGR) class for probabilistic forecasting.
+
+    This class implements NGR as described in the literature, supporting both exchangeable
+    and non-exchangeable ensemble members. It estimates parameters using either log-likelihood
+    maximization or CRPS minimization and generates Gaussian predictive distributions.
+
+    Attributes:
+        exchangeable (bool): Whether ensemble members are exchangeable (True) or not (False).
+        estimation_method (str): Method for parameter estimation ('log_likelihood' or 'crps').
+        params (np.ndarray): Fitted parameters (a, b or [b1, ..., bm], gamma, delta).
+        m (int): Number of ensemble members, inferred from training data.
+    """
+
+    def __init__(self, exchangeable=True, estimation_method='log_likelihood'):
+        """
+        Initialize the NGR model.
+
+        Args:
+            exchangeable (bool): If True, assumes exchangeable ensemble members (uses Eq. 3.6).
+                                 If False, treats members as non-exchangeable (uses Eq. 3.2).
+            estimation_method (str): 'log_likelihood' for Eq. (3.10) or 'crps' for Eq. (3.9).
+        """
+        self.exchangeable = exchangeable
+        self.estimation_method = estimation_method.lower()
+        if self.estimation_method not in ['log_likelihood', 'crps']:
+            raise ValueError("estimation_method must be 'log_likelihood' or 'crps'")
+        self.params = None
+        self.m = None
+
+    def _compute_mu_t(self, X, params):
+        """
+        Compute the predictive mean μt for each sample.
+
+        Args:
+            X (np.ndarray): Ensemble data of shape (n_samples, m).
+            params (np.ndarray): Model parameters.
+
+        Returns:
+            np.ndarray: Predictive means of shape (n_samples,).
+        """
+        if self.exchangeable:
+            a, b = params[0], params[1]
+            xt = np.mean(X, axis=1)  # Ensemble mean (Eq. 3.5)
+            return a + b * xt  # Eq. (3.6)
+        else:
+            a = params[0]
+            b = params[1:1 + self.m]
+            return a + np.dot(X, b)  # Eq. (3.2)
+
+    def _compute_sigma_t(self, X, params):
+        """
+        Compute the predictive standard deviation σt for each sample.
+
+        Args:
+            X (np.ndarray): Ensemble data of shape (n_samples, m).
+            params (np.ndarray): Model parameters.
+
+        Returns:
+            np.ndarray: Predictive standard deviations of shape (n_samples,).
+        """
+        st2 = np.var(X, axis=1, ddof=1)  # Ensemble variance (Eq. 3.4 with m-1)
+        gamma, delta = params[-2], params[-1]
+        c = gamma ** 2  # Ensures c >= 0
+        d = delta ** 2  # Ensures d >= 0
+        sigma_t2 = c + d * st2  # Eq. (3.3)
+        return np.sqrt(np.maximum(sigma_t2, 1e-8))  # Avoid zero/negative
+
+    def _log_likelihood(self, params, X, y):
+        """
+        Negative log-likelihood objective function for minimization (based on Eq. 3.10).
+
+        Args:
+            params (np.ndarray): Parameters to optimize.
+            X (np.ndarray): Ensemble data of shape (n_samples, m).
+            y (np.ndarray): Observations of shape (n_samples,).
+
+        Returns:
+            float: Negative sum of log-likelihood.
+        """
+        mu_t = self._compute_mu_t(X, params)
+        sigma_t = self._compute_sigma_t(X, params)
+        ll = -0.5 * (y - mu_t) ** 2 / sigma_t ** 2 - np.log(sigma_t)
+        return -np.sum(ll)
+
+    def _crps(self, params, X, y):
+        """
+        CRPS objective function for minimization (based on Eq. 3.9).
+
+        Args:
+            params (np.ndarray): Parameters to optimize.
+            X (np.ndarray): Ensemble data of shape (n_samples, m).
+            y (np.ndarray): Observations of shape (n_samples,).
+
+        Returns:
+            float: Average CRPS over all samples.
+        """
+        mu_t = self._compute_mu_t(X, params)
+        sigma_t = self._compute_sigma_t(X, params)
+        z = (y - mu_t) / sigma_t
+        crps = sigma_t * (z * (2 * norm.cdf(z) - 1) + 2 * norm.pdf(z) - 1 / np.sqrt(np.pi))
+        return np.mean(crps)
+
+    def fit(self, X_train, y_train):
+        """
+        Fit the NGR model to training data.
+
+        Args:
+            X_train (np.ndarray): Ensemble data of shape (n_samples, m).
+            y_train (np.ndarray): Observations of shape (n_samples,).
+
+        Raises:
+            ValueError: If data shapes are inconsistent.
+        """
+        if X_train.shape[0] != y_train.shape[0]:
+            raise ValueError("Number of samples in X_train and y_train must match")
+        self.m = X_train.shape[1]
+
+        # Initialize parameters
+        if self.exchangeable:
+            initial_params = np.array([0.0, 1.0, 1.0, 1.0])  # [a, b, gamma, delta]
+        else:
+            initial_b = [1.0 / self.m] * self.m
+            initial_params = np.array([0.0] + initial_b + [1.0, 1.0])  # [a, b1,...,bm, gamma, delta]
+
+        # Select objective function
+        objective = self._log_likelihood if self.estimation_method == 'log_likelihood' else self._crps
+
+        # Optimize parameters
+        result = minimize(
+            objective,
+            initial_params,
+            args=(X_train, y_train),
+            method='L-BFGS-B',
+            options={'maxiter': 1000}
+        )
+        if not result.success:
+            print("Warning: Optimization did not converge:", result.message)
+        self.params = result.x
+
+    def predict(self, X_test):
+        """
+        Generate predictive mean and standard deviation for test data.
+
+        Args:
+            X_test (np.ndarray): Ensemble data of shape (n_test, m).
+
+        Returns:
+            tuple: (mu_t, sigma_t), arrays of shape (n_test,) for mean and standard deviation.
+
+        Raises:
+            ValueError: If model is not fitted or X_test has wrong number of members.
+        """
+        if self.params is None:
+            raise ValueError("Model must be fitted before prediction")
+        if X_test.shape[1] != self.m:
+            raise ValueError(f"X_test must have {self.m} ensemble members")
+        mu_t = self._compute_mu_t(X_test, self.params)
+        sigma_t = self._compute_sigma_t(X_test, self.params)
+        return mu_t, sigma_t
+
+    def prob_less_than(self, X_test, q):
+        """
+        Compute the probability that y <= q for each test sample (Eq. 3.8).
+
+        Args:
+            X_test (np.ndarray): Ensemble data of shape (n_test, m).
+            q (float or np.ndarray): Quantile(s) of interest.
+
+        Returns:
+            np.ndarray: Probabilities of shape (n_test,).
+        """
+        mu_t, sigma_t = self.predict(X_test)
+        return norm.cdf(q, loc=mu_t, scale=sigma_t)
+
+class WAS_mme_NGR_Model:
+    """
+    A Nonhomogeneous Gaussian Regression (NGR) approach to probabilistic forecasting on gridded data. 
+    Fits NGR per grid point and predicts the Gaussian distribution, then computes tercile probabilities for new data. 
+    """
+
+    def __init__(self, exchangeable=True, estimation_method='log_likelihood', nb_cores=1):
+        """
+        Parameters
+        ----------
+        exchangeable : bool, optional
+            Whether ensemble members are exchangeable (default=True).
+        estimation_method : str, optional
+            'log_likelihood' or 'crps' (default='log_likelihood').
+        nb_cores : int, optional
+            Number of CPU cores for Dask parallelization (default=1).
+
+        """
+        self.exchangeable = exchangeable
+        self.estimation_method = estimation_method
+        self.nb_cores = nb_cores
+
+    def fit_predict(self, X, y, X_test):
+        """
+        Trains the NGR model on (X, y) and predicts tercile class probabilities for X_test.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_members)
+            Ensemble predictor data for training.
+        y : array-like, shape (n_samples,)
+            Observations for training.
+        X_test : array-like, shape (n_test, n_members)
+            Ensemble predictor data for the forecast/test scenario.
+
+        Returns
+        -------
+        preds_proba : np.ndarray, shape (3, n_test)
+            Probability of each of the 3 tercile classes for each test sample. 
+            If invalid, the array is filled with NaNs.
+        """
+        # Reshape X_test if 1D
+        if X_test.ndim == 1:
+            X_test = X_test.reshape(1, -1)
+        n_test = X_test.shape[0]
+
+        # Identify rows with valid data
+        mask = np.isfinite(y) & np.all(np.isfinite(X), axis=-1)
+        if np.any(mask):
+            # Subset to valid
+            y_clean = y[mask]
+            X_clean = X[mask, :]
+
+            # Compute terciles from training observations
+            terciles = np.nanpercentile(y_clean, [33, 67])
+            t33, t67 = terciles
+
+            if np.isnan(t33):
+                return np.full((3, n_test), np.nan)
+
+            # Fit NGR
+            model = NGR(self.exchangeable, self.estimation_method)
+            model.fit(X_clean, y_clean)
+
+            # Compute cumulative probabilities
+            p_less_t33 = model.prob_less_than(X_test, t33)
+            p_less_t67 = model.prob_less_than(X_test, t67)
+
+            # Compute tercile probabilities
+            p_b = p_less_t33
+            p_n = p_less_t67 - p_less_t33
+            p_a = 1 - p_less_t67
+
+            # Stack into (3, n_test)
+            preds_proba = np.stack([p_b, p_n, p_a], axis=0)
+
+            # Check for invalid values (e.g., nan or negative probs)
+            if np.any(np.isnan(preds_proba)) or np.any(preds_proba < 0):
+                return np.full((3, n_test), np.nan)
+
+            return preds_proba
+        else:
+            return np.full((3, n_test), np.nan)
+
+    def compute_model(self, X_train, y_train, X_test):
+        """
+        Computes NGR-based class probabilities for each grid cell in `y_train`.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Predictors with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Observations with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Test predictors with dimensions (forecast, M, Y, X), where 'forecast' may be renamed if conflicting.
+
+        Returns
+        -------
+        xarray.DataArray
+            Class probabilities (3, forecast) for each grid cell.
+        """
+        # Chunk sizes
+        chunksize_x = np.round(len(y_train.get_index("X")) / self.nb_cores)
+        chunksize_y = np.round(len(y_train.get_index("Y")) / self.nb_cores)
+        
+        # Align time for training
+        X_train['T'] = y_train['T']
+        X_train = X_train.transpose('T', 'M', 'Y', 'X')
+        y_train = y_train.transpose('T', 'Y', 'X')
+        
+        # Handle test dim to avoid conflict
+        if 'T' in X_test.dims:
+            X_test = X_test.rename({'T': 'forecast'})
+        else:
+            X_test = X_test.transpose('forecast', 'M', 'Y', 'X')
+        
+        # Dask client
+        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+
+        result = xr.apply_ufunc(
+            self.fit_predict,
+            X_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            X_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[('T', 'M'), ('T',), ('forecast', 'M')],
+            output_core_dims=[('probability', 'forecast')],  
+            vectorize=True,
+            dask='parallelized',
+            output_dtypes=['float'],
+            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},  
+        )
+        
+        result_ = result.compute()
+        client.close()
+
+        # Rename back to 'T'
+        result_ = result_.rename({'forecast': 'T'})
+
+        return result_
+
+    def forecast(self, Predictant, Predictor, Predictor_for_year):
+        """
+        Runs the NGR model on a single forecast year.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            The observed variable (e.g., rainfall) with dimensions (T, Y, X).
+        Predictor : xarray.DataArray
+            The training ensemble predictors with dimensions (T, M, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Ensemble predictors for the forecast period, with dimensions (forecast=1, M, Y, X).
+
+        Returns
+        -------
+        xarray.DataArray
+            Probability of each tercile class (PB, PN, PA) for every grid cell, 
+            with the time dimension for the forecast.
+        """
+        # Chunk sizes
+        chunksize_x = np.round(len(Predictant.get_index("X")) / self.nb_cores)
+        chunksize_y = np.round(len(Predictant.get_index("Y")) / self.nb_cores)
+        
+        # Align T for training
+        Predictor['T'] = Predictant['T']
+        Predictor = Predictor.transpose('T', 'M', 'Y', 'X')
+        Predictant = Predictant.transpose('T', 'Y', 'X')
+        
+        # Handle forecast dim to avoid conflict
+        if 'T' in Predictor_for_year.dims:
+            Predictor_for_year_ = Predictor_for_year.rename({'T': 'forecast'})
+        else:
+            Predictor_for_year_ = Predictor_for_year.transpose('forecast', 'M', 'Y', 'X')
+        
+        # Parallel with Dask
+        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        result = xr.apply_ufunc(
+            self.fit_predict,
+            Predictor.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            Predictant.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            Predictor_for_year_.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[('T', 'M'), ('T',), ('forecast', 'M')],
+            output_core_dims=[('probability', 'forecast')],
+            vectorize=True,
+            dask='parallelized',
+            output_dtypes=['float'],
+            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
+        )
+
+        # Compute
+        result_ = result.compute()
+        client.close()
+        
+        # Rename forecast dim to T
+        result_ = result_.rename({'forecast': 'T'})
+        
+        # Adjust the T coordinate value
+        year = Predictor_for_year.coords['T'].values[0].astype('datetime64[Y]').astype(int) + 1970
+        T_value_1 = Predictant.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
+        result_ = result_.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        result_['T'] = result_['T'].astype('datetime64[ns]') 
+        
+        # Label probability dimension
+        result_ = result_.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        
+        # Transpose and return
+        return result_.transpose('probability', 'T', 'Y', 'X')
+
+############### Flexible  Nonhomogeneous Regression Model for WAS-MME ################
+
+class FlexibleNGR:
+    """
+    Flexible Nonhomogeneous Regression (NGR) class supporting multiple predictive distributions.
+
+    This class extends standard NGR to handle non-Gaussian predictands by allowing different
+    predictive distributions such as Gaussian, lognormal, logistic, Generalized Extreme Value (GEV),
+    gamma, weibull, laplace (biexponential), and pareto.
+    It uses ensemble statistics (mean and variance) to parameterize the predictive distribution,
+    with parameters estimated via maximum likelihood.
+
+    Attributes:
+        distribution (str): The type of predictive distribution ('gaussian', 'lognormal', 'logistic', 'gev',
+                            'gamma', 'weibull', 'laplace', 'pareto').
+        params (np.ndarray): Fitted parameters specific to the chosen distribution.
+    """
+
+    def __init__(self, distribution='gaussian'):
+        """
+        Initialize the FlexibleNGR model.
+
+        Args:
+            distribution (str): The predictive distribution to use.
+                                Options: 'gaussian', 'lognormal', 'logistic', 'gev', 'gamma', 'weibull',
+                                         'laplace', 'pareto'.
+                                Default is 'gaussian' (standard NGR).
+
+        Raises:
+            ValueError: If an unsupported distribution is specified.
+        """
+        self.distribution = distribution.lower()
+        supported = ['gaussian', 'lognormal', 'logistic', 'gev', 'gamma', 'weibull', 'laplace', 'pareto']
+        if self.distribution not in supported:
+            raise ValueError(f"Supported distributions are: {', '.join(supported)}")
+        self.params = None
+
+    def _compute_ensemble_stats(self, X):
+        """
+        Compute ensemble mean and variance for each sample.
+
+        Args:
+            X (np.ndarray): Ensemble data of shape (n_samples, n_members).
+
+        Returns:
+            tuple: (ensemble_mean, ensemble_var), each of shape (n_samples,).
+        """
+        ensemble_mean = np.mean(X, axis=1)
+        ensemble_var = np.var(X, axis=1, ddof=1)
+        return ensemble_mean, ensemble_var
+
+    def _log_likelihood_gaussian(self, params, ensemble_mean, ensemble_var, y):
+        a, b, gamma, delta = params
+        mu_t = a + b * ensemble_mean
+        sigma_t2 = gamma**2 + delta**2 * ensemble_var  # Ensure positivity
+        sigma_t = np.sqrt(np.maximum(sigma_t2, 1e-8))  # Avoid division by zero
+        ll = -0.5 * (y - mu_t)**2 / sigma_t2 - np.log(sigma_t)
+        return -np.sum(ll)
+
+    def _log_likelihood_lognormal(self, params, ensemble_mean, ensemble_var, y):
+        if np.any(y <= 0):
+            return np.inf  # Invalid for lognormal
+        ln_y = np.log(y)
+        return self._log_likelihood_gaussian(params, ensemble_mean, ensemble_var, ln_y)
+
+    def _log_likelihood_logistic(self, params, ensemble_mean, ensemble_std, y):
+        a, b, c, d = params
+        mu_t = a + b * ensemble_mean
+        sigma_t = np.exp(c + d * ensemble_std)  # Scale parameter, ensure positivity
+        z = (y - mu_t) / sigma_t
+        ll = -z - np.log(sigma_t) - 2 * np.log(1 + np.exp(-z))
+        return -np.sum(ll)
+
+    def _log_likelihood_gev(self, params, ensemble_mean, y):
+        a, b, c, d, xi = params
+        mu_t = a + b * ensemble_mean
+        sigma_t = np.exp(c + d * ensemble_mean)  # Scale parameter
+        z = 1 + xi * (y - mu_t) / sigma_t
+        if np.any(z <= 0):
+            return np.inf  # Invalid for GEV support
+        if xi != 0:
+            ll = -np.log(sigma_t) + (-1/xi - 1) * np.log(z) - z**(-1/xi)
+        else:  # Gumbel case
+            u = (y - mu_t) / sigma_t
+            ll = -np.log(sigma_t) - u - np.exp(-u)
+        return -np.sum(ll)
+
+    def _log_likelihood_gamma(self, params, ensemble_mean, y):
+        a, b, gamma, delta = params
+        mu_t = np.maximum(a + b * ensemble_mean, 1e-8)
+        sigma2_t = np.maximum(gamma**2 + delta**2 * ensemble_mean, 1e-8)
+        alpha_t = mu_t**2 / sigma2_t
+        beta_t = sigma2_t / mu_t
+        ll = scigamma.logpdf(y, a=alpha_t, scale=beta_t)
+        return -np.sum(ll)
+
+    def _log_likelihood_weibull(self, params, ensemble_mean, ensemble_std, y):
+        a, b, c, d = params
+        scale_t = np.exp(a + b * ensemble_mean)
+        shape_t = np.exp(c + d * np.log(ensemble_std + 1e-8))
+        ll = weibull_min.logpdf(y, c=shape_t, scale=scale_t)
+        return -np.sum(ll)
+
+    def _log_likelihood_laplace(self, params, ensemble_mean, ensemble_std, y):
+        a, b, c, d = params
+        loc_t = a + b * ensemble_mean
+        scale_t = np.exp(c + d * ensemble_std)
+        ll = laplace.logpdf(y, loc=loc_t, scale=scale_t)
+        return -np.sum(ll)
+
+    def _log_likelihood_pareto(self, params, ensemble_mean, ensemble_std, y):
+        a, b, c, d = params
+        scale_t = np.exp(a + b * ensemble_mean)
+        shape_t = np.exp(c + d * np.log(ensemble_std + 1e-8)) + 1  # Ensure shape > 1 for finite mean
+        ll = pareto.logpdf(y, b=shape_t, scale=scale_t)
+        return -np.sum(ll)
+
+    def fit(self, X_train, y_train):
+        if X_train.shape[0] != y_train.shape[0]:
+            raise ValueError("Number of samples in X_train and y_train must match")
+
+        ensemble_mean, ensemble_var = self._compute_ensemble_stats(X_train)
+        ensemble_std = np.sqrt(ensemble_var)
+
+        if self.distribution == 'gaussian':
+            initial_params = [0.0, 1.0, 1.0, 1.0]
+            objective = lambda p: self._log_likelihood_gaussian(p, ensemble_mean, ensemble_var, y_train)
+        elif self.distribution == 'lognormal':
+            initial_params = [0.0, 1.0, 1.0, 1.0]
+            objective = lambda p: self._log_likelihood_lognormal(p, ensemble_mean, ensemble_var, y_train)
+        elif self.distribution == 'logistic':
+            initial_params = [0.0, 1.0, 0.0, 0.0]
+            objective = lambda p: self._log_likelihood_logistic(p, ensemble_mean, ensemble_std, y_train)
+        elif self.distribution == 'gev':
+            initial_params = [0.0, 1.0, 0.0, 0.0, 0.1]
+            bounds = [(-np.inf, np.inf)] * 4 + [(-0.5, 0.5)]
+            result = minimize(self._log_likelihood_gev, initial_params, args=(ensemble_mean, y_train),
+                              method='L-BFGS-B', bounds=bounds)
+            if not result.success:
+                print(f"Warning: GEV optimization did not converge: {result.message}")
+            self.params = result.x
+            return
+        elif self.distribution == 'gamma':
+            initial_params = [0.0, 1.0, 1.0, 1.0]
+            objective = lambda p: self._log_likelihood_gamma(p, ensemble_mean, y_train)
+        elif self.distribution == 'weibull':
+            initial_params = [0.0, 0.0, 0.0, 0.0]
+            objective = lambda p: self._log_likelihood_weibull(p, ensemble_mean, ensemble_std, y_train)
+        elif self.distribution == 'laplace':
+            initial_params = [0.0, 1.0, 0.0, 0.0]
+            objective = lambda p: self._log_likelihood_laplace(p, ensemble_mean, ensemble_std, y_train)
+        elif self.distribution == 'pareto':
+            initial_params = [0.0, 0.0, 0.0, 0.0]
+            objective = lambda p: self._log_likelihood_pareto(p, ensemble_mean, ensemble_std, y_train)
+        else:
+            raise ValueError("Unsupported distribution")
+
+        result = minimize(objective, initial_params, method='L-BFGS-B')
+        if not result.success:
+            print(f"Warning: {self.distribution} optimization did not converge: {result.message}")
+        self.params = result.x
+
+    def predict(self, X_test):
+        if self.params is None:
+            raise ValueError("Model must be fitted before prediction")
+
+        ensemble_mean, ensemble_var = self._compute_ensemble_stats(X_test)
+        ensemble_std = np.sqrt(ensemble_var)
+
+        if self.distribution in ['gaussian', 'lognormal']:
+            a, b, gamma, delta = self.params
+            mu_t = a + b * ensemble_mean
+            sigma_t = np.sqrt(np.maximum(gamma**2 + delta**2 * ensemble_var, 1e-8))
+            return mu_t, sigma_t
+        elif self.distribution == 'logistic':
+            a, b, c, d = self.params
+            mu_t = a + b * ensemble_mean
+            sigma_t = np.exp(c + d * ensemble_std)
+            return mu_t, sigma_t
+        elif self.distribution == 'gev':
+            a, b, c, d, xi = self.params
+            mu_t = a + b * ensemble_mean
+            sigma_t = np.exp(c + d * ensemble_mean)
+            return mu_t, sigma_t, xi
+        elif self.distribution == 'gamma':
+            a, b, gamma, delta = self.params
+            mu_t = np.maximum(a + b * ensemble_mean, 1e-8)
+            sigma2_t = np.maximum(gamma**2 + delta**2 * ensemble_mean, 1e-8)
+            alpha_t = mu_t**2 / sigma2_t
+            beta_t = sigma2_t / mu_t
+            return alpha_t, beta_t
+        elif self.distribution == 'weibull':
+            a, b, c, d = self.params
+            scale_t = np.exp(a + b * ensemble_mean)
+            shape_t = np.exp(c + d * np.log(ensemble_std + 1e-8))
+            return scale_t, shape_t
+        elif self.distribution == 'laplace':
+            a, b, c, d = self.params
+            loc_t = a + b * ensemble_mean
+            scale_t = np.exp(c + d * ensemble_std)
+            return loc_t, scale_t
+        elif self.distribution == 'pareto':
+            a, b, c, d = self.params
+            scale_t = np.exp(a + b * ensemble_mean)
+            shape_t = np.exp(c + d * np.log(ensemble_std + 1e-8)) + 1
+            return scale_t, shape_t
+
+    def prob_less_than(self, X_test, q):
+        if self.distribution == 'gaussian':
+            mu_t, sigma_t = self.predict(X_test)
+            return norm.cdf(q, loc=mu_t, scale=sigma_t)
+        elif self.distribution == 'lognormal':
+            mu_t, sigma_t = self.predict(X_test)
+            if q <= 0:
+                return np.zeros_like(mu_t)
+            return norm.cdf(np.log(q), loc=mu_t, scale=sigma_t)
+        elif self.distribution == 'logistic':
+            mu_t, sigma_t = self.predict(X_test)
+            return logistic.cdf(q, loc=mu_t, scale=sigma_t)
+        elif self.distribution == 'gev':
+            mu_t, sigma_t, xi = self.predict(X_test)
+            return genextreme.cdf(q, c=-xi, loc=mu_t, scale=sigma_t)
+        elif self.distribution == 'gamma':
+            alpha_t, beta_t = self.predict(X_test)
+            return scigamma.cdf(q, a=alpha_t, scale=beta_t)
+        elif self.distribution == 'weibull':
+            scale_t, shape_t = self.predict(X_test)
+            return weibull_min.cdf(q, c=shape_t, scale=scale_t)
+        elif self.distribution == 'laplace':
+            loc_t, scale_t = self.predict(X_test)
+            return laplace.cdf(q, loc=loc_t, scale=scale_t)
+        elif self.distribution == 'pareto':
+            scale_t, shape_t = self.predict(X_test)
+            return pareto.cdf(q, b=shape_t, scale=scale_t)
+
+class WAS_mme_FlexibleNGR_Model:
+    """
+    A Flexible Nonhomogeneous Regression approach to probabilistic forecasting on gridded data. 
+    Fits FlexibleNGR per grid point with the specified distribution, predicts the distribution, 
+    then computes tercile probabilities for new data.
+    """
+
+    def __init__(self, distribution='gaussian', nb_cores=1):
+        """
+        Parameters
+        ----------
+        distribution : str, optional
+            The predictive distribution to use (default='gaussian').
+        nb_cores : int, optional
+            Number of CPU cores for Dask (default=1).
+
+        """
+        self.distribution = distribution
+        self.nb_cores = nb_cores
+
+    def fit_predict(self, X, y, X_test):
+        """
+        Trains the FlexibleNGR on (X, y) and predicts tercile class probabilities for X_test.
+
+        Parameters
+        ----------
+        X : np.ndarray, shape (n_samples, n_members)
+            Ensemble predictor data for training.
+        y : np.ndarray, shape (n_samples,)
+            Observations for training.
+        X_test : np.ndarray, shape (n_test, n_members)
+            Ensemble predictor data for forecast/test.
+
+        Returns
+        -------
+        np.ndarray, shape (3, n_test)
+            Probability of each tercile class (PB, PN, PA). 
+            If invalid, filled with NaNs.
+        """
+        # Reshape X_test if 1D
+        if X_test.ndim == 1:
+            X_test = X_test.reshape(1, -1)
+        n_test = X_test.shape[0]
+
+        # Identify valid rows
+        mask = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+        if np.any(mask):
+            # Subset to valid
+            y_clean = y[mask]
+            X_clean = X[mask, :]
+
+            # Compute empirical terciles from training observations
+            terciles = np.nanpercentile(y_clean, [33.333333333333336, 66.66666666666667])
+            t33, t67 = terciles
+
+            if np.isnan(t33) or np.isnan(t67):
+                return np.full((3, n_test), np.nan)
+
+            # Fit FlexibleNGR
+            model = FlexibleNGR(distribution=self.distribution)
+            try:
+                model.fit(X_clean, y_clean)
+            except:
+                return np.full((3, n_test), np.nan)
+
+            # Compute cumulative probabilities
+            p_less_t33 = model.prob_less_than(X_test, t33)
+            p_less_t67 = model.prob_less_than(X_test, t67)
+
+            # Compute tercile probabilities
+            p_b = p_less_t33
+            p_n = p_less_t67 - p_less_t33
+            p_a = 1 - p_less_t67
+
+            # Stack into (3, n_test)
+            preds_proba = np.stack([p_b, p_n, p_a], axis=0)
+
+            # Check for invalid values
+            if np.any(np.isnan(preds_proba)) or np.any(preds_proba < 0):
+                return np.full((3, n_test), np.nan)
+
+            return preds_proba
+        else:
+            return np.full((3, n_test), np.nan)
+
+    def compute_model(self, X_train, y_train, X_test):
+        """
+        Computes Flexible NGR-based class probabilities for each grid cell.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Predictors with dims (T, M, Y, X).
+        y_train : xarray.DataArray
+            Observations with dims (T, Y, X).
+        X_test : xarray.DataArray
+            Test predictors with dims (forecast, M, Y, X), where 'forecast' may be renamed if conflicting.
+
+        Returns
+        -------
+        xarray.DataArray
+            Class probabilities (probability=3, forecast, Y, X).
+        """
+        # Chunk sizes
+        chunksize_x = np.round(len(y_train.get_index("X")) / self.nb_cores)
+        chunksize_y = np.round(len(y_train.get_index("Y")) / self.nb_cores)
+        
+        # Align and transpose
+        X_train['T'] = y_train['T']
+        X_train = X_train.transpose('T', 'M', 'Y', 'X')
+        y_train = y_train.transpose('T', 'Y', 'X')
+        
+        # Handle test dim to avoid conflict
+        if 'T' in X_test.dims:
+            X_test = X_test.rename({'T': 'forecast'})
+        X_test = X_test.transpose('forecast', 'M', 'Y', 'X')
+
+        # Dask client
+        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+
+        result = xr.apply_ufunc(
+            self.fit_predict,
+            X_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            X_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[['T', 'M'], ['T'], ['forecast', 'M']],
+            output_core_dims=[['probability', 'forecast']],
+            vectorize=True,
+            dask='parallelized',
+            output_dtypes=['float'],
+            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
+        )
+        
+        result_ = result.compute()
+        client.close()
+
+        # Rename back to 'T'
+        result_ = result_.rename({'forecast': 'T'})
+
+        return result_.assign_coords(probability=['PB', 'PN', 'PA'])
+
+    def forecast(self, Predictant, Predictor, Predictor_for_year):
+        """
+        Runs the Flexible NGR model for a single forecast period.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed variable (T, Y, X).
+        Predictor : xarray.DataArray
+            Training ensemble predictors (T, M, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Ensemble predictors for forecast (forecast=1, M, Y, X).
+
+        Returns
+        -------
+        xarray.DataArray
+            Probabilities (PB, PN, PA, T=1, Y, X) with forecast time.
+        """
+        # Chunk sizes
+        chunksize_x = np.round(len(Predictant.get_index("X")) / self.nb_cores)
+        chunksize_y = np.round(len(Predictant.get_index("Y")) / self.nb_cores)
+        
+        # Align T for training
+        Predictor['T'] = Predictant['T']
+        Predictor = Predictor.transpose('T', 'M', 'Y', 'X')
+        Predictant = Predictant.transpose('T', 'Y', 'X')
+        
+        # Handle forecast dim to avoid conflict
+        if 'T' in Predictor_for_year.dims:
+            Predictor_for_year_ = Predictor_for_year.rename({'T': 'forecast'})
+        else:
+            Predictor_for_year_ = Predictor_for_year.transpose('forecast', 'M', 'Y', 'X')
+        
+        # Parallel with Dask
+        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        result = xr.apply_ufunc(
+            self.fit_predict,
+            Predictor.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            Predictant.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            Predictor_for_year_.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[['T', 'M'], ['T'], ['forecast', 'M']],
+            output_core_dims=[['probability', 'forecast']],
+            vectorize=True,
+            dask='parallelized',
+            output_dtypes=['float'],
+            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
+        )
+
+        # Compute
+        result_ = result.compute()
+        client.close()
+        
+        # Rename forecast dim to T
+        result_ = result_.rename({'forecast': 'T'})
+        
+        # Adjust the T coordinate value
+        year = Predictor_for_year.coords['T'].values[0].astype('datetime64[Y]').astype(int) + 1970
+        T_value_1 = Predictant.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
+        result_ = result_.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        result_['T'] = result_['T'].astype('datetime64[ns]') 
+        
+        # Label probabilities
+        result_ = result_.assign_coords(probability=['PB', 'PN', 'PA'])
+        
+        # Transpose and return
+        return result_.transpose('probability', 'T', 'Y', 'X')
+
+############################### BMA Sloughter modified ###############################
+
+class BMA_Sloughter:
+    def __init__(self, distribution='gaussian'):
+        """
+        Initialize the BMA model with the specified distribution.
+
+        Parameters:
+        - distribution: str, one of 'gaussian', 'gamma', 'lognormal', 'weibull', 't' (default: 'gaussian')
+        """
+        if distribution not in ['gaussian', 'gamma', 'lognormal', 'weibull', 't']:
+            raise ValueError("Unsupported distribution. Choose from 'gaussian', 'gamma', 'lognormal', 'weibull', 't'.")
+        self.distribution = distribution
+        self.debiasing_models = []
+        self.weights = None
+        self.disp = None  # Dispersion parameters (e.g., sigma for gaussian, alpha for gamma, etc.)
+        self.dist_configs = self._get_dist_configs()
+        self.config = self.dist_configs[self.distribution]
+        if self.distribution == 't':
+            self.df = 22  # Fixed degrees of freedom for Student's t
+        else:
+            self.df = None
+
+    def _get_dist_configs(self):
+        return {
+            'gaussian': {
+                'pdf': lambda y, mu, sigma: norm.pdf(y, loc=mu, scale=sigma),
+                'cdf': lambda q, mu, sigma: norm.cdf(q, loc=mu, scale=sigma),
+                'initial': lambda res: np.std(res) if len(res) > 0 else 1.0,
+                'bounds': (1e-5, np.inf),
+                'closed_update': lambda r, res: np.sqrt(np.sum(r * res**2) / np.sum(r)) if np.sum(r) > 0 else 1.0
+            },
+            'gamma': {
+                'pdf': lambda y, mu, alpha: gamma.pdf(y, a=alpha, loc=0, scale=mu / alpha),
+                'cdf': lambda q, mu, alpha: gamma.cdf(q, a=alpha, loc=0, scale=mu / alpha),
+                'initial': lambda y, mu: (np.mean(mu)**2 / np.var(y)) if np.var(y) > 0 and np.mean(mu) > 0 else 1.0,
+                'bounds': (0.01, 1000),
+                'closed_update': None
+            },
+            'lognormal': {
+                'pdf': lambda y, mu, s: lognorm.pdf(y, s=s, loc=0, scale=np.exp(np.log(mu) - s**2 / 2)),
+                'cdf': lambda q, mu, s: lognorm.cdf(q, s=s, loc=0, scale=np.exp(np.log(mu) - s**2 / 2)),
+                'initial': lambda y, mu: np.sqrt(np.log(1 + np.var(y) / np.mean(mu)**2)) if np.mean(mu) > 0 and np.var(y) >= 0 else 0.5,
+                'bounds': (0.01, 10),
+                'closed_update': None
+            },
+            'weibull': {
+                'pdf': lambda y, mu, c: weibull_min.pdf(y, c=c, loc=0, scale=mu / sp_gamma(1 + 1/c)),
+                'cdf': lambda q, mu, c: weibull_min.cdf(q, c=c, loc=0, scale=mu / sp_gamma(1 + 1/c)),
+                'initial': lambda y, mu: 2.0,
+                'bounds': (0.1, 10),
+                'closed_update': None
+            },
+            't': {
+                'pdf': lambda y, mu, scale: t.pdf(y, df=self.df, loc=mu, scale=scale),
+                'cdf': lambda q, mu, scale: t.cdf(q, df=self.df, loc=mu, scale=scale),
+                'initial': lambda res: np.std(res) * np.sqrt((self.df - 2) / self.df) if self.df > 2 else 1.0,
+                'bounds': (1e-5, np.inf),
+                'closed_update': None
+            }
+        }
+
+    def fit(self, ensemble_forecasts, observations):
+        """
+        Fit the BMA model using historical ensemble forecasts and observations.
+        
+        Parameters:
+        - ensemble_forecasts: 2D array of shape (n_samples, m_members)
+        - observations: 1D array of shape (n_samples)
+        """
+        n_samples, m_members = ensemble_forecasts.shape
+        
+        # Step 1: Debiasing using linear regression for each ensemble member
+        self.debiasing_models = []
+        μ_train = np.zeros((n_samples, m_members))
+        for k in range(m_members):
+            X_k = ensemble_forecasts[:, k].reshape(-1, 1)
+            model = LinearRegression()
+            model.fit(X_k, observations)
+            self.debiasing_models.append(model)
+            μ_train[:, k] = model.predict(X_k)
+        
+        # Handle non-positive μ for positive distributions
+        if self.distribution in ['gamma', 'lognormal', 'weibull']:
+            μ_train = np.maximum(μ_train, 1e-5)
+        
+        # Step 2: Estimate BMA weights and dispersion parameters using EM algorithm
+        wk = np.ones(m_members) / m_members
+        disp = np.zeros(m_members)
+        for k in range(m_members):
+            res_k = observations - μ_train[:, k]
+            if self.distribution in ['gaussian', 't']:
+                disp[k] = self.config['initial'](res_k)
+            else:
+                disp[k] = self.config['initial'](observations, μ_train[:, k])
+        
+        prev_LL = -np.inf
+        tol = 1e-6
+        max_iter = 100
+        
+        for iter in range(max_iter):
+            # E-step: Compute responsibilities (r_tk)
+            r_tk = np.zeros((n_samples, m_members))
+            for t in range(n_samples):
+                log_p_tk = np.log(wk)
+                for k in range(m_members):
+                    pdf_val = self.config['pdf'](observations[t], μ_train[t, k], disp[k])
+                    log_p_tk[k] += np.log(pdf_val + 1e-10)
+                log_p_t = np.logaddexp.reduce(log_p_tk)
+                r_tk[t] = np.exp(log_p_tk - log_p_t)
+            
+            # M-step: Update weights
+            sum_r_tk = np.sum(r_tk, axis=0)
+            wk_new = sum_r_tk / n_samples
+            
+            # Update dispersion parameters
+            disp_new = np.zeros(m_members)
+            for k in range(m_members):
+                if self.config['closed_update'] is not None:
+                    res_k = observations - μ_train[:, k]
+                    disp_new[k] = self.config['closed_update'](r_tk[:, k], res_k)
+                else:
+                    def neg_ll(dsp):
+                        pdf_vals = self.config['pdf'](observations, μ_train[:, k], dsp)
+                        pdf_vals = np.maximum(pdf_vals, 1e-10)
+                        return -np.sum(r_tk[:, k] * np.log(pdf_vals))
+                    res = minimize_scalar(neg_ll, bounds=self.config['bounds'], method='bounded', options={'xatol': 1e-5})
+                    if res.success:
+                        disp_new[k] = res.x
+                    else:
+                        disp_new[k] = disp[k]
+            
+            # Update parameters
+            wk = wk_new
+            disp = disp_new
+            
+            # Compute log-likelihood for convergence check
+            LL = 0
+            for t in range(n_samples):
+                log_p_tk = np.log(wk)
+                for k in range(m_members):
+                    pdf_val = self.config['pdf'](observations[t], μ_train[t, k], disp[k])
+                    log_p_tk[k] += np.log(pdf_val + 1e-10)
+                log_p_t = np.logaddexp.reduce(log_p_tk)
+                LL += log_p_t
+            
+            if iter > 0 and abs(LL - prev_LL) < tol:
+                break
+            prev_LL = LL
+        
+        self.weights = wk
+        self.disp = disp
+
+    def predict_cdf(self, new_forecasts, q):
+        """
+        Compute the BMA predictive CDF at a given value q for new forecasts.
+        
+        Parameters:
+        - new_forecasts: 2D array of shape (n_new, m_members)
+        - q: Scalar value at which to compute the CDF.
+        
+        Returns:
+        - cdf_values: Array of shape (n_new,)
+        """
+        n_new, m_members = new_forecasts.shape
+        if len(self.debiasing_models) != m_members:
+            raise ValueError("Number of ensemble members in new_forecasts does not match the trained model.")
+        
+        # Compute debiased forecasts (μ_new) for new data
+        μ_new = np.zeros((n_new, m_members))
+        for k in range(m_members):
+            X_k = new_forecasts[:, k].reshape(-1, 1)
+            μ_new[:, k] = self.debiasing_models[k].predict(X_k)
+        
+        if self.distribution in ['gamma', 'lognormal', 'weibull']:
+            μ_new = np.maximum(μ_new, 1e-5)
+        
+        # Compute BMA predictive CDF
+        cdf_k = np.zeros((n_new, m_members))
+        for k in range(m_members):
+            cdf_k[:, k] = self.config['cdf'](q, μ_new[:, k], self.disp[k])
+        cdf_values = np.sum(self.weights * cdf_k, axis=1)
+        return cdf_values
+
+    def predict_mean(self, new_forecasts):
+        """
+        Compute the BMA predictive mean for new forecasts.
+        
+        Parameters:
+        - new_forecasts: 2D array of shape (n_new, m_members).
+        
+        Returns:
+        - mean_values: Array of shape (n_new,)
+        """
+        n_new, m_members = new_forecasts.shape
+        if len(self.debiasing_models) != m_members:
+            raise ValueError("Number of ensemble members in new_forecasts does not match the trained model.")
+        
+        # Compute debiased forecasts (μ_new) for new data
+        μ_new = np.zeros((n_new, m_members))
+        for k in range(m_members):
+            X_k = new_forecasts[:, k].reshape(-1, 1)
+            μ_new[:, k] = self.debiasing_models[k].predict(X_k)
+        
+        # Compute BMA predictive mean
+        mean_values = np.sum(self.weights * μ_new, axis=1)
+        return mean_values
+
+
+
+class WAS_mme_BMA_Sloughter:
+    
+    def __init__(self, dist_method='gaussian', nb_cores=1):
+        
+        self.dist_method=dist_method
+        self.nb_cores=nb_cores
+    
+    def fit_predict(self, X, y, X_test):
+        
+        mask = np.isfinite(y) & np.all(np.isfinite(X), axis=-1)
+
+        if np.any(mask):
+            # Subset to valid
+            y_clean = y[mask]
+            X_clean = X[mask, :]
+            model = BMA_Sloughter( self.dist_method)
+            model.fit(X_clean, y_clean)
+            preds = model.predict_mean(X_test)
+            return preds
+        else:
+            return np.full((1,), np.nan)
+
+    def predict_proba(self, X, y, X_test):
+        mask = np.isfinite(y) & np.all(np.isfinite(X), axis=-1)
+        
+        if np.any(mask):
+            # Subset to valid
+            y_clean = y[mask]
+            X_clean = X[mask, :]
+
+            # Compute terciles from training observations
+            terciles = np.nanpercentile(y_clean, [33, 67])
+            t33, t67 = terciles
+
+            if np.isnan(t33):
+                return np.full(3, np.nan)
+
+            model = BMA_Sloughter( self.dist_method)
+            model.fit(X_clean, y_clean)
+
+            p_b = model.predict_cdf(X_test, t33)
+            p_n = model.predict_cdf(X_test, t67) - p_b
+            p_a = 1 - model.predict_cdf(X_test, t67)
+            return np.array([p_b, p_n, p_a])
+        else:
+            return np.full((3,), np.nan)        
+        
+
+    def compute_model(self, X_train, y_train, X_test):
+        """
+        Computes NGR-based class probabilities for each grid cell in `y_train`.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Predictors with dimensions (T, member).
+        y_train : xarray.DataArray
+            Observations with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Test predictors with dimensions (T, member).
+
+        Returns
+        -------
+        xarray.DataArray
+            Class probabilities (3) for each grid cell.
+        """
+        # Chunk sizes
+        chunksize_x = np.round(len(y_train.get_index("X")) / self.nb_cores)
+        chunksize_y = np.round(len(y_train.get_index("Y")) / self.nb_cores)
+        
+        # Align time
+        X_train['T'] = y_train['T']
+        X_train = X_train.transpose('T', 'M', 'Y', 'X')
+        y_train = y_train.transpose('T', 'Y', 'X')
+        
+        # Squeeze X_test
+        X_test = X_test.transpose('T', 'M', 'Y', 'X')
+
+        # Dask client
+        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+
+        result = xr.apply_ufunc(
+            self.fit_predict,
+            X_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            X_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[('T','M'), ('T',), ('T','M')],
+            output_core_dims=[('T',)],  
+            vectorize=True,
+            dask='parallelized',
+            output_dtypes=['float']
+        )
+        
+        result_ = result.compute()
+        client.close()
+        return result_
+
+
+    def compute_prob(self, X_train, y_train, X_test):
+        """
+        Computes NGR-based class probabilities for each grid cell in `y_train`.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Predictors with dimensions (T, member).
+        y_train : xarray.DataArray
+            Observations with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Test predictors with dimensions (T, member).
+
+        Returns
+        -------
+        xarray.DataArray
+            Class probabilities (3) for each grid cell.
+        """
+        # Chunk sizes
+        chunksize_x = np.round(len(y_train.get_index("X")) / self.nb_cores)
+        chunksize_y = np.round(len(y_train.get_index("Y")) / self.nb_cores)
+        
+        # Align time
+        X_train['T'] = y_train['T']
+        X_train = X_train.transpose('T', 'M', 'Y', 'X')
+        y_train = y_train.transpose('T', 'Y', 'X')
+        
+        # Squeeze X_test
+        X_test = X_test.transpose('T', 'M', 'Y', 'X')
+
+        # Dask client
+        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+
+        result = xr.apply_ufunc(
+            self.predict_proba,
+            X_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            X_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[('T','M'), ('T',), ('T','M')],
+            output_core_dims=[('probability', 'T')],  
+            vectorize=True,
+            dask='parallelized',
+            output_dtypes=['float'],
+            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},  
+        )
+        
+        result_ = result.compute()
+        client.close()
+        return result_
+
+    def forecast(self, Predictant, Predictor, Predictor_for_year):
+        predict_mean = self.compute_model(Predictant, Predictor, Predictor_for_year)
+        predict_proba = self.compute_prob(Predictant, Predictor, Predictor_for_year)
+        return predict_mean, predict_proba

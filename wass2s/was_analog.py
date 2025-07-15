@@ -143,7 +143,6 @@ class WAS_Analog:
     Notes
     -----
     - Performance Considerations: For large datasets (e.g., many years or high-dimensional data), the AgglomerativeClustering method (`agglomerative_based`) may be significantly slower than K-Means (`kmeans_based`) or SOM (`som`) due to its computational complexity. Users should consider testing with smaller datasets or reducing the number of clusters when using AgglomerativeClustering.
-    - The `plot_clusters` method can be used to visualize clustering results for `kmeans_based` and `agglomerative_based` methods, projecting years onto a 2D PCA space colored by cluster.
     """
 
     def __init__(self, dir_to_save, year_start, year_forecast,
@@ -151,7 +150,7 @@ class WAS_Analog:
                                 {'reanalysis_name': 'ERA5', 'model_name': 'NCEP_2', 'variable': 'SP', 'area': [60, -180, -60, 180]},
                                 {'reanalysis_name': 'ERA5', 'model_name': 'NCEP_2', 'variable': 'VGRD_850', 'area': [60, -180, -60, 180]}],
                  method_analog="som", month_of_initialization=None,
-                 lead_time=None, ensemble_mean="mean", rolling=3, standardize=True, multivariateEOF=False,
+                 lead_time=None, ensemble_mean="mean", rolling=3, standardize=True, detrend=False, multivariateEOF=False,
                  eof_explained_var=0.95, clim_year_start=None, clim_year_end=None,
                  index_compute=None, some_grid_size=(None, None), some_learning_rate=0.5, radius=1.0,
                  some_neighborhood_function='gaussian', some_sigma=1.0, some_num_iteration=2000, dist_method="gamma",
@@ -169,6 +168,7 @@ class WAS_Analog:
         self.multivariateEOF = multivariateEOF
         self.rolling = rolling
         self.standardize = standardize
+        self.detrend = False
         self.clim_year_start = clim_year_start
         self.clim_year_end = clim_year_end
         self.index_compute = index_compute
@@ -268,8 +268,7 @@ class WAS_Analog:
         store_file_path = {}
 
         for center, var, area in zip(centers, variables, areas):
-            combined_output_path = dir_to_save / f"{center}_{var}_{self.year_start}_{year_end}_{season}.nc"
-        
+            combined_output_path = dir_to_save / f"{center}_{var}_{self.year_start}_{year_end}_{season}_{area[0]}_{area[1]}{area[2]}{area[3]}.nc" 
             if not force_download and combined_output_path.exists():
                 print(f"{combined_output_path} exists. Skipping download.")
                 store_file_path[var] = xr.open_dataset(combined_output_path)
@@ -437,8 +436,8 @@ class WAS_Analog:
         store_hdcst_file_path = {}
 
         for cent, syst, var, area in zip(selected_centres, selected_systems, variables, areas):
-            forecast_file = dir_to_save / f"forecast_{cent}{syst}_{var}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}.nc"
-            hindcast_file = dir_to_save / f"hindcast_{cent}{syst}_{var}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}.nc"
+            forecast_file = dir_to_save / f"forecast_{cent}{syst}_{var}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}_{area[0]}_{area[1]}{area[2]}{area[3]}.nc"
+            hindcast_file = dir_to_save / f"hindcast_{cent}{syst}_{var}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}_{area[0]}_{area[1]}{area[2]}{area[3]}.nc"
                
             if not force_download and forecast_file.exists():
                 print(f"Forecast file {forecast_file} exists. Skipping download.")
@@ -632,13 +631,22 @@ class WAS_Analog:
         data = data.rename({"X": "lon", "Y": "lat"})
         data = data.fillna(data.mean(dim="T", skipna=True))
         print("Computing EOFs...")
-        model = xe.single.EOF(n_modes=100)
+        model = xe.single.EOF(n_modes=100, use_coslat=True, center=False)
         model.fit(data, dim='T')
         explained_var = model.explained_variance_ratio()
         cumulative_var = explained_var.cumsum()
         n_modes = np.where(cumulative_var >= self.eof_explained_var)[0][0] + 1
         print(f"Selected {n_modes} modes explaining {cumulative_var[n_modes-1].values*100:.2f}% variance")
         return model.scores().isel(mode=slice(0, n_modes))
+
+    def _detrended_da(self, da):
+        """Detrend a DataArray by removing the linear trend."""
+        if 'T' not in da.dims:
+            raise ValueError("DataArray must have a time dimension 'T' for detrending.")
+        trend = da.polyfit(dim='T', deg=1)
+        da_detrended = da - (trend.polyval(da['T']) if 'polyval' in dir(trend) else trend)
+        return da_detrended.isel(degree=0, drop=True).to_array().drop_vars('variable').squeeze(),\
+             trend.isel(degree=0, drop=True).to_array().drop_vars('variable').squeeze()
 
     def _prepare_data_for_clustering(self, unique_years, target_year=None):
         """Helper to prepare data (indices or EOFs) for clustering methods."""
@@ -648,6 +656,8 @@ class WAS_Analog:
 
         if self.index_compute:
             ddd_sst = ddd.get('SST')
+            if self.detrend:
+                ddd_sst, _ = self._detrended_da(ddd_sst)
             if ddd_sst is None:
                 raise ValueError("SST data not found in downloaded datasets for clustering.")
             indices_dataset = self.calc_index(self.index_compute, ddd_sst)
@@ -655,10 +665,9 @@ class WAS_Analog:
             data_scaled, index_data = self.arrange_indices_for_som(indices_dataset_sel_years)
         else:
             if self.multivariateEOF:
-                data_vars = [ddd[var].rename({"X": "lon", "Y": "lat"}) for var in ddd]
-                combined_data = xr.concat([d.to_array().squeeze() for d in data_vars], dim='variable').stack(feature=('variable', 'lon', 'lat'))
-                model = xe.single.EOF(n_modes=100)
-                model.fit(combined_data, dim='T')
+                data_vars = [self._detrended_da(ddd[var].rename({"X": "lon", "Y": "lat"}))[0] if self.detrend else ddd[var].rename({"X": "lon", "Y": "lat"}) for var in ddd]
+                model = xe.single.EOF(n_modes=100, use_coslat=True, center=False)
+                model.fit(data_vars, dim='T')
                 explained_var = model.explained_variance_ratio()
                 n_modes = np.where(explained_var.cumsum() >= self.eof_explained_var)[0][0] + 1
                 scores = model.scores().isel(mode=slice(0, n_modes))
@@ -677,6 +686,8 @@ class WAS_Analog:
             else:
                 df_final = pd.DataFrame()
                 for var in ddd:
+                    if self.detrend:
+                        ddd[var], _ = self._detrended_da(ddd[var])
                     scores = self.compute_eofs(ddd[var])
                     scores = scores.where(scores['T'].dt.year.isin(unique_years), drop=True)
                     scores = scores.assign_coords(year=('T', scores['T'].dt.year.data), month_name=('T', scores['T'].dt.strftime('%b').data))
@@ -820,7 +831,7 @@ class WAS_Analog:
         predictor_detrend = sig.detrend(predictor_, axis=0)
         ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
         
-        eof = xe.single.EOF(n_modes=50)
+        eof = xe.single.EOF(n_modes=50, use_coslat=True, center=False)
         eof.fit(ddd.fillna(ddd.mean(dim="T", skipna=True)), dim="T")
         scores = eof.scores()
         

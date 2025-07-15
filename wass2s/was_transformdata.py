@@ -4,15 +4,8 @@ WAS_TransformData: Skewness Analysis and Transformation for Geospatial Time-Seri
 This module provides the `WAS_TransformData` class to analyze skewness, apply
 transformations, fit distributions, and visualize geospatial time-series data with
 dimensions (T, Y, X) representing time, latitude, and longitude, respectively.
-
-Notes
------
-- Ensure Natural Earth data is available for `cartopy` mapping features.
-- The `inv_boxcox` function is manually implemented for SciPy 1.11.3 compatibility,
-  as it is not available until SciPy 1.12.0.
 """
 
-# ── core imports ────────────────────────────────────────────────────────────────
 import xarray as xr
 import numpy as np
 from scipy.stats import skew, boxcox
@@ -24,7 +17,6 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.colors import ListedColormap, BoundaryNorm
-# ────────────────────────────────────────────────────────────────────────────────
 
 def inv_boxcox(y, lmbda):
     """
@@ -422,7 +414,8 @@ class WAS_TransformData:
                 elif m in ('clipping', 'binning'):
                     self.transformed_data[:, iy, ix] = cell
                 else:
-                    print(f"Warning: unknown method '{m}' at Y={iy}, X={ix}")
+                    pass
+                    #print(f"Warning: unknown method '{m}' at Y={iy}, X={ix}")
 
         return self.transformed_data
 

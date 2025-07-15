@@ -5190,4 +5190,729 @@ class WAS_LogisticRegression_Model:
         # Drop the time dimension (we're forecasting a single instance) and reorder dimensions
         return result_.drop_vars('T').squeeze().transpose('probability', 'T', 'Y', 'X')
 
+############################################ Implement MARS ############################################
+###########################################################################################################################################################################################################################################################################################################################################
 
+def evaluate_basis(X, basis):
+    """Evaluate a basis function on the input data X."""
+    if not basis:  # Constant term
+        return np.ones(X.shape[0])
+    result = np.ones(X.shape[0])
+    for v, t, s in basis:
+        if s == 1:
+            h = np.maximum(0, X[:, v] - t)
+        else:
+            h = np.maximum(0, t - X[:, v])
+        result *= h
+    return result
+
+class MARS:
+    """Multivariate Adaptive Regression Splines with Generalized Cross-Validation."""
+    def __init__(self, max_terms=21, max_degree=1, c=3):
+        """
+        Initialize MARS model.
+
+        Parameters:
+        - max_terms: Maximum number of basis functions (default: 21)
+        - max_degree: Maximum degree of interaction (default: 1)
+        - c: Cost parameter for effective parameters in GCV (default: 3)
+        """
+        self.max_terms = max_terms
+        self.max_degree = max_degree
+        self.c = c
+        self.basis_functions = None
+        self.beta = None
+        self.t_candidates = None
+
+    def calculate_gcv(self, X, y, basis_functions, beta):
+        """Calculate the Generalized Cross-Validation score."""
+        n = X.shape[0]
+        M = len(basis_functions)
+        design = np.column_stack([evaluate_basis(X, b) for b in basis_functions])
+        y_pred = design @ beta
+        rss = np.sum((y - y_pred)**2)
+        # Effective parameters: M + c * (M - 1)/2, but 1 if only constant term
+        effective_params = M + self.c * (M - 1) / 2 if M > 1 else 1
+        gcv = rss / (n * (1 - effective_params / n)**2)
+        return gcv
+
+    def fit(self, X, y):
+        """Fit the MARS model to the data."""
+        n_samples, n_features = X.shape
+        self.t_candidates = [np.sort(np.unique(X[:, v]))[1:-1] for v in range(n_features)] if n_samples > 2 else []
+
+        # Forward Pass: Build the initial model
+        self.basis_functions = [[]]  # Start with constant term
+        current_design = np.ones((n_samples, 1))
+        self.beta = np.array([np.mean(y)])
+        current_sse = np.sum((y - self.beta[0])**2)
+
+        while len(self.basis_functions) < self.max_terms:
+            best_sse = current_sse
+            best_parent_idx = None
+            best_v = None
+            best_t = None
+            best_beta_new = None
+            best_col_left = None
+            best_col_right = None
+
+            current_cols = current_design.shape[1]
+
+            for i, existing_basis in enumerate(self.basis_functions):
+                current_degree = len(existing_basis)
+                if current_degree >= self.max_degree:
+                    continue
+                used_vars = {vv for vv, _, _ in existing_basis}
+                parent_col = current_design[:, i]
+
+                for v in range(n_features):
+                    if v in used_vars:
+                        continue
+                    for t in self.t_candidates[v]:
+                        h_left = np.maximum(0, X[:, v] - t)
+                        h_right = np.maximum(0, t - X[:, v])
+                        col_left = parent_col * h_left
+                        col_right = parent_col * h_right
+                        new_design = np.hstack((current_design, col_left[:, np.newaxis], col_right[:, np.newaxis]))
+                        beta_new, _, rank, _ = np.linalg.lstsq(new_design, y, rcond=None)
+                        if rank <= current_cols:
+                            continue
+                        sse_new = np.sum((y - new_design @ beta_new)**2)
+                        if sse_new < best_sse:
+                            best_sse = sse_new
+                            best_parent_idx = i
+                            best_v = v
+                            best_t = t
+                            best_beta_new = beta_new
+                            best_col_left = col_left
+                            best_col_right = col_right
+
+            if best_parent_idx is not None and len(self.basis_functions) + 2 <= self.max_terms:
+                existing_basis = self.basis_functions[best_parent_idx]
+                new_left = existing_basis + [(best_v, best_t, 1)]
+                new_right = existing_basis + [(best_v, best_t, -1)]
+                self.basis_functions.append(new_left)
+                self.basis_functions.append(new_right)
+                current_design = np.hstack((current_design, best_col_left[:, np.newaxis], best_col_right[:, np.newaxis]))
+                self.beta = best_beta_new
+                current_sse = best_sse
+            else:
+                break
+
+        # Backward Pass with GCV: Prune the model
+        best_gcv = self.calculate_gcv(X, y, self.basis_functions, self.beta)
+        best_model = (self.basis_functions.copy(), self.beta.copy(), best_gcv)
+
+        while len(self.basis_functions) > 1:  # Keep at least the constant term
+            gcv_scores = []
+            for m in range(1, len(self.basis_functions)):  # Skip constant term
+                pruned_basis = self.basis_functions[:m] + self.basis_functions[m+1:]
+                design = np.column_stack([evaluate_basis(X, b) for b in pruned_basis])
+                beta_pruned = np.linalg.lstsq(design, y, rcond=None)[0]
+                gcv = self.calculate_gcv(X, y, pruned_basis, beta_pruned)
+                gcv_scores.append((gcv, m, beta_pruned))
+
+            if not gcv_scores:
+                break
+
+            min_gcv, m_to_remove, beta_pruned = min(gcv_scores, key=lambda x: x[0])
+
+            if min_gcv < best_gcv:
+                best_gcv = min_gcv
+                self.basis_functions = self.basis_functions[:m_to_remove] + self.basis_functions[m_to_remove+1:]
+                self.beta = beta_pruned
+                best_model = (self.basis_functions.copy(), self.beta.copy(), best_gcv)
+            else:
+                break
+
+        self.basis_functions, self.beta, _ = best_model
+
+    def predict(self, X):
+        """Predict using the fitted MARS model."""
+        n_samples = X.shape[0]
+        y_pred = np.zeros(n_samples)
+        for m, basis in enumerate(self.basis_functions):
+            y_pred += self.beta[m] * evaluate_basis(X, basis)
+        return y_pred
+
+class WAS_MARS_Model:
+    """
+    A class to perform MARS-based modeling on spatiotemporal datasets for climate prediction.
+    MARS stands for Multivariate Adaptive Regression Splines with Generalized Cross-Validation.
+
+    This class is designed to work with Dask and Xarray for parallelized, high-performance 
+    regression computations across large datasets with spatial and temporal dimensions. The primary 
+    methods are for fitting the model, making predictions, and calculating probabilistic predictions 
+    for climate terciles. 
+
+    Attributes
+    ----------
+    nb_cores : int, optional
+        The number of CPU cores to use for parallel computation (default is 1).
+    dist_method : str, optional
+        Distribution method for tercile probability calculations. One of
+        {"t","gamma","normal","lognormal","nonparam"}. Default = "gamma".
+    max_terms : int, optional
+        Maximum number of basis functions for MARS (default: 21).
+    max_degree : int, optional
+        Maximum degree of interaction for MARS (default: 1).
+    c : float, optional
+        Cost parameter for effective parameters in GCV for MARS (default: 3).
+
+    Methods
+    -------
+    fit_predict(x, y, x_test, y_test=None)
+        Fits a MARS model, makes predictions, and calculates error if y_test is provided.
+
+    compute_model(X_train, y_train, X_test, y_test)
+        Applies the MARS model across a dataset using parallel computation with Dask.
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det)
+        Computes tercile probabilities for hindcast predictions over specified years.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year)
+        Generates a single-year forecast and computes tercile probabilities.
+    """
+
+    def __init__(self, nb_cores=1, dist_method="gamma", max_terms=21, max_degree=1, c=3):
+        """
+        Initializes the WAS_MARS_Model with specified parameters.
+        
+        Parameters
+        ----------
+        nb_cores : int, optional
+            Number of CPU cores to use for parallel computation, by default 1.
+        dist_method : str, optional
+            Distribution method to compute tercile probabilities, by default "gamma".
+        max_terms : int, optional
+            Maximum number of basis functions for MARS, by default 21.
+        max_degree : int, optional
+            Maximum degree of interaction for MARS, by default 1.
+        c : float, optional
+            Cost parameter for GCV in MARS, by default 3.
+        """
+        self.nb_cores = nb_cores
+        self.dist_method = dist_method
+        self.max_terms = max_terms
+        self.max_degree = max_degree
+        self.c = c
+    
+    def fit_predict(self, x, y, x_test, y_test=None):
+        """
+        Fits a MARS model to the provided training data, makes predictions 
+        on the test data, and calculates the prediction error (if y_test is provided).
+        
+        Parameters
+        ----------
+        x : array-like, shape (n_samples, n_features)
+            Training data (predictors).
+        y : array-like, shape (n_samples,)
+            Training targets.
+        x_test : array-like, shape (n_features,) or (1, n_features)
+            Test data (predictors).
+        y_test : float or None
+            Test target value. If None, no error is computed.
+
+        Returns
+        -------
+        np.ndarray
+            If y_test is not None, returns [error, prediction].
+            If y_test is None, returns [prediction].
+        """
+        model = MARS(max_terms=self.max_terms, max_degree=self.max_degree, c=self.c)
+        mask = np.isfinite(y) & np.all(np.isfinite(x), axis=-1)
+
+        if np.any(mask):
+            y_clean = y[mask]
+            x_clean = x[mask, :]
+            model.fit(x_clean, y_clean)
+
+            if x_test.ndim == 1:
+                x_test = x_test.reshape(1, -1)
+
+            preds = model.predict(x_test)
+            preds[preds < 0] = 0  
+
+            if y_test is not None:
+                error_ = y_test - preds
+                return np.array([error_, preds]).squeeze()
+            else:
+                # Only return prediction if y_test is None
+                return np.array([preds]).squeeze()
+        else:
+            # If no valid data, return NaNs
+            if y_test is not None:
+                return np.array([np.nan, np.nan]).squeeze()
+            else:
+                return np.array([np.nan]).squeeze()
+
+    def compute_model(self, X_train, y_train, X_test, y_test):
+        """
+        Applies MARS regression across a spatiotemporal dataset in parallel.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictors with dims ('T','features').
+        y_train : xarray.DataArray
+            Training targets with dims ('T','Y','X').
+        X_test : xarray.DataArray
+            Test predictors, shape ('features',) or (T, features).
+        y_test : xarray.DataArray
+            Test targets with dims ('Y','X'), or broadcastable.
+
+        Returns
+        -------
+        xarray.DataArray
+            dims ('output','Y','X'), where 'output'=[error, prediction].
+        """
+        chunksize_x = int(np.round(len(y_train.get_index("X")) / self.nb_cores))
+        chunksize_y = int(np.round(len(y_train.get_index("Y")) / self.nb_cores))
+        
+        # Align times
+        X_train['T'] = y_train['T']
+        y_train = y_train.transpose('T', 'Y', 'X')
+        X_test = X_test.squeeze()
+        y_test = y_test.drop_vars('T').squeeze().transpose('Y', 'X')
+
+        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        result_da = xr.apply_ufunc(
+            self.fit_predict,
+            X_train,
+            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            X_test,
+            y_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[('T','features'), ('T',), ('features',), ()],
+            vectorize=True,
+            dask='parallelized',
+            output_core_dims=[('output',)],
+            output_dtypes=['float'],
+            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
+        )
+        result_ = result_da.compute()
+        client.close()
+        return result_.isel(output=1)
+    
+    # --------------------------------------------------------------------------
+    #  Probability Calculation Methods
+    # --------------------------------------------------------------------------
+    @staticmethod
+    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Student's t-based method.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            first_t = (first_tercile - best_guess) / error_std
+            second_t = (second_tercile - best_guess) / error_std
+
+            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
+            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
+            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
+
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2):
+        """
+        Gamma-based method.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time), dtype=float)
+
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        T1 = np.asarray(T1, dtype=float)
+        T2 = np.asarray(T2, dtype=float)
+
+        alpha = (best_guess**2) / error_variance
+        theta = error_variance / best_guess
+
+        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
+        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
+        pred_prob[0, :] = cdf_t1
+        pred_prob[1, :] = cdf_t2 - cdf_t1
+        pred_prob[2, :] = 1.0 - cdf_t2
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        """
+        Non-parametric method (requires historical errors).
+        """
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+
+        for t in range(n_time):
+            if np.isnan(best_guess[t]):
+                continue
+
+            dist = best_guess[t] + error_samples  
+            dist = dist[np.isfinite(dist)]  
+            if len(dist) == 0:
+                continue
+
+            p_below   = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above   = 1.0 - (p_below + p_between)
+
+            pred_prob[0, t] = p_below
+            pred_prob[1, t] = p_between
+            pred_prob[2, t] = p_above
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+        """
+        Normal-based method using the Gaussian CDF.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std) - \
+                              stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
+        """
+        Lognormal-based method.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+
+        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
+        mu = np.log(best_guess) - sigma**2 / 2
+        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - \
+                          lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
+        return pred_prob
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
+        """
+        Compute tercile probabilities using self.dist_method.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray (T, Y, X)
+            Observed data.
+        clim_year_start : int
+        clim_year_end : int
+            The start and end years for the climatology.
+        hindcast_det : xarray.DataArray
+            Deterministic forecast with dims (output=2, T, Y, X).
+
+        Returns
+        -------
+        hindcast_prob : xarray.DataArray
+            dims (probability=3, T, Y, X) => [PB, PN, PA].
+        """
+        # 1) Identify climatology slice
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant - hindcast_det).var(dim='T')
+
+        T1 = terciles.isel(quantile=0).drop_vars('quantile')
+        T2 = terciles.isel(quantile=1).drop_vars('quantile')
+
+        # 2) Distinguish distribution method
+        if self.dist_method == "t":
+            dof = len(Predictant.get_index("T")) - 2
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+            )
+
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk":True},
+            )
+
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = (Predictant - hindcast_det)
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_samples,
+                T1,
+                T2,
+                input_core_dims=[('T',), ('T',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
+            )
+
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}. "
+                             "Must be one of ['t','gamma','normal','lognormal','nonparam'].")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB','PN','PA']))
+        return hindcast_prob.transpose('probability','T','Y','X')
+
+    # --------------------------------------------------------------------------
+    #  FORECAST METHOD
+    # --------------------------------------------------------------------------
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year):
+        """
+        Generates a single-year forecast using MARS, then computes 
+        tercile probabilities using self.dist_method.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed data with dims (T, Y, X).
+        clim_year_start : int
+            Start year for climatology
+        clim_year_end : int
+            End year for climatology
+        Predictor : xarray.DataArray
+            Historical predictor data with dims (T, features).
+        hindcast_det : xarray.DataArray
+            Historical deterministic forecast with dims (output=[error,prediction], T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Single-year predictor with shape (features,) or (1, features).
+
+        Returns
+        -------
+        result_ : xarray.DataArray
+            dims (output=2, Y, X) => [error, prediction]. 
+            For a true forecast, error is typically NaN.
+        hindcast_prob : xarray.DataArray
+            dims (probability=3, Y, X) => [PB, PN, PA].
+        """
+        # Provide a dummy y_test with the same shape as the spatial domain => [NaNs]
+        y_test_dummy = xr.full_like(Predictant.isel(T=0), np.nan)
+
+        # Chunk sizes
+        chunksize_x = int(np.round(len(Predictant.get_index("X")) / self.nb_cores))
+        chunksize_y = int(np.round(len(Predictant.get_index("Y")) / self.nb_cores))
+
+        # Align time dimension
+        Predictor['T'] = Predictant['T']
+        Predictant = Predictant.transpose('T','Y','X')
+        Predictor_for_year_ = Predictor_for_year.squeeze()
+
+        # 1) Fit+predict in parallel => shape (output=2, Y, X)
+        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        result_da = xr.apply_ufunc(
+            self.fit_predict,
+            Predictor,
+            Predictant.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            Predictor_for_year_,
+            y_test_dummy.chunk({'Y': chunksize_y, 'X': chunksize_x}),  # dummy y_test
+            input_core_dims=[
+                ('T','features'),  # x
+                ('T',),           # y
+                ('features',),    # x_test
+                ()
+            ],
+            vectorize=True,
+            dask='parallelized',
+            output_core_dims=[('output',)],  # output=2 => [error, prediction]
+            output_dtypes=['float'],
+            dask_gufunc_kwargs={'output_sizes': {'output':2}},
+        )
+        result_ = result_da.compute()
+        client.close()
+        result_ = result_.isel(output=1)
+
+        # 2) Compute thresholds T1, T2 from climatology
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        T1 = terciles.isel(quantile=0).drop_vars('quantile')
+        T2 = terciles.isel(quantile=1).drop_vars('quantile')
+        error_variance = (Predictant - hindcast_det).var(dim='T')
+        
+        # Expand single prediction to T=1 so probability methods can handle it
+        forecast_expanded = result_.expand_dims(
+            T=[pd.Timestamp(Predictor_for_year.coords['T'].values[0]).to_pydatetime()]
+        )
+        year = Predictor_for_year.coords['T'].values[0].astype('datetime64[Y]').astype(int) + 1970
+        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
+        
+        forecast_expanded = forecast_expanded.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        forecast_expanded['T'] = forecast_expanded['T'].astype('datetime64[ns]')
+
+        # 3) Tercile probabilities
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            dof = len(Predictant.get_index("T")) - 2
+
+
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_expanded,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+            )
+
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_expanded,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}}
+            )
+
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_expanded,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}}
+            )
+
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_expanded,
+                error_variance,
+                T1,
+                T2,
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}}
+            )
+
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = Predictant - hindcast_det
+            error_samples = error_samples.rename({'T':'S'})
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                forecast_expanded,
+                error_samples,
+                T1,
+                T2,
+                input_core_dims=[('T',), ('S',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True, 
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}}
+            )
+
+        else:
+            raise ValueError(
+                f"Invalid dist_method: {self.dist_method}. "
+                "Choose 't','gamma','normal','lognormal','nonparam'."
+            )
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB','PN','PA']))
+        hindcast_prob_out = hindcast_prob.transpose('probability','T','Y','X') #.drop_vars('T').squeeze()
+
+        return forecast_expanded, hindcast_prob_out

@@ -38,22 +38,34 @@ class WAS_EOF:
     """
 
     def __init__(self, n_modes=None, use_coslat=True, standardize=False,
-                  opti_explained_variance=None, L2norm=True):
+                  opti_explained_variance=None, detrend=True, L2norm=True):
         self.n_modes = n_modes
         self.use_coslat = use_coslat
         self.standardize = standardize
         self.opti_explained_variance = opti_explained_variance
+        self.detrend = detrend
         self.L2norm = L2norm
         self.model = None
+
+    def _detrended_da(self, da):
+        """Detrend a DataArray by removing the linear trend."""
+        if 'T' not in da.dims:
+            raise ValueError("DataArray must have a time dimension 'T' for detrending.")
+        trend = da.polyfit(dim='T', deg=1)
+        da_detrended = da - (trend.polyval(da['T']) if 'polyval' in dir(trend) else trend)
+        return da_detrended.isel(degree=0, drop=True).to_array().drop_vars('variable').squeeze(),\
+             trend.isel(degree=0, drop=True).to_array().drop_vars('variable').squeeze()
 
     def fit(self, predictor, dim="T", clim_year_start=None, clim_year_end=None):
         predictor = predictor.fillna(predictor.mean(dim="T", skipna=True))
         predictor = predictor.rename({"X": "lon", "Y": "lat"})
+        if self.detrend:
+            predictor, _ = self._detrended_da(predictor)
 
         if self.n_modes is not None:
             self.model = xe.single.EOF(n_modes=self.n_modes, use_coslat=self.use_coslat, standardize=self.standardize)
         else:
-            self.model = xe.single.EOF(n_modes=self.n_modes, use_coslat=self.use_coslat, standardize=self.standardize)
+            self.model = xe.single.EOF(n_modes=100, use_coslat=self.use_coslat, standardize=self.standardize)
             self.model.fit(predictor, dim=dim)
 
             if self.opti_explained_variance is not None:

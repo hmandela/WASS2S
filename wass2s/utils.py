@@ -920,9 +920,7 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
     return selected_vars_in_order # selected_vars
 
 
-
-
-def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, logo=None, logo_size=0.5):
+def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, logo=None, logo_size=0.4):
     """
     Plot probabilistic forecasts with tercile categories.
 
@@ -961,12 +959,7 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     mask_an = max_category == 2  # Above Normal (AN)
     
     # Step 3: Define custom colormaps
-    # BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FFF5F0', '#FB6A4A', '#67000D'])
-    # NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#F7FCF5', '#74C476', '#00441B'])
-    # AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#F7FBFF', '#6BAED6', '#08306B'])
-
     if reverse_cmap:
-        
         AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#FDAE61', '#F46D43', '#D73027']) 
         NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FEE391'])
         BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#ABDDA4', '#66C2A5', '#3288BD'])  
@@ -976,12 +969,20 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
         AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#ABDDA4', '#66C2A5', '#3288BD'])          
     
     # Create a figure with GridSpec
-    fig = plt.figure(figsize=(8, 6))
-    gs = gridspec.GridSpec(2, 3, height_ratios=[15, 0.5])
-    
+    # fig = plt.figure(figsize=(8, 6.5))  # Increased height to accommodate logo
+    # gs = gridspec.GridSpec(3, 3, height_ratios=[15, 0.8, 0.7], hspace=0.2)
+
+    fig = plt.figure(figsize=(10, 8))
+    gs = gridspec.GridSpec(3, 3, height_ratios=[8, 0.2, 3], hspace=0.03)
+
     # Main map axis
     ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
+
+    # Modify by Mandela
     
+    ###################
+    ##################
+
     # Step 4: Plot each category
     # Multiply by 100 to convert probabilities to percentages
     
@@ -999,20 +1000,17 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     #                    xr.where(max_prob.where(mask_nn) * 100 > 60, 60, max_prob.where(mask_nn) * 100)).values
     # an_data = xr.where((max_prob.where(mask_an) * 100) < 45, 45,
     #                    xr.where(max_prob.where(mask_an) * 100 > 60, 60, max_prob.where(mask_an) * 100)).values    
-    
+
+
+    # Step 4: Plot each category
     bn_data = xr.where((xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100)<45, 45,
                        xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100).values  
     nn_data = xr.where((xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100)<45, 45,
                    xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100).values
     an_data = xr.where((xr.where(max_prob.where(mask_an)>0.6,0.6,max_prob.where(mask_an))* 100)<45, 45,
                    xr.where(max_prob.where(mask_an)>0.6,0.6,max_prob.where(mask_an))* 100).values
-     
-
     
     # Define the data ranges for color normalization  
-    # vmin and vmax are set to 35% and 65% respectively for all categories
-    # This ensures that the color mapping is consistent across all plots 
-     
     vmin = 35  # Minimum probability percentage
     vmax = 65  # Maximum probability percentage
 
@@ -1023,7 +1021,6 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
             cmap=BN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
         )
     else:
-        # Create a dummy mappable for BN
         bn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=BN_cmap)
         bn_plot.set_array([])
 
@@ -1034,7 +1031,6 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
             cmap=NN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
         )
     else:
-        # Create a dummy mappable for NN
         nn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=NN_cmap)
         nn_plot.set_array([])
 
@@ -1045,7 +1041,6 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
             cmap=AN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
         )
     else:
-        # Create a dummy mappable for AN
         an_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=AN_cmap)
         an_plot.set_array([])
 
@@ -1054,8 +1049,6 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     ax.add_feature(cfeature.BORDERS, linestyle=':')
     
     # Step 6: Add individual colorbars with fixed ticks
-    
-    # Function to create ticks at intervals of 10 from 0 to 100
     def create_ticks():
         ticks = np.arange(35, 66, 5)
         return ticks
@@ -1084,114 +1077,25 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     cbar_an.set_ticklabels([f"{tick}" for tick in ticks])
     
     # Set the title with the formatted model_name
-    # Convert model_name to string if necessary
     if isinstance(model_name, np.ndarray):
         model_name_str = str(model_name.item())
     else:
         model_name_str = str(model_name)
     ax.set_title(f"{model_name_str}", fontsize=13, pad=20)
+
     # Step 7: Add logo if provided
+    logo_ax = fig.add_subplot(gs[2, 2])
+    logo_ax.axis('off')
     if logo is not None:
         im = image.imread(logo)
-        # add logo
         addLogo = OffsetImage(im, zoom=logo_size)
-        # addLogo.image.axes = ax
-        addLogo.set_offset('lower right')
-        ab = AnnotationBbox(addLogo, (1.1, -0.1), frameon=False, xycoords='axes fraction', boxcoords="axes fraction")
-        ax.add_artist(ab)   
-    # Step 8: Adjust layout and save the plot
-    plt.tight_layout()
-    plt.savefig(f"{dir_to_save}/{model_name_str.replace(" ", "_")}.png", dpi=300, bbox_inches='tight')
+        ab = AnnotationBbox(addLogo, (0.5, 0.5), frameon=False, xycoords='axes fraction')
+        logo_ax.add_artist(ab)
+
+    plt.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.03, wspace=0.3)
+    plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.png", dpi=300, bbox_inches='tight')
     plt.show()
-    
-
-def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name):
-    """
-    Plot probabilistic forecasts with tercile categories using contourf.
-
-    Parameters
-    ----------
-    dir_to_save : str
-        Directory path to save the plot.
-    forecast_prob : xarray.DataArray
-        Data array containing probability forecasts with a 'probability' dimension.
-    model_name : str or numpy.ndarray
-        Name of the model for the plot title.
-
-    Notes
-    -----
-    Similar to plot_prob_forecasts but uses contourf instead of pcolormesh for plotting.
-    Saves the plot as a PNG file and displays it.
-    """
-    max_prob = forecast_prob.max(dim="probability", skipna=True)
-    filled_prob = forecast_prob.fillna(-9999)
-    max_category = filled_prob.argmax(dim="probability")
-    mask_bn = max_category == 0
-    mask_nn = max_category == 1
-    mask_an = max_category == 2
-    BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FDAE61', '#F46D43', '#D73027'])
-    NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FFFFCC'])
-    AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#ABDDA4', '#66C2A5', '#3288BD'])
-    fig = plt.figure(figsize=(8, 6))
-    gs = gridspec.GridSpec(2, 3, height_ratios=[15, 0.5])
-    ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
-    bn_data = xr.where((xr.where(max_prob.where(mask_bn) > 0.6, 0.6, max_prob.where(mask_bn)) * 100) < 45, 45,
-                       xr.where(max_prob.where(mask_bn) > 0.6, 0.6, max_prob.where(mask_bn)) * 100).values
-    nn_data = xr.where((xr.where(max_prob.where(mask_nn) > 0.6, 0.6, max_prob.where(mask_nn)) * 100) < 45, 45,
-                       xr.where(max_prob.where(mask_nn) > 0.6, 0.6, max_prob.where(mask_nn)) * 100).values
-    an_data = xr.where((xr.where(max_prob.where(mask_an) > 0.6, 0.6, max_prob.where(mask_an)) * 100) < 45, 45,
-                       xr.where(max_prob.where(mask_an) > 0.6, 0.6, max_prob.where(mask_an)) * 100).values
-    vmin, vmax = 35, 65
-    if np.any(~np.isnan(bn_data)):
-        bn_plot = ax.contourf(
-            forecast_prob['X'], forecast_prob['Y'], bn_data,
-            cmap=BN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
-        )
-    else:
-        bn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=BN_cmap)
-        bn_plot.set_array([])
-    if np.any(~np.isnan(nn_data)):
-        nn_plot = ax.contourf(
-            forecast_prob['X'], forecast_prob['Y'], nn_data,
-            cmap=NN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
-        )
-    else:
-        nn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=NN_cmap)
-        nn_plot.set_array([])
-    if np.any(~np.isnan(an_data)):
-        an_plot = ax.contourf(
-            forecast_prob['X'], forecast_prob['Y'], an_data,
-            cmap=AN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
-        )
-    else:
-        an_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=AN_cmap)
-        an_plot.set_array([])
-    ax.coastlines()
-    ax.add_feature(cfeature.BORDERS, linestyle=':')
-    def create_ticks():
-        return np.arange(35, 66, 5)
-    ticks = create_ticks()
-    cbar_ax_bn = fig.add_subplot(gs[1, 0])
-    cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal')
-    cbar_bn.set_label('Below-Normal (%)')
-    cbar_bn.set_ticks(ticks)
-    cbar_bn.set_ticklabels([f"{tick}" for tick in ticks])
-    cbar_ax_nn = fig.add_subplot(gs[1, 1])
-    cbar_nn = plt.colorbar(nn_plot, cax=cbar_ax_nn, orientation='horizontal')
-    cbar_nn.set_label('Near-Normal (%)')
-    cbar_nn.set_ticks(ticks)
-    cbar_nn.set_ticklabels([f"{tick}" for tick in ticks])
-    cbar_ax_an = fig.add_subplot(gs[1, 2])
-    cbar_an = plt.colorbar(an_plot, cax=cbar_ax_an, orientation='horizontal')
-    cbar_an.set_label('Above-Normal (%)')
-    cbar_an.set_ticks(ticks)
-    cbar_an.set_ticklabels([f"{tick}" for tick in ticks])
-    model_name_str = str(model_name.item()) if isinstance(model_name, np.ndarray) else str(model_name)
-    ax.set_title(f"Forecast Probabilities - {model_name_str}", fontsize=14, pad=20)
-    plt.tight_layout()
-    plt.savefig(f"{dir_to_save}/Forecast_{model_name_str}_.png", dpi=300, bbox_inches='tight')
-    plt.show()
-
+  
 def plot_tercile(A):
     """
     Plot a tercile map with categories: Below, Normal, Above.
