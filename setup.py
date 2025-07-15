@@ -3,7 +3,7 @@ import os
 
 setup(
     name="wass2s",
-    version="0.2.1",
+    version="0.2.2",
     author="HOUNGNIBO C. M. Mandela",
     author_email="hmandelahmadiba@gmail.com",
     description="A Python package for seasonal climate forecast.",
@@ -13,7 +13,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         "numpy",
-        "pandas",
+        "pandas>=1.6.0",
         "xarray",
         "dask",
         "scikit-learn",
