@@ -1686,7 +1686,7 @@ def svp(T):
     """
     return 0.6108 * np.exp(17.27 * T / (T + 237.3))
 
-def et0_fao56_daily(tmax, tmin, tdew, u10, v10, rs, mlsp, dem):
+def et0_fao56_daily(tmax, tmin, rs, mlsp, dem, tdew=None, u10=None, v10=None, wff=None):
     """
     Compute daily reference evapotranspiration (ET₀) using the FAO-56 Penman-Monteith equation.
 
@@ -1701,10 +1701,12 @@ def et0_fao56_daily(tmax, tmin, tdew, u10, v10, rs, mlsp, dem):
         Daily minimum temperature in °C, with dimensions ('T', 'Y', 'X').
     tdew : xarray.DataArray
         Daily mean dew point temperature in °C, with dimensions ('T', 'Y', 'X').
-    u10 : xarray.DataArray
+    u10 : xarray.DataArray, optional
         Daily mean zonal wind speed at 10 m height in m s^-1, with dimensions ('T', 'Y', 'X').
-    v10 : xarray.DataArray
+    v10 : xarray.DataArray, optional
         Daily mean meridional wind speed at 10 m height in m s^-1, with dimensions ('T', 'Y', 'X').
+    wff : xarray.DataArray, optional
+        Daily mean wind speed at 10 m height in m s^-1, with dimensions ('T', 'Y', 'X').
     rs : xarray.DataArray
         Daily mean incoming solar radiation in W m^-2 or MJ m^-2 day^-1, with dimensions ('T', 'Y', 'X').
     mlsp : xarray.DataArray
@@ -1755,11 +1757,23 @@ def et0_fao56_daily(tmax, tmin, tdew, u10, v10, rs, mlsp, dem):
     PSI = 0.665e-3 * P  # Psychrometric constant (kPa °C^-1)
 
     # --- 4 Wind ---
-    ws10 = np.hypot(u10, v10)  # Wind speed at 10 m
-    u2 = ws10 * 4.87 / np.log(67.8 * 10.0 - 5.42)  # Wind speed at 2 m
+    if wff is not None:
+        ws10 = wff
+        u2 = ws10 * 4.87 / np.log(67.8 * 10.0 - 5.42)  # Wind speed at 2 m
+    elif u10 is not None and v10 is not None: # Use u10 and v10 if available
+        ws10 = np.hypot(u10, v10)  # Wind speed at 10 m
+        u2 = ws10 * 4.87 / np.log(67.8 * 10.0 - 5.42)  # Wind speed at 2 m
+    else:
+        raise ValueError("Either 'wff' or both 'u10' and 'v10' must be provided for wind speed calculation.")
+
 
     # --- 5 Vapour pressures ---
-    ea = svp(tdew)  # Actual vapor pressure (kPa)
+    if tdew is None:
+        # If dew point is not provided, use average of tmax and tmin
+        ea = svp(tmin)  # Actual vapor pressure (kPa)
+    else:
+        ea = svp(tdew)  # Actual vapor pressure (kPa)
+    
     es = (svp(tmax) + svp(tmin)) / 2  # Saturated vapor pressure (kPa)
     vpd = es - ea  # Vapor pressure deficit (kPa)
 
@@ -1792,7 +1806,6 @@ def et0_fao56_daily(tmax, tmin, tdew, u10, v10, rs, mlsp, dem):
     et0.name = "ET0"
     return et0
 
-
 # Other commmented code to use after
 
 # retrieve Zone for PCR
@@ -1804,6 +1817,7 @@ def et0_fao56_daily(tmax, tmin, tdew, u10, v10, rs, mlsp, dem):
 # scores = pca.scores()
 # expl = pca.explained_variance_ratio()
 # expl
+
 
 
 # def plot_prob_forecats(dir_to_save, forecast_prob, model_name):    
