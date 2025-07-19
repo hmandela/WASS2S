@@ -1222,8 +1222,7 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
     x_coords = obs_fcst_year.X
 
     if calendar.isleap(year_forecast):
-        dayofyear = obs_hdcst['T'].dt.dayofyear
-        daily_climatology = da.groupby(dayofyear).mean(dim='T')
+        daily_climatology = obs_hdcst.groupby('T.dayofyear').mean(dim='T')
         data = daily_climatology.to_numpy()
         dummy = xr.DataArray(
             data=data,
@@ -1231,8 +1230,10 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
             dims=["T", "Y", "X"]
         ) * mask
     else:
-        da_noleap = obs_hdcst.sel(T=~((obs_hdcst['T'].dt.month == 2) & (obs_hdcst['T'].dt.day == 29)))
-        daily_climatology = da_noleap.groupby('T.dayofyear').mean(dim='T')
+        # da_noleap = obs_hdcst.sel(T=~((obs_hdcst['T'].dt.month == 2) & (obs_hdcst['T'].dt.day == 29)))
+        # daily_climatology = da_noleap.groupby('T.dayofyear').mean(dim='T')
+        daily_climatology = obs_hdcst.groupby('T.dayofyear').mean(dim='T')
+        daily_climatology = daily_climatology.sel(dayofyear=~((daily_climatology['dayofyear'] == 60)))
         data = daily_climatology.to_numpy()
         dummy = xr.DataArray(
             data=data,
@@ -1576,6 +1577,7 @@ fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization,
             if param=="PRCP":
                 ds_filled.where(ds_filled >= 0, 0)
             ds_processed = ds_filled.to_dataset(name=param)
+            ds_processed = ds_processed.transpose("T", "Y", "X")
             ds_processed.to_netcdf(save_path)
         else:
             print(f"[SKIP] {save_path} already exists.")
@@ -1602,6 +1604,7 @@ fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization,
             if param=="PRCP":
                 ds_filled.where(ds_filled >= 0, 0)
             ds_processed = ds_filled.to_dataset(name=param)
+            ds_processed = ds_processed.transpose("T", "Y", "X")
             ds_processed.to_netcdf(save_path)
         else:
             print(f"[SKIP] {save_path} already exists.")

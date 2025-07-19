@@ -897,6 +897,9 @@ class WAS_bias_correction:
     - xarray support preserves coordinates and attributes.
     - Non-parametric method: 'QUANT' (empirical quantile mapping).
     - Parametric methods: 'NORM' (normal), or 'DIST' with specified distribution.
+    - Handles NaNs: Ignores NaNs in fitting by filtering them out; if fewer than 2 valid points
+      per grid cell in obs or mod, flags as all_nan and outputs NaNs for that grid in application.
+      NaNs in input data during application are propagated as NaNs in output.
     """
 
     @staticmethod
@@ -1111,9 +1114,16 @@ class WAS_bias_correction:
             Fitted parameters including delta (mean difference).
         """
         n_cols = obs.shape[1]
-        par = {'delta': np.zeros(n_cols)}
+        par = {'delta': np.full(n_cols, np.nan), 'all_nan': np.zeros(n_cols, dtype=bool)}
         for col in range(n_cols):
-            par['delta'][col] = np.mean(obs[:, col]) - np.mean(mod[:, col])
+            o = obs[:, col]
+            m = mod[:, col]
+            o_valid = o[~np.isnan(o)]
+            m_valid = m[~np.isnan(m)]
+            if len(o_valid) < 2 or len(m_valid) < 2:
+                par['all_nan'][col] = True
+                continue
+            par['delta'][col] = np.mean(o_valid) - np.mean(m_valid)
         return {'class': 'fitMean', 'par': par}
 
     @staticmethod
@@ -1133,8 +1143,14 @@ class WAS_bias_correction:
         ndarray
             Corrected data.
         """
+        n_cols = x.shape[1]
+        corrected = np.full_like(x, np.nan)
         par = fobj['par']
-        return x + par['delta'][np.newaxis, :]
+        for col in range(n_cols):
+            if par['all_nan'][col]:
+                continue
+            corrected[:, col] = x[:, col] + par['delta'][col]
+        return corrected
 
     @staticmethod
     def fitVarscale(obs, mod):
@@ -1154,13 +1170,21 @@ class WAS_bias_correction:
             Fitted parameters including means and standard deviations.
         """
         n_cols = obs.shape[1]
-        par = {'mean_o': np.zeros(n_cols), 'std_o': np.zeros(n_cols),
-               'mean_m': np.zeros(n_cols), 'std_m': np.zeros(n_cols)}
+        par = {'mean_o': np.full(n_cols, np.nan), 'std_o': np.full(n_cols, np.nan),
+               'mean_m': np.full(n_cols, np.nan), 'std_m': np.full(n_cols, np.nan),
+               'all_nan': np.zeros(n_cols, dtype=bool)}
         for col in range(n_cols):
-            par['mean_o'][col] = np.mean(obs[:, col])
-            par['std_o'][col] = np.std(obs[:, col])
-            par['mean_m'][col] = np.mean(mod[:, col])
-            std_m = np.std(mod[:, col])
+            o = obs[:, col]
+            m = mod[:, col]
+            o_valid = o[~np.isnan(o)]
+            m_valid = m[~np.isnan(m)]
+            if len(o_valid) < 2 or len(m_valid) < 2:
+                par['all_nan'][col] = True
+                continue
+            par['mean_o'][col] = np.mean(o_valid)
+            par['std_o'][col] = np.std(o_valid)
+            par['mean_m'][col] = np.mean(m_valid)
+            std_m = np.std(m_valid)
             par['std_m'][col] = std_m if std_m > 1e-6 else 1.0
         return {'class': 'fitVarscale', 'par': par}
 
@@ -1181,9 +1205,12 @@ class WAS_bias_correction:
         ndarray
             Corrected data.
         """
+        n_cols = x.shape[1]
+        corrected = np.full_like(x, np.nan)
         par = fobj['par']
-        corrected = np.zeros_like(x)
-        for col in range(x.shape[1]):
+        for col in range(n_cols):
+            if par['all_nan'][col]:
+                continue
             corrected[:, col] = par['mean_o'][col] + (x[:, col] - par['mean_m'][col]) * (par['std_o'][col] / par['std_m'][col])
         return corrected
 
@@ -1210,21 +1237,23 @@ class WAS_bias_correction:
         """
         n_cols = obs.shape[1]
         nq = int(1 / qstep) + 1
-        par = {'modq': np.zeros((nq, n_cols)), 'fitq': np.zeros((nq, n_cols))}
+        par = {'modq': np.full((nq, n_cols), np.nan), 'fitq': np.full((nq, n_cols), np.nan),
+               'all_nan': np.zeros(n_cols, dtype=bool)}
         probs = np.linspace(0, 1, nq)
         for col in range(n_cols):
             o = obs[:, col]
             m = mod[:, col]
-            if len(o) == 0 or len(m) == 0:
-                par['modq'][:, col] = np.nan
-                par['fitq'][:, col] = np.nan
+            o_valid = o[~np.isnan(o)]
+            m_valid = m[~np.isnan(m)]
+            if len(o_valid) < 2 or len(m_valid) < 2:
+                par['all_nan'][col] = True
                 continue
-            par['modq'][:, col] = np.quantile(m, probs)
+            par['modq'][:, col] = np.quantile(m_valid, probs)
             if nboot > 1:
-                boot_q = np.array([np.quantile(np.random.choice(o, len(o), replace=True), probs) for _ in range(nboot)])
+                boot_q = np.array([np.quantile(np.random.choice(o_valid, len(o_valid), replace=True), probs) for _ in range(nboot)])
                 par['fitq'][:, col] = np.mean(boot_q, axis=0)
             else:
-                par['fitq'][:, col] = np.quantile(o, probs)
+                par['fitq'][:, col] = np.quantile(o_valid, probs)
         return {'class': 'fitQuant', 'par': par}
 
     @staticmethod
@@ -1247,9 +1276,11 @@ class WAS_bias_correction:
             Corrected data.
         """
         n_cols = x.shape[1]
-        corrected = np.zeros_like(x)
+        corrected = np.full_like(x, np.nan)
         par = fobj['par']
         for col in range(n_cols):
+            if par['all_nan'][col]:
+                continue
             xi = x[:, col]
             modq = par['modq'][:, col]
             fitq = par['fitq'][:, col]
@@ -1284,7 +1315,8 @@ class WAS_bias_correction:
             If unknown distribution.
         """
         n_cols = obs.shape[1]
-        par = {'par_o': [], 'par_m': [], 'distr': distr}
+        par = {'par_o': [], 'par_m': [], 'distr': distr,
+               'all_nan': np.zeros(n_cols, dtype=bool)}
         dist_map = {
             'normal': norm,
             'lognormal': lognorm,
@@ -1297,18 +1329,25 @@ class WAS_bias_correction:
         for col in range(n_cols):
             o = obs[:, col]
             m = mod[:, col]
-            if distr == 'normal':
-                par_o = dist.fit(o)
-                par_m = dist.fit(m)
-            elif distr == 'lognormal':
-                par_o = dist.fit(o)
-                par_m = dist.fit(m)
-            elif distr == 'gamma':
-                par_o = dist.fit(o, floc=0)
-                par_m = dist.fit(m, floc=0)
-            elif distr == 'weibull':
-                par_o = dist.fit(o, floc=0)
-                par_m = dist.fit(m, floc=0)
+            o_valid = o[~np.isnan(o)]
+            m_valid = m[~np.isnan(m)]
+            if len(o_valid) < 2 or len(m_valid) < 2:
+                par['all_nan'][col] = True
+                par['par_o'].append(None)
+                par['par_m'].append(None)
+                continue
+            if distr.lower() == 'normal':
+                par_o = dist.fit(o_valid)
+                par_m = dist.fit(m_valid)
+            elif distr.lower() == 'lognormal':
+                par_o = dist.fit(o_valid)
+                par_m = dist.fit(m_valid)
+            elif distr.lower() == 'gamma':
+                par_o = dist.fit(o_valid, floc=0)
+                par_m = dist.fit(m_valid, floc=0)
+            elif distr.lower() == 'weibull':
+                par_o = dist.fit(o_valid, floc=0)
+                par_m = dist.fit(m_valid, floc=0)
             par['par_o'].append(par_o)
             par['par_m'].append(par_m)
         return {'class': 'fitDist', 'par': par}
@@ -1331,7 +1370,7 @@ class WAS_bias_correction:
             Corrected data.
         """
         n_cols = x.shape[1]
-        corrected = np.zeros_like(x)
+        corrected = np.full_like(x, np.nan)
         par = fobj['par']
         distr = par['distr'].lower()
         dist_map = {
@@ -1344,6 +1383,8 @@ class WAS_bias_correction:
         if dist is None:
             raise ValueError(f"Unknown distribution: {distr}")
         for col in range(n_cols):
+            if par['all_nan'][col]:
+                continue
             par_o = par['par_o'][col]
             par_m = par['par_m'][col]
             cdf = dist.cdf(x[:, col], *par_m)

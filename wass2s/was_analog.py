@@ -268,7 +268,7 @@ class WAS_Analog:
         store_file_path = {}
 
         for center, var, area in zip(centers, variables, areas):
-            combined_output_path = dir_to_save / f"{center}_{var}_{self.year_start}_{year_end}_{season}_{area[0]}_{area[1]}{area[2]}{area[3]}.nc" 
+            combined_output_path = dir_to_save / f"{center}_{var}_{self.year_start}_{year_end}_{season}_{area[0]}{area[1]}{area[2]}{area[3]}.nc" 
             if not force_download and combined_output_path.exists():
                 print(f"{combined_output_path} exists. Skipping download.")
                 store_file_path[var] = xr.open_dataset(combined_output_path)
@@ -436,8 +436,8 @@ class WAS_Analog:
         store_hdcst_file_path = {}
 
         for cent, syst, var, area in zip(selected_centres, selected_systems, variables, areas):
-            forecast_file = dir_to_save / f"forecast_{cent}{syst}_{var}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}_{area[0]}_{area[1]}{area[2]}{area[3]}.nc"
-            hindcast_file = dir_to_save / f"hindcast_{cent}{syst}_{var}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}_{area[0]}_{area[1]}{area[2]}{area[3]}.nc"
+            forecast_file = dir_to_save / f"forecast_{cent}{syst}_{var}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}_{area[0]}{area[1]}{area[2]}{area[3]}.nc"
+            hindcast_file = dir_to_save / f"hindcast_{cent}{syst}_{var}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}_{area[0]}{area[1]}{area[2]}{area[3]}.nc"
                
             if not force_download and forecast_file.exists():
                 print(f"Forecast file {forecast_file} exists. Skipping download.")
