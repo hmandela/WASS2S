@@ -185,7 +185,7 @@ class WAS_Download:
     ):
         # 1 W m-2 = 0.0864 MJ m-2 day-1
         """
-        Generate a dictionary for agro-meteorological observation variables.
+        Generate a dictionary for agrometeorological observation variables.
 
         Parameters:
             variables (dict): Mapping of agro variable short names to full names.
@@ -994,7 +994,12 @@ class WAS_Download:
             # else:
             #     print(f"Unknown variable code: {v}, skipping.")
             #     continue
-    
+
+            if cent == "jma" and year_forecast is None:
+                day_of_initialization = init_day_dict_jma[month_of_initialization]
+            if cent == "ncep" and year_forecast is None:
+                day_of_initialization = init_day_dict_ncep[month_of_initialization]
+
             # Build a single output path
             abb_mont_ini = month_abbr[int(month_of_initialization)]
             
@@ -1004,19 +1009,20 @@ class WAS_Download:
     
             output_file = (
                 dir_to_save /
-                f"{file_prefix}_{cent}{syst}_{v}_{abb_mont_ini}{day_of_initialization}_{years_str}_{lead_str}.nc"
+                f"{file_prefix}_{cent}{syst}_{v}_{abb_mont_ini}01_{years_str}_{lead_str}.nc"
             )
-    
+
+            # output_file = (
+            #     dir_to_save /
+            #     f"{file_prefix}_{cent}{syst}_{v}_{abb_mont_ini}{day_of_initialization}_{years_str}_{lead_str}.nc"
+            # )
+            
+
             if not force_download and output_file.exists():
                 print(f"{output_file} already exists. Skipping download.")
                 store_file_path[f"{cent}{syst}"] = output_file
             
             else:
-
-                if cent == "jma" and year_forecast is None:
-                    day_of_initialization = init_day_dict_jma[month_of_initialization]
-                if cent == "ncep" and year_forecast is None:
-                    day_of_initialization = init_day_dict_ncep[month_of_initialization]
 
                 try:
                     # Temporary file to download
@@ -1084,7 +1090,7 @@ class WAS_Download:
                     if "latitude" in ds.coords:
                         ds = ds.isel(latitude=slice(None, None, -1))
 
-                    if v in ["TMIN","TEMP","TMAX","SST"]:
+                    if v in ["TMIN","TEMP","TMAX","SST", "TDEW"]:
                         ds = ds - 273.15
                     if v =="SLP":
                         ds = ds / 100

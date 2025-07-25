@@ -199,6 +199,7 @@ class WAS_Cross_Validator:
 
         elif isinstance(model, WAS_Analog):
 
+            # revoir l'option dutiliser download_and_process ici, enfin deviter les repetitions
 
             print("Cross-validation ongoing")
             for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(np.unique(Predictant['T'].dt.year), self.nb_omit), total=n_splits), start=1):
@@ -239,6 +240,9 @@ class WAS_Cross_Validator:
 
         elif isinstance(model, WAS_mme_RoebberGA):
 
+            Predictor = Predictor.fillna(Predictor.mean(dim="T", skipna=True))
+            Predictant = Predictant.fillna(Predictant.mean(dim="T", skipna=True))
+
             print("Cross-validation ongoing")
             for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
                 X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
@@ -255,18 +259,8 @@ class WAS_Cross_Validator:
 
         elif isinstance(model, WAS_mme_NGR_Model):
 
-            print("Cross-validation ongoing")
-            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
-                X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
-                y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
-                pred_det = model.compute_model(X_train, y_train, X_test)
-                hindcast_det.append(pred_det)
-
-            hindcast_det = xr.concat(hindcast_det, dim="T")
-            hindcast_det['T'] = Predictant['T']
-            return hindcast_det
-
-        elif isinstance(model, WAS_mme_FlexibleNGR_Model):
+            Predictor = Predictor.fillna(Predictor.mean(dim="T", skipna=True))
+            Predictant = Predictant.fillna(Predictant.mean(dim="T", skipna=True))
 
             print("Cross-validation ongoing")
             for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
@@ -280,6 +274,9 @@ class WAS_Cross_Validator:
             return hindcast_det
 
         elif isinstance(model, WAS_mme_FlexibleNGR_Model):
+
+            Predictor = Predictor.fillna(Predictor.mean(dim="T", skipna=True))
+            Predictant = Predictant.fillna(Predictant.mean(dim="T", skipna=True))
 
             print("Cross-validation ongoing")
             for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
@@ -294,10 +291,14 @@ class WAS_Cross_Validator:
 
         elif isinstance(model, WAS_mme_BMA_Sloughter):
 
+            Predictor = Predictor.fillna(Predictor.mean(dim="T", skipna=True))
+            Predictant = Predictant.fillna(Predictant.mean(dim="T", skipna=True))
+
             print("Cross-validation ongoing")
             for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
                 X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
                 y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
+                print(X_train, y_train, X_test)
                 pred_det = model.compute_model(X_train, y_train, X_test)
                 pred_prob = model.compute_prob(X_train, y_train, X_test)
                 hindcast_det.append(pred_det)

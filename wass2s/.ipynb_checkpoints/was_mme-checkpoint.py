@@ -200,8 +200,7 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
         Year for which the forecast is generated.
     score_metric : str, optional
         Metric used to organize scores (e.g., 'Pearson', 'MAE', 'GROC'). Default is 'GROC'.
-    var: str, optional
-        variables used ( e.g., 'PRCP')
+
     Returns
     -------
     all_model_hdcst : xarray.DataArray
@@ -271,8 +270,7 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
                         )
             all_model_fcst[i] = myfill(fcst, rainfall)
     else:
-        # target_prefixes = [m.replace(m.split('.')[1], '') for m in best_models]
-        target_prefixes = [m.split('.')[0] for m in best_models]
+        target_prefixes = [m.replace(m.split('.')[1], '') for m in best_models]
         scores_organized = {
             model: da for key, da in scores[score_metric].items() 
             for model in list(hdcsted.keys()) if any(model.startswith(prefix) for prefix in target_prefixes)
@@ -303,16 +301,15 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
               .rename({'T': 'S'})
               .transpose('S', 'M', 'Y', 'X')
         ) * mask
-        all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="S", skipna=True))
+        
         all_model_fcst = (
             xr.concat(forecast_det_list, dim='M')
               .assign_coords({'M': predictor_names})
               .rename({'T': 'S'})
               .transpose('S', 'M', 'Y', 'X')
         ) * mask
-        all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="S", skipna=True))
+        
         obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
-        obs = obs.fillna(obs.mean(dim="T", skipna=True))
 
     elif Prob:
         all_model_hdcst = (
@@ -320,15 +317,14 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
               .assign_coords({'M': predictor_names})
               .transpose('probability', 'T', 'M', 'Y', 'X')
         ) * mask
-        all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
+        
         all_model_fcst = (
             xr.concat(forecast_det_list, dim='M')
               .assign_coords({'M': predictor_names})
               .transpose('probability', 'T', 'M', 'Y', 'X')
         ) * mask
-        all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
+        
         obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
-        obs = obs.fillna(obs.mean(dim="T", skipna=True))
 
     else:
         all_model_hdcst = (
@@ -336,15 +332,14 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
               .assign_coords({'M': predictor_names})
               .transpose('T', 'M', 'Y', 'X')
         ) * mask
-        all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
+        
         all_model_fcst = (
             xr.concat(forecast_det_list, dim='M')
               .assign_coords({'M': predictor_names})
               .transpose('T', 'M', 'Y', 'X')
         ) * mask
-        all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
+        
         obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
-        obs = obs.fillna(obs.mean(dim="T", skipna=True))
     
     return all_model_hdcst, all_model_fcst, obs, scores_organized
 
@@ -11824,15 +11819,15 @@ class WAS_mme_FlexibleNGR_Model:
 ############################### BMA Sloughter modified ###############################
 
 class BMA_Sloughter:
-    def __init__(self, distribution='normal'):
+    def __init__(self, distribution='gaussian'):
         """
         Initialize the BMA model with the specified distribution.
 
         Parameters:
         - distribution: str, one of 'gaussian', 'gamma', 'lognormal', 'weibull', 't' (default: 'gaussian')
         """
-        if distribution not in ['normal', 'gamma', 'lognormal', 'weibull', 't']:
-            raise ValueError("Unsupported distribution. Choose from 'normal', 'gamma', 'lognormal', 'weibull', 't'.")
+        if distribution not in ['gaussian', 'gamma', 'lognormal', 'weibull', 't']:
+            raise ValueError("Unsupported distribution. Choose from 'gaussian', 'gamma', 'lognormal', 'weibull', 't'.")
         self.distribution = distribution
         self.debiasing_models = []
         self.weights = None
@@ -11846,7 +11841,7 @@ class BMA_Sloughter:
 
     def _get_dist_configs(self):
         return {
-            'normal': {
+            'gaussian': {
                 'pdf': lambda y, mu, sigma: norm.pdf(y, loc=mu, scale=sigma),
                 'cdf': lambda q, mu, sigma: norm.cdf(q, loc=mu, scale=sigma),
                 'initial': lambda res: np.std(res) if len(res) > 0 else 1.0,
@@ -11912,7 +11907,7 @@ class BMA_Sloughter:
         disp = np.zeros(m_members)
         for k in range(m_members):
             res_k = observations - μ_train[:, k]
-            if self.distribution in ['normal', 't']:
+            if self.distribution in ['gaussian', 't']:
                 disp[k] = self.config['initial'](res_k)
             else:
                 disp[k] = self.config['initial'](observations, μ_train[:, k])
@@ -12033,7 +12028,7 @@ class BMA_Sloughter:
 
 class WAS_mme_BMA_Sloughter:
     
-    def __init__(self, dist_method='normal', nb_cores=1):
+    def __init__(self, dist_method='gaussian', nb_cores=1):
         
         self.dist_method=dist_method
         self.nb_cores=nb_cores
@@ -12081,7 +12076,8 @@ class WAS_mme_BMA_Sloughter:
 
     def compute_model(self, X_train, y_train, X_test):
         """
-        Compute the model for the given training data.
+        Computes NGR-based class probabilities for each grid cell in `y_train`.
+
         Parameters
         ----------
         X_train : xarray.DataArray
@@ -12106,12 +12102,7 @@ class WAS_mme_BMA_Sloughter:
         y_train = y_train.transpose('T', 'Y', 'X')
         
         # Squeeze X_test
-        #X_test = X_test.transpose('T', 'M', 'Y', 'X')
-
-        # Handle test dim to avoid conflict
-        if 'T' in X_test.dims:
-            X_test = X_test.rename({'T': 'forecast'})
-        X_test = X_test.transpose('forecast', 'M', 'Y', 'X')
+        X_test = X_test.transpose('T', 'M', 'Y', 'X')
 
         # Dask client
         client = Client(n_workers=self.nb_cores, threads_per_worker=1)
@@ -12121,8 +12112,8 @@ class WAS_mme_BMA_Sloughter:
             X_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             X_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[('T','M'), ('T',), ('forecast','M')],
-            output_core_dims=[('forecast',)],  
+            input_core_dims=[('T','M'), ('T',), ('T','M')],
+            output_core_dims=[('T',)],  
             vectorize=True,
             dask='parallelized',
             output_dtypes=['float']
@@ -12130,12 +12121,12 @@ class WAS_mme_BMA_Sloughter:
         
         result_ = result.compute()
         client.close()
-        return result_.rename({'forecast': 'T'}).transpose('T', 'Y', 'X')
+        return result_
 
 
     def compute_prob(self, X_train, y_train, X_test):
         """
-        Computes class probabilities for each grid cell in `y_train`.
+        Computes NGR-based class probabilities for each grid cell in `y_train`.
 
         Parameters
         ----------
@@ -12160,10 +12151,8 @@ class WAS_mme_BMA_Sloughter:
         X_train = X_train.transpose('T', 'M', 'Y', 'X')
         y_train = y_train.transpose('T', 'Y', 'X')
         
-        # Handle test dim to avoid conflict
-        if 'T' in X_test.dims:
-            X_test = X_test.rename({'T': 'forecast'})
-        X_test = X_test.transpose('forecast', 'M', 'Y', 'X')
+        # Squeeze X_test
+        X_test = X_test.transpose('T', 'M', 'Y', 'X')
 
         # Dask client
         client = Client(n_workers=self.nb_cores, threads_per_worker=1)
@@ -12173,8 +12162,8 @@ class WAS_mme_BMA_Sloughter:
             X_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             X_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[('T','M'), ('T',), ('forecast','M')],
-            output_core_dims=[('probability', 'forecast')],  
+            input_core_dims=[('T','M'), ('T',), ('T','M')],
+            output_core_dims=[('probability', 'T')],  
             vectorize=True,
             dask='parallelized',
             output_dtypes=['float'],
@@ -12183,7 +12172,7 @@ class WAS_mme_BMA_Sloughter:
         
         result_ = result.compute()
         client.close()
-        return result_.rename({'forecast': 'T'}).assign_coords(probability=('probability', ['PB', 'PN', 'PA'])).transpose('probability', 'T', 'Y', 'X')
+        return result_
 
     def forecast(self, Predictant, Predictor, Predictor_for_year):
         predict_mean = self.compute_model(Predictant, Predictor, Predictor_for_year)

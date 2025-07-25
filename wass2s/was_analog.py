@@ -73,6 +73,7 @@ import scipy.signal as sig
 import xeofs as xe
 import xskillscore as xs
 from wass2s.utils import *
+from wass2s.was_bias_correction import *
 
 class WAS_Analog:
     """Analog-based forecasting toolkit for seasonal climate applications.
@@ -296,7 +297,7 @@ class WAS_Analog:
                     store_file_path[var] = ds
                     ds.to_netcdf(combined_output_path)
                     print(f"Saved NOAA ERSST data to {combined_output_path}")
-                    return ds
+                    return store_file_path
                 except Exception as e:
                     print(f"Failed to download NOAA.SST: {e}")
                     continue
@@ -436,8 +437,8 @@ class WAS_Analog:
         store_hdcst_file_path = {}
 
         for cent, syst, var, area in zip(selected_centres, selected_systems, variables, areas):
-            forecast_file = dir_to_save / f"forecast_{cent}{syst}_{var}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}_{area[0]}{area[1]}{area[2]}{area[3]}.nc"
-            hindcast_file = dir_to_save / f"hindcast_{cent}{syst}_{var}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}_{area[0]}{area[1]}{area[2]}{area[3]}.nc"
+            forecast_file = dir_to_save / f"forecast_{cent}{syst}_{var}_{year_forecast}_{abb_mont_ini}Ic_{season_str}_{lead_time[0]}_{area[0]}{area[1]}{area[2]}{area[3]}.nc"
+            hindcast_file = dir_to_save / f"hindcast_{cent}{syst}_{var}_{self.clim_year_start}_{self.clim_year_end}{abb_mont_ini}Ic_{season_str}_{lead_time[0]}_{area[0]}{area[1]}{area[2]}{area[3]}.nc"
                
             if not force_download and forecast_file.exists():
                 print(f"Forecast file {forecast_file} exists. Skipping download.")
@@ -787,6 +788,7 @@ class WAS_Analog:
         """Identify similar years using correlation-based analog method."""
 
         _, ddd = self.download_and_process()
+
         ddd = ddd.get(self.predictor_vars[0]['variable'])
 
         if ddd is None:
@@ -812,10 +814,10 @@ class WAS_Analog:
             correlations.append(correlation)
         
         similar = xr.concat(correlations, dim='T').assign_coords(T=unique_years)
-        similar = xr.where(similar > 0.5, 1, 0).sum(dim=["X", "Y"])
+        similar = xr.where(similar > 0.3, 1, 0).sum(dim=["X", "Y"])
         similar = similar.sortby(similar, ascending=False)
-        top_3 = similar.isel(T=slice(3))
-        similar_years = top_3['T'].to_numpy()
+        top_2 = similar.isel(T=slice(1, 3))
+        similar_years = top_2['T'].to_numpy()
         print(f"Similar years for {reference_year}: {similar_years}")
         return similar_years
 
@@ -827,9 +829,12 @@ class WAS_Analog:
         if ddd is None:
             raise ValueError(f"Variable {self.predictor_vars[0]['variable']} not found in downloaded data.")
         
-        predictor_ = ddd.fillna(ddd.groupby("T.month").mean("T", skipna=True))
-        predictor_detrend = sig.detrend(predictor_, axis=0)
-        ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
+        # predictor_ = ddd.fillna(ddd.groupby("T.month").mean("T", skipna=True))
+        # predictor_detrend = sig.detrend(predictor_, axis=0)
+        # ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
+
+        if self.detrend:
+            ddd, _ = self._detrended_da(ddd)
         
         eof = xe.single.EOF(n_modes=50, use_coslat=True, center=False)
         eof.fit(ddd.fillna(ddd.mean(dim="T", skipna=True)), dim="T")
@@ -856,8 +861,8 @@ class WAS_Analog:
         
         similar = xr.concat(correlations, dim='T').assign_coords(T=unique_years)
         similar = similar.sortby(similar, ascending=False)
-        top_3 = similar.isel(T=slice(3))
-        similar_years = top_3['T'].to_numpy()
+        top_2 = similar.isel(T=slice(1,3))
+        similar_years = top_2['T'].to_numpy()
         print(f"Similar years for {reference_year}: {similar_years}")
         return similar_years
 
@@ -941,6 +946,7 @@ class WAS_Analog:
         
         sst_hist = self.download_reanalysis(force_download=False)
         sst_hdcst, sst_for = self.download_models(force_download=False)
+
         variables = [item['variable'] for item in self.predictor_vars]
         print(f"Processing variables: {variables}")
         data_var_concatenated = {}
@@ -966,6 +972,7 @@ class WAS_Analog:
                 hindcast.append(sst_hdcst_i)
             sst_hdcst_ = xr.concat(hindcast, dim='T')          
             sst_hdcst_ = sst_hdcst_.interp(Y=sst_hist_.Y, X=sst_hist_.X, method="linear", kwargs={"fill_value": "extrapolate"})
+ 
 
             # process forecast data
             sst_for_ = sst_for_.interp(Y=sst_hist_.Y, X=sst_hist_.X, method="linear", kwargs={"fill_value": "extrapolate"})
@@ -978,38 +985,66 @@ class WAS_Analog:
             sst_for_ = sst_for_.drop_vars('T', errors='ignore').squeeze().rename({'forecastMonth': 'T'})
 
             # Correct forecast systematic bias
+            biasr = WAS_bias_correction()
+
             sst_for_bias_corrected = []
             for m in lead_time:
-                sst_hist_mean = sst_hist_.sel(T=slice(str(self.clim_year_start), str(self.clim_year_end))).where(sst_hist_['T'].dt.month.isin(m), drop=True).mean(dim="T",skipna=True)
-                sst_hdcst_mean = sst_hdcst_.sel(T=slice(str(self.clim_year_start), str(self.clim_year_end))).where(sst_hdcst_['T'].dt.month.isin(m), drop=True).mean(dim="T",skipna=True)
-                if var in ["TMIN", "TEMP", "TMAX", "SST", "HUSS_1000", "HUSS_925", "HUSS_850", "SLP", "UGRD10", "VGRD10", "UGRD_1000", "UGRD_925", "UGRD_850", "VGRD_1000", "VGRD_925", "VGRD_850"]:
-                    sst_for_bias_corrected.append(sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True) - sst_hdcst_mean + sst_hist_mean)
-                if var in ["PRCP", "DSWR", "DLWR", "NOLR"]:
-                    sst_for_bias_corrected.append(sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True) * sst_hist_mean / sst_hdcst_mean)
-            sst_for_ = xr.concat(sst_for_bias_corrected, dim='T')
+                m = m + base_time.month
+                sst_hist_mean = sst_hist_.sel(T=slice(str(self.clim_year_start), str(self.clim_year_end))).where(sst_hist_['T'].dt.month.isin(m), drop=True)#.mean(dim="T",skipna=True)
+                sst_hist_mean = sst_hist_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze()
 
-            # Concatenate hindcast and forecast data
+
+                sst_hdcst_mean = sst_hdcst_.sel(T=slice(str(self.clim_year_start), str(self.clim_year_end))).where(sst_hdcst_['T'].dt.month.isin(m), drop=True)#.mean(dim="T",skipna=True)
+                sst_hdcst_mean = sst_hdcst_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+                
+                sst_for_mean = sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True)
+                sst_for_mean = sst_for_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze('variable', drop=True)
+                
+                if var in ["TMIN", "TEMP", "TMAX", "SST", "HUSS_1000", "HUSS_925", "HUSS_850", "SLP", "UGRD10", "VGRD10", "UGRD_1000", "UGRD_925", "UGRD_850", "VGRD_1000", "VGRD_925", "VGRD_850"]:
+                    fobj_quant_da = biasr.fitBC(sst_hist_mean, sst_hdcst_mean, method='QUANT', qstep=0.01, nboot=10)
+                    sst_for_bias_corrected.append(biasr.doBC(sst_for_mean, fobj_quant_da, type='linear'))
+                    # sst_for_bias_corrected.append(sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True) - sst_hdcst_mean + sst_hist_mean)
+                # if var in ["PRCP", "DSWR", "DLWR", "NOLR"]:
+                    # fobj_quant = qmap.fitQmap(sst_hist_mean, sst_hdcst_mean, method='QUANT', wet_day=0.1,  qstep=0.001)
+                    # sst_for_bias_corrected.append(sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True) * sst_hist_mean / sst_hdcst_mean)
+            sst_for_ = xr.concat(sst_for_bias_corrected, dim='T').sortby("T")
+
+            # Concatenate hist and forecast data
             sst_hist_ = sst_hist_.sel(T=slice(f"{self.year_start}-01", f"{base_time.year}-{base_time.month:02d}"))
+            sst_hist_ = sst_hist_.to_array().drop_vars(['variable'], errors='ignore').squeeze()
             concatenated_ds = xr.concat([sst_hist_, sst_for_], dim='T')
+            concatenated_ds = concatenated_ds.sortby("T")
+            concatenated_ds = concatenated_ds.to_dataset(name=var)
 
             if isinstance(self.rolling, int) and self.rolling > 1:
-                print(f"Applied rolling mean with window size {self.rolling} for {var}.")
-                concatenated_ds = concatenated_ds.rolling(T=self.rolling, center=False, min_periods=self.rolling).mean()
+               print(f"Applied rolling mean with window size {self.rolling} for {var}.")
+               concatenated_ds = concatenated_ds.rolling(T=self.rolling, center=False, min_periods=self.rolling).mean()
 
-            print(f"Standardized or computed anomalies for {var}.")
-            concatenated_ds_st = self.standardize_timeseries(concatenated_ds) if self.standardize else self.anomaly_timeseries(concatenated_ds)
+            if self.standardize:
+                print(f"Standardizing timeseries for {var}.")
+                concatenated_ds_st = self.standardize_timeseries(concatenated_ds)
+            else:
+                print(f"Computing anomalies for {var}.")
+                concatenated_ds_st = self.anomaly_timeseries(concatenated_ds)
 
+            first_year = concatenated_ds_st.isel(T=0).T.dt.year.item()
+            last_month = concatenated_ds_st.isel(T=-1).T.dt.month.item()
 
-            first_year = concatenated_ds_st.T.dt.year[0].item()
-            last_month = concatenated_ds_st.T.dt.month[-1].item() + 1
-            start_date = pd.to_datetime(f"{first_year}-{last_month:02d}")
-            concatenated_ds_st = concatenated_ds_st.sel(T=slice(start_date, None))
+            if last_month == 12:
+                start_month = 1
+                first_year += 1
+            else:
+                start_month = last_month + 1
+
+            concatenated_ds_st = concatenated_ds_st.sel(T=slice(f"{first_year}-{start_month:02d}", f"{self.year_forecast}-{last_month:02d}"))
             new_time = pd.DatetimeIndex([pd.to_datetime(f"{first_year+1}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))])
+            # ds_shifted = concatenated_ds_st.assign_coords(T=new_time, month=('T', new_time.month))
+            # start_date = pd.to_datetime(f"{first_year}-{last_month:02d}")
+            # concatenated_ds_st = concatenated_ds_st.sel(T=slice(start_date, None))
+            # new_time = pd.DatetimeIndex([pd.to_datetime(f"{first_year+1}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))])
             # ds_shifted = concatenated_ds_st.assign_coords(T=new_time, month=('T', new_time.month))
             ds_shifted = concatenated_ds_st.assign_coords(T=new_time)
     
-            # ds_shifted = ds_shifted.astype({f"{var.lower()}": "float32"})
-            # concatenated_ds_st = concatenated_ds_st.astype({f"{var.lower()}": "float32"})
             data_var_shifted[var] = ds_shifted.to_array().drop_vars(['variable'], errors='ignore').squeeze()
             data_var_concatenated[var] = concatenated_ds_st.to_array().drop_vars(['variable'], errors='ignore').squeeze()
         return data_var_concatenated, data_var_shifted
@@ -1201,6 +1236,11 @@ class WAS_Analog:
         ireference_year = 2100
 
         similar_years = method_map[self.method_analog](predictant, itrain, ireference_year)
+        if len(similar_years)>2:
+            similar_years = similar_years[:2]
+        else:
+            similar_years = similar_years[:len(similar_years)]
+
         sim_obs = [predictant.sel(T=str(year)) for year in similar_years if year in predictant['T'].dt.year.values]
 
         if not sim_obs:
