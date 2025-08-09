@@ -10,6 +10,8 @@ import matplotlib.cm as cm
 from matplotlib.patches import Rectangle
 from matplotlib import gridspec
 from matplotlib.offsetbox import  (OffsetImage, AnnotationBbox)
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+import matplotlib.image as mpimg
 import matplotlib.image as image
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -920,7 +922,7 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
             selected_vars_in_order.extend(matches)        
     return selected_vars_in_order # selected_vars
 
-def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, logo=None, logo_size=0.5):
+def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, logo=None, logo_position="lower left", sigma=None, res=None):
     """
     Plot probabilistic forecasts with tercile categories.
 
@@ -946,6 +948,43 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     Saves the plot as a PNG file and displays it.
     Uses custom colormaps for each tercile category.
     """
+
+    if res is not None:
+        min_X = forecast_prob['X'].min().values
+        max_X = forecast_prob['X'].max().values
+        min_Y = forecast_prob['Y'].min().values
+        max_Y = forecast_prob['Y'].max().values
+        num_X = int((max_X - min_X) / res) + 1
+        num_Y = int((max_Y - min_Y) / res) + 1
+        new_X = np.linspace(min_X, max_X, num_X)
+        new_Y = np.linspace(min_Y, max_Y, num_Y)
+        forecast_prob = forecast_prob.interp(X=new_X, Y=new_Y, method='linear',
+                                                kwargs={'fill_value': 'extrapolate'}    
+                                            )
+
+    if sigma is not None:
+        # Create a smoothed copy
+        forecast_prob_smoothed = forecast_prob * 0.0  # Initialize with same shape and coords
+        
+        # Smooth each probability layer spatially
+        for p in forecast_prob.probability.values:
+            layer = forecast_prob.sel(probability=p)
+            layer_smoothed = xr.apply_ufunc(
+                gaussian_filter,
+                layer,
+                input_core_dims=[['Y', 'X']],
+                output_core_dims=[['Y', 'X']],
+                kwargs={'sigma': sigma}
+            )
+            forecast_prob_smoothed.loc[{'probability': p}] = layer_smoothed
+        
+        # Normalize smoothed probabilities to sum to 1 at each grid point
+        sum_probs = forecast_prob_smoothed.sum('probability')
+        forecast_prob_smoothed = forecast_prob_smoothed / sum_probs.where(sum_probs != 0, 1.0)
+        
+        # Replace original with smoothed
+        forecast_prob = forecast_prob_smoothed
+
     # Step 1: Extract maximum probability and category
     max_prob = forecast_prob.max(dim="probability", skipna=True)  # Maximum probability at each grid point
     # Fill NaN values with a very low value 
@@ -960,104 +999,92 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     
     # Step 3: Define custom colormaps
     if reverse_cmap:
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#FDAE61', '#F46D43', '#D73027']) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FEE391'])
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#ABDDA4', '#66C2A5', '#3288BD'])  
+        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ["#ffffe5", "#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]) 
+        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ["#f0f0f0","#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252"])
+        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ["#f7fcfd", "#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"])  
     else:
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FDAE61', '#F46D43', '#D73027']) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FEE391'])
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#ABDDA4', '#66C2A5', '#3288BD'])          
+        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ["#ffffe5", "#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]) 
+        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ["#f0f0f0","#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252"])
+        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ["#f7fcfd", "#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"])          
     
     # Create a figure with GridSpec
-    fig = plt.figure(figsize=(8, 6))
-    gs = gridspec.GridSpec(2, 3, height_ratios=[6, 0.5], hspace=0.03)
+    fig = plt.figure(figsize=(10, 8))
+    gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2], hspace=-0.6, wspace=0.2)
 
     # Main map axis
     ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
 
-    # Modify by Mandela
+    gl = ax.gridlines(draw_labels=True, linewidth=0.05, color='gray', alpha=0.8)
+    gl.top_labels = False
+    gl.right_labels = False
     
-    ###################
-    ##################
-
-    sigma = 4.0  # Smoothing parameter (Gaussian sigma); 
-    
-    # Create a smoothed copy
-    forecast_prob_smoothed = forecast_prob * 0.0  # Initialize with same shape and coords
-    
-    # Smooth each probability layer spatially
-    for p in forecast_prob.probability.values:
-        layer = forecast_prob.sel(probability=p)
-        layer_smoothed = xr.apply_ufunc(
-            gaussian_filter,
-            layer,
-            input_core_dims=[['Y', 'X']],
-            output_core_dims=[['Y', 'X']],
-            kwargs={'sigma': sigma}
-        )
-        forecast_prob_smoothed.loc[{'probability': p}] = layer_smoothed
-    
-    # Normalize smoothed probabilities to sum to 1 at each grid point
-    sum_probs = forecast_prob_smoothed.sum('probability')
-    forecast_prob_smoothed = forecast_prob_smoothed / sum_probs.where(sum_probs != 0, 1.0)
-    
-    # Replace original with smoothed
-    forecast_prob = forecast_prob_smoothed
+    bn_data = (max_prob.where(mask_bn) * 100).values
+    nn_data = (max_prob.where(mask_nn) * 100).values
+    an_data = (max_prob.where(mask_an) * 100).values
 
     # Step 4: Plot each category
-    bn_data = xr.where((xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100)<45, 45,
-                       xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100).values  
-    nn_data = xr.where((xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100)<45, 45,
-                   xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100).values
-    an_data = xr.where((xr.where(max_prob.where(mask_an)>0.6,0.6,max_prob.where(mask_an))* 100)<45, 45,
-                   xr.where(max_prob.where(mask_an)>0.6,0.6,max_prob.where(mask_an))* 100).values
+   # def clip_prob(data, mask):
+   #     prob = max_prob.where(mask)
+   #     prob = xr.where(prob > 0.6, 0.6, prob) * 100
+   #     prob = xr.where(prob < 25, 25, prob)
+   #     return prob.values
+
+   # bn_data = clip_prob(max_prob, mask_bn)
+   # nn_data = clip_prob(max_prob, mask_nn)
+   # an_data = clip_prob(max_prob, mask_an)
+
+
+    # Step _: Add  Land colors
+    ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#fde0dd", edgecolor="black", zorder=0) # #dfc27d
     
-    # Define the data ranges for color normalization  
-    vmin = 35  # Minimum probability percentage
-    vmax = 65  # Maximum probability percentage
+    # # Define the data ranges for color normalization  
+    # vmin = 25  # Minimum probability percentage
+    # vmax = 65  # Maximum probability percentage
 
     # Plot BN (Below Normal)
     if np.any(~np.isnan(bn_data)):
         bn_plot = ax.pcolormesh(
             forecast_prob['X'], forecast_prob['Y'], bn_data,
-            cmap=BN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
+            cmap=BN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=35, vmax=85
         )
     else:
-        bn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=BN_cmap)
+        bn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=35, vmax=85), cmap=BN_cmap)
         bn_plot.set_array([])
 
     # Plot NN (Near Normal)
     if np.any(~np.isnan(nn_data)):
         nn_plot = ax.pcolormesh(
             forecast_prob['X'], forecast_prob['Y'], nn_data,
-            cmap=NN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
+            cmap=NN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=35, vmax=65
         )
     else:
-        nn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=NN_cmap)
+        nn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=35, vmax=65), cmap=NN_cmap)
         nn_plot.set_array([])
 
     # Plot AN (Above Normal)
     if np.any(~np.isnan(an_data)):
         an_plot = ax.pcolormesh(
             forecast_prob['X'], forecast_prob['Y'], an_data,
-            cmap=AN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
+            cmap=AN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=35, vmax=85
         )
     else:
-        an_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=AN_cmap)
+        an_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=35, vmax=85), cmap=AN_cmap)
         an_plot.set_array([])
 
-    # Step 5: Add coastlines and borders
+    # Step 5: Add coastlines and borders and Land
     ax.coastlines()
-    ax.add_feature(cfeature.BORDERS, linestyle=':')
+    ax.add_feature(cfeature.BORDERS, edgecolor='black', linewidth=1.0, linestyle='solid')
+    ax.add_feature(cfeature.OCEAN, facecolor="lightblue")
     
     # Step 6: Add individual colorbars with fixed ticks
-    def create_ticks():
-        ticks = np.arange(35, 66, 5)
+    def create_ticks(vn=35, vx=86, step=5):
+        ticks = np.arange(vn, vx, step)
         return ticks
 
-    ticks = create_ticks()
+    #ticks = create_ticks(vn=35, vx=86, step=5)
 
     # For BN (Below Normal)
+    ticks = create_ticks(vn=35, vx=86, step=5)
     cbar_ax_bn = fig.add_subplot(gs[1, 0])
     cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal')
     cbar_bn.set_label(f'{labels[0]} (%)')
@@ -1065,6 +1092,7 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     cbar_bn.set_ticklabels([f"{tick}" for tick in ticks])
 
     # For NN (Near Normal)
+    ticks = create_ticks(vn=35, vx=66, step=5)
     cbar_ax_nn = fig.add_subplot(gs[1, 1])
     cbar_nn = plt.colorbar(nn_plot, cax=cbar_ax_nn, orientation='horizontal')
     cbar_nn.set_label(f'{labels[1]} (%)')
@@ -1072,6 +1100,7 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     cbar_nn.set_ticklabels([f"{tick}" for tick in ticks])
 
     # For AN (Above Normal)
+    ticks = create_ticks(vn=35, vx=86, step=5)
     cbar_ax_an = fig.add_subplot(gs[1, 2])
     cbar_an = plt.colorbar(an_plot, cax=cbar_ax_an, orientation='horizontal')
     cbar_an.set_label(f'{labels[2]} (%)')
@@ -1085,16 +1114,21 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
         model_name_str = str(model_name)
     ax.set_title(f"{model_name_str}", fontsize=13, pad=20)
 
-    # Step 7: Add logo if provided
-    if logo is not None:
-        from matplotlib.offsetbox import OffsetImage, AnnotationBbox
-        im = image.imread(logo)
-        imagebox = OffsetImage(im, zoom=logo_size)
-        ab = AnnotationBbox(imagebox, (0.05, 0.95), xycoords='figure fraction', frameon=False)
-        fig.add_artist(ab)
 
-    plt.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.03, wspace=0.3)
-    plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.png", dpi=300, bbox_inches='tight')
+    # Step 7: Add logo if provided
+    
+    if logo is not None:
+        ax_logo = inset_axes(ax,
+                            width="7%",          
+                            height="21%",         
+                            loc=logo_position,
+                            borderpad=0.1)        
+        ax_logo.imshow(mpimg.imread(logo))
+        ax_logo.axis("off") 
+
+    # plt.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.03, wspace=0.03)
+    plt.subplots_adjust(top=0.95, bottom=0.08, left=0.06, right=0.94, hspace=-0.6, wspace=0.2)
+    plt.savefig(f"{dir_to_save}", dpi=300, bbox_inches='tight')
     plt.show()
 
 
@@ -1270,7 +1304,7 @@ def plot_prob_forecasts1(dir_to_save, forecast_prob, model_name, labels=["Below-
         ab = AnnotationBbox(addLogo, (0.5, 0.5), frameon=False, xycoords='axes fraction')
         logo_ax.add_artist(ab)
 
-    plt.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.03, wspace=0.3)
+    plt.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=-0.6, wspace=0.2)
     plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.png", dpi=300, bbox_inches='tight')
     plt.show()
 
@@ -1336,7 +1370,7 @@ def plot_prob_forecasts2(dir_to_save, forecast_prob, model_name, labels=["Below-
     
     ###################
     ##################
-    sigma = 2.0  # Smoothing parameter (Gaussian sigma); adjust as needed
+    sigma = 2.0  # Smoothing parameter (Gaussian sigma); 
     
     # Create a smoothed copy
     forecast_prob_smoothed = forecast_prob * 0.0  # Initialize with same shape and coords
@@ -2071,7 +2105,7 @@ def et0_fao56_daily(tmax, tmin, rs, mlsp, dem, tdew=None, u10=None, v10=None, wf
     rs : xarray.DataArray
         Daily mean incoming solar radiation in W m^-2 or MJ m^-2 day^-1, with dimensions ('T', 'Y', 'X').
     mlsp : xarray.DataArray
-        Daily mean sea-level pressure in Pa, with dimensions ('T', 'Y', 'X').
+        Daily mean sea-level pressure in hPa, with dimensions ('T', 'Y', 'X').
     dem : xarray.DataArray
         Digital elevation model (terrain height) in meters, with dimensions ('Y', 'X').
 
@@ -2113,7 +2147,7 @@ def et0_fao56_daily(tmax, tmin, rs, mlsp, dem, tdew=None, u10=None, v10=None, wf
     Δ = 4098 * svp(tmean) / (tmean + 237.3)**2  # Slope of svp curve (kPa °C^-1)
 
     # --- 3 Pressures ---
-    P0 = mlsp / 1000.0  # Pa to kPa
+    P0 = mlsp / 10.0  # hPa to kPa
     P = P0 * (1 - 0.0065 * dem / (tmean + 273.15))**5.257  # Hypsometric equation
     PSI = 0.665e-3 * P  # Psychrometric constant (kPa °C^-1)
 
@@ -2130,7 +2164,7 @@ def et0_fao56_daily(tmax, tmin, rs, mlsp, dem, tdew=None, u10=None, v10=None, wf
 
     # --- 5 Vapour pressures ---
     if tdew is None:
-        # If dew point is not provided, use average of tmax and tmin
+        # If dew point is not provided, use tmin
         ea = svp(tmin)  # Actual vapor pressure (kPa)
     else:
         ea = svp(tdew)  # Actual vapor pressure (kPa)

@@ -516,7 +516,8 @@ class WAS_TransformData:
             )
         kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
         df_mean['cluster'] = kmeans.fit_predict(df_mean[['value']])
-        clusters_da = df_mean.set_index(['Y', 'X'])['cluster'].to_xarray()
+        # clusters_da = df_mean.set_index(['Y', 'X'])['cluster'].to_xarray()
+        clusters_da = df_mean['cluster'].to_xarray()
         valid_mask = ~np.isnan(data.isel(T=0))
         clusters_da = clusters_da * xr.where(valid_mask, 1, np.nan)
         _, clusters_aligned = xr.align(data, clusters_da, join='inner')
@@ -531,7 +532,7 @@ class WAS_TransformData:
                 dist_codes[cl] = np.nan
                 continue
             try:
-                ftr = Fitter(cl_data, distributions=dist_names, timeout=30)
+                ftr = Fitter(cl_data, distributions=dist_names, timeout=120)
                 ftr.fit()
                 best_name = next(iter(ftr.get_best(method='sumsquare_error')))
                 dist_codes[cl] = self.distribution_map[best_name]

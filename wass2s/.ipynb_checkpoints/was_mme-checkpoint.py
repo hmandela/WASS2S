@@ -19,12 +19,13 @@ from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import GridSearchCV, KFold
+from sklearn.model_selection import RandomizedSearchCV
 from xgboost import XGBRegressor
-from lightgbm import LGBMRegressor
-from sklearn.linear_model import Ridge
-from sklearn.linear_model import Lasso
-from sklearn.neighbors import KNeighborsRegressor
-from sklearn.tree import DecisionTreeRegressor
+from hpelm import HPELM
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.metrics import mean_squared_error
+# from sklearn.neighbors import KNeighborsRegressor
+# from sklearn.tree import DecisionTreeRegressor
 from sklearn.svm import SVR
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.ensemble import AdaBoostRegressor
@@ -200,7 +201,8 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
         Year for which the forecast is generated.
     score_metric : str, optional
         Metric used to organize scores (e.g., 'Pearson', 'MAE', 'GROC'). Default is 'GROC'.
-
+    var: str, optional
+        variables used ( e.g., 'PRCP')
     Returns
     -------
     all_model_hdcst : xarray.DataArray
@@ -270,7 +272,8 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
                         )
             all_model_fcst[i] = myfill(fcst, rainfall)
     else:
-        target_prefixes = [m.replace(m.split('.')[1], '') for m in best_models]
+        # target_prefixes = [m.replace(m.split('.')[1], '') for m in best_models]
+        target_prefixes = [m.split('.')[0] for m in best_models]
         scores_organized = {
             model: da for key, da in scores[score_metric].items() 
             for model in list(hdcsted.keys()) if any(model.startswith(prefix) for prefix in target_prefixes)
@@ -301,15 +304,16 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
               .rename({'T': 'S'})
               .transpose('S', 'M', 'Y', 'X')
         ) * mask
-        
+        all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="S", skipna=True))
         all_model_fcst = (
             xr.concat(forecast_det_list, dim='M')
               .assign_coords({'M': predictor_names})
               .rename({'T': 'S'})
               .transpose('S', 'M', 'Y', 'X')
         ) * mask
-        
+        all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="S", skipna=True))
         obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
+        obs = obs.fillna(obs.mean(dim="T", skipna=True))
 
     elif Prob:
         all_model_hdcst = (
@@ -317,14 +321,15 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
               .assign_coords({'M': predictor_names})
               .transpose('probability', 'T', 'M', 'Y', 'X')
         ) * mask
-        
+        all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
         all_model_fcst = (
             xr.concat(forecast_det_list, dim='M')
               .assign_coords({'M': predictor_names})
               .transpose('probability', 'T', 'M', 'Y', 'X')
         ) * mask
-        
+        all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
         obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
+        obs = obs.fillna(obs.mean(dim="T", skipna=True))
 
     else:
         all_model_hdcst = (
@@ -332,14 +337,15 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
               .assign_coords({'M': predictor_names})
               .transpose('T', 'M', 'Y', 'X')
         ) * mask
-        
+        all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
         all_model_fcst = (
             xr.concat(forecast_det_list, dim='M')
               .assign_coords({'M': predictor_names})
               .transpose('T', 'M', 'Y', 'X')
         ) * mask
-        
+        all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
         obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
+        obs = obs.fillna(obs.mean(dim="T", skipna=True))
     
     return all_model_hdcst, all_model_fcst, obs, scores_organized
 
@@ -2750,7 +2756,7 @@ class WAS_mme_BMA:
         self.bma.summary()
 
 
-class WAS_mme_ELR:
+class WAS_mme_xcELR:
     """
     Extended Logistic Regression (ELR) for Multi-Model Ensemble (MME) forecasting derived from xcast package.
 
@@ -2854,19 +2860,8 @@ class WAS_mme_ELR:
         
         return hindcast_prob.transpose('probability', 'T', 'Y', 'X').load()
 
-class NonHomogeneousGaussianRegression:
-    """
-    Placeholder for Non-Homogeneous Gaussian Regression model.
-
-    This class is not implemented in the provided code and serves as a placeholder for future development.
-
-    Parameters
-    ----------
-    None
-    """
-    pass
     
-class WAS_mme_ELM:
+class WAS_mme_xcELM:
     """
     Extreme Learning Machine (ELM) for Multi-Model Ensemble (MME) forecasting derived from xcast.
 
@@ -3379,52 +3374,131 @@ class WAS_mme_ELM:
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_ * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
-          
-class WAS_mme_MLP:
-    """
-    Multi-Layer Perceptron (MLP) for Multi-Model Ensemble (MME) forecasting.
 
-    This class implements a Multi-Layer Perceptron model using scikit-learn's MLPRegressor
-    for deterministic forecasting, with optional tercile probability calculations using
-    various statistical distributions.
+
+class HPELMWrapper(BaseEstimator, RegressorMixin):
+    """
+    Wrapper for HPELM to make it compatible with scikit-learn's RandomizedSearchCV.
+    """
+    def __init__(self, neurons=10, activation='sigm', norm=1.0, random_state=42):
+        self.neurons = neurons
+        self.activation = activation
+        self.norm = norm
+        self.random_state = random_state
+        self.model = None
+
+    def fit(self, X, y):
+        self.model = HPELM(inputs=X.shape[1], outputs=1, classification='r', norm=self.norm)
+        self.model.add_neurons(self.neurons, self.activation)
+        self.model.train(X, y, 'r')
+        return self
+
+    def predict(self, X):
+        return self.model.predict(X).ravel()
+
+    def get_params(self, deep=True):
+        return {'neurons': self.neurons, 'activation': self.activation, 'norm': self.norm, 'random_state': self.random_state}
+
+    def set_params(self, **params):
+        for param, value in params.items():
+            setattr(self, param, value)
+        return self
+
+class WAS_mme_hpELM:
+    """
+    Extreme Learning Machine (ELM) based Multi-Model Ensemble (MME) forecasting using hpelm library.
+    This class implements a single-model forecasting approach using HPELM for deterministic predictions,
+    with optional tercile probability calculations using various statistical distributions.
+    Implements hyperparameter optimization via randomized search.
 
     Parameters
     ----------
-    hidden_layer_sizes : tuple, optional
-        Sizes of the hidden layers in the MLP (e.g., (10, 5)). Default is (10, 5).
-    activation : str, optional
-        Activation function for the hidden layers ('identity', 'logistic', 'tanh', 'relu').
-        Default is 'relu'.
-    solver : str, optional
-        Optimization algorithm ('lbfgs', 'sgd', 'adam'). Default is 'adam'.
-    max_iter : int, optional
-        Maximum number of iterations for the solver. Default is 200.
-    alpha : float, optional
-        L2 regularization parameter. Default is 0.01.
+    neurons_range : list of int, optional
+        List of neuron counts to tune for HPELM (default is [10, 20, 50, 100]).
+    activation_options : list of str, optional
+        Activation functions to tune for HPELM (default is ['sigm', 'tanh', 'relu', 'rbf_linf', 'rbf_gauss']).
+    norm_range : list of float, optional
+        Regularization parameters to tune for HPELM (default is [0.1, 1.0, 10.0, 100.0]).
     random_state : int, optional
-        Seed for random number generation for reproducibility. Default is 42.
+        Seed for reproducibility (default is 42).
     dist_method : str, optional
-        Distribution method for tercile probability calculations ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
-        Default is 'gamma'.
+        Distribution method for tercile probabilities ('t', 'gamma', etc.) (default is 'gamma').
+    n_iter_search : int, optional
+        Number of iterations for randomized search (default is 10).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 3).
     """
-    def __init__(self, hidden_layer_sizes=(10, 5), activation='relu', solver='adam',
-                 max_iter=200, alpha=0.01, random_state=42, dist_method="gamma"):
-
-        self.hidden_layer_sizes = hidden_layer_sizes
-        self.activation = activation
-        self.solver = solver
-        self.max_iter = max_iter
-        self.alpha = alpha
+    def __init__(self,
+                 neurons_range=[10, 20, 50, 100],
+                 activation_options=['sigm', 'tanh', 'relu', 'rbf_linf', 'rbf_gauss'],
+                 norm_range=[0.1, 1.0, 10.0, 100.0],
+                 random_state=42,
+                 dist_method="gamma",
+                 n_iter_search=10,
+                 cv_folds=3):
+        self.neurons_range = neurons_range
+        self.activation_options = activation_options
+        self.norm_range = norm_range
         self.random_state = random_state
         self.dist_method = dist_method
-        self.mlp = None
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
+        self.hpelm = None
 
-    def compute_model(self, X_train, y_train, X_test, y_test):
+    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
         """
-        Compute deterministic hindcast using the MLP model.
+        Independently computes the best hyperparameters using randomized search on stacked training data.
 
-        Fits the MLPRegressor on training data and predicts deterministic values for the test data.
-        Handles data stacking and NaN removal.
+        Parameters
+        ----------
+        Predictors : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        Predictand : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        clim_year_start : int
+            Start year of the climatology period.
+        clim_year_end : int
+            End year of the climatology period.
+
+        Returns
+        -------
+        dict
+            Best hyperparameters found.
+        """
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Prepare parameter distributions
+        param_dist = {
+            'neurons': self.neurons_range,
+            'activation': self.activation_options,
+            'norm': self.norm_range
+        }
+
+        # Initialize HPELM wrapper for scikit-learn compatibility
+        model = HPELMWrapper(random_state=self.random_state)
+
+        # Randomized search
+        random_search = RandomizedSearchCV(
+            model, param_distributions=param_dist, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+
+        random_search.fit(X_train_clean, y_train_clean)
+        best_params = random_search.best_params_
+        return best_params
+
+    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        """
+        Compute deterministic hindcast using the HPELM model with injected hyperparameters.
 
         Parameters
         ----------
@@ -3436,56 +3510,1991 @@ class WAS_mme_MLP:
             Testing predictor data with dimensions (T, M, Y, X).
         y_test : xarray.DataArray
             Testing predictand data with dimensions (T, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
 
         Returns
         -------
         predicted_da : xarray.DataArray
             Deterministic hindcast with dimensions (T, Y, X).
         """
-        # Initialize MLPRegressor
-        self.mlp = MLPRegressor(hidden_layer_sizes=self.hidden_layer_sizes,
-                                activation=self.activation,
-                                solver=self.solver,
-                                max_iter=self.max_iter,
-                                alpha=self.alpha,
-                                random_state=self.random_state)
-        
         # Extract coordinate variables from X_test
         time = X_test['T']
         lat = X_test['Y']
         lon = X_test['X']
         n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
+        n_lat = len(X_test.coords['Y'])
+        n_lon = len(X_test.coords['X'])
+
         # Stack training data
         X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
         y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1)
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-        
+
         # Stack testing data
         X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
         y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the MLP model
-        self.mlp.fit(X_train_clean, y_train_clean)
-        y_pred = self.mlp.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end)
+
+        # Initialize the HPELM model with best parameters
+        self.hpelm = HPELM(
+            inputs=X_train_clean.shape[1],
+            outputs=1,
+            classification='r',
+            norm=best_params['norm']
+        )
+        self.hpelm.add_neurons(best_params['neurons'], best_params['activation'])
+        self.hpelm.train(X_train_clean, y_train_clean, 'r')
+        y_pred = self.hpelm.predict(X_test_stacked[~test_nan_mask]).ravel()
+
+        # Reconstruct predictions
         result = np.empty_like(np.squeeze(y_test_stacked))
         result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
         result[~np.squeeze(test_nan_mask)] = y_pred
-        
+
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        predicted_da = xr.DataArray(
+            data=predictions_reshaped,
+            coords={'T': time, 'Y': lat, 'X': lon},
+            dims=['T', 'Y', 'X']
+        )
+        return predicted_da
+
+    # ------------------ Probability Calculation Methods ------------------
+    @staticmethod
+    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Student's t-based method
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            first_t = (first_tercile - best_guess) / error_std
+            second_t = (second_tercile - best_guess) / error_std
+            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
+            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
+            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Weibull minimum-based method.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
+                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
+        """Gamma-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time), dtype=float)
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        T1 = np.asarray(T1, dtype=float)
+        T2 = np.asarray(T2, dtype=float)
+        alpha = (best_guess ** 2) / error_variance
+        theta = error_variance / best_guess
+        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
+        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
+        pred_prob[0, :] = cdf_t1
+        pred_prob[1, :] = cdf_t2 - cdf_t1
+        pred_prob[2, :] = 1.0 - cdf_t2
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        """Non-parametric method using historical error samples."""
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+        for t in range(n_time):
+            if np.isnan(best_guess[t]):
+                continue
+            dist = best_guess[t] + error_samples
+            dist = dist[np.isfinite(dist)]
+            if len(dist) == 0:
+                continue
+            p_below = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above = 1.0 - (p_below + p_between)
+            pred_prob[0, t] = p_below
+            pred_prob[1, t] = p_between
+            pred_prob[2, t] = p_above
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+        """Normal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
+        """Lognormal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
+        mu = np.log(best_guess) - sigma ** 2 / 2
+        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
+        return pred_prob
+
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
+        """
+        Compute tercile probabilities using the chosen distribution method.
+        Predictant is expected to be an xarray DataArray with dims (T, Y, X).
+        """
+        if "M" in Predictant.coords:
+            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        Predictant = Predictant.transpose('T', 'Y', 'X')
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant - hindcast_det).var(dim='T')
+        dof = len(Predictant.get_index("T")) - 2
+
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = Predictant - hindcast_det
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('T',), (), ()],
+                output_core_dims=[('probability', 'T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+    
+    @staticmethod
+    def _reshape_and_filter_data(da):
+        """
+        Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
+        and remove rows containing NaNs.
+        """
+        da_stacked = da.stack(sample=('T', 'Y', 'X'))
+        if 'M' in da.dims:
+            da_stacked = da_stacked.transpose('sample', 'M')
+        else:
+            da_stacked = da_stacked.transpose('sample')
+        da_values = da_stacked.values
+        nan_mask = np.any(np.isnan(da_values), axis=1)
+        return da_values[~nan_mask], nan_mask, da_values
+
+
+
+
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year, best_params=None):
+        """
+        Forecast method using a single HPELM model with optimized hyperparameters.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
+
+        Returns
+        -------
+        forecast_det : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        forecast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
+        """
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        # Standardize Predictor_for_year using hindcast climatology
+        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
+        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
+        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
+
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
+        y_test = Predictant_st.isel(T=[-1])
+
+        # Extract coordinates from X_test
+        time = Predictor_for_year_st['T']
+        lat = Predictor_for_year_st['Y']
+        lon = Predictor_for_year_st['X']
+        n_time = len(Predictor_for_year_st.coords['T'])
+        n_lat = len(Predictor_for_year_st.coords['Y'])
+        n_lon = len(Predictor_for_year_st.coords['X'])
+
+        # Stack training data and remove rows with NaNs
+        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Stack testing data
+        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
+
+        # Initialize and fit the HPELM model with best parameters
+        self.hpelm = HPELM(
+            inputs=X_train_clean.shape[1],
+            outputs=1,
+            classification='r',
+            norm=best_params['norm']
+        )
+        self.hpelm.add_neurons(best_params['neurons'], best_params['activation'])
+        self.hpelm.train(X_train_clean, y_train_clean, 'r')
+        y_pred = self.hpelm.predict(X_test_stacked[~test_nan_mask]).ravel()
+
+        # Reconstruct the prediction array
+        result = np.empty_like(np.squeeze(y_test_stacked))
+        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
+        result[~np.squeeze(test_nan_mask)] = y_pred
+
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        result_da = xr.DataArray(
+            data=predictions_reshaped,
+            coords={'T': time, 'Y': lat, 'X': lon},
+            dims=['T', 'Y', 'X']
+        ) * mask
+
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
+        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        result_da['T'] = result_da['T'].astype('datetime64[ns]')
+
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant_no_m.get_index("T")) - 2
+
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = Predictant_no_m - hindcast_det_cross
+            error_samples = error_samples.rename({'T': 'S'})
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('S',), (), ()],
+                output_core_dims=[('probability', 'T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+
+class WAS_mme_RF_hpELM:
+    """
+    Stacking ensemble with Random Forest as base model and HPELM as meta-model for Multi-Model Ensemble (MME) forecasting.
+    This class implements a stacking ensemble using RandomForestRegressor as the base model,
+    with an HPELM meta-model, for deterministic forecasting and optional tercile probability calculations.
+    Implements hyperparameter optimization via randomized search for both base and meta models.
+
+    Parameters
+    ----------
+    n_estimators_range : list of int, optional
+        List of n_estimators values to tune for Random Forest (default is [50, 100, 200, 300]).
+    max_depth_range : list of int or None, optional
+        List of max depths to tune for Random Forest (default is [None, 10, 20, 30]).
+    min_samples_split_range : list of int, optional
+        List of minimum samples required to split to tune for Random Forest (default is [2, 5, 10]).
+    min_samples_leaf_range : list of int, optional
+        List of minimum samples required at leaf node to tune for Random Forest (default is [1, 2, 4]).
+    max_features_range : list of str or float, optional
+        List of max features to tune for Random Forest (default is ['auto', 'sqrt', 0.33, 0.5]).
+    neurons_range : list of int, optional
+        List of neuron counts to tune for HPELM (default is [10, 20, 50, 100]).
+    activation_options : list of str, optional
+        Activation functions to tune for HPELM (default is ['sigm', 'tanh', 'relu', 'rbf_linf', 'rbf_gauss']).
+    norm_range : list of float, optional
+        Regularization parameters to tune for HPELM (default is [0.1, 1.0, 10.0, 100.0]).
+    random_state : int, optional
+        Seed for reproducibility (default is 42).
+    dist_method : str, optional
+        Distribution method for tercile probabilities ('t', 'gamma', etc.) (default is 'gamma').
+    n_iter_search : int, optional
+        Number of iterations for randomized search (default is 10).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 3).
+    """
+    def __init__(self,
+                 n_estimators_range=[50, 100, 200, 300],
+                 max_depth_range=[None, 10, 20, 30],
+                 min_samples_split_range=[2, 5, 10],
+                 min_samples_leaf_range=[1, 2, 4],
+                 max_features_range=['auto', 'sqrt', 0.33, 0.5],
+                 neurons_range=[10, 20, 50, 100],
+                 activation_options=['sigm', 'tanh', 'relu', 'rbf_linf', 'rbf_gauss'],
+                 norm_range=[0.1, 1.0, 10.0, 100.0],
+                 random_state=42,
+                 dist_method="gamma",
+                 n_iter_search=10,
+                 cv_folds=3):
+        self.n_estimators_range = n_estimators_range
+        self.max_depth_range = max_depth_range
+        self.min_samples_split_range = min_samples_split_range
+        self.min_samples_leaf_range = min_samples_leaf_range
+        self.max_features_range = max_features_range
+        self.neurons_range = neurons_range
+        self.activation_options = activation_options
+        self.norm_range = norm_range
+        self.random_state = random_state
+        self.dist_method = dist_method
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
+        self.stacking_model = None
+
+    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
+        """
+        Independently computes the best hyperparameters using randomized search on stacked training data.
+
+        Parameters
+        ----------
+        Predictors : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        Predictand : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        clim_year_start : int
+            Start year of the climatology period.
+        clim_year_end : int
+            End year of the climatology period.
+
+        Returns
+        -------
+        dict
+            Best hyperparameters found.
+        """
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+
+        # For Random Forest (base model)
+        param_dist_rf = {
+            'n_estimators': self.n_estimators_range,
+            'max_depth': self.max_depth_range,
+            'min_samples_split': self.min_samples_split_range,
+            'min_samples_leaf': self.min_samples_leaf_range,
+            'max_features': self.max_features_range
+        }
+        model_rf = RandomForestRegressor(random_state=self.random_state)
+        random_search_rf = RandomizedSearchCV(
+            model_rf, param_distributions=param_dist_rf, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+        random_search_rf.fit(X_train_clean, y_train_clean)
+        best_rf = random_search_rf.best_params_
+
+        # For HPELM (meta model)
+        param_dist_hpelm = {
+            'neurons': self.neurons_range,
+            'activation': self.activation_options,
+            'norm': self.norm_range
+        }
+        model_hpelm = HPELMWrapper(random_state=self.random_state)
+        random_search_hpelm = RandomizedSearchCV(
+            model_hpelm, param_distributions=param_dist_hpelm, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+        random_search_hpelm.fit(X_train_clean, y_train_clean)
+        best_hpelm = random_search_hpelm.best_params_
+
+        return {'rf': best_rf, 'hpelm': best_hpelm}
+
+    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        """
+        Compute deterministic hindcast using the stacking ensemble of Random Forest (base) and HPELM (meta).
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters for 'rf' and 'hpelm'. If None, computes internally.
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
+        """
+        # Extract coordinate variables from X_test
+        time = X_test['T']
+        lat = X_test['Y']
+        lon = X_test['X']
+        n_time = len(X_test.coords['T'])
+        n_lat = len(X_test.coords['Y'])
+        n_lon = len(X_test.coords['X'])
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Stack testing data
+        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+        # Initialize base model (Random Forest)
+        rf = RandomForestRegressor(**best_params['rf'], random_state=self.random_state)
+        base_models = [('rf', rf)]
+
+        # Initialize meta-model (HPELM)
+        meta_model = HPELMWrapper(**best_params['hpelm'], random_state=self.random_state)
+
+        # Initialize stacking ensemble
+        self.stacking_model = StackingRegressor(estimators=base_models, final_estimator=meta_model)
+
+        # Fit the stacking model on clean training data
+        self.stacking_model.fit(X_train_clean, y_train_clean)
+
+        # Predict on clean test data
+        y_pred_test = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
+
+        # Reconstruct predictions
+        result = np.empty_like(np.squeeze(y_test_stacked))
+        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
+        result[~np.squeeze(test_nan_mask)] = y_pred_test
+
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        predicted_da = xr.DataArray(
+            data=predictions_reshaped,
+            coords={'T': time, 'Y': lat, 'X': lon},
+            dims=['T', 'Y', 'X']
+        )
+        return predicted_da
+
+    # ------------------ Probability Calculation Methods ------------------
+    @staticmethod
+    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Student's t-based method
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            first_t = (first_tercile - best_guess) / error_std
+            second_t = (second_tercile - best_guess) / error_std
+            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
+            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
+            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Weibull minimum-based method.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
+                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
+        """Gamma-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time), dtype=float)
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        T1 = np.asarray(T1, dtype=float)
+        T2 = np.asarray(T2, dtype=float)
+        alpha = (best_guess ** 2) / error_variance
+        theta = error_variance / best_guess
+        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
+        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
+        pred_prob[0, :] = cdf_t1
+        pred_prob[1, :] = cdf_t2 - cdf_t1
+        pred_prob[2, :] = 1.0 - cdf_t2
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        """Non-parametric method using historical error samples."""
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+        for t in range(n_time):
+            if np.isnan(best_guess[t]):
+                continue
+            dist = best_guess[t] + error_samples
+            dist = dist[np.isfinite(dist)]
+            if len(dist) == 0:
+                continue
+            p_below = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above = 1.0 - (p_below + p_between)
+            pred_prob[0, t] = p_below
+            pred_prob[1, t] = p_between
+            pred_prob[2, t] = p_above
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+        """Normal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
+        """Lognormal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
+        mu = np.log(best_guess) - sigma ** 2 / 2
+        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
+        return pred_prob
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
+        """
+        Compute tercile probabilities using the chosen distribution method.
+        Predictant is expected to be an xarray DataArray with dims (T, Y, X).
+        """
+        if "M" in Predictant.coords:
+            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        Predictant = Predictant.transpose('T', 'Y', 'X')
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant - hindcast_det).var(dim='T')
+        dof = len(Predictant.get_index("T")) - 2
+
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = Predictant - hindcast_det
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('T',), (), ()],
+                output_core_dims=[('probability', 'T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+    @staticmethod
+    def _reshape_and_filter_data(da):
+        """
+        Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
+        and remove rows containing NaNs.
+        """
+        da_stacked = da.stack(sample=('T', 'Y', 'X'))
+        if 'M' in da.dims:
+            da_stacked = da_stacked.transpose('sample', 'M')
+        else:
+            da_stacked = da_stacked.transpose('sample')
+        da_values = da_stacked.values
+        nan_mask = np.any(np.isnan(da_values), axis=1)
+        return da_values[~nan_mask], nan_mask, da_values
+
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year, best_params=None):
+        """
+        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters for 'rf' and 'hpelm'. If None, computes internally.
+
+        Returns
+        -------
+        forecast_det : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        forecast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
+        """
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        # Standardize Predictor_for_year using hindcast climatology
+        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
+        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
+        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
+
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
+        y_test = Predictant_st.isel(T=[-1])
+
+        # Extract coordinates from X_test
+        time = Predictor_for_year_st['T']
+        lat = Predictor_for_year_st['Y']
+        lon = Predictor_for_year_st['X']
+        n_time = len(Predictor_for_year_st.coords['T'])
+        n_lat = len(Predictor_for_year_st.coords['Y'])
+        n_lon = len(Predictor_for_year_st.coords['X'])
+
+        # Stack training data and remove rows with NaNs
+        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Stack testing data
+        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+        # Initialize base model (Random Forest)
+        rf = RandomForestRegressor(**best_params['rf'], random_state=self.random_state)
+        base_models = [('rf', rf)]
+
+        # Initialize meta-model (HPELM)
+        meta_model = HPELMWrapper(**best_params['hpelm'], random_state=self.random_state)
+
+        # Initialize stacking ensemble
+        self.stacking_model = StackingRegressor(estimators=base_models, final_estimator=meta_model)
+
+        # Fit the stacking model
+        self.stacking_model.fit(X_train_clean, y_train_clean)
+        y_pred = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
+
+        # Reconstruct the prediction array
+        result = np.empty_like(np.squeeze(y_test_stacked))
+        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
+        result[~np.squeeze(test_nan_mask)] = y_pred
+
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        result_da = xr.DataArray(
+            data=predictions_reshaped,
+            coords={'T': time, 'Y': lat, 'X': lon},
+            dims=['T', 'Y', 'X']
+        ) * mask
+
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
+        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        result_da['T'] = result_da['T'].astype('datetime64[ns]')
+
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant_no_m.get_index("T")) - 2
+
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = Predictant_no_m - hindcast_det_cross
+            error_samples = error_samples.rename({'T': 'S'})
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('S',), (), ()],
+                output_core_dims=[('probability', 'T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+
+class WAS_mme_StackXGboost_hpELM:
+    """
+    Stacking ensemble with XGBoost as base model and HPELM as meta-model for Multi-Model Ensemble (MME) forecasting.
+    This class implements a stacking ensemble using XGBRegressor as the base model,
+    with an HPELM meta-model, for deterministic forecasting and optional tercile probability calculations.
+    Implements hyperparameter optimization via randomized search for both base and meta models.
+
+    Parameters
+    ----------
+    n_estimators_range : list of int, optional
+        List of n_estimators values to tune for XGBoost (default is [50, 100, 200, 300]).
+    learning_rate_range : list of float, optional
+        List of learning rates to tune for XGBoost (default is [0.01, 0.05, 0.1, 0.2]).
+    max_depth_range : list of int, optional
+        List of max depths to tune for XGBoost (default is [3, 5, 7, 9]).
+    min_child_weight_range : list of float, optional
+        List of minimum child weights to tune for XGBoost (default is [1, 3, 5]).
+    subsample_range : list of float, optional
+        List of subsample ratios to tune for XGBoost (default is [0.6, 0.8, 1.0]).
+    colsample_bytree_range : list of float, optional
+        List of column sampling ratios to tune for XGBoost (default is [0.6, 0.8, 1.0]).
+    neurons_range : list of int, optional
+        List of neuron counts to tune for HPELM (default is [10, 20, 50, 100]).
+    activation_options : list of str, optional
+        Activation functions to tune for HPELM (default is ['sigm', 'tanh', 'relu', 'rbf_linf', 'rbf_gauss']).
+    norm_range : list of float, optional
+        Regularization parameters to tune for HPELM (default is [0.1, 1.0, 10.0, 100.0]).
+    random_state : int, optional
+        Seed for reproducibility (default is 42).
+    dist_method : str, optional
+        Distribution method for tercile probabilities ('t', 'gamma', etc.) (default is 'gamma').
+    n_iter_search : int, optional
+        Number of iterations for randomized search (default is 10).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 3).
+    """
+    def __init__(self,
+                 n_estimators_range=[50, 100, 200, 300],
+                 learning_rate_range=[0.01, 0.05, 0.1, 0.2],
+                 max_depth_range=[3, 5, 7, 9],
+                 min_child_weight_range=[1, 3, 5],
+                 subsample_range=[0.6, 0.8, 1.0],
+                 colsample_bytree_range=[0.6, 0.8, 1.0],
+                 neurons_range=[10, 20, 50, 100],
+                 activation_options=['sigm', 'tanh', 'relu', 'rbf_linf', 'rbf_gauss'],
+                 norm_range=[0.1, 1.0, 10.0, 100.0],
+                 random_state=42,
+                 dist_method="gamma",
+                 n_iter_search=10,
+                 cv_folds=3):
+        self.n_estimators_range = n_estimators_range
+        self.learning_rate_range = learning_rate_range
+        self.max_depth_range = max_depth_range
+        self.min_child_weight_range = min_child_weight_range
+        self.subsample_range = subsample_range
+        self.colsample_bytree_range = colsample_bytree_range
+        self.neurons_range = neurons_range
+        self.activation_options = activation_options
+        self.norm_range = norm_range
+        self.random_state = random_state
+        self.dist_method = dist_method
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
+        self.stacking_model = None
+
+
+    
+    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
+        """
+        Independently computes the best hyperparameters using randomized search on stacked training data.
+
+        Parameters
+        ----------
+        Predictors : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        Predictand : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        clim_year_start : int
+            Start year of the climatology period.
+        clim_year_end : int
+            End year of the climatology period.
+
+        Returns
+        -------
+        dict
+            Best hyperparameters found.
+        """
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # For XGBoost (base model)
+        param_dist_xgb = {
+            'n_estimators': self.n_estimators_range,
+            'learning_rate': self.learning_rate_range,
+            'max_depth': self.max_depth_range,
+            'min_child_weight': self.min_child_weight_range,
+            'subsample': self.subsample_range,
+            'colsample_bytree': self.colsample_bytree_range
+        }
+        model_xgb = XGBRegressor(random_state=self.random_state, verbosity=0)
+        random_search_xgb = RandomizedSearchCV(
+            model_xgb, param_distributions=param_dist_xgb, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+        random_search_xgb.fit(X_train_clean, y_train_clean)
+        best_xgb = random_search_xgb.best_params_
+
+        # For HPELM (meta model)
+        param_dist_hpelm = {
+            'neurons': self.neurons_range,
+            'activation': self.activation_options,
+            'norm': self.norm_range
+        }
+        model_hpelm = HPELMWrapper(random_state=self.random_state)
+        random_search_hpelm = RandomizedSearchCV(
+            model_hpelm, param_distributions=param_dist_hpelm, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+        random_search_hpelm.fit(X_train_clean, y_train_clean)
+        best_hpelm = random_search_hpelm.best_params_
+
+        return {'xgb': best_xgb, 'hpelm': best_hpelm}
+
+    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        """
+        Compute deterministic hindcast using the stacking ensemble of XGBoost (base) and HPELM (meta).
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters for 'xgb' and 'hpelm'. If None, computes internally.
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
+        """
+        # Extract coordinate variables from X_test
+        time = X_test['T']
+        lat = X_test['Y']
+        lon = X_test['X']
+        n_time = len(X_test.coords['T'])
+        n_lat = len(X_test.coords['Y'])
+        n_lon = len(X_test.coords['X'])
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Stack testing data
+        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+        # Initialize base model (XGBoost)
+        xgb = XGBRegressor(**best_params['xgb'], random_state=self.random_state, verbosity=0)
+        base_models = [('xgb', xgb)]
+
+        # Initialize meta-model (HPELM)
+        meta_model = HPELMWrapper(**best_params['hpelm'], random_state=self.random_state)
+
+        # Initialize stacking ensemble
+        self.stacking_model = StackingRegressor(estimators=base_models, final_estimator=meta_model)
+
+        # Fit the stacking model on clean training data
+        self.stacking_model.fit(X_train_clean, y_train_clean)
+
+        # Predict on clean test data
+        y_pred_test = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
+
+        # Reconstruct predictions
+        result = np.empty_like(np.squeeze(y_test_stacked))
+        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
+        result[~np.squeeze(test_nan_mask)] = y_pred_test
+
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        predicted_da = xr.DataArray(
+            data=predictions_reshaped,
+            coords={'T': time, 'Y': lat, 'X': lon},
+            dims=['T', 'Y', 'X']
+        )
+        return predicted_da
+
+    # ------------------ Probability Calculation Methods ------------------
+    @staticmethod
+    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Student's t-based method
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            first_t = (first_tercile - best_guess) / error_std
+            second_t = (second_tercile - best_guess) / error_std
+            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
+            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
+            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Weibull minimum-based method.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
+                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
+        """Gamma-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time), dtype=float)
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        T1 = np.asarray(T1, dtype=float)
+        T2 = np.asarray(T2, dtype=float)
+        alpha = (best_guess ** 2) / error_variance
+        theta = error_variance / best_guess
+        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
+        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
+        pred_prob[0, :] = cdf_t1
+        pred_prob[1, :] = cdf_t2 - cdf_t1
+        pred_prob[2, :] = 1.0 - cdf_t2
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        """Non-parametric method using historical error samples."""
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+        for t in range(n_time):
+            if np.isnan(best_guess[t]):
+                continue
+            dist = best_guess[t] + error_samples
+            dist = dist[np.isfinite(dist)]
+            if len(dist) == 0:
+                continue
+            p_below = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above = 1.0 - (p_below + p_between)
+            pred_prob[0, t] = p_below
+            pred_prob[1, t] = p_between
+            pred_prob[2, t] = p_above
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+        """Normal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
+        """Lognormal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
+        mu = np.log(best_guess) - sigma ** 2 / 2
+        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
+        return pred_prob
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
+        """
+        Compute tercile probabilities using the chosen distribution method.
+        Predictant is expected to be an xarray DataArray with dims (T, Y, X).
+        """
+        if "M" in Predictant.coords:
+            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        Predictant = Predictant.transpose('T', 'Y', 'X')
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant - hindcast_det).var(dim='T')
+        dof = len(Predictant.get_index("T")) - 2
+
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = (Predictant - hindcast_det)
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('T',), (), ()],
+                output_core_dims=[('probability', 'T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+    @staticmethod
+    def _reshape_and_filter_data(da):
+        """
+        Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
+        and remove rows containing NaNs.
+        """
+        da_stacked = da.stack(sample=('T', 'Y', 'X'))
+        if 'M' in da.dims:
+            da_stacked = da_stacked.transpose('sample', 'M')
+        else:
+            da_stacked = da_stacked.transpose('sample')
+        da_values = da_stacked.values
+        nan_mask = np.any(np.isnan(da_values), axis=1)
+        return da_values[~nan_mask], nan_mask, da_values
+
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year, best_params=None):
+        """
+        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters for 'xgb' and 'hpelm'. If None, computes internally.
+
+        Returns
+        -------
+        forecast_det : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        forecast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
+        """
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        # Standardize Predictor_for_year using hindcast climatology
+        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
+        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
+        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
+
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
+        y_test = Predictant_st.isel(T=[-1])
+
+        # Extract coordinates from X_test
+        time = Predictor_for_year_st['T']
+        lat = Predictor_for_year_st['Y']
+        lon = Predictor_for_year_st['X']
+        n_time = len(Predictor_for_year_st.coords['T'])
+        n_lat = len(Predictor_for_year_st.coords['Y'])
+        n_lon = len(Predictor_for_year_st.coords['X'])
+
+        # Stack training data and remove rows with NaNs
+        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Stack testing data
+        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+        # Initialize base model (XGBoost)
+        xgb = XGBRegressor(**best_params['xgb'], random_state=self.random_state, verbosity=0)
+        base_models = [('xgb', xgb)]
+
+        # Initialize meta-model (HPELM)
+        meta_model = HPELMWrapper(**best_params['hpelm'], random_state=self.random_state)
+
+        # Initialize stacking ensemble
+        self.stacking_model = StackingRegressor(estimators=base_models, final_estimator=meta_model)
+
+        # Fit the stacking model on clean training data
+        self.stacking_model.fit(X_train_clean, y_train_clean)
+
+        # Predict on clean test data
+        y_pred = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
+
+        # Reconstruct the prediction array
+        result = np.empty_like(np.squeeze(y_test_stacked))
+        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
+        result[~np.squeeze(test_nan_mask)] = y_pred
+
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        result_da = xr.DataArray(data=predictions_reshaped,
+                                 coords={'T': time, 'Y': lat, 'X': lon},
+                                 dims=['T', 'Y', 'X']) * mask
+
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
+        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        result_da['T'] = result_da['T'].astype('datetime64[ns]')
+
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant_no_m.get_index("T")) - 2
+
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = Predictant_no_m - hindcast_det_cross
+            error_samples = error_samples.rename({'T': 'S'})
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('S',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+
+class WAS_mme_MLP:
+    """
+    Multi-Layer Perceptron (MLP) for Multi-Model Ensemble (MME) forecasting.
+    This class implements a Multi-Layer Perceptron model using scikit-learn's MLPRegressor
+    for deterministic forecasting, with optional tercile probability calculations using
+    various statistical distributions. Implements hyperparameter optimization via randomized search.
+
+    Parameters
+    ----------
+    hidden_layer_sizes_range : list of tuples, optional
+        List of hidden layer sizes to tune, e.g., [(10,), (10, 5), (20, 10)] (default).
+    activation_options : list of str, optional
+        Activation functions to tune ('identity', 'logistic', 'tanh', 'relu') (default is ['relu', 'tanh', 'logistic']).
+    solver_options : list of str, optional
+        Solvers to tune ('lbfgs', 'sgd', 'adam') (default is ['adam', 'sgd', 'lbfgs']).
+    alpha_range : list of float, optional
+        L2 regularization parameters to tune (default is [0.0001, 0.001, 0.01, 0.1]).
+    max_iter : int, optional
+        Maximum iterations (default is 200).
+    random_state : int, optional
+        Seed for reproducibility (default is 42).
+    dist_method : str, optional
+        Distribution method for tercile probabilities ('t', 'gamma', etc.) (default is 'gamma').
+    n_iter_search : int, optional
+        Number of iterations for randomized search (default is 10).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 3).
+    """
+    def __init__(self,
+                 hidden_layer_sizes_range=[(10,), (10, 5), (20, 10)],
+                 activation_options=['relu', 'tanh', 'logistic'],
+                 solver_options=['adam', 'sgd', 'lbfgs'],
+                 alpha_range=[0.0001, 0.001, 0.01, 0.1],
+                 max_iter=200, random_state=42, dist_method="gamma",
+                 n_iter_search=10, cv_folds=3):
+
+        self.hidden_layer_sizes_range = hidden_layer_sizes_range
+        self.activation_options = activation_options
+        self.solver_options = solver_options
+        self.alpha_range = alpha_range
+        self.max_iter = max_iter
+        self.random_state = random_state
+        self.dist_method = dist_method
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
+        self.mlp = None
+
+    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
+        """
+        Independently computes the best hyperparameters using randomized search on stacked training data.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        clim_year_start : int
+            Start year of the climatology period.
+        clim_year_end : int
+            End year of the climatology period. 
+        Returns
+        -------
+        dict
+            Best hyperparameters found.
+        """
+
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()  # Flatten to 1D
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Prepare parameter distributions
+        param_dist = {
+            'hidden_layer_sizes': self.hidden_layer_sizes_range,
+            'activation': self.activation_options,
+            'solver': self.solver_options,
+            'alpha': self.alpha_range
+        }
+
+        # Initialize MLPRegressor base model
+        model = MLPRegressor(max_iter=self.max_iter, random_state=self.random_state)
+
+        # Randomized search
+        random_search = RandomizedSearchCV(
+            model, param_distributions=param_dist, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+
+        random_search.fit(X_train_clean, y_train_clean)
+        best_params = random_search.best_params_
+
+        return best_params
+
+    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        """
+        Compute deterministic hindcast using the MLP model with injected hyperparameters.
+
+        Stacks and cleans the data, uses provided best_params (or computes if None),
+        fits the final MLP with best params, and predicts on test data.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
+        """
+        # Extract coordinates
+        time = X_test['T']
+        lat = X_test['Y']
+        lon = X_test['X']
+        n_time = len(X_test.coords['T'])
+        n_lat = len(X_test.coords['Y'])
+        n_lon = len(X_test.coords['X'])
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()  # Flatten to 1D
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+
+        # Initialize and fit MLP with best params
+        self.mlp = MLPRegressor(
+            hidden_layer_sizes=best_params['hidden_layer_sizes'],
+            activation=best_params['activation'],
+            solver=best_params['solver'],
+            alpha=best_params['alpha'],
+            max_iter=self.max_iter,
+            random_state=self.random_state
+        )
+        self.mlp.fit(X_train_clean, y_train_clean)
+
+        # Stack testing data
+        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()  # Flatten to 1D
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Predict
+        y_pred = self.mlp.predict(X_test_stacked[~test_nan_mask])
+
+        # Reconstruct the prediction array
+        result = np.full_like(y_test_stacked, np.nan)
+        result[test_nan_mask] = y_test_stacked[test_nan_mask]
+        result[~test_nan_mask] = y_pred
+
         predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
         predicted_da = xr.DataArray(data=predictions_reshaped,
                                     coords={'T': time, 'Y': lat, 'X': lon},
                                     dims=['T', 'Y', 'X'])
         return predicted_da
+
 
     # ------------------ Probability Calculation Methods ------------------
     @staticmethod
@@ -3509,6 +5518,7 @@ class WAS_mme_MLP:
             pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
 
         return pred_prob
+
     @staticmethod
     def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
         """
@@ -3540,20 +5550,20 @@ class WAS_mme_MLP:
         """
         n_time = len(best_guess)
         pred_prob = np.empty((3, n_time))
-    
+
         if np.all(np.isnan(best_guess)):
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
-    
+
             # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
             pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
+
         return pred_prob
+
     @staticmethod
     def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
         """Gamma-distribution based method."""
@@ -3628,11 +5638,27 @@ class WAS_mme_MLP:
         """
         Compute tercile probabilities for the hindcast using the chosen distribution method.
         Predictant is an xarray DataArray with dims (T, Y, X).
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed data with dimensions (T, Y, X).
+        clim_year_start : int or str
+            Start year for climatology.
+        clim_year_end : int or str
+            End year for climatology.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
+
+        Returns
+        -------
+        hindcast_prob : xarray.DataArray
+            Probabilities for below-normal (PB), normal (PN), and above-normal (PA) with dimensions (probability, T, Y, X).
         """
         if "M" in Predictant.coords:
             Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
         mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
+
         # Ensure Predictant is (T, Y, X)
         Predictant = Predictant.transpose('T', 'Y', 'X')
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
@@ -3641,7 +5667,7 @@ class WAS_mme_MLP:
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
         error_variance = (Predictant - hindcast_det).var(dim='T')
         dof = len(Predictant.get_index("T")) - 2
-        
+
         if self.dist_method == "t":
             calc_func = self.calculate_tercile_probabilities
             hindcast_prob = xr.apply_ufunc(
@@ -3674,8 +5700,6 @@ class WAS_mme_MLP:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-            
-            
         elif self.dist_method == "gamma":
             calc_func = self.calculate_tercile_probabilities_gamma
             hindcast_prob = xr.apply_ufunc(
@@ -3739,7 +5763,7 @@ class WAS_mme_MLP:
             )
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
+
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
@@ -3758,12 +5782,14 @@ class WAS_mme_MLP:
         nan_mask = np.any(np.isnan(da_values), axis=1)
         return da_values[~nan_mask], nan_mask, da_values
 
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
-        """
-        Generate deterministic and probabilistic forecast for a target year using the MLP model.
 
-        Fits the MLPRegressor on standardized hindcast data, predicts deterministic values for the target year,
-        reverses standardization, and computes tercile probabilities.
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year, best_params=None):
+        """
+        Generate deterministic and probabilistic forecast for a target year using the MLP model with injected hyperparameters.
+
+        Stacks and cleans the data, uses provided best_params (or computes if None),
+        fits the final MLP with best params, predicts for the target year, reverses standardization,
+        and computes tercile probabilities.
 
         Parameters
         ----------
@@ -3779,96 +5805,96 @@ class WAS_mme_MLP:
             Deterministic hindcast data for error estimation with dimensions (T, Y, X).
         Predictor_for_year : xarray.DataArray
             Predictor data for the target year with dimensions (T, M, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
 
         Returns
         -------
-        result_da : xarray.DataArray
+        forecast_det : xarray.DataArray
             Deterministic forecast with dimensions (T, Y, X).
-        hindcast_prob : xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where probability
-            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
+        forecast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
         """
-        # if "M" in Predictant.coords:
-        #     Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0,M=0)), 1, np.nan).drop_vars(['T','M']).squeeze().to_numpy()
-        
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars('T').squeeze().to_numpy()
+
         # Standardize Predictor_for_year using hindcast climatology
         mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
         std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
         Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        y_test = Predictant_st.isel(T=[-1])
-        
-        # For forecast, we use the same single MLP model.
-        if self.mlp is None:
-            self.mlp = MLPRegressor(hidden_layer_sizes=self.hidden_layer_sizes,
-                                    activation=self.activation,
-                                    solver=self.solver,
-                                    max_iter=self.max_iter,
-                                    alpha=self.alpha,
-                                    random_state=self.random_state)
 
-        # Extract coordinates from X_test
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
+        y_test = Predictant_st.isel(T=[-1])
+
+        # Extract coordinates
         time = Predictor_for_year_st['T']
         lat = Predictor_for_year_st['Y']
         lon = Predictor_for_year_st['X']
         n_time = len(Predictor_for_year_st.coords['T'])
         n_lat = len(Predictor_for_year_st.coords['Y'])
         n_lon = len(Predictor_for_year_st.coords['X'])
-        
-        # Stack training data and remove rows with NaNs
+
+        # Stack training data
         X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
+        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-        
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+        # Initialize and fit MLP with best params
+        self.mlp = MLPRegressor(
+            hidden_layer_sizes=best_params['hidden_layer_sizes'],
+            activation=best_params['activation'],
+            solver=best_params['solver'],
+            alpha=best_params['alpha'],
+            max_iter=self.max_iter,
+            random_state=self.random_state
+        )
+        self.mlp.fit(X_train_clean, y_train_clean)
+
         # Stack testing data
         X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))        
-        # Fit the MLP model
-        self.mlp.fit(X_train_clean, y_train_clean)
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Predict
         y_pred = self.mlp.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred
-        
+
+        # Reconstruct the prediction array
+        result = np.full_like(y_test_stacked, np.nan)
+        result[test_nan_mask] = y_test_stacked[test_nan_mask]
+        result[~test_nan_mask] = y_pred
+
         predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
         result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
-
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-
-        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
+                                 coords={'T': time, 'Y': lat, 'X': lon},
+                                 dims=['T', 'Y', 'X']) * mask
+        result_da = reverse_standardize(result_da, Predictant_no_m,
+                                             clim_year_start, clim_year_end)
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
         result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
         result_da['T'] = result_da['T'].astype('datetime64[ns]')
 
-
-        
-        # Compute tercile probabilities on the predictions
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant_no_m.get_index("T")) - 2
+
         if self.dist_method == "t":
             calc_func = self.calculate_tercile_probabilities
             hindcast_prob = xr.apply_ufunc(
@@ -3885,6 +5911,7 @@ class WAS_mme_MLP:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
+
         elif self.dist_method == "weibull_min":
             calc_func = self.calculate_tercile_probabilities_weibull_min
             hindcast_prob = xr.apply_ufunc(
@@ -3901,8 +5928,6 @@ class WAS_mme_MLP:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-            
-            
         elif self.dist_method == "gamma":
             calc_func = self.calculate_tercile_probabilities_gamma
             hindcast_prob = xr.apply_ufunc(
@@ -3914,7 +5939,7 @@ class WAS_mme_MLP:
                 input_core_dims=[('T',), (), (), ()],
                 vectorize=True,
                 dask='parallelized',
-                output_core_dims=[('probability','T')],
+                output_core_dims=[('probability', 'T')],
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
@@ -3929,7 +5954,7 @@ class WAS_mme_MLP:
                 input_core_dims=[('T',), (), (), ()],
                 vectorize=True,
                 dask='parallelized',
-                output_core_dims=[('probability','T')],
+                output_core_dims=[('probability', 'T')],
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
@@ -3944,14 +5969,14 @@ class WAS_mme_MLP:
                 input_core_dims=[('T',), (), (), ()],
                 vectorize=True,
                 dask='parallelized',
-                output_core_dims=[('probability','T')],
+                output_core_dims=[('probability', 'T')],
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
         elif self.dist_method == "nonparam":
             calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
+            error_samples = Predictant_no_m - hindcast_det_cross
+            error_samples = error_samples.rename({'T': 'S'})
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
                 result_da,
@@ -3959,7 +5984,7 @@ class WAS_mme_MLP:
                 terciles.isel(quantile=0).drop_vars('quantile'),
                 terciles.isel(quantile=1).drop_vars('quantile'),
                 input_core_dims=[('T',), ('S',), (), ()],
-                output_core_dims=[('probability','T')],
+                output_core_dims=[('probability', 'T')],
                 vectorize=True,
                 dask='parallelized',
                 output_dtypes=[float],
@@ -3967,76 +5992,182 @@ class WAS_mme_MLP:
             )
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
+
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
 
+          
+
+
 class WAS_mme_GradientBoosting:
-    def __init__(self, n_estimators=100, learning_rate=0.1, max_depth=3,
-                 random_state=42, dist_method="gamma"):
-        """
-        Single-model implementation using GradientBoostingRegressor.
-        
-        Parameters:
-         - n_estimators: int, number of boosting iterations.
-         - learning_rate: float, learning rate.
-         - max_depth: int, maximum depth of individual regression estimators.
-         - random_state: int, for reproducibility.
-         - dist_method: string, method for tercile probability calculations.
-                        Options: 't', 'gamma', 'nonparam', 'normal', 'lognormal'.
-        """
-        self.n_estimators = n_estimators
-        self.learning_rate = learning_rate
-        self.max_depth = max_depth
+    """
+    Gradient Boosting for Multi-Model Ensemble (MME) forecasting.
+    This class implements a GradientBoostingRegressor model using scikit-learn
+    for deterministic forecasting, with optional tercile probability calculations using
+    various statistical distributions. Implements hyperparameter optimization via randomized search.
+
+    Parameters
+    ----------
+    n_estimators_range : list of int, optional
+        List of n_estimators values to tune (default is [50, 100, 200, 300]).
+    learning_rate_range : list of float, optional
+        List of learning rates to tune (default is [0.01, 0.05, 0.1, 0.2]).
+    max_depth_range : list of int, optional
+        List of max depths to tune (default is [3, 5, 7, 9]).
+    min_samples_split_range : list of int, optional
+        List of minimum samples required to split to tune (default is [2, 5, 10]).
+    min_samples_leaf_range : list of int, optional
+        List of minimum samples required at leaf node to tune (default is [1, 2, 4]).
+    random_state : int, optional
+        Seed for reproducibility (default is 42).
+    dist_method : str, optional
+        Distribution method for tercile probabilities ('t', 'gamma', etc.) (default is 'gamma').
+    n_iter_search : int, optional
+        Number of iterations for randomized search (default is 10).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 3).
+    """
+    def __init__(self,
+                 n_estimators_range=[50, 100, 200, 300],
+                 learning_rate_range=[0.01, 0.05, 0.1, 0.2],
+                 max_depth_range=[3, 5, 7, 9],
+                 min_samples_split_range=[2, 5, 10],
+                 min_samples_leaf_range=[1, 2, 4],
+                 random_state=42,
+                 dist_method="gamma",
+                 n_iter_search=10,
+                 cv_folds=3):
+        self.n_estimators_range = n_estimators_range
+        self.learning_rate_range = learning_rate_range
+        self.max_depth_range = max_depth_range
+        self.min_samples_split_range = min_samples_split_range
+        self.min_samples_leaf_range = min_samples_leaf_range
         self.random_state = random_state
         self.dist_method = dist_method
-        
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
         self.gb = None
 
-    def compute_model(self, X_train, y_train, X_test, y_test):
+    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
         """
-        Fit the GradientBoostingRegressor on the training data and predict on X_test.
-        The input data (xarray DataArrays) are assumed to have dimensions including 'T', 'Y', 'X'.
-        The predictions are then reshaped back to (T, Y, X).
+        Independently computes the best hyperparameters using randomized search on stacked training data.
+
+        Parameters
+        ----------
+        Predictors : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        Predictand : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        clim_year_start : int
+            Start year of the climatology period.
+        clim_year_end : int
+            End year of the climatology period.
+
+        Returns
+        -------
+        dict
+            Best hyperparameters found.
         """
-        # Initialize the model
-        self.gb = GradientBoostingRegressor(n_estimators=self.n_estimators,
-                                            learning_rate=self.learning_rate,
-                                            max_depth=self.max_depth,
-                                            random_state=self.random_state)
-        
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Prepare parameter distributions
+        param_dist = {
+            'n_estimators': self.n_estimators_range,
+            'learning_rate': self.learning_rate_range,
+            'max_depth': self.max_depth_range,
+            'min_samples_split': self.min_samples_split_range,
+            'min_samples_leaf': self.min_samples_leaf_range
+        }
+
+        # Initialize GradientBoostingRegressor base model
+        model = GradientBoostingRegressor(random_state=self.random_state)
+
+        # Randomized search
+        random_search = RandomizedSearchCV(
+            model, param_distributions=param_dist, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+
+        random_search.fit(X_train_clean, y_train_clean)
+        best_params = random_search.best_params_
+
+        return best_params
+
+    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        """
+        Compute deterministic hindcast using the GradientBoostingRegressor model with injected hyperparameters.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
+        """
         # Extract coordinate variables from X_test
         time = X_test['T']
         lat = X_test['Y']
         lon = X_test['X']
         n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
+        n_lat = len(X_test.coords['Y'])
+        n_lon = len(X_test.coords['X'])
+
         # Stack training data
         X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
         y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
         train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-        
+
         # Stack testing data
         X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
         y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
         test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+        # Initialize the model with best parameters
+        self.gb = GradientBoostingRegressor(
+            n_estimators=best_params['n_estimators'],
+            learning_rate=best_params['learning_rate'],
+            max_depth=best_params['max_depth'],
+            min_samples_split=best_params['min_samples_split'],
+            min_samples_leaf=best_params['min_samples_leaf'],
+            random_state=self.random_state
+        )
+
         # Fit the model and predict on non-NaN testing data
         self.gb.fit(X_train_clean, y_train_clean)
         y_pred = self.gb.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct predictions (leaving NaN rows unchanged)
+
+        # Reconstruct predictions
         result = np.empty_like(np.squeeze(y_test_stacked))
         result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
         result[~np.squeeze(test_nan_mask)] = y_pred
-        
+
         predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
         predicted_da = xr.DataArray(data=predictions_reshaped,
                                     coords={'T': time, 'Y': lat, 'X': lon},
@@ -4056,7 +6187,6 @@ class WAS_mme_GradientBoosting:
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
-            # Transform thresholds
             first_t = (first_tercile - best_guess) / error_std
             second_t = (second_tercile - best_guess) / error_std
 
@@ -4065,51 +6195,26 @@ class WAS_mme_GradientBoosting:
             pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
 
         return pred_prob
+
     @staticmethod
     def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
         """
         Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best guess values.
-        error_variance : array-like
-            Variance associated with forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-            
-        Returns
-        -------
-        pred_prob : np.ndarray
-            A 3 x n_time array with probabilities for being below the first tercile,
-            between the first and second tercile, and above the second tercile.
         """
         n_time = len(best_guess)
         pred_prob = np.empty((3, n_time))
-    
+
         if np.all(np.isnan(best_guess)):
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
             pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
+
         return pred_prob
+
     @staticmethod
     def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
         n_time = len(best_guess)
@@ -4181,7 +6286,6 @@ class WAS_mme_GradientBoosting:
         Compute tercile probabilities using the chosen distribution method.
         Predictant is expected to be an xarray DataArray with dims (T, Y, X).
         """
-        
         if "M" in Predictant.coords:
             Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
         mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
@@ -4193,7 +6297,7 @@ class WAS_mme_GradientBoosting:
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
         error_variance = (Predictant - hindcast_det).var(dim='T')
         dof = len(Predictant.get_index("T")) - 2
-        
+
         if self.dist_method == "t":
             calc_func = self.calculate_tercile_probabilities
             hindcast_prob = xr.apply_ufunc(
@@ -4210,7 +6314,6 @@ class WAS_mme_GradientBoosting:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-
         elif self.dist_method == "weibull_min":
             calc_func = self.calculate_tercile_probabilities_weibull_min
             hindcast_prob = xr.apply_ufunc(
@@ -4227,8 +6330,6 @@ class WAS_mme_GradientBoosting:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-
-            
         elif self.dist_method == "gamma":
             calc_func = self.calculate_tercile_probabilities_gamma
             hindcast_prob = xr.apply_ufunc(
@@ -4246,7 +6347,7 @@ class WAS_mme_GradientBoosting:
             )
         elif self.dist_method == "nonparam":
             calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det) 
+            error_samples = (Predictant - hindcast_det)
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
                 hindcast_det,
@@ -4292,7 +6393,7 @@ class WAS_mme_GradientBoosting:
             )
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
+
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
@@ -4312,37 +6413,50 @@ class WAS_mme_GradientBoosting:
         return da_values[~nan_mask], nan_mask, da_values
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
-                 hindcast_det_cross, Predictor_for_year):
+                 hindcast_det_cross, Predictor_for_year, best_params=None):
         """
-        Forecast method using a single MLP model.
-        Steps:
-         - Standardize the predictor for the target year using hindcast climatology.
-         - Fit the MLP (if not already fitted) on standardized hindcast data.
-         - Predict for the target year.
-         - Reconstruct predictions into original (T, Y, X) shape.
-         - Reverse the standardization.
-         - Compute tercile probabilities using the chosen distribution.
+        Forecast method using a single GradientBoosting model with optimized hyperparameters.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
+
+        Returns
+        -------
+        forecast_det : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        forecast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
         """
-        # if "M" in Predictant.coords:
-        #     Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
         # Standardize Predictor_for_year using hindcast climatology
         mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
         std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
         Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        y_test = Predictant_st.isel(T=[-1])
-        
 
-        if self.gb is None:
-            self.gb = GradientBoostingRegressor(n_estimators=self.n_estimators,
-                                                learning_rate=self.learning_rate,
-                                                max_depth=self.max_depth,
-                                                random_state=self.random_state)
-        
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
+        y_test = Predictant_st.isel(T=[-1])
+
         # Extract coordinates from X_test
         time = Predictor_for_year_st['T']
         lat = Predictor_for_year_st['Y']
@@ -4350,55 +6464,61 @@ class WAS_mme_GradientBoosting:
         n_time = len(Predictor_for_year_st.coords['T'])
         n_lat = len(Predictor_for_year_st.coords['Y'])
         n_lon = len(Predictor_for_year_st.coords['X'])
-        
+
         # Stack training data and remove rows with NaNs
         X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
+        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-        
+
         # Stack testing data
         X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the MLP model
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
+
+        # Initialize and fit the model with best parameters
+        self.gb = GradientBoostingRegressor(
+            n_estimators=best_params['n_estimators'],
+            learning_rate=best_params['learning_rate'],
+            max_depth=best_params['max_depth'],
+            min_samples_split=best_params['min_samples_split'],
+            min_samples_leaf=best_params['min_samples_leaf'],
+            random_state=self.random_state
+        )
         self.gb.fit(X_train_clean, y_train_clean)
         y_pred = self.gb.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
+
+        # Reconstruct the prediction array
         result = np.empty_like(np.squeeze(y_test_stacked))
         result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
         result[~np.squeeze(test_nan_mask)] = y_pred
-        
+
         predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
         result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
+                                 coords={'T': time, 'Y': lat, 'X': lon},
+                                 dims=['T', 'Y', 'X']) * mask
 
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
         new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
         result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        result_da['T'] = result_da['T'].astype('datetime64[ns]')        
-        
-        # Compute tercile probabilities on the predictions
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        result_da['T'] = result_da['T'].astype('datetime64[ns]')
+
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant_no_m.get_index("T")) - 2
+
         if self.dist_method == "t":
             calc_func = self.calculate_tercile_probabilities
             hindcast_prob = xr.apply_ufunc(
@@ -4415,12 +6535,11 @@ class WAS_mme_GradientBoosting:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-
         elif self.dist_method == "weibull_min":
             calc_func = self.calculate_tercile_probabilities_weibull_min
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
-                hindcast_det,
+                result_da,
                 error_variance,
                 terciles.isel(quantile=0).drop_vars('quantile'),
                 terciles.isel(quantile=1).drop_vars('quantile'),
@@ -4432,7 +6551,6 @@ class WAS_mme_GradientBoosting:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-            
         elif self.dist_method == "gamma":
             calc_func = self.calculate_tercile_probabilities_gamma
             hindcast_prob = xr.apply_ufunc(
@@ -4480,11 +6598,11 @@ class WAS_mme_GradientBoosting:
             )
         elif self.dist_method == "nonparam":
             calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
+            error_samples = Predictant_no_m - hindcast_det_cross
+            error_samples = error_samples.rename({'T': 'S'})
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
-                result_,
+                result_da,
                 error_samples,
                 terciles.isel(quantile=0).drop_vars('quantile'),
                 terciles.isel(quantile=1).drop_vars('quantile'),
@@ -4497,52 +6615,127 @@ class WAS_mme_GradientBoosting:
             )
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
+
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_da * mask, mask * hindcast_prob.drop_vars('T').squeeze().transpose('probability', 'Y', 'X')
+
+
+
+
 
 
 
 class WAS_mme_XGBoosting:
     """
     XGBoost-based Multi-Model Ensemble (MME) forecasting.
-
     This class implements a single-model forecasting approach using XGBoost's XGBRegressor
     for deterministic predictions, with optional tercile probability calculations using
-    various statistical distributions.
+    various statistical distributions. Implements hyperparameter optimization via randomized search.
 
     Parameters
     ----------
-    n_estimators : int, optional
-        Number of boosting rounds. Default is 100.
-    learning_rate : float, optional
-        Learning rate for boosting. Default is 0.1.
-    max_depth : int, optional
-        Maximum tree depth for base learners. Default is 3.
+    n_estimators_range : list of int, optional
+        List of n_estimators values to tune (default is [50, 100, 200, 300]).
+    learning_rate_range : list of float, optional
+        List of learning rates to tune (default is [0.01, 0.05, 0.1, 0.2]).
+    max_depth_range : list of int, optional
+        List of max depths to tune (default is [3, 5, 7, 9]).
+    min_child_weight_range : list of float, optional
+        List of minimum child weights to tune (default is [1, 3, 5]).
+    subsample_range : list of float, optional
+        List of subsample ratios to tune (default is [0.6, 0.8, 1.0]).
+    colsample_bytree_range : list of float, optional
+        List of column sampling ratios to tune (default is [0.6, 0.8, 1.0]).
     random_state : int, optional
-        Seed for random number generation for reproducibility. Default is 42.
+        Seed for reproducibility (default is 42).
     dist_method : str, optional
-        Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
-        Default is 'gamma'.
+        Distribution method for tercile probabilities ('t', 'gamma', etc.) (default is 'gamma').
+    n_iter_search : int, optional
+        Number of iterations for randomized search (default is 10).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 3).
     """
-    def __init__(self, n_estimators=100, learning_rate=0.1, max_depth=3,
-                 random_state=42, dist_method="gamma"):
-
-        self.n_estimators = n_estimators
-        self.learning_rate = learning_rate
-        self.max_depth = max_depth
+    def __init__(self,
+                 n_estimators_range=[50, 100, 200, 300],
+                 learning_rate_range=[0.01, 0.05, 0.1, 0.2],
+                 max_depth_range=[3, 5, 7, 9],
+                 min_child_weight_range=[1, 3, 5],
+                 subsample_range=[0.6, 0.8, 1.0],
+                 colsample_bytree_range=[0.6, 0.8, 1.0],
+                 random_state=42,
+                 dist_method="gamma",
+                 n_iter_search=10,
+                 cv_folds=3):
+        self.n_estimators_range = n_estimators_range
+        self.learning_rate_range = learning_rate_range
+        self.max_depth_range = max_depth_range
+        self.min_child_weight_range = min_child_weight_range
+        self.subsample_range = subsample_range
+        self.colsample_bytree_range = colsample_bytree_range
         self.random_state = random_state
         self.dist_method = dist_method
-        
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
         self.xgb = None
 
-    def compute_model(self, X_train, y_train, X_test, y_test):
+    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
         """
-        Compute deterministic hindcast using the XGBoost model.
+        Independently computes the best hyperparameters using randomized search on stacked training data.
 
-        Fits the XGBRegressor on training data and predicts deterministic values for the test data.
-        Handles data stacking and NaN removal to ensure robust predictions.
+        Parameters
+        ----------
+        Predictors : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        Predictand : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        clim_year_start : int
+            Start year of the climatology period.
+        clim_year_end : int
+            End year of the climatology period.
+
+        Returns
+        -------
+        dict
+            Best hyperparameters found.
+        """
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Prepare parameter distributions
+        param_dist = {
+            'n_estimators': self.n_estimators_range,
+            'learning_rate': self.learning_rate_range,
+            'max_depth': self.max_depth_range,
+            'min_child_weight': self.min_child_weight_range,
+            'subsample': self.subsample_range,
+            'colsample_bytree': self.colsample_bytree_range
+        }
+
+        # Initialize XGBRegressor base model
+        model = XGBRegressor(random_state=self.random_state, verbosity=0)
+
+        # Randomized search
+        random_search = RandomizedSearchCV(
+            model, param_distributions=param_dist, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+
+        random_search.fit(X_train_clean, y_train_clean)
+        best_params = random_search.best_params_
+
+        return best_params
+
+    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        """
+        Compute deterministic hindcast using the XGBRegressor model with injected hyperparameters.
 
         Parameters
         ----------
@@ -4554,126 +6747,64 @@ class WAS_mme_XGBoosting:
             Testing predictor data with dimensions (T, M, Y, X).
         y_test : xarray.DataArray
             Testing predictand data with dimensions (T, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
 
         Returns
         -------
         predicted_da : xarray.DataArray
             Deterministic hindcast with dimensions (T, Y, X).
         """
-        # Initialize the XGBRegressor
-        self.xgb = XGBRegressor(n_estimators=self.n_estimators,
-                                learning_rate=self.learning_rate,
-                                max_depth=self.max_depth,
-                                random_state=self.random_state,
-                                verbosity=0)
-        
         # Extract coordinate variables from X_test
         time = X_test['T']
         lat = X_test['Y']
         lon = X_test['X']
         n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
+        n_lat = len(X_test.coords['Y'])
+        n_lon = len(X_test.coords['X'])
+
         # Stack training data
         X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
         y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
         train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-        
+
         # Stack testing data
         X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
         y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
         test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
 
-        
-        # Fit the XGBRegressor and predict on non-NaN testing rows
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end)
+
+        # Initialize the model with best parameters
+        self.xgb = XGBRegressor(
+            n_estimators=best_params['n_estimators'],
+            learning_rate=best_params['learning_rate'],
+            max_depth=best_params['max_depth'],
+            min_child_weight=best_params['min_child_weight'],
+            subsample=best_params['subsample'],
+            colsample_bytree=best_params['colsample_bytree'],
+            random_state=self.random_state,
+            verbosity=0
+        )
+
+        # Fit the model and predict on non-NaN testing data
         self.xgb.fit(X_train_clean, y_train_clean)
         y_pred = self.xgb.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct predictions: keep rows with NaNs unchanged
+
+        # Reconstruct predictions
         result = np.empty_like(np.squeeze(y_test_stacked))
         result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
         result[~np.squeeze(test_nan_mask)] = y_pred
-        
+
         predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
         predicted_da = xr.DataArray(data=predictions_reshaped,
                                     coords={'T': time, 'Y': lat, 'X': lon},
                                     dims=['T', 'Y', 'X'])
         return predicted_da
-
-    # def compute_model(self, X_train, y_train, X_test, y_test):
-    #     """
-    #     Fit an XGBRegressor to spatiotemporal training data and predict on the test data.
-        
-    #     Parameters
-    #     ----------
-    #     X_train, y_train : xarray.DataArray
-    #         Training features and target values with dims ('T', 'Y', 'X', 'M') or ('T', 'Y', 'X') if M=1.
-        
-    #     X_test, y_test : xarray.DataArray
-    #         Test features and target values with the same structure.
-        
-    #     Returns
-    #     -------
-    #     predicted_da : xarray.DataArray
-    #         Predictions in the same shape as y_test, with coords (T, Y, X).
-    #     """
-    #     # === Ensure model hyperparameters are valid ===
-    #     n_estimators = int(self.n_estimators) if hasattr(self, 'n_estimators') else 100
-    #     learning_rate = float(self.learning_rate) if hasattr(self, 'learning_rate') else 0.1
-    #     max_depth = int(self.max_depth) if hasattr(self, 'max_depth') else 3
-    #     random_state = int(self.random_state) if hasattr(self, 'random_state') else 42
-    
-    #     # === Initialize model ===
-    #     self.xgb = XGBRegressor(
-    #         n_estimators=n_estimators,
-    #         learning_rate=learning_rate,
-    #         max_depth=max_depth,
-    #         random_state=random_state,
-    #         verbosity=0
-    #     )
-    
-    #     # === Extract coordinates for output reconstruction ===
-    #     time = X_test['T']
-    #     lat = X_test['Y']
-    #     lon = X_test['X']
-    #     n_time, n_lat, n_lon = len(time), len(lat), len(lon)
-    
-    #     # === Stack training data ===
-    #     X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', ...).values
-    #     y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', ...).values
-    
-    #     train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-    #     X_train_clean = X_train_stacked[~train_nan_mask]
-    #     y_train_clean = y_train_stacked[~train_nan_mask].ravel()
-    
-    #     # === Stack test data ===
-    #     X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', ...).values
-    #     y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', ...).values
-    #     test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-    
-    #     # === Fit model and predict ===
-    #     self.xgb.fit(X_train_clean, y_train_clean)
-    #     y_pred = self.xgb.predict(X_test_stacked[~test_nan_mask])
-    
-    #     # === Reconstruct prediction array ===
-    #     result = np.full(y_test_stacked.shape, np.nan)
-    #     result[~test_nan_mask] = y_pred.reshape(-1, 1)
-    
-    #     predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-    
-    #     predicted_da = xr.DataArray(
-    #         data=predictions_reshaped,
-    #         coords={'T': time, 'Y': lat, 'X': lon},
-    #         dims=['T', 'Y', 'X']
-    #     )
-    
-    #     return predicted_da
-
 
     # ------------------ Probability Calculation Methods ------------------
     @staticmethod
@@ -4688,7 +6819,6 @@ class WAS_mme_XGBoosting:
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
-            # Transform thresholds
             first_t = (first_tercile - best_guess) / error_std
             second_t = (second_tercile - best_guess) / error_std
 
@@ -4697,50 +6827,26 @@ class WAS_mme_XGBoosting:
             pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
 
         return pred_prob
+
     @staticmethod
     def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
         """
         Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best guess values.
-        error_variance : array-like
-            Variance associated with forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-            
-        Returns
-        -------
-        pred_prob : np.ndarray
-            A 3 x n_time array with probabilities for being below the first tercile,
-            between the first and second tercile, and above the second tercile.
         """
         n_time = len(best_guess)
         pred_prob = np.empty((3, n_time))
-    
+
         if np.all(np.isnan(best_guess)):
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
             pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
+
         return pred_prob
+
     @staticmethod
     def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
         """Gamma-distribution based method."""
@@ -4813,37 +6919,13 @@ class WAS_mme_XGBoosting:
 
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
         """
-        Compute tercile probabilities for hindcast data.
-
-        Calculates probabilities for below-normal, normal, and above-normal categories using
-        the specified distribution method, based on climatological terciles.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed predictand data with dimensions (T, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast data with dimensions (T, Y, X).
-
-        Returns
-        -------
-        hindcast_prob : xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where probability
-            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
-        """        """
         Compute tercile probabilities using the chosen distribution method.
         Predictant is expected to be an xarray DataArray with dims (T, Y, X).
         """
-        
         if "M" in Predictant.coords:
             Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
         mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
-        # Ensure Predictant is (T, Y, X)
+
         Predictant = Predictant.transpose('T', 'Y', 'X')
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
@@ -4851,7 +6933,7 @@ class WAS_mme_XGBoosting:
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
         error_variance = (Predictant - hindcast_det).var(dim='T')
         dof = len(Predictant.get_index("T")) - 2
-        
+
         if self.dist_method == "t":
             calc_func = self.calculate_tercile_probabilities
             hindcast_prob = xr.apply_ufunc(
@@ -4868,7 +6950,6 @@ class WAS_mme_XGBoosting:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-
         elif self.dist_method == "weibull_min":
             calc_func = self.calculate_tercile_probabilities_weibull_min
             hindcast_prob = xr.apply_ufunc(
@@ -4885,8 +6966,6 @@ class WAS_mme_XGBoosting:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-            
-            
         elif self.dist_method == "gamma":
             calc_func = self.calculate_tercile_probabilities_gamma
             hindcast_prob = xr.apply_ufunc(
@@ -4904,7 +6983,7 @@ class WAS_mme_XGBoosting:
             )
         elif self.dist_method == "nonparam":
             calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)  
+            error_samples = (Predictant - hindcast_det)
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
                 hindcast_det,
@@ -4950,7 +7029,7 @@ class WAS_mme_XGBoosting:
             )
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
+
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
@@ -4970,12 +7049,9 @@ class WAS_mme_XGBoosting:
         return da_values[~nan_mask], nan_mask, da_values
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
-                 hindcast_det_cross, Predictor_for_year):
+                 hindcast_det_cross, Predictor_for_year, best_params=None):
         """
-        Generate deterministic and probabilistic forecast for a target year using the XGBoost model.
-
-        Fits the XGBRegressor on standardized hindcast data, predicts deterministic values for the target year,
-        reverses standardization, and computes tercile probabilities.
+        Forecast method using a single XGBoost model with optimized hyperparameters.
 
         Parameters
         ----------
@@ -4991,36 +7067,32 @@ class WAS_mme_XGBoosting:
             Deterministic hindcast data for error estimation with dimensions (T, Y, X).
         Predictor_for_year : xarray.DataArray
             Predictor data for the target year with dimensions (T, M, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
 
         Returns
         -------
-        result_da : xarray.DataArray
+        forecast_det : xarray.DataArray
             Deterministic forecast with dimensions (T, Y, X).
-        hindcast_prob : xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where probability
-            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
+        forecast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
         """
-        # if "M" in Predictant.coords:
-        #     Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
         # Standardize Predictor_for_year using hindcast climatology
         mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
         std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
         Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        
+
         hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
         y_test = Predictant_st.isel(T=[-1])
-        
-        # Use the same single XGBoost model for forecasting.
-        if self.xgb is None:
-            self.xgb = XGBRegressor(n_estimators=self.n_estimators,
-                                    learning_rate=self.learning_rate,
-                                    max_depth=self.max_depth,
-                                    random_state=self.random_state,
-                                    verbosity=0)
-        
+
         # Extract coordinates from X_test
         time = Predictor_for_year_st['T']
         lat = Predictor_for_year_st['Y']
@@ -5028,56 +7100,63 @@ class WAS_mme_XGBoosting:
         n_time = len(Predictor_for_year_st.coords['T'])
         n_lat = len(Predictor_for_year_st.coords['Y'])
         n_lon = len(Predictor_for_year_st.coords['X'])
-        
+
         # Stack training data and remove rows with NaNs
         X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
+        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-        
+
         # Stack testing data
         X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the MLP model
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
+
+        # Initialize and fit the model with best parameters
+        self.xgb = XGBRegressor(
+            n_estimators=best_params['n_estimators'],
+            learning_rate=best_params['learning_rate'],
+            max_depth=best_params['max_depth'],
+            min_child_weight=best_params['min_child_weight'],
+            subsample=best_params['subsample'],
+            colsample_bytree=best_params['colsample_bytree'],
+            random_state=self.random_state,
+            verbosity=0
+        )
         self.xgb.fit(X_train_clean, y_train_clean)
         y_pred = self.xgb.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
+
+        # Reconstruct the prediction array
         result = np.empty_like(np.squeeze(y_test_stacked))
         result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
         result[~np.squeeze(test_nan_mask)] = y_pred
-        
+
         predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
         result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
+                                 coords={'T': time, 'Y': lat, 'X': lon},
+                                 dims=['T', 'Y', 'X']) * mask
 
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-            
-        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
         new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
         result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
         result_da['T'] = result_da['T'].astype('datetime64[ns]')
-        
-        # Compute tercile probabilities on predictions
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant_no_m.get_index("T")) - 2
+
         if self.dist_method == "t":
             calc_func = self.calculate_tercile_probabilities
             hindcast_prob = xr.apply_ufunc(
@@ -5098,7 +7177,7 @@ class WAS_mme_XGBoosting:
             calc_func = self.calculate_tercile_probabilities_weibull_min
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
-                hindcast_det,
+                result_da,
                 error_variance,
                 terciles.isel(quantile=0).drop_vars('quantile'),
                 terciles.isel(quantile=1).drop_vars('quantile'),
@@ -5110,8 +7189,6 @@ class WAS_mme_XGBoosting:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-            
-            
         elif self.dist_method == "gamma":
             calc_func = self.calculate_tercile_probabilities_gamma
             hindcast_prob = xr.apply_ufunc(
@@ -5159,8 +7236,8 @@ class WAS_mme_XGBoosting:
             )
         elif self.dist_method == "nonparam":
             calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
+            error_samples = Predictant_no_m - hindcast_det_cross
+            error_samples = error_samples.rename({'T': 'S'})
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
                 result_da,
@@ -5176,47 +7253,730 @@ class WAS_mme_XGBoosting:
             )
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
+
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T','Y', 'X')
+        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+
+
+
+
+class WAS_mme_RF:
+    """
+    Random Forest-based Multi-Model Ensemble (MME) forecasting.
+    This class implements a single-model forecasting approach using scikit-learn's RandomForestRegressor
+    for deterministic predictions, with optional tercile probability calculations using
+    various statistical distributions. Implements hyperparameter optimization via randomized search.
+
+    Parameters
+    ----------
+    n_estimators_range : list of int, optional
+        List of n_estimators values to tune (default is [50, 100, 200, 300]).
+    max_depth_range : list of int, optional
+        List of max depths to tune (default is [None, 10, 20, 30]).
+    min_samples_split_range : list of int, optional
+        List of minimum samples required to split to tune (default is [2, 5, 10]).
+    min_samples_leaf_range : list of int, optional
+        List of minimum samples required at leaf node to tune (default is [1, 2, 4]).
+    max_features_range : list of str or float, optional
+        List of max features to tune (default is ['auto', 'sqrt', 0.33, 0.5]).
+    random_state : int, optional
+        Seed for reproducibility (default is 42).
+    dist_method : str, optional
+        Distribution method for tercile probabilities ('t', 'gamma', etc.) (default is 'gamma').
+    n_iter_search : int, optional
+        Number of iterations for randomized search (default is 10).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 3).
+    """
+    def __init__(self,
+                 n_estimators_range=[50, 100, 200, 300],
+                 max_depth_range=[None, 10, 20, 30],
+                 min_samples_split_range=[2, 5, 10],
+                 min_samples_leaf_range=[1, 2, 4],
+                 max_features_range=['auto', 'sqrt', 0.33, 0.5],
+                 random_state=42,
+                 dist_method="gamma",
+                 n_iter_search=10,
+                 cv_folds=3):
+        self.n_estimators_range = n_estimators_range
+        self.max_depth_range = max_depth_range
+        self.min_samples_split_range = min_samples_split_range
+        self.min_samples_leaf_range = min_samples_leaf_range
+        self.max_features_range = max_features_range
+        self.random_state = random_state
+        self.dist_method = dist_method
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
+        self.rf = None
+
+    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
+        """
+        Independently computes the best hyperparameters using randomized search on stacked training data.
+
+        Parameters
+        ----------
+        Predictors : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        Predictand : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        clim_year_start : int
+            Start year of the climatology period.
+        clim_year_end : int
+            End year of the climatology period.
+
+        Returns
+        -------
+        dict
+            Best hyperparameters found.
+        """
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Prepare parameter distributions
+        param_dist = {
+            'n_estimators': self.n_estimators_range,
+            'max_depth': self.max_depth_range,
+            'min_samples_split': self.min_samples_split_range,
+            'min_samples_leaf': self.min_samples_leaf_range,
+            'max_features': self.max_features_range
+        }
+
+        # Initialize RandomForestRegressor base model
+        model = RandomForestRegressor(random_state=self.random_state)
+
+        # Randomized search
+        random_search = RandomizedSearchCV(
+            model, param_distributions=param_dist, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+
+        random_search.fit(X_train_clean, y_train_clean)
+        best_params = random_search.best_params_
+
+        return best_params
+
+    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        """
+        Compute deterministic hindcast using the RandomForestRegressor model with injected hyperparameters.
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
+        """
+        # Extract coordinate variables from X_test
+        time = X_test['T']
+        lat = X_test['Y']
+        lon = X_test['X']
+        n_time = len(X_test.coords['T'])
+        n_lat = len(X_test.coords['Y'])
+        n_lon = len(X_test.coords['X'])
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Stack testing data
+        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end)
+
+        # Initialize the model with best parameters
+        self.rf = RandomForestRegressor(
+            n_estimators=best_params['n_estimators'],
+            max_depth=best_params['max_depth'],
+            min_samples_split=best_params['min_samples_split'],
+            min_samples_leaf=best_params['min_samples_leaf'],
+            max_features=best_params['max_features'],
+            random_state=self.random_state
+        )
+
+        # Fit the model and predict on non-NaN testing data
+        self.rf.fit(X_train_clean, y_train_clean)
+        y_pred = self.rf.predict(X_test_stacked[~test_nan_mask])
+
+        # Reconstruct predictions
+        result = np.empty_like(np.squeeze(y_test_stacked))
+        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
+        result[~np.squeeze(test_nan_mask)] = y_pred
+
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        predicted_da = xr.DataArray(data=predictions_reshaped,
+                                    coords={'T': time, 'Y': lat, 'X': lon},
+                                    dims=['T', 'Y', 'X'])
+        return predicted_da
+
+    # ------------------ Probability Calculation Methods ------------------
+    @staticmethod
+    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Student's t-based method
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            first_t = (first_tercile - best_guess) / error_std
+            second_t = (second_tercile - best_guess) / error_std
+
+            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
+            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
+            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
+
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Weibull minimum-based method.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
+                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
+
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
+        """Gamma-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time), dtype=float)
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        T1 = np.asarray(T1, dtype=float)
+        T2 = np.asarray(T2, dtype=float)
+        alpha = (best_guess**2) / error_variance
+        theta = error_variance / best_guess
+        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
+        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
+        pred_prob[0, :] = cdf_t1
+        pred_prob[1, :] = cdf_t2 - cdf_t1
+        pred_prob[2, :] = 1.0 - cdf_t2
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        """Non-parametric method using historical error samples."""
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+        for t in range(n_time):
+            if np.isnan(best_guess[t]):
+                continue
+            dist = best_guess[t] + error_samples
+            dist = dist[np.isfinite(dist)]
+            if len(dist) == 0:
+                continue
+            p_below = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above = 1.0 - (p_below + p_between)
+            pred_prob[0, t] = p_below
+            pred_prob[1, t] = p_between
+            pred_prob[2, t] = p_above
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+        """Normal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
+        """Lognormal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
+        mu = np.log(best_guess) - sigma**2 / 2
+        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
+        return pred_prob
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
+        """
+        Compute tercile probabilities using the chosen distribution method.
+        Predictant is expected to be an xarray DataArray with dims (T, Y, X).
+        """
+        if "M" in Predictant.coords:
+            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        Predictant = Predictant.transpose('T', 'Y', 'X')
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant - hindcast_det).var(dim='T')
+        dof = len(Predictant.get_index("T")) - 2
+
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = (Predictant - hindcast_det)
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('T',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+    @staticmethod
+    def _reshape_and_filter_data(da):
+        """
+        Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
+        and remove rows containing NaNs.
+        """
+        da_stacked = da.stack(sample=('T', 'Y', 'X'))
+        if 'M' in da.dims:
+            da_stacked = da_stacked.transpose('sample', 'M')
+        else:
+            da_stacked = da_stacked.transpose('sample')
+        da_values = da_stacked.values
+        nan_mask = np.any(np.isnan(da_values), axis=1)
+        return da_values[~nan_mask], nan_mask, da_values
+
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 hindcast_det_cross, Predictor_for_year, best_params=None):
+        """
+        Forecast method using a single Random Forest model with optimized hyperparameters.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
+
+        Returns
+        -------
+        forecast_det : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        forecast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
+        """
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        # Standardize Predictor_for_year using hindcast climatology
+        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
+        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
+        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
+
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
+        y_test = Predictant_st.isel(T=[-1])
+
+        # Extract coordinates from X_test
+        time = Predictor_for_year_st['T']
+        lat = Predictor_for_year_st['Y']
+        lon = Predictor_for_year_st['X']
+        n_time = len(Predictor_for_year_st.coords['T'])
+        n_lat = len(Predictor_for_year_st.coords['Y'])
+        n_lon = len(Predictor_for_year_st.coords['X'])
+
+        # Stack training data and remove rows with NaNs
+        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Stack testing data
+        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
+
+        # Initialize and fit the model with best parameters
+        self.rf = RandomForestRegressor(
+            n_estimators=best_params['n_estimators'],
+            max_depth=best_params['max_depth'],
+            min_samples_split=best_params['min_samples_split'],
+            min_samples_leaf=best_params['min_samples_leaf'],
+            max_features=best_params['max_features'],
+            random_state=self.random_state
+        )
+        self.rf.fit(X_train_clean, y_train_clean)
+        y_pred = self.rf.predict(X_test_stacked[~test_nan_mask])
+
+        # Reconstruct the prediction array
+        result = np.empty_like(np.squeeze(y_test_stacked))
+        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
+        result[~np.squeeze(test_nan_mask)] = y_pred
+
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        result_da = xr.DataArray(data=predictions_reshaped,
+                                 coords={'T': time, 'Y': lat, 'X': lon},
+                                 dims=['T', 'Y', 'X']) * mask
+
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
+        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        result_da['T'] = result_da['T'].astype('datetime64[ns]')
+
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant_no_m.get_index("T")) - 2
+
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = Predictant_no_m - hindcast_det_cross
+            error_samples = error_samples.rename({'T': 'S'})
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('S',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
 
 
 class WAS_mme_AdaBoost:
     """
     AdaBoost-based Multi-Model Ensemble (MME) forecasting.
-
     This class implements a single-model forecasting approach using scikit-learn's AdaBoostRegressor
     for deterministic predictions, with optional tercile probability calculations using
-    various statistical distributions.
+    various statistical distributions. Implements hyperparameter optimization via randomized search.
 
     Parameters
     ----------
-    n_estimators : int, optional
-        Number of boosting iterations. Default is 50.
-    learning_rate : float, optional
-        Learning rate for boosting. Default is 0.1.
+    n_estimators_range : list of int, optional
+        List of n_estimators values to tune (default is [50, 100, 200, 300]).
+    learning_rate_range : list of float, optional
+        List of learning rates to tune (default is [0.01, 0.05, 0.1, 0.5, 1.0]).
     random_state : int, optional
-        Seed for random number generation for reproducibility. Default is 42.
+        Seed for reproducibility (default is 42).
     dist_method : str, optional
-        Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
-        Default is 'gamma'.
+        Distribution method for tercile probabilities ('t', 'gamma', etc.) (default is 'gamma').
+    n_iter_search : int, optional
+        Number of iterations for randomized search (default is 10).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 3).
     """
-    def __init__(self, n_estimators=50, learning_rate=0.1, random_state=42, dist_method="gamma"):
-
-        self.n_estimators = n_estimators
-        self.learning_rate = learning_rate
+    def __init__(self,
+                 n_estimators_range=[50, 100, 200, 300],
+                 learning_rate_range=[0.01, 0.05, 0.1, 0.5, 1.0],
+                 random_state=42,
+                 dist_method="gamma",
+                 n_iter_search=10,
+                 cv_folds=3):
+        self.n_estimators_range = n_estimators_range
+        self.learning_rate_range = learning_rate_range
         self.random_state = random_state
         self.dist_method = dist_method
-        
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
         self.adaboost = None
 
-    def compute_model(self, X_train, y_train, X_test, y_test):
+    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
         """
-        Compute deterministic hindcast using the AdaBoost model.
+        Independently computes the best hyperparameters using randomized search on stacked training data.
 
-        Fits the AdaBoostRegressor on training data and predicts deterministic values for the test data.
-        Handles data stacking and NaN removal to ensure robust predictions.
+        Parameters
+        ----------
+        Predictors : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        Predictand : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        clim_year_start : int
+            Start year of the climatology period.
+        clim_year_end : int
+            End year of the climatology period.
+
+        Returns
+        -------
+        dict
+            Best hyperparameters found.
+        """
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Prepare parameter distributions
+        param_dist = {
+            'n_estimators': self.n_estimators_range,
+            'learning_rate': self.learning_rate_range
+        }
+
+        # Initialize AdaBoostRegressor base model
+        model = AdaBoostRegressor(random_state=self.random_state)
+
+        # Randomized search
+        random_search = RandomizedSearchCV(
+            model, param_distributions=param_dist, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+
+        random_search.fit(X_train_clean, y_train_clean)
+        best_params = random_search.best_params_
+
+        return best_params
+
+    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        """
+        Compute deterministic hindcast using the AdaBoost model with injected hyperparameters.
 
         Parameters
         ----------
@@ -5228,48 +7988,54 @@ class WAS_mme_AdaBoost:
             Testing predictor data with dimensions (T, M, Y, X).
         y_test : xarray.DataArray
             Testing predictand data with dimensions (T, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
 
         Returns
         -------
         predicted_da : xarray.DataArray
             Deterministic hindcast with dimensions (T, Y, X).
         """
-        # Initialize the AdaBoostRegressor
-        self.adaboost = AdaBoostRegressor(n_estimators=self.n_estimators,
-                                          learning_rate=self.learning_rate,
-                                          random_state=self.random_state)
-        
         # Extract coordinate variables from X_test
         time = X_test['T']
         lat = X_test['Y']
         lon = X_test['X']
         n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
+        n_lat = len(X_test.coords['Y'])
+        n_lon = len(X_test.coords['X'])
+
         # Stack training data
         X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
         y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
         train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-        
+
         # Stack testing data
         X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
         y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
         test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the AdaBoost model and predict on non-NaN testing rows
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end)
+
+        # Initialize the model with best parameters
+        self.adaboost = AdaBoostRegressor(
+            n_estimators=best_params['n_estimators'],
+            learning_rate=best_params['learning_rate'],
+            random_state=self.random_state
+        )
+
+        # Fit the model and predict on non-NaN testing data
         self.adaboost.fit(X_train_clean, y_train_clean)
         y_pred = self.adaboost.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct prediction array (leaving rows with NaNs unchanged)
+
+        # Reconstruct predictions
         result = np.empty_like(np.squeeze(y_test_stacked))
         result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
         result[~np.squeeze(test_nan_mask)] = y_pred
-        
+
         predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
         predicted_da = xr.DataArray(data=predictions_reshaped,
                                     coords={'T': time, 'Y': lat, 'X': lon},
@@ -5289,60 +8055,31 @@ class WAS_mme_AdaBoost:
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
-            # Transform thresholds
             first_t = (first_tercile - best_guess) / error_std
             second_t = (second_tercile - best_guess) / error_std
-
             pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
             pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
             pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-
         return pred_prob
+
     @staticmethod
     def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
         """
         Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best guess values.
-        error_variance : array-like
-            Variance associated with forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-            
-        Returns
-        -------
-        pred_prob : np.ndarray
-            A 3 x n_time array with probabilities for being below the first tercile,
-            between the first and second tercile, and above the second tercile.
         """
         n_time = len(best_guess)
         pred_prob = np.empty((3, n_time))
-    
+
         if np.all(np.isnan(best_guess)):
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
             pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
         return pred_prob
+
     @staticmethod
     def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
         """Gamma-distribution based method."""
@@ -5421,8 +8158,7 @@ class WAS_mme_AdaBoost:
         if "M" in Predictant.coords:
             Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
         mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
-        # Ensure Predictant is (T, Y, X)
+
         Predictant = Predictant.transpose('T', 'Y', 'X')
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
@@ -5430,7 +8166,7 @@ class WAS_mme_AdaBoost:
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
         error_variance = (Predictant - hindcast_det).var(dim='T')
         dof = len(Predictant.get_index("T")) - 2
-        
+
         if self.dist_method == "t":
             calc_func = self.calculate_tercile_probabilities
             hindcast_prob = xr.apply_ufunc(
@@ -5463,8 +8199,6 @@ class WAS_mme_AdaBoost:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-            
-            
         elif self.dist_method == "gamma":
             calc_func = self.calculate_tercile_probabilities_gamma
             hindcast_prob = xr.apply_ufunc(
@@ -5482,7 +8216,7 @@ class WAS_mme_AdaBoost:
             )
         elif self.dist_method == "nonparam":
             calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)  
+            error_samples = (Predictant - hindcast_det)
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
                 hindcast_det,
@@ -5528,7 +8262,7 @@ class WAS_mme_AdaBoost:
             )
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
+
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
@@ -5548,12 +8282,9 @@ class WAS_mme_AdaBoost:
         return da_values[~nan_mask], nan_mask, da_values
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
-                 hindcast_det_cross, Predictor_for_year):
+                 hindcast_det_cross, Predictor_for_year, best_params=None):
         """
-        Generate deterministic and probabilistic forecast for a target year using the AdaBoost model.
-
-        Fits the AdaBoostRegressor on standardized hindcast data, predicts deterministic values for the target year,
-        reverses standardization, and computes tercile probabilities.
+        Forecast method using a single AdaBoost model with optimized hyperparameters.
 
         Parameters
         ----------
@@ -5569,36 +8300,32 @@ class WAS_mme_AdaBoost:
             Deterministic hindcast data for error estimation with dimensions (T, Y, X).
         Predictor_for_year : xarray.DataArray
             Predictor data for the target year with dimensions (T, M, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters. If None, computes internally.
 
         Returns
         -------
-        result_da : xarray.DataArray
+        forecast_det : xarray.DataArray
             Deterministic forecast with dimensions (T, Y, X).
-        hindcast_prob : xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where probability
-            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
+        forecast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
         """
-        # Create a land mask from the first time step
-        # if "M" in Predictant.coords:
-        #     Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
         # Standardize Predictor_for_year using hindcast climatology
         mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
         std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
         Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        
-        # Standardize hindcast and predictant
+
         hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
         y_test = Predictant_st.isel(T=[-1])
-        
-        # Use the same XGBoost model for forecasting.
-        if self.adaboost is None:
-            self.adaboost = AdaBoostRegressor(n_estimators=self.n_estimators,
-                                              learning_rate=self.learning_rate,
-                                              random_state=self.random_state)
-        
+
         # Extract coordinates from X_test
         time = Predictor_for_year_st['T']
         lat = Predictor_for_year_st['Y']
@@ -5606,56 +8333,58 @@ class WAS_mme_AdaBoost:
         n_time = len(Predictor_for_year_st.coords['T'])
         n_lat = len(Predictor_for_year_st.coords['Y'])
         n_lon = len(Predictor_for_year_st.coords['X'])
-        
+
         # Stack training data and remove rows with NaNs
         X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
+        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-        
+
         # Stack testing data
         X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the MLP model
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
+
+        # Initialize and fit the model with best parameters
+        self.adaboost = AdaBoostRegressor(
+            n_estimators=best_params['n_estimators'],
+            learning_rate=best_params['learning_rate'],
+            random_state=self.random_state
+        )
         self.adaboost.fit(X_train_clean, y_train_clean)
         y_pred = self.adaboost.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
+
+        # Reconstruct the prediction array
         result = np.empty_like(np.squeeze(y_test_stacked))
         result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
         result[~np.squeeze(test_nan_mask)] = y_pred
-        
+
         predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
         result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
+                                 coords={'T': time, 'Y': lat, 'X': lon},
+                                 dims=['T', 'Y', 'X']) * mask
 
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-            
-        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
         new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
         result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
         result_da['T'] = result_da['T'].astype('datetime64[ns]')
-        
-        # Compute tercile probabilities on predictions
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant_no_m.get_index("T")) - 2
+
         if self.dist_method == "t":
             calc_func = self.calculate_tercile_probabilities
             hindcast_prob = xr.apply_ufunc(
@@ -5676,7 +8405,7 @@ class WAS_mme_AdaBoost:
             calc_func = self.calculate_tercile_probabilities_weibull_min
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
-                hindcast_det,
+                result_da,
                 error_variance,
                 terciles.isel(quantile=0).drop_vars('quantile'),
                 terciles.isel(quantile=1).drop_vars('quantile'),
@@ -5688,9 +8417,6 @@ class WAS_mme_AdaBoost:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-            
-        
-            
         elif self.dist_method == "gamma":
             calc_func = self.calculate_tercile_probabilities_gamma
             hindcast_prob = xr.apply_ufunc(
@@ -5738,11 +8464,11 @@ class WAS_mme_AdaBoost:
             )
         elif self.dist_method == "nonparam":
             calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
+            error_samples = Predictant_no_m - hindcast_det_cross
+            error_samples = error_samples.rename({'T': 'S'})
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
-                result_,
+                result_da,
                 error_samples,
                 terciles.isel(quantile=0).drop_vars('quantile'),
                 terciles.isel(quantile=1).drop_vars('quantile'),
@@ -5755,1856 +8481,148 @@ class WAS_mme_AdaBoost:
             )
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T','Y', 'X')
 
-
-
-class WAS_mme_LGBM_Boosting:
-    """
-    LightGBM-based Multi-Model Ensemble (MME) forecasting.
-
-    This class implements a single-model forecasting approach using LightGBM's LGBMRegressor
-    for deterministic predictions, with optional tercile probability calculations using
-    various statistical distributions.
-
-    Parameters
-    ----------
-    n_estimators : int, optional
-        Number of boosting iterations. Default is 100.
-    learning_rate : float, optional
-        Learning rate for boosting. Default is 0.1.
-    max_depth : int, optional
-        Maximum tree depth (-1 for no limit). Default is -1.
-    random_state : int, optional
-        Seed for random number generation for reproducibility. Default is 42.
-    dist_method : str, optional
-        Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
-        Default is 'gamma'.
-    """
-    def __init__(self, n_estimators=100, learning_rate=0.1, max_depth=-1,
-                 random_state=42, dist_method="gamma"):
-
-        self.n_estimators = n_estimators
-        self.learning_rate = learning_rate
-        self.max_depth = max_depth
-        self.random_state = random_state
-        self.dist_method = dist_method
-        
-        self.lgbm = None
-
-    def compute_model(self, X_train, y_train, X_test, y_test):
-        """
-        Compute deterministic hindcast using the LightGBM model.
-
-        Fits the LGBMRegressor on training data and predicts deterministic values for the test data.
-        Handles data stacking and NaN removal to ensure robust predictions.
-
-        Parameters
-        ----------
-        X_train : xarray.DataArray
-            Training predictor data with dimensions (T, M, Y, X).
-        y_train : xarray.DataArray
-            Training predictand data with dimensions (T, Y, X).
-        X_test : xarray.DataArray
-            Testing predictor data with dimensions (T, M, Y, X).
-        y_test : xarray.DataArray
-            Testing predictand data with dimensions (T, Y, X).
-
-        Returns
-        -------
-        predicted_da : xarray.DataArray
-            Deterministic hindcast with dimensions (T, Y, X).
-        """
-        # Initialize LGBMRegressor
-        self.lgbm = LGBMRegressor(n_estimators=self.n_estimators,
-                                  learning_rate=self.learning_rate,
-                                  max_depth=self.max_depth,
-                                  random_state=self.random_state)
-        
-        # Extract coordinate variables from X_test
-        time = X_test['T']
-        lat = X_test['Y']
-        lon = X_test['X']
-        n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
-        # Stack training data
-        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the model and predict on non-NaN rows
-        self.lgbm.fit(X_train_clean, y_train_clean)
-        y_pred = self.lgbm.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct predictions, leaving rows with NaNs intact
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        predicted_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])
-        return predicted_da
-
-    # ------------------ Probability Calculation Methods ------------------
-    @staticmethod
-    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Student's t-based method
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            # Transform thresholds
-            first_t = (first_tercile - best_guess) / error_std
-            second_t = (second_tercile - best_guess) / error_std
-
-            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best guess values.
-        error_variance : array-like
-            Variance associated with forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-            
-        Returns
-        -------
-        pred_prob : np.ndarray
-            A 3 x n_time array with probabilities for being below the first tercile,
-            between the first and second tercile, and above the second tercile.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-    
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
-            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
-        """Gamma-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=float)
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        best_guess = np.asarray(best_guess, dtype=float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        T1 = np.asarray(T1, dtype=float)
-        T2 = np.asarray(T2, dtype=float)
-        alpha = (best_guess**2) / error_variance
-        theta = error_variance / best_guess
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
-        pred_prob[0, :] = cdf_t1
-        pred_prob[1, :] = cdf_t2 - cdf_t1
-        pred_prob[2, :] = 1.0 - cdf_t2
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
-        """Normal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
-        """Lognormal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-        mu = np.log(best_guess) - sigma**2 / 2
-        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
-        return pred_prob
-
-    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
-        """
-        Compute tercile probabilities using the chosen distribution method.
-        Predictant is expected to be an xarray DataArray with dims (T, Y, X).
-        """
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)  
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('T',), (), ()],
-                output_core_dims=[('probability','T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-    @staticmethod
-    def _reshape_and_filter_data(da):
-        """
-        Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
-        and remove rows containing NaNs.
-        """
-        da_stacked = da.stack(sample=('T', 'Y', 'X'))
-        if 'M' in da.dims:
-            da_stacked = da_stacked.transpose('sample', 'M')
-        else:
-            da_stacked = da_stacked.transpose('sample')
-        da_values = da_stacked.values
-        nan_mask = np.any(np.isnan(da_values), axis=1)
-        return da_values[~nan_mask], nan_mask, da_values
-
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
-                 hindcast_det_cross, Predictor_for_year):
-        """
-        Generate deterministic and probabilistic forecast for a target year using the LightGBM model.
-
-        Fits the LGBMRegressor on standardized hindcast data, predicts deterministic values for the target year,
-        reverses standardization, and computes tercile probabilities.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast data for training with dimensions (T, M, Y, X).
-        hindcast_det_cross : xarray.DataArray
-            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
-        Predictor_for_year : xarray.DataArray
-            Predictor data for the target year with dimensions (T, M, Y, X).
-
-        Returns
-        -------
-        result_da : xarray.DataArray
-            Deterministic forecast with dimensions (T, Y, X).
-        hindcast_prob : xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where probability
-            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
-        """
-        # # Create a mask from the first time step (excluding NaNs)
-        # if "M" in Predictant.coords:
-        #     Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
-        # Standardize Predictor_for_year using hindcast climatology
-        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        
-        # Standardize hindcast and predictant
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        y_test = Predictant_st.isel(T=[-1])
-        
-        # Use the same XGBoost model for forecasting.
-        if self.lgbm is None:
-            self.lgbm = LGBMRegressor(n_estimators=self.n_estimators,
-                                      learning_rate=self.learning_rate,
-                                      max_depth=self.max_depth,
-                                      random_state=self.random_state)
-        
-        # Extract coordinates from X_test
-        time = Predictor_for_year_st['T']
-        lat = Predictor_for_year_st['Y']
-        lon = Predictor_for_year_st['X']
-        n_time = len(Predictor_for_year_st.coords['T'])
-        n_lat = len(Predictor_for_year_st.coords['Y'])
-        n_lon = len(Predictor_for_year_st.coords['X'])
-        
-        # Stack training data and remove rows with NaNs
-        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))        
-        # Fit the MLP model
-        self.lgbm.fit(X_train_clean, y_train_clean)
-        y_pred = self.lgbm.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
-
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-            
-        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        result_da['T'] = result_da['T'].astype('datetime64[ns]')
-        
-        # Compute tercile probabilities on predictions using the chosen distribution method
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-                        
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('S',), (), ()],
-                output_core_dims=[('probability','T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
 
-    
-class WAS_mme_Stack_MLP_RF:
+class WAS_mme_Stack_RF_MLP:
     """
-    Stacking ensemble with MLP and Random Forest for Multi-Model Ensemble (MME) forecasting.
-
-    This class implements a stacking ensemble using MLPRegressor and RandomForestRegressor as base models,
-    with a LinearRegression meta-model, for deterministic forecasting and optional tercile probability calculations.
-
-    Parameters
-    ----------
-    hidden_layer_sizes : tuple, optional
-        Sizes of the hidden layers for the MLP base model (e.g., (10, 5)). Default is (10, 5).
-    activation : str, optional
-        Activation function for the MLP ('identity', 'logistic', 'tanh', 'relu'). Default is 'relu'.
-    max_iter : int, optional
-        Maximum number of iterations for the MLP solver. Default is 200.
-    solver : str, optional
-        Optimization algorithm for the MLP ('lbfgs', 'sgd', 'adam'). Default is 'adam'.
-    random_state : int, optional
-        Seed for random number generation for reproducibility. Default is 42.
-    alpha : float, optional
-        L2 regularization parameter for the MLP. Default is 0.01.
-    n_estimators : int, optional
-        Number of trees in the Random Forest base model. Default is 100.
-    dist_method : str, optional
-        Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
-        Default is 'gamma'.
-    """
-    def __init__(self, 
-                 hidden_layer_sizes=(10, 5),
-                 activation='relu',
-                 max_iter=200, 
-                 solver='adam',
-                 random_state=42,
-                 alpha=0.01, 
-                 n_estimators=100, 
-                 dist_method="gamma"):
-        self.hidden_layer_sizes = hidden_layer_sizes
-        self.activation = activation
-        self.solver = solver
-        self.max_iter = max_iter
-        self.random_state = random_state
-        self.alpha = alpha
-        self.n_estimators = n_estimators
-        self.dist_method = dist_method
-
-    def compute_model(self, X_train, y_train, X_test, y_test):
-        """
-        Compute deterministic hindcast using the stacking ensemble of MLP and Random Forest.
-
-        Fits the stacking ensemble (MLP and Random Forest base models with a LinearRegression meta-model)
-        on training data and predicts deterministic values for the test data.
-
-        Parameters
-        ----------
-        X_train : xarray.DataArray
-            Training predictor data with dimensions (T, M, Y, X).
-        y_train : xarray.DataArray
-            Training predictand data with dimensions (T, Y, X).
-        X_test : xarray.DataArray
-            Testing predictor data with dimensions (T, M, Y, X).
-        y_test : xarray.DataArray
-            Testing predictand data with dimensions (T, Y, X).
-
-        Returns
-        -------
-        predicted_da : xarray.DataArray
-            Deterministic hindcast with dimensions (T, Y, X).
-        """
-
-        # Initialize the base models (MLP and Random Forest)
-        self.base_models = [
-            ('mlp', MLPRegressor(
-                hidden_layer_sizes=self.hidden_layer_sizes,
-                activation=self.activation,
-                solver=self.solver,
-                max_iter=self.max_iter,
-                random_state=self.random_state,
-                alpha=self.alpha
-            )),
-            ('rf', RandomForestRegressor(n_estimators=self.n_estimators))
-        ]
-        
-        # Initialize the meta-model (Linear Regression)
-        self.meta_model = LinearRegression()
-        
-        # Initialize the stacking ensemble
-        self.stacking_model = StackingRegressor(
-            estimators=self.base_models,
-            final_estimator=self.meta_model
-        )
-        
-        # Extract coordinate variables from X_test
-        time = X_test['T']
-        lat = X_test['Y']
-        lon = X_test['X']
-        n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
-        # Stack training data
-        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the stacking ensemble only on rows without NaNs
-        self.stacking_model.fit(X_train_clean, y_train_clean)
-        y_pred_test = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Rebuild the predictions into the original shape,
-        # leaving NaN rows intact.
-        # Reconstruct predictions, leaving rows with NaNs intact
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred_test
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        predicted_da = xr.DataArray(
-            data=predictions_reshaped,
-            coords={'T': time, 'Y': lat, 'X': lon},
-            dims=['T', 'Y', 'X']
-        )
-        return predicted_da
-
-    # ------------------ Probability Calculation Methods ------------------
-    @staticmethod
-    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Student's t-based method
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            # Transform thresholds
-            first_t = (first_tercile - best_guess) / error_std
-            second_t = (second_tercile - best_guess) / error_std
-
-            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best guess values.
-        error_variance : array-like
-            Variance associated with forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-            
-        Returns
-        -------
-        pred_prob : np.ndarray
-            A 3 x n_time array with probabilities for being below the first tercile,
-            between the first and second tercile, and above the second tercile.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-    
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
-            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
-        """Gamma-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=float)
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        best_guess = np.asarray(best_guess, dtype=float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        T1 = np.asarray(T1, dtype=float)
-        T2 = np.asarray(T2, dtype=float)
-        alpha = (best_guess ** 2) / error_variance
-        theta = error_variance / best_guess
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
-        pred_prob[0, :] = cdf_t1
-        pred_prob[1, :] = cdf_t2 - cdf_t1
-        pred_prob[2, :] = 1.0 - cdf_t2
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
-        """Normal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
-        """Lognormal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
-        mu = np.log(best_guess) - sigma ** 2 / 2
-        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
-        return pred_prob
-
-    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
-        """
-        Compute tercile probabilities using the chosen distribution method.
-        This method extracts the climatology terciles from Predictant over the period
-        [clim_year_start, clim_year_end], computes an error variance (or uses error samples),
-        and then applies the chosen probability function.
-        """
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
-        # Ensure Predictant is (T, Y, X)
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        # For error variance, here we use the difference between Predictant and hindcast_det
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            # For nonparametric, assume hindcast_det contains error samples
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)  
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('T',), (), ()],
-                output_core_dims=[('probability', 'T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-    @staticmethod
-    def _reshape_and_filter_data(da):
-        """
-        Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
-        and remove any rows with NaNs.
-        """
-        da_stacked = da.stack(sample=('T', 'Y', 'X'))
-        if 'M' in da.dims:
-            da_stacked = da_stacked.transpose('sample', 'M')
-        else:
-            da_stacked = da_stacked.transpose('sample')
-        da_values = da_stacked.values
-        nan_mask = np.any(np.isnan(da_values), axis=1)
-        return da_values[~nan_mask], nan_mask, da_values
-
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
-        """
-        Forecast method that uses the trained stacking ensemble to predict for a new year,
-        then computes tercile probabilities.
-        """
-        # if "M" in Predictant.coords:
-        #     Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
-        # Standardize predictor for the target year using hindcast stats
-        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        y_test = Predictant_st.isel(T=[-1])
-        
-        # Initialize stacking ensemble (if not already done)
-        self.base_models = [
-            ('mlp', MLPRegressor(
-                hidden_layer_sizes=self.hidden_layer_sizes,
-                activation=self.activation,
-                solver=self.solver,
-                max_iter=self.max_iter,
-                random_state=self.random_state,
-                alpha=self.alpha
-            )),
-            ('rf', RandomForestRegressor(n_estimators=self.n_estimators))
-        ]
-        self.meta_model = LinearRegression()
-        self.stacking_model = StackingRegressor(estimators=self.base_models, final_estimator=self.meta_model)
-        
-        # Extract coordinates from X_test
-        time = Predictor_for_year_st['T']
-        lat = Predictor_for_year_st['Y']
-        lon = Predictor_for_year_st['X']
-        n_time = len(Predictor_for_year_st.coords['T'])
-        n_lat = len(Predictor_for_year_st.coords['Y'])
-        n_lon = len(Predictor_for_year_st.coords['X'])
-        
-        # Stack training data and remove rows with NaNs
-        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))        
-        # Fit the MLP model
-        self.stacking_model.fit(X_train_clean, y_train_clean)
-        y_pred = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-            
-        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        result_da['T'] = result_da['T'].astype('datetime64[ns]')
-        
-        # Compute tercile probabilities on the predictions using the chosen distribution
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('S',), (), ()],
-                output_core_dims=[('probability','T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-
-class WAS_mme_Stack_Lasso_RF_MLP:
-    """
-    Stacking ensemble with Lasso and Random Forest base models, and MLP meta-model for Multi-Model Ensemble (MME) forecasting.
-
-    This class implements a stacking ensemble using Lasso and RandomForestRegressor as base models,
+    Stacking ensemble with Random Forest as base model and MLP as meta-model for Multi-Model Ensemble (MME) forecasting.
+    This class implements a stacking ensemble using RandomForestRegressor as the base model,
     with an MLPRegressor meta-model, for deterministic forecasting and optional tercile probability calculations.
+    Implements hyperparameter optimization via randomized search for both base and meta models.
 
     Parameters
     ----------
-    lasso_alpha : float, optional
-        Regularization strength for the Lasso base model. Default is 0.01.
-    n_estimators : int, optional
-        Number of trees in the Random Forest base model. Default is 100.
-    mlp_hidden_layer_sizes : tuple, optional
-        Sizes of the hidden layers for the MLP meta-model (e.g., (10, 5)). Default is (10, 5).
-    mlp_activation : str, optional
-        Activation function for the MLP ('identity', 'logistic', 'tanh', 'relu'). Default is 'relu'.
-    mlp_solver : str, optional
-        Optimization algorithm for the MLP ('lbfgs', 'sgd', 'adam'). Default is 'adam'.
-    mlp_max_iter : int, optional
-        Maximum number of iterations for the MLP solver. Default is 200.
-    mlp_alpha : float, optional
-        L2 regularization parameter for the MLP. Default is 0.01.
-    random_state : int, optional
-        Seed for random number generation for reproducibility. Default is 42.
-    dist_method : str, optional
-        Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min').
-        Default is 'gamma'.
-    """
-    def __init__(self, 
-                 lasso_alpha=0.01, 
-                 n_estimators=100, 
-                 mlp_hidden_layer_sizes=(10, 5), 
-                 mlp_activation='relu', 
-                 mlp_solver='adam', 
-                 mlp_max_iter=200, 
-                 mlp_alpha=0.01, 
-                 random_state=42,
-                dist_method="gamma"):
-        """
-        Base models: Lasso and RandomForestRegressor.
-        Meta-model: MLPRegressor.
-        """
-        self.lasso_alpha = lasso_alpha
-        self.n_estimators = n_estimators
-        self.mlp_hidden_layer_sizes = mlp_hidden_layer_sizes
-        self.mlp_activation = mlp_activation
-        self.mlp_solver = mlp_solver
-        self.mlp_max_iter = mlp_max_iter
-        self.mlp_alpha = mlp_alpha
-        self.random_state = random_state
-        self.dist_method = dist_method
-
-        self.base_models = None
-        self.meta_model = None
-        self.stacking_model = None
-
-    def compute_model(self, X_train, y_train, X_test, y_test):
-        """
-        Compute deterministic hindcast using the stacking ensemble of Lasso and Random Forest with an MLP meta-model.
-
-        Fits the stacking ensemble (Lasso and Random Forest base models with an MLPRegressor meta-model)
-        on training data and predicts deterministic values for the test data.
-
-        Parameters
-        ----------
-        X_train : xarray.DataArray
-            Training predictor data with dimensions (T, M, Y, X).
-        y_train : xarray.DataArray
-            Training predictand data with dimensions (T, Y, X).
-        X_test : xarray.DataArray
-            Testing predictor data with dimensions (T, M, Y, X).
-        y_test : xarray.DataArray
-            Testing predictand data with dimensions (T, Y, X).
-
-        Returns
-        -------
-        predicted_da : xarray.DataArray
-            Deterministic hindcast with dimensions (T, Y, X).
-        """
-        # Define base models: Lasso and RandomForestRegressor
-        self.base_models = [
-            ('lasso', Lasso(alpha=self.lasso_alpha, random_state=self.random_state)),
-            ('rf', RandomForestRegressor(n_estimators=self.n_estimators, random_state=self.random_state))
-        ]
-        # Define meta-model: MLPRegressor
-        self.meta_model = MLPRegressor(
-            hidden_layer_sizes=self.mlp_hidden_layer_sizes,
-            activation=self.mlp_activation,
-            solver=self.mlp_solver,
-            max_iter=self.mlp_max_iter,
-            random_state=self.random_state,
-            alpha=self.mlp_alpha
-        )
-        # Create stacking ensemble
-        self.stacking_model = StackingRegressor(
-            estimators=self.base_models,
-            final_estimator=self.meta_model
-        )
-        
-        # Extract coordinate variables from X_test
-        time = X_test['T']
-        lat = X_test['Y']
-        lon = X_test['X']
-        n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
-        # Stack training data
-        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the stacking ensemble only on rows without NaNs
-        self.stacking_model.fit(X_train_clean, y_train_clean)
-        y_pred_test = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Rebuild the predictions into the original shape,
-        # leaving NaN rows intact.
-        # Reconstruct predictions, leaving rows with NaNs intact
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred_test
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        predicted_da = xr.DataArray(
-            data=predictions_reshaped,
-            coords={'T': time, 'Y': lat, 'X': lon},
-            dims=['T', 'Y', 'X']
-        )
-        return predicted_da
-
-    # ------------------ Probability Calculation Methods ------------------
-    @staticmethod
-    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Student's t-based method
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            # Transform thresholds
-            first_t = (first_tercile - best_guess) / error_std
-            second_t = (second_tercile - best_guess) / error_std
-
-            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best guess values.
-        error_variance : array-like
-            Variance associated with forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-            
-        Returns
-        -------
-        pred_prob : np.ndarray
-            A 3 x n_time array with probabilities for being below the first tercile,
-            between the first and second tercile, and above the second tercile.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-    
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
-            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
-        """Gamma-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=float)
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        best_guess = np.asarray(best_guess, dtype=float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        T1 = np.asarray(T1, dtype=float)
-        T2 = np.asarray(T2, dtype=float)
-        alpha = (best_guess**2) / error_variance
-        theta = error_variance / best_guess
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
-        pred_prob[0, :] = cdf_t1
-        pred_prob[1, :] = cdf_t2 - cdf_t1
-        pred_prob[2, :] = 1.0 - cdf_t2
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
-        """Normal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
-        """Lognormal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-        mu = np.log(best_guess) - sigma**2 / 2
-        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
-        return pred_prob
-
-    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
-        """
-        Compute tercile probabilities using the chosen distribution method.
-        Predictant should be an xarray DataArray with dims (T, Y, X).
-        """
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
-        # Ensure Predictant is in (T, Y, X)
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)  
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('T',), (), ()],
-                output_core_dims=[('probability', 'T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-    @staticmethod
-    def _reshape_and_filter_data(da):
-        """
-        Helper: stack DataArray from (T, Y, X[, M]) to (n_samples, n_features),
-        and remove rows with NaNs.
-        """
-        da_stacked = da.stack(sample=('T', 'Y', 'X'))
-        if 'M' in da.dims:
-            da_stacked = da_stacked.transpose('sample', 'M')
-        else:
-            da_stacked = da_stacked.transpose('sample')
-        da_values = da_stacked.values
-        nan_mask = np.any(np.isnan(da_values), axis=1)
-        return da_values[~nan_mask], nan_mask, da_values
-
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
-        """
-        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
-
-        Fits the stacking ensemble (Lasso and Random Forest base models with an MLPRegressor meta-model)
-        on standardized hindcast data, predicts deterministic values for the target year,
-        reverses standardization, and computes tercile probabilities.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast data for training with dimensions (T, M, Y, X).
-        hindcast_det_cross : xarray.DataArray
-            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
-        Predictor_for_year : xarray.DataArray
-            Predictor data for the target year with dimensions (T, M, Y, X).
-
-        Returns
-        -------
-        result_da : xarray.DataArray
-            Deterministic forecast with dimensions (T, Y, X).
-        hindcast_prob : xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where probability
-            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
-        """
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-      
-        
-        # Standardize predictor for the target year using hindcast stats
-        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        y_test = Predictant_st.isel(T=[-1])
-        
-        # Initialize stacking ensemble if not already done
-        self.base_models = [
-            ('lasso', Lasso(alpha=self.lasso_alpha, random_state=self.random_state)),
-            ('rf', RandomForestRegressor(n_estimators=self.n_estimators, random_state=self.random_state))
-        ]
-        self.meta_model = MLPRegressor(
-            hidden_layer_sizes=self.mlp_hidden_layer_sizes,
-            activation=self.mlp_activation,
-            solver=self.mlp_solver,
-            max_iter=self.mlp_max_iter,
-            random_state=self.random_state,
-            alpha=self.mlp_alpha
-        )
-        self.stacking_model = StackingRegressor(estimators=self.base_models, final_estimator=self.meta_model)
-        
-        # Extract coordinates from X_test
-        time = Predictor_for_year_st['T']
-        lat = Predictor_for_year_st['Y']
-        lon = Predictor_for_year_st['X']
-        n_time = len(Predictor_for_year_st.coords['T'])
-        n_lat = len(Predictor_for_year_st.coords['Y'])
-        n_lon = len(Predictor_for_year_st.coords['X'])
-        
-        # Stack training data and remove rows with NaNs
-        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))        
-        # Fit the MLP model
-        self.stacking_model.fit(X_train_clean, y_train_clean)
-        y_pred = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        
-        # Compute tercile probabilities using the chosen distribution method
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('S',), (), ()],
-                output_core_dims=[('probability','T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-
-class WAS_mme_Stack_MLP_Ada_Ridge:
-    """
-    Stacking ensemble with MLP and AdaBoost base models, and Ridge meta-model for Multi-Model Ensemble (MME) forecasting.
-
-    This class implements a stacking ensemble using MLPRegressor and AdaBoostRegressor as base models,
-    with a Ridge meta-model, for deterministic forecasting and optional tercile probability calculations.
-
-    Parameters
-    ----------
-    hidden_layer_sizes : tuple, optional
-        Sizes of the hidden layers for the MLP base model (e.g., (10, 5)). Default is (10, 5).
-    activation : str, optional
-        Activation function for the MLP ('identity', 'logistic', 'tanh', 'relu'). Default is 'relu'.
+    n_estimators_range : list of int, optional
+        List of n_estimators values to tune for Random Forest (default is [50, 100, 200, 300]).
+    max_depth_range : list of int or None, optional
+        List of max depths to tune for Random Forest (default is [None, 10, 20, 30]).
+    min_samples_split_range : list of int, optional
+        List of minimum samples required to split to tune for Random Forest (default is [2, 5, 10]).
+    min_samples_leaf_range : list of int, optional
+        List of minimum samples required at leaf node to tune for Random Forest (default is [1, 2, 4]).
+    max_features_range : list of str or float, optional
+        List of max features to tune for Random Forest (default is ['auto', 'sqrt', 0.33, 0.5]).
+    hidden_layer_sizes_range : list of tuples, optional
+        List of hidden layer sizes to tune for MLP (default is [(10,), (10, 5), (20, 10)]).
+    activation_options : list of str, optional
+        Activation functions to tune for MLP (default is ['relu', 'tanh', 'logistic']).
+    solver_options : list of str, optional
+        Solvers to tune for MLP (default is ['adam', 'sgd', 'lbfgs']).
+    alpha_range : list of float, optional
+        L2 regularization parameters to tune for MLP (default is [0.0001, 0.001, 0.01, 0.1]).
     max_iter : int, optional
-        Maximum number of iterations for the MLP solver. Default is 200.
-    solver : str, optional
-        Optimization algorithm for the MLP ('lbfgs', 'sgd', 'adam'). Default is 'adam'.
-    mlp_alpha : float, optional
-        L2 regularization parameter for the MLP. Default is 0.01.
-    n_estimators_adaboost : int, optional
-        Number of boosting iterations for AdaBoost. Default is 50.
-    ridge_alpha : float, optional
-        Regularization strength for the Ridge meta-model. Default is 1.0.
+        Maximum iterations for MLP (default is 200).
     random_state : int, optional
-        Seed for random number generation for reproducibility. Default is 42.
+        Seed for reproducibility (default is 42).
     dist_method : str, optional
-        Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
+        Distribution method for tercile probabilities ('t', 'gamma', etc.) (default is 'gamma').
+    n_iter_search : int, optional
+        Number of iterations for randomized search (default is 10).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 3).
     """
-    def __init__(self, 
-                 hidden_layer_sizes=(10, 5), 
-                 activation='relu', 
-                 max_iter=200, 
-                 solver='adam', 
-                 mlp_alpha=0.01,
-                 n_estimators_adaboost=50, 
-                 ridge_alpha=1.0, 
+    def __init__(self,
+                 n_estimators_range=[50, 100, 200, 300],
+                 max_depth_range=[None, 10, 20, 30],
+                 min_samples_split_range=[2, 5, 10],
+                 min_samples_leaf_range=[1, 2, 4],
+                 max_features_range=['auto', 'sqrt', 0.33, 0.5],
+                 hidden_layer_sizes_range=[(10,), (10, 5), (20, 10)],
+                 activation_options=['relu', 'tanh', 'logistic'],
+                 solver_options=['adam', 'sgd', 'lbfgs'],
+                 alpha_range=[0.0001, 0.001, 0.01, 0.1],
+                 max_iter=200,
                  random_state=42,
-                 dist_method="gamma"):
-
-        self.hidden_layer_sizes = hidden_layer_sizes
-        self.activation = activation
+                 dist_method="gamma",
+                 n_iter_search=10,
+                 cv_folds=3):
+        self.n_estimators_range = n_estimators_range
+        self.max_depth_range = max_depth_range
+        self.min_samples_split_range = min_samples_split_range
+        self.min_samples_leaf_range = min_samples_leaf_range
+        self.max_features_range = max_features_range
+        self.hidden_layer_sizes_range = hidden_layer_sizes_range
+        self.activation_options = activation_options
+        self.solver_options = solver_options
+        self.alpha_range = alpha_range
         self.max_iter = max_iter
-        self.solver = solver
-        self.mlp_alpha = mlp_alpha
-        self.n_estimators_adaboost = n_estimators_adaboost
-        self.ridge_alpha = ridge_alpha
         self.random_state = random_state
         self.dist_method = dist_method
-
-        self.base_models = None
-        self.meta_model = None
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
         self.stacking_model = None
 
-    def compute_model(self, X_train, y_train, X_test, y_test):
+    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
         """
-        Compute deterministic hindcast using the stacking ensemble of MLP and AdaBoost with a Ridge meta-model.
+        Independently computes the best hyperparameters using randomized search on stacked training data.
 
-        Fits the stacking ensemble (MLP and AdaBoost base models with a Ridge meta-model)
-        on training data and predicts deterministic values for the test data.
+        Parameters
+        ----------
+        Predictors : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        Predictand : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        clim_year_start : int
+            Start year of the climatology period.
+        clim_year_end : int
+            End year of the climatology period.
+
+        Returns
+        -------
+        dict
+            Best hyperparameters found.
+        """
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # For Random Forest (base model)
+        param_dist_rf = {
+            'n_estimators': self.n_estimators_range,
+            'max_depth': self.max_depth_range,
+            'min_samples_split': self.min_samples_split_range,
+            'min_samples_leaf': self.min_samples_leaf_range,
+            'max_features': self.max_features_range
+        }
+        model_rf = RandomForestRegressor(random_state=self.random_state)
+        random_search_rf = RandomizedSearchCV(
+            model_rf, param_distributions=param_dist_rf, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+        random_search_rf.fit(X_train_clean, y_train_clean)
+        best_rf = random_search_rf.best_params_
+
+        # For MLP (meta model)
+        param_dist_mlp = {
+            'hidden_layer_sizes': self.hidden_layer_sizes_range,
+            'activation': self.activation_options,
+            'solver': self.solver_options,
+            'alpha': self.alpha_range
+        }
+        model_mlp = MLPRegressor(max_iter=self.max_iter, random_state=self.random_state)
+        random_search_mlp = RandomizedSearchCV(
+            model_mlp, param_distributions=param_dist_mlp, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+        random_search_mlp.fit(X_train_clean, y_train_clean)
+        best_mlp = random_search_mlp.best_params_
+
+        return {'rf': best_rf, 'mlp': best_mlp}
+
+    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        """
+        Compute deterministic hindcast using the stacking ensemble of Random Forest (base) and MLP (meta).
 
         Parameters
         ----------
@@ -7616,75 +8634,63 @@ class WAS_mme_Stack_MLP_Ada_Ridge:
             Testing predictor data with dimensions (T, M, Y, X).
         y_test : xarray.DataArray
             Testing predictand data with dimensions (T, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters for 'rf' and 'mlp'. If None, computes internally.
 
         Returns
         -------
         predicted_da : xarray.DataArray
             Deterministic hindcast with dimensions (T, Y, X).
         """
-        # Define base models
-        self.base_models = [
-            ('mlp', MLPRegressor(
-                hidden_layer_sizes=self.hidden_layer_sizes,
-                activation=self.activation,
-                solver=self.solver,
-                max_iter=self.max_iter,
-                random_state=self.random_state,
-                alpha=self.mlp_alpha
-            )),
-            ('ada', AdaBoostRegressor(
-                n_estimators=self.n_estimators_adaboost,
-                random_state=self.random_state
-            ))
-        ]
-        # Define meta-model (Ridge)
-        self.meta_model = Ridge(alpha=self.ridge_alpha, random_state=self.random_state)
-        
-        # Build stacking ensemble
-        self.stacking_model = StackingRegressor(
-            estimators=self.base_models,
-            final_estimator=self.meta_model
-        )
-        
         # Extract coordinate variables from X_test
         time = X_test['T']
         lat = X_test['Y']
         lon = X_test['X']
         n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
+        n_lat = len(X_test.coords['Y'])
+        n_lon = len(X_test.coords['X'])
+
         # Stack training data
         X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
         y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
         train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-        
+
         # Stack testing data
         X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
         y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
         test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the stacking ensemble only on rows without NaNs
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+        # Initialize base model (Random Forest)
+        rf = RandomForestRegressor(**best_params['rf'], random_state=self.random_state)
+        base_models = [('rf', rf)]
+
+        # Initialize meta-model (MLP)
+        meta_model = MLPRegressor(**best_params['mlp'], max_iter=self.max_iter, random_state=self.random_state)
+
+        # Initialize stacking ensemble
+        self.stacking_model = StackingRegressor(estimators=base_models, final_estimator=meta_model)
+
+        # Fit the stacking model on clean training data
         self.stacking_model.fit(X_train_clean, y_train_clean)
+
+        # Predict on clean test data
         y_pred_test = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Rebuild the predictions into the original shape,
-        # leaving NaN rows intact.
-        # Reconstruct predictions, leaving rows with NaNs intact
+
+        # Reconstruct predictions
         result = np.empty_like(np.squeeze(y_test_stacked))
         result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
         result[~np.squeeze(test_nan_mask)] = y_pred_test
-        
+
         predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        predicted_da = xr.DataArray(
-            data=predictions_reshaped,
-            coords={'T': time, 'Y': lat, 'X': lon},
-            dims=['T', 'Y', 'X']
-        )
+        predicted_da = xr.DataArray(data=predictions_reshaped,
+                                    coords={'T': time, 'Y': lat, 'X': lon},
+                                    dims=['T', 'Y', 'X'])
         return predicted_da
 
     # ------------------ Probability Calculation Methods ------------------
@@ -7695,65 +8701,35 @@ class WAS_mme_Stack_MLP_Ada_Ridge:
         """
         n_time = len(best_guess)
         pred_prob = np.empty((3, n_time))
-
         if np.all(np.isnan(best_guess)):
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
-            # Transform thresholds
             first_t = (first_tercile - best_guess) / error_std
             second_t = (second_tercile - best_guess) / error_std
-
             pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
             pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
             pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-
         return pred_prob
+
     @staticmethod
     def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
         """
         Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best guess values.
-        error_variance : array-like
-            Variance associated with forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-            
-        Returns
-        -------
-        pred_prob : np.ndarray
-            A 3 x n_time array with probabilities for being below the first tercile,
-            between the first and second tercile, and above the second tercile.
         """
         n_time = len(best_guess)
         pred_prob = np.empty((3, n_time))
-    
+
         if np.all(np.isnan(best_guess)):
             pred_prob[:] = np.nan
         else:
             error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
             pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
             pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
         return pred_prob
+
     @staticmethod
     def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
         """Gamma-distribution based method."""
@@ -7832,8 +8808,7 @@ class WAS_mme_Stack_MLP_Ada_Ridge:
         if "M" in Predictant.coords:
             Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
         mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
-        # Ensure Predictant is (T, Y, X)
+
         Predictant = Predictant.transpose('T', 'Y', 'X')
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
@@ -7841,622 +8816,7 @@ class WAS_mme_Stack_MLP_Ada_Ridge:
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
         error_variance = (Predictant - hindcast_det).var(dim='T')
         dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)  
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('T',), (), ()],
-                output_core_dims=[('probability', 'T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
-    @staticmethod
-    def _reshape_and_filter_data(da):
-        """
-        Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
-        and remove rows containing NaNs.
-        """
-        da_stacked = da.stack(sample=('T', 'Y', 'X'))
-        if 'M' in da.dims:
-            da_stacked = da_stacked.transpose('sample', 'M')
-        else:
-            da_stacked = da_stacked.transpose('sample')
-        da_values = da_stacked.values
-        nan_mask = np.any(np.isnan(da_values), axis=1)
-        return da_values[~nan_mask], nan_mask, da_values
-
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
-        """
-        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
-
-        Fits the stacking ensemble (MLP and AdaBoost base models with a Ridge meta-model)
-        on standardized hindcast data, predicts deterministic values for the target year,
-        reverses standardization, and computes tercile probabilities.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast data for training with dimensions (T, M, Y, X).
-        hindcast_det_cross : xarray.DataArray
-            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
-        Predictor_for_year : xarray.DataArray
-            Predictor data for the target year with dimensions (T, M, Y, X).
-
-        Returns
-        -------
-        result_da : xarray.DataArray
-            Deterministic forecast with dimensions (T, Y, X).
-        hindcast_prob : xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where probability
-            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
-        """
-        mask = xr.where(~np.isnan(Predictant.isel(T=0, M=0)), 1, np.nan).drop_vars(['T','M']).squeeze()
-        mask.name = None
-
-        # Standardize predictor for the target year using hindcast statistics
-        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        y_test = Predictant_st.isel(T=[-1])
-        
-        # Initialize stacking ensemble if not already done
-        self.base_models = [
-            ('mlp', MLPRegressor(
-                hidden_layer_sizes=self.hidden_layer_sizes,
-                activation=self.activation,
-                solver=self.solver,
-                max_iter=self.max_iter,
-                random_state=self.random_state,
-                alpha=self.mlp_alpha
-            )),
-            ('ada', AdaBoostRegressor(n_estimators=self.n_estimators_adaboost, random_state=self.random_state))
-        ]
-        self.meta_model = Ridge(alpha=self.ridge_alpha, random_state=self.random_state)
-        self.stacking_model = StackingRegressor(estimators=self.base_models, final_estimator=self.meta_model)
-        
-        # Extract coordinates from X_test
-        time = Predictor_for_year_st['T']
-        lat = Predictor_for_year_st['Y']
-        lon = Predictor_for_year_st['X']
-        n_time = len(Predictor_for_year_st.coords['T'])
-        n_lat = len(Predictor_for_year_st.coords['Y'])
-        n_lon = len(Predictor_for_year_st.coords['X'])
-        
-        # Stack training data and remove rows with NaNs
-        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))        
-        # Fit the MLP model
-        self.stacking_model.fit(X_train_clean, y_train_clean)
-        y_pred = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        
-        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        result_da['T'] = result_da['T'].astype('datetime64[ns]')
-        
-        # Compute tercile probabilities on predictions
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('S',), (), ()],
-                output_core_dims=[('probability','T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-
-class WAS_mme_Stack_RF_GB_Ridge:
-    """
-    Stacking ensemble with Random Forest and Gradient Boosting base models, and Ridge meta-model for Multi-Model Ensemble (MME) forecasting.
-
-    This class implements a stacking ensemble using RandomForestRegressor and GradientBoostingRegressor as base models,
-    with a Ridge meta-model, for deterministic forecasting and optional tercile probability calculations.
-
-    Parameters
-    ----------
-    n_estimators_rf : int, optional
-        Number of trees in the Random Forest base model. Default is 100.
-    max_depth_rf : int or None, optional
-        Maximum depth for Random Forest trees (None for no limit). Default is None.
-    n_estimators_gb : int, optional
-        Number of boosting iterations for Gradient Boosting. Default is 100.
-    learning_rate_gb : float, optional
-        Learning rate for Gradient Boosting. Default is 0.1.
-    ridge_alpha : float, optional
-        Regularization strength for the Ridge meta-model. Default is 1.0.
-    random_state : int, optional
-        Seed for random number generation for reproducibility. Default is 42.
-    dist_method : str, optional
-        Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
-    """
-    def __init__(self, 
-                 n_estimators_rf=100, 
-                 max_depth_rf=None,
-                 n_estimators_gb=100,
-                 learning_rate_gb=0.1,
-                 ridge_alpha=1.0,
-                 random_state=42,
-                 dist_method="gamma"):
-
-        self.n_estimators_rf = n_estimators_rf
-        self.max_depth_rf = max_depth_rf
-        self.n_estimators_gb = n_estimators_gb
-        self.learning_rate_gb = learning_rate_gb
-        self.ridge_alpha = ridge_alpha
-        self.random_state = random_state
-        self.dist_method = dist_method
-
-        self.base_models = None
-        self.meta_model = None
-        self.stacking_model = None
-
-    def compute_model(self, X_train, y_train, X_test, y_test):
-        """
-        Compute deterministic hindcast using the stacking ensemble of Random Forest and Gradient Boosting with a Ridge meta-model.
-
-        Fits the stacking ensemble (Random Forest and Gradient Boosting base models with a Ridge meta-model)
-        on training data and predicts deterministic values for the test data.
-
-        Parameters
-        ----------
-        X_train : xarray.DataArray
-            Training predictor data with dimensions (T, M, Y, X).
-        y_train : xarray.DataArray
-            Training predictand data with dimensions (T, Y, X).
-        X_test : xarray.DataArray
-            Testing predictor data with dimensions (T, M, Y, X).
-        y_test : xarray.DataArray
-            Testing predictand data with dimensions (T, Y, X).
-
-        Returns
-        -------
-        predicted_da : xarray.DataArray
-            Deterministic hindcast with dimensions (T, Y, X).
-        """
-        # Define base models:
-        self.base_models = [
-            ('rf', RandomForestRegressor(n_estimators=self.n_estimators_rf,
-                                         max_depth=self.max_depth_rf,
-                                         random_state=self.random_state)),
-            ('gb', GradientBoostingRegressor(n_estimators=self.n_estimators_gb,
-                                             learning_rate=self.learning_rate_gb,
-                                             random_state=self.random_state))
-        ]
-        # Define meta-model (Ridge)
-        self.meta_model = Ridge(alpha=self.ridge_alpha, random_state=self.random_state)
-        
-        # Create the stacking ensemble
-        self.stacking_model = StackingRegressor(
-            estimators=self.base_models,
-            final_estimator=self.meta_model
-        )
-        
-        # Extract coordinate variables from X_test
-        time = X_test['T']
-        lat = X_test['Y']
-        lon = X_test['X']
-        n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
-        # Stack training data
-        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the stacking ensemble only on rows without NaNs
-        self.stacking_model.fit(X_train_clean, y_train_clean)
-        y_pred_test = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Rebuild the predictions into the original shape,
-        # leaving NaN rows intact.
-        # Reconstruct predictions, leaving rows with NaNs intact
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred_test
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        predicted_da = xr.DataArray(
-            data=predictions_reshaped,
-            coords={'T': time, 'Y': lat, 'X': lon},
-            dims=['T', 'Y', 'X']
-        )
-        return predicted_da
-
-    # ------------------ Probability Calculation Methods ------------------
-    @staticmethod
-    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Student's t-based method
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            # Transform thresholds
-            first_t = (first_tercile - best_guess) / error_std
-            second_t = (second_tercile - best_guess) / error_std
-
-            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best guess values.
-        error_variance : array-like
-            Variance associated with forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-            
-        Returns
-        -------
-        pred_prob : np.ndarray
-            A 3 x n_time array with probabilities for being below the first tercile,
-            between the first and second tercile, and above the second tercile.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-    
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
-            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
-        """Gamma-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=float)
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        best_guess = np.asarray(best_guess, dtype=float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        T1 = np.asarray(T1, dtype=float)
-        T2 = np.asarray(T2, dtype=float)
-        alpha = (best_guess ** 2) / error_variance
-        theta = error_variance / best_guess
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
-        pred_prob[0, :] = cdf_t1
-        pred_prob[1, :] = cdf_t2 - cdf_t1
-        pred_prob[2, :] = 1.0 - cdf_t2
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
-        """Normal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
-        """Lognormal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
-        mu = np.log(best_guess) - sigma ** 2 / 2
-        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
-        return pred_prob
-
-    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
-        """
-        Compute tercile probabilities for hindcasts based on the chosen distribution.
-        Predictant is an xarray DataArray with dims (T, Y, X).
-        """
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
-        # Ensure Predictant is (T, Y, X)
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
         if self.dist_method == "t":
             calc_func = self.calculate_tercile_probabilities
             hindcast_prob = xr.apply_ufunc(
@@ -8489,8 +8849,6 @@ class WAS_mme_Stack_RF_GB_Ridge:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-            
-            
         elif self.dist_method == "gamma":
             calc_func = self.calculate_tercile_probabilities_gamma
             hindcast_prob = xr.apply_ufunc(
@@ -8507,1206 +8865,6 @@ class WAS_mme_Stack_RF_GB_Ridge:
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
         elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)  
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('T',), (), ()],
-                output_core_dims=[('probability', 'T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-    @staticmethod
-    def _reshape_and_filter_data(da):
-        """
-        Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
-        and remove rows containing NaNs.
-        """
-        da_stacked = da.stack(sample=('T', 'Y', 'X'))
-        if 'M' in da.dims:
-            da_stacked = da_stacked.transpose('sample', 'M')
-        else:
-            da_stacked = da_stacked.transpose('sample')
-        da_values = da_stacked.values
-        nan_mask = np.any(np.isnan(da_values), axis=1)
-        return da_values[~nan_mask], nan_mask, da_values
-
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
-        """
-        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
-
-        Fits the stacking ensemble (Random Forest and Gradient Boosting base models with a Ridge meta-model)
-        on standardized hindcast data, predicts deterministic values for the target year,
-        reverses standardization, and computes tercile probabilities.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast data for training with dimensions (T, M, Y, X).
-        hindcast_det_cross : xarray.DataArray
-            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
-        Predictor_for_year : xarray.DataArray
-            Predictor data for the target year with dimensions (T, M, Y, X).
-
-        Returns
-        -------
-        result_da : xarray.DataArray
-            Deterministic forecast with dimensions (T, Y, X).
-        hindcast_prob : xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where probability
-            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
-        """
-        mask = xr.where(~np.isnan(Predictant.isel(T=0, M=0)), 1, np.nan)\
-                .drop_vars(['T', 'M']).squeeze()
-        mask.name = None
-        
-        # Standardize Predictor_for_year using hindcast climatology
-        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        y_test = Predictant_st.isel(T=[-1])
-        
-        # Initialize stacking ensemble if not already set
-        self.base_models = [
-            ('mlp', MLPRegressor(
-                hidden_layer_sizes=(10,5),  # Or set via parameters if needed
-                activation='relu',
-                solver='adam',
-                max_iter=200,
-                random_state=self.random_state,
-                alpha=0.01
-            )),
-            ('ada', AdaBoostRegressor(n_estimators=50, random_state=self.random_state))
-        ]
-        self.meta_model = Ridge(alpha=1.0, random_state=self.random_state)
-        self.stacking_model = StackingRegressor(estimators=self.base_models, final_estimator=self.meta_model)
-        
-        # Extract coordinates from X_test
-        time = Predictor_for_year_st['T']
-        lat = Predictor_for_year_st['Y']
-        lon = Predictor_for_year_st['X']
-        n_time = len(Predictor_for_year_st.coords['T'])
-        n_lat = len(Predictor_for_year_st.coords['Y'])
-        n_lon = len(Predictor_for_year_st.coords['X'])
-        
-        # Stack training data and remove rows with NaNs
-        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))        
-        # Fit the MLP model
-        self.stacking_model.fit(X_train_clean, y_train_clean)
-        y_pred = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()        
-        
-        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        result_da['T'] = result_da['T'].astype('datetime64[ns]')
-        
-        # Compute tercile probabilities on predictions
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('S',), (), ()],
-                output_core_dims=[('probability','T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-
-
-class WAS_mme_Stack_KNN_Tree_SVR:
-    """
-    Stacking ensemble with K-Nearest Neighbors and Decision Tree base models, and SVR meta-model for Multi-Model Ensemble (MME) forecasting.
-
-    This class implements a stacking ensemble using KNeighborsRegressor and DecisionTreeRegressor as base models,
-    with an SVR meta-model, for deterministic forecasting and optional tercile probability calculations.
-
-    Parameters
-    ----------
-    n_neighbors : int, optional
-        Number of neighbors for K-Nearest Neighbors. Default is 5.
-    tree_max_depth : int or None, optional
-        Maximum depth for the Decision Tree (None for no limit). Default is None.
-    svr_C : float, optional
-        Regularization parameter for SVR. Default is 1.0.
-    svr_kernel : str, optional
-        Kernel type for SVR ('linear', 'poly', 'rbf', 'sigmoid'). Default is 'rbf'.
-    random_state : int, optional
-        Seed for random number generation for reproducibility. Default is 42.
-    dist_method : str, optional
-        Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
-    """
-    def __init__(self, 
-                 n_neighbors=5,
-                 tree_max_depth=None,
-                 svr_C=1.0,
-                 svr_kernel='rbf',
-                 random_state=42,
-                 dist_method="gamma"):
-
-        self.n_neighbors = n_neighbors
-        self.tree_max_depth = tree_max_depth
-        self.svr_C = svr_C
-        self.svr_kernel = svr_kernel
-        self.random_state = random_state
-        self.dist_method = dist_method
-
-        self.base_models = None
-        self.meta_model = None
-        self.stacking_model = None
-
-    def compute_model(self, X_train, y_train, X_test, y_test):
-        """
-        Compute deterministic hindcast using the stacking ensemble of KNN and Decision Tree with an SVR meta-model.
-
-        Fits the stacking ensemble (KNeighborsRegressor and DecisionTreeRegressor base models with an SVR meta-model)
-        on training data and predicts deterministic values for the test data.
-
-        Parameters
-        ----------
-        X_train : xarray.DataArray
-            Training predictor data with dimensions (T, M, Y, X).
-        y_train : xarray.DataArray
-            Training predictand data with dimensions (T, Y, X).
-        X_test : xarray.DataArray
-            Testing predictor data with dimensions (T, M, Y, X).
-        y_test : xarray.DataArray
-            Testing predictand data with dimensions (T, Y, X).
-
-        Returns
-        -------
-        predicted_da : xarray.DataArray
-            Deterministic hindcast with dimensions (T, Y, X).
-        """
-        # Define base models:
-        self.base_models = [
-            ('knn', KNeighborsRegressor(n_neighbors=self.n_neighbors)),
-            ('tree', DecisionTreeRegressor(max_depth=self.tree_max_depth, random_state=self.random_state))
-        ]
-        # Define meta-model: SVR
-        self.meta_model = SVR(C=self.svr_C, kernel=self.svr_kernel)
-        
-        # Build stacking ensemble
-        self.stacking_model = StackingRegressor(
-            estimators=self.base_models,
-            final_estimator=self.meta_model,
-            n_jobs=-1
-        )
-        
-        # Extract coordinate variables from X_test
-        time = X_test['T']
-        lat = X_test['Y']
-        lon = X_test['X']
-        n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
-        # Stack training data
-        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the stacking ensemble only on rows without NaNs
-        self.stacking_model.fit(X_train_clean, y_train_clean)
-        y_pred_test = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Rebuild the predictions into the original shape,
-        # leaving NaN rows intact.
-        # Reconstruct predictions, leaving rows with NaNs intact
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred_test
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        predicted_da = xr.DataArray(
-            data=predictions_reshaped,
-            coords={'T': time, 'Y': lat, 'X': lon},
-            dims=['T', 'Y', 'X']
-        )
-        return predicted_da
-
-    # ------------------ Probability Calculation Methods ------------------
-    @staticmethod
-    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Student's t-based method
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            # Transform thresholds
-            first_t = (first_tercile - best_guess) / error_std
-            second_t = (second_tercile - best_guess) / error_std
-
-            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best guess values.
-        error_variance : array-like
-            Variance associated with forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-            
-        Returns
-        -------
-        pred_prob : np.ndarray
-            A 3 x n_time array with probabilities for being below the first tercile,
-            between the first and second tercile, and above the second tercile.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-    
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
-            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
-        return pred_prob
-    @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
-        """Gamma-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=float)
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        best_guess = np.asarray(best_guess, dtype=float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        T1 = np.asarray(T1, dtype=float)
-        T2 = np.asarray(T2, dtype=float)
-        alpha = (best_guess ** 2) / error_variance
-        theta = error_variance / best_guess
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
-        pred_prob[0, :] = cdf_t1
-        pred_prob[1, :] = cdf_t2 - cdf_t1
-        pred_prob[2, :] = 1.0 - cdf_t2
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
-        """Normal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
-        """Lognormal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
-        mu = np.log(best_guess) - sigma ** 2 / 2
-        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
-        return pred_prob
-
-    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
-        """
-        Compute tercile probabilities using the chosen distribution method.
-        Predictant is expected to be an xarray DataArray with dimensions (T, Y, X).
-        """
-        
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
-        # Ensure Predictant is (T, Y, X)
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)  
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('T',), (), ()],
-                output_core_dims=[('probability','T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-    @staticmethod
-    def _reshape_and_filter_data(da):
-        """
-        Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
-        and remove rows containing NaNs.
-        """
-        da_stacked = da.stack(sample=('T', 'Y', 'X'))
-        if 'M' in da.dims:
-            da_stacked = da_stacked.transpose('sample', 'M')
-        else:
-            da_stacked = da_stacked.transpose('sample')
-        da_values = da_stacked.values
-        nan_mask = np.any(np.isnan(da_values), axis=1)
-        return da_values[~nan_mask], nan_mask, da_values
-
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
-        """
-        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
-
-        Fits the stacking ensemble (KNN and Decision Tree base models with an SVR meta-model)
-        on standardized hindcast data, predicts deterministic values for the target year,
-        reverses standardization, and computes tercile probabilities.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast data for training with dimensions (T, M, Y, X).
-        hindcast_det_cross : xarray.DataArray
-            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
-        Predictor_for_year : xarray.DataArray
-            Predictor data for the target year with dimensions (T, M, Y, X).
-
-        Returns
-        -------
-        result_da : xarray.DataArray
-            Deterministic forecast with dimensions (T, Y, X).
-        hindcast_prob : xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where probability
-            includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
-        """
-        mask = xr.where(~np.isnan(Predictant.isel(T=0, M=0)), 1, np.nan)\
-                .drop_vars(['T', 'M']).squeeze()
-        mask.name = None
-        
-        # Standardize the predictor for the target year using hindcast climatology
-        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        y_test = Predictant_st.isel(T=[-1])
-        
-        # Initialize stacking ensemble if not already done
-        self.base_models = [
-            ('knn', KNeighborsRegressor(n_neighbors=self.n_neighbors)),
-            ('tree', DecisionTreeRegressor(max_depth=self.tree_max_depth, random_state=self.random_state))
-        ]
-        self.meta_model = SVR(C=self.svr_C, kernel=self.svr_kernel)
-        self.stacking_model = StackingRegressor(estimators=self.base_models, final_estimator=self.meta_model)
-        
-        # Extract coordinates from X_test
-        time = Predictor_for_year_st['T']
-        lat = Predictor_for_year_st['Y']
-        lon = Predictor_for_year_st['X']
-        n_time = len(Predictor_for_year_st.coords['T'])
-        n_lat = len(Predictor_for_year_st.coords['Y'])
-        n_lon = len(Predictor_for_year_st.coords['X'])
-        
-        # Stack training data and remove rows with NaNs
-        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))        
-        # Fit the MLP model
-        self.stacking_model.fit(X_train_clean, y_train_clean)
-        y_pred = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-            
-        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        result_da['T'] = result_da['T'].astype('datetime64[ns]')        
-        
-        # Compute tercile probabilities on predictions
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-            
-            
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_da,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability','T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                result_,
-                error_samples,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), ('S',), (), ()],
-                output_core_dims=[('probability','T')],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
-
-class WAS_mme_StackXGboost_Ml:
-    """
-    Stacking ensemble with XGBoost base model and Linear Regression meta-model for Multi-Model Ensemble (MME) forecasting.
-
-    This class implements a stacking ensemble using XGBRegressor as the base model,
-    with a LinearRegression meta-model, for deterministic forecasting and optional tercile probability calculations.
-
-    Parameters
-    ----------
-    n_estimators : int, optional
-        Number of gradient boosted trees in XGBoost. Default is 100.
-    max_depth : int, optional
-        Maximum depth of each tree in XGBoost. Default is 3.
-    learning_rate : float, optional
-        Boosting learning rate for XGBoost. Default is 0.1.
-    random_state : int, optional
-        Seed for random number generation for reproducibility. Default is 42.
-    dist_method : str, optional
-        Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
-    """
-    def __init__(
-        self,
-        n_estimators=100,
-        max_depth=3,
-        learning_rate=0.1,
-        random_state=42,
-        dist_method="gamma"
-    ):
-
-        self.n_estimators = n_estimators
-        self.max_depth = max_depth
-        self.learning_rate = learning_rate
-        self.random_state = random_state
-        self.dist_method = dist_method
-
-    def compute_model(self, X_train, y_train, X_test, y_test):
-        """
-        Train a stacking regressor with XGBoost as the base model and 
-        Linear Regression as the meta-model, then generate deterministic
-        predictions on X_test.
-        
-        Parameters
-        ----------
-        X_train : xarray.DataArray
-            Predictor training data with dimensions (T, Y, X, M) or (T, Y, X).
-        y_train : xarray.DataArray
-            Predictand training data with dimensions (T, Y, X, M) or (T, Y, X).
-        X_test : xarray.DataArray
-            Predictor testing data with dimensions (T, Y, X, M) or (T, Y, X).
-        y_test : xarray.DataArray
-            Predictand testing data with dimensions (T, Y, X, M) or (T, Y, X).
-
-        Returns
-        -------
-        predicted_da : xarray.DataArray
-            The predictions over X_test in the original grid shape.
-        """
-        # Initialize the base model (XGBoost)
-        self.base_models = [
-            ('xgb', XGBRegressor(
-                n_estimators=self.n_estimators,
-                max_depth=self.max_depth,
-                learning_rate=self.learning_rate,
-                random_state=self.random_state
-            ))
-        ]
-        
-        # Initialize the meta-model (Linear Regression)
-        self.meta_model = LinearRegression()
-        
-        # Initialize the stacking ensemble
-        self.stacking_model = StackingRegressor(
-            estimators=self.base_models,
-            final_estimator=self.meta_model
-        )
-        
-        # Extract coordinate variables from X_test
-        time = X_test['T']
-        lat = X_test['Y']
-        lon = X_test['X']
-        n_time = len(X_test.coords['T'])
-        n_lat  = len(X_test.coords['Y'])
-        n_lon  = len(X_test.coords['X'])
-        
-        # Stack training data
-        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
-        
-        # Stack testing data
-        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-        
-        # Fit the stacking ensemble only on rows without NaNs
-        self.stacking_model.fit(X_train_clean, y_train_clean)
-        y_pred_test = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Rebuild the predictions into the original shape,
-        # leaving NaN rows intact.
-        # Reconstruct predictions, leaving rows with NaNs intact
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred_test
-        
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        predicted_da = xr.DataArray(
-            data=predictions_reshaped,
-            coords={'T': time, 'Y': lat, 'X': lon},
-            dims=['T', 'Y', 'X']
-        )
-        return predicted_da
-
-    # ------------------ Probability Calculation Methods ------------------
-    @staticmethod
-    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Student's t-based method
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            # Transform thresholds
-            first_t = (first_tercile - best_guess) / error_std
-            second_t = (second_tercile - best_guess) / error_std
-
-            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """
-        Weibull minimum-based method.
-        
-        Here, we assume:
-          - best_guess is used as the location,
-          - error_std (sqrt(error_variance)) as the scale, and 
-          - dof (degrees of freedom) as the shape parameter.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-    
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-    
-            # Using the weibull_min CDF with best_guess as loc and error_std as scale.
-            # Note: Adjust these assumptions if your application requires a different parameterization.
-            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                               stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-    
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
-        """Gamma-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=float)
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-
-        best_guess = np.asarray(best_guess, dtype=float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        T1 = np.asarray(T1, dtype=float)
-        T2 = np.asarray(T2, dtype=float)
-
-        alpha = (best_guess ** 2) / error_variance
-        theta = error_variance / best_guess
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
-        pred_prob[0, :] = cdf_t1
-        pred_prob[1, :] = cdf_t2 - cdf_t1
-        pred_prob[2, :] = 1.0 - cdf_t2
-
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
-        """Normal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
-        """Lognormal-distribution based method."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
-        mu = np.log(best_guess) - sigma ** 2 / 2
-        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
-        return pred_prob
-
-    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
-        """
-        Compute tercile probabilities using the chosen distribution method.
-        This method extracts the climatology terciles from Predictant over the period
-        [clim_year_start, clim_year_end], computes an error variance (or uses error samples),
-        and then applies the chosen probability function.
-        """
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-        
-        # Ensure Predictant is (T, Y, X)
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        
-        # For error variance, here we use the difference between Predictant and hindcast_det
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
-        # Choose the appropriate probability calculation function
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                terciles.isel(quantile=0).drop_vars('quantile'),
-                terciles.isel(quantile=1).drop_vars('quantile'),
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            # For nonparametric, assume hindcast_det contains error samples
             calc_func = self.calculate_tercile_probabilities_nonparametric
             error_samples = (Predictant - hindcast_det)
             hindcast_prob = xr.apply_ufunc(
@@ -9720,7 +8878,7 @@ class WAS_mme_StackXGboost_Ml:
                 vectorize=True,
                 dask='parallelized',
                 output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
         elif self.dist_method == "normal":
             calc_func = self.calculate_tercile_probabilities_normal
@@ -9735,7 +8893,7 @@ class WAS_mme_StackXGboost_Ml:
                 dask='parallelized',
                 output_core_dims=[('probability', 'T')],
                 output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
         elif self.dist_method == "lognormal":
             calc_func = self.calculate_tercile_probabilities_lognormal
@@ -9750,7 +8908,7 @@ class WAS_mme_StackXGboost_Ml:
                 dask='parallelized',
                 output_core_dims=[('probability', 'T')],
                 output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}.")
@@ -9762,7 +8920,7 @@ class WAS_mme_StackXGboost_Ml:
     def _reshape_and_filter_data(da):
         """
         Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
-        and remove any rows with NaNs.
+        and remove rows containing NaNs.
         """
         da_stacked = da.stack(sample=('T', 'Y', 'X'))
         if 'M' in da.dims:
@@ -9773,61 +8931,50 @@ class WAS_mme_StackXGboost_Ml:
         nan_mask = np.any(np.isnan(da_values), axis=1)
         return da_values[~nan_mask], nan_mask, da_values
 
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year):
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year, best_params=None):
         """
-        Forecast method that uses the trained stacking ensemble to predict for a new year,
-        then computes tercile probabilities.
-        
+        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
+
         Parameters
         ----------
         Predictant : xarray.DataArray
-            Historical predictand data.
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
         clim_year_start : int or str
-            Start of the climatology period (e.g., 1981).
+            Start year of the climatology period.
         clim_year_end : int or str
-            End of the climatology period (e.g., 2010).
+            End year of the climatology period.
         hindcast_det : xarray.DataArray
-            Deterministic hindcasts used for training (predictors).
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
         hindcast_det_cross : xarray.DataArray
-            Deterministic hindcasts for cross-validation (for error estimation).
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
         Predictor_for_year : xarray.DataArray
-            Predictor data for the target forecast year.
-        
+            Predictor data for the target year with dimensions (T, M, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters for 'rf' and 'mlp'. If None, computes internally.
+
         Returns
         -------
         result_da : xarray.DataArray
-            The deterministic forecast for the target year.
+            Deterministic forecast with dimensions (T, Y, X).
         hindcast_prob : xarray.DataArray
-            Tercile probability forecast for the target year.
+            Tercile probabilities with dimensions (probability, T, Y, X).
         """
-        mask = xr.where(~np.isnan(Predictant.isel(T=0, M=0)), 1, np.nan)\
-                .drop_vars(['T', 'M']).squeeze()
-        mask.name = None
-        
-        # Standardize the predictor for the target year using hindcast climatology
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        # Standardize Predictor_for_year using hindcast climatology
         mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
         std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
         Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        
+
         hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
         y_test = Predictant_st.isel(T=[-1])
-        
-        # Initialize stacking ensemble (if not already done or to retrain)
-        self.base_models = [
-            ('xgb', XGBRegressor(
-                n_estimators=self.n_estimators,
-                max_depth=self.max_depth,
-                learning_rate=self.learning_rate,
-                random_state=self.random_state
-            ))
-        ]
-        self.meta_model = LinearRegression()
-        self.stacking_model = StackingRegressor(
-            estimators=self.base_models,
-            final_estimator=self.meta_model
-        )
-        
+
         # Extract coordinates from X_test
         time = Predictor_for_year_st['T']
         lat = Predictor_for_year_st['Y']
@@ -9835,54 +8982,65 @@ class WAS_mme_StackXGboost_Ml:
         n_time = len(Predictor_for_year_st.coords['T'])
         n_lat = len(Predictor_for_year_st.coords['Y'])
         n_lon = len(Predictor_for_year_st.coords['X'])
-        
+
         # Stack training data and remove rows with NaNs
         X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # train_nan_mask = np.any(np.isnan(X_train_stacked), axis=1) | np.any(np.isnan(y_train_stacked), axis=1)
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
-        
+        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-        
+
         # Stack testing data
         X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        # test_nan_mask = np.any(np.isnan(X_test_stacked), axis=1) | np.any(np.isnan(y_test_stacked), axis=1)
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))         
-        # Fit the stacking model
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+        # Initialize base model (Random Forest)
+        rf = RandomForestRegressor(**best_params['rf'], random_state=self.random_state)
+        base_models = [('rf', rf)]
+
+        # Initialize meta-model (MLP)
+        meta_model = MLPRegressor(**best_params['mlp'], max_iter=self.max_iter, random_state=self.random_state)
+
+        # Initialize stacking ensemble
+        self.stacking_model = StackingRegressor(estimators=base_models, final_estimator=meta_model)
+
+        # Fit the stacking model on clean training data
         self.stacking_model.fit(X_train_clean, y_train_clean)
+
+        # Predict on clean test data
         y_pred = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
-        
-        # Reconstruct the prediction array (keeping NaN rows intact)
+
+        # Reconstruct the prediction array
         result = np.empty_like(np.squeeze(y_test_stacked))
         result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
         result[~np.squeeze(test_nan_mask)] = y_pred
-        
+
         predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
         result_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])* mask
-        result_da = reverse_standardize(result_da, Predictant.isel(M=0).drop_vars("M").squeeze(),
-                                        clim_year_start, clim_year_end)
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        
-        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
+                                 coords={'T': time, 'Y': lat, 'X': lon},
+                                 dims=['T', 'Y', 'X']) * mask
+
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
         new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
         result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        result_da['T'] = result_da['T'].astype('datetime64[ns]')        
-        
-        # Compute tercile probabilities on predictions
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        result_da['T'] = result_da['T'].astype('datetime64[ns]')
+
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        error_variance = (Predictant - hindcast_det_cross).var(dim='T')
-        dof = len(Predictant.get_index("T")) - 2
-        
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant_no_m.get_index("T")) - 2
+
         if self.dist_method == "t":
             calc_func = self.calculate_tercile_probabilities
             hindcast_prob = xr.apply_ufunc(
@@ -9897,7 +9055,448 @@ class WAS_mme_StackXGboost_Ml:
                 dask='parallelized',
                 output_core_dims=[('probability','T')],
                 output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = Predictant_no_m - hindcast_det_cross
+            error_samples = error_samples.rename({'T': 'S'})
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('S',), (), ()],
+                output_core_dims=[('probability','T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+
+
+
+
+
+
+class WAS_mme_StackXGboost_MLP:
+    """
+    Stacking ensemble with XGBoost base model and MLP meta-model for Multi-Model Ensemble (MME) forecasting.
+    This class implements a stacking ensemble using XGBRegressor as the base model,
+    with an MLPRegressor meta-model, for deterministic forecasting and optional tercile probability calculations.
+    Implements hyperparameter optimization via randomized search for both base and meta models.
+
+    Parameters
+    ----------
+    n_estimators_range : list of int, optional
+        List of n_estimators values to tune for XGBoost (default is [50, 100, 200, 300]).
+    learning_rate_range : list of float, optional
+        List of learning rates to tune for XGBoost (default is [0.01, 0.05, 0.1, 0.2]).
+    max_depth_range : list of int, optional
+        List of max depths to tune for XGBoost (default is [3, 5, 7, 9]).
+    min_child_weight_range : list of float, optional
+        List of minimum child weights to tune for XGBoost (default is [1, 3, 5]).
+    subsample_range : list of float, optional
+        List of subsample ratios to tune for XGBoost (default is [0.6, 0.8, 1.0]).
+    colsample_bytree_range : list of float, optional
+        List of column sampling ratios to tune for XGBoost (default is [0.6, 0.8, 1.0]).
+    hidden_layer_sizes_range : list of tuples, optional
+        List of hidden layer sizes to tune for MLP (default is [(10,), (10, 5), (20, 10)]).
+    activation_options : list of str, optional
+        Activation functions to tune for MLP (default is ['relu', 'tanh', 'logistic']).
+    solver_options : list of str, optional
+        Solvers to tune for MLP (default is ['adam', 'sgd', 'lbfgs']).
+    alpha_range : list of float, optional
+        L2 regularization parameters to tune for MLP (default is [0.0001, 0.001, 0.01, 0.1]).
+    max_iter : int, optional
+        Maximum iterations for MLP (default is 200).
+    random_state : int, optional
+        Seed for reproducibility (default is 42).
+    dist_method : str, optional
+        Distribution method for tercile probabilities ('t', 'gamma', etc.) (default is 'gamma').
+    n_iter_search : int, optional
+        Number of iterations for randomized search (default is 10).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 3).
+    """
+    def __init__(self,
+                 n_estimators_range=[50, 100, 200, 300],
+                 learning_rate_range=[0.01, 0.05, 0.1, 0.2],
+                 max_depth_range=[3, 5, 7, 9],
+                 min_child_weight_range=[1, 3, 5],
+                 subsample_range=[0.6, 0.8, 1.0],
+                 colsample_bytree_range=[0.6, 0.8, 1.0],
+                 hidden_layer_sizes_range=[(10,), (10, 5), (20, 10)],
+                 activation_options=['relu', 'tanh', 'logistic'],
+                 solver_options=['adam', 'sgd', 'lbfgs'],
+                 alpha_range=[0.0001, 0.001, 0.01, 0.1],
+                 max_iter=200,
+                 random_state=42,
+                 dist_method="gamma",
+                 n_iter_search=10,
+                 cv_folds=3):
+        self.n_estimators_range = n_estimators_range
+        self.learning_rate_range = learning_rate_range
+        self.max_depth_range = max_depth_range
+        self.min_child_weight_range = min_child_weight_range
+        self.subsample_range = subsample_range
+        self.colsample_bytree_range = colsample_bytree_range
+        self.hidden_layer_sizes_range = hidden_layer_sizes_range
+        self.activation_options = activation_options
+        self.solver_options = solver_options
+        self.alpha_range = alpha_range
+        self.max_iter = max_iter
+        self.random_state = random_state
+        self.dist_method = dist_method
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
+        self.stacking_model = None
+
+    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
+        """
+        Independently computes the best hyperparameters using randomized search on stacked training data.
+
+        Parameters
+        ----------
+        Predictors : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        Predictand : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        clim_year_start : int
+            Start year of the climatology period.
+        clim_year_end : int
+            End year of the climatology period.
+
+        Returns
+        -------
+        dict
+            Best hyperparameters found.
+        """
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # For XGBoost (base model)
+        param_dist_xgb = {
+            'n_estimators': self.n_estimators_range,
+            'learning_rate': self.learning_rate_range,
+            'max_depth': self.max_depth_range,
+            'min_child_weight': self.min_child_weight_range,
+            'subsample': self.subsample_range,
+            'colsample_bytree': self.colsample_bytree_range
+        }
+        model_xgb = XGBRegressor(random_state=self.random_state, verbosity=0)
+        random_search_xgb = RandomizedSearchCV(
+            model_xgb, param_distributions=param_dist_xgb, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+        random_search_xgb.fit(X_train_clean, y_train_clean)
+        best_xgb = random_search_xgb.best_params_
+
+        # For MLP (meta model)
+        param_dist_mlp = {
+            'hidden_layer_sizes': self.hidden_layer_sizes_range,
+            'activation': self.activation_options,
+            'solver': self.solver_options,
+            'alpha': self.alpha_range
+        }
+        model_mlp = MLPRegressor(max_iter=self.max_iter, random_state=self.random_state)
+        random_search_mlp = RandomizedSearchCV(
+            model_mlp, param_distributions=param_dist_mlp, n_iter=self.n_iter_search,
+            cv=self.cv_folds, scoring='neg_mean_squared_error',
+            random_state=self.random_state, error_score=np.nan
+        )
+        random_search_mlp.fit(X_train_clean, y_train_clean)
+        best_mlp = random_search_mlp.best_params_
+
+        return {'xgb': best_xgb, 'mlp': best_mlp}
+
+    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        """
+        Compute deterministic hindcast using the stacking ensemble of XGBoost (base) and MLP (meta).
+
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data with dimensions (T, M, Y, X).
+        y_train : xarray.DataArray
+            Training predictand data with dimensions (T, Y, X).
+        X_test : xarray.DataArray
+            Testing predictor data with dimensions (T, M, Y, X).
+        y_test : xarray.DataArray
+            Testing predictand data with dimensions (T, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters for 'xgb' and 'mlp'. If None, computes internally.
+
+        Returns
+        -------
+        predicted_da : xarray.DataArray
+            Deterministic hindcast with dimensions (T, Y, X).
+        """
+        # Extract coordinate variables from X_test
+        time = X_test['T']
+        lat = X_test['Y']
+        lon = X_test['X']
+        n_time = len(X_test.coords['T'])
+        n_lat = len(X_test.coords['Y'])
+        n_lon = len(X_test.coords['X'])
+
+        # Stack training data
+        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Stack testing data
+        X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+        # Initialize base model (XGBoost)
+        xgb = XGBRegressor(**best_params['xgb'], random_state=self.random_state, verbosity=0)
+        base_models = [('xgb', xgb)]
+
+        # Initialize meta-model (MLP)
+        meta_model = MLPRegressor(**best_params['mlp'], max_iter=self.max_iter, random_state=self.random_state)
+
+        # Initialize stacking ensemble
+        self.stacking_model = StackingRegressor(estimators=base_models, final_estimator=meta_model)
+
+        # Fit the stacking model on clean training data
+        self.stacking_model.fit(X_train_clean, y_train_clean)
+
+        # Predict on clean test data
+        y_pred_test = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
+
+        # Reconstruct predictions
+        result = np.empty_like(np.squeeze(y_test_stacked))
+        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
+        result[~np.squeeze(test_nan_mask)] = y_pred_test
+
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        predicted_da = xr.DataArray(data=predictions_reshaped,
+                                    coords={'T': time, 'Y': lat, 'X': lon},
+                                    dims=['T', 'Y', 'X'])
+        return predicted_da
+
+    # ------------------ Probability Calculation Methods ------------------
+    @staticmethod
+    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Student's t-based method
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            first_t = (first_tercile - best_guess) / error_std
+            second_t = (second_tercile - best_guess) / error_std
+            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
+            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
+            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
+        """
+        Weibull minimum-based method.
+        """
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
+                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2, dof=None):
+        """Gamma-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time), dtype=float)
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        T1 = np.asarray(T1, dtype=float)
+        T2 = np.asarray(T2, dtype=float)
+        alpha = (best_guess ** 2) / error_variance
+        theta = error_variance / best_guess
+        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
+        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
+        pred_prob[0, :] = cdf_t1
+        pred_prob[1, :] = cdf_t2 - cdf_t1
+        pred_prob[2, :] = 1.0 - cdf_t2
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        """Non-parametric method using historical error samples."""
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+        for t in range(n_time):
+            if np.isnan(best_guess[t]):
+                continue
+            dist = best_guess[t] + error_samples
+            dist = dist[np.isfinite(dist)]
+            if len(dist) == 0:
+                continue
+            p_below = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above = 1.0 - (p_below + p_between)
+            pred_prob[0, t] = p_below
+            pred_prob[1, t] = p_between
+            pred_prob[2, t] = p_above
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+        """Normal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.all(np.isnan(best_guess)):
+            pred_prob[:] = np.nan
+        else:
+            error_std = np.sqrt(error_variance)
+            pred_prob[0, :] = norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[1, :] = norm.cdf(second_tercile, loc=best_guess, scale=error_std) - norm.cdf(first_tercile, loc=best_guess, scale=error_std)
+            pred_prob[2, :] = 1 - norm.cdf(second_tercile, loc=best_guess, scale=error_std)
+        return pred_prob
+
+    @staticmethod
+    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
+        """Lognormal-distribution based method."""
+        n_time = len(best_guess)
+        pred_prob = np.empty((3, n_time))
+        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
+            pred_prob[:] = np.nan
+            return pred_prob
+        sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
+        mu = np.log(best_guess) - sigma ** 2 / 2
+        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
+        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
+        return pred_prob
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
+        """
+        Compute tercile probabilities using the chosen distribution method.
+        Predictant is expected to be an xarray DataArray with dims (T, Y, X).
+        """
+        if "M" in Predictant.coords:
+            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        Predictant = Predictant.transpose('T', 'Y', 'X')
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant - hindcast_det).var(dim='T')
+        dof = len(Predictant.get_index("T")) - 2
+
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
         elif self.dist_method == "weibull_min":
             calc_func = self.calculate_tercile_probabilities_weibull_min
@@ -9915,8 +9514,228 @@ class WAS_mme_StackXGboost_Ml:
                 output_dtypes=['float'],
                 dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
-            
-            
+        elif self.dist_method == "gamma":
+            calc_func = self.calculate_tercile_probabilities_gamma
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "nonparam":
+            calc_func = self.calculate_tercile_probabilities_nonparametric
+            error_samples = (Predictant - hindcast_det)
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_samples,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), ('T',), (), ()],
+                output_core_dims=[('probability', 'T')],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[float],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "normal":
+            calc_func = self.calculate_tercile_probabilities_normal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "lognormal":
+            calc_func = self.calculate_tercile_probabilities_lognormal
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                hindcast_det,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}.")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+
+    @staticmethod
+    def _reshape_and_filter_data(da):
+        """
+        Helper: stack the DataArray from (T, Y, X[, M]) to (n_samples, n_features)
+        and remove rows containing NaNs.
+        """
+        da_stacked = da.stack(sample=('T', 'Y', 'X'))
+        if 'M' in da.dims:
+            da_stacked = da_stacked.transpose('sample', 'M')
+        else:
+            da_stacked = da_stacked.transpose('sample')
+        da_values = da_stacked.values
+        nan_mask = np.any(np.isnan(da_values), axis=1)
+        return da_values[~nan_mask], nan_mask, da_values
+
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year, best_params=None):
+        """
+        Generate deterministic and probabilistic forecast for a target year using the stacking ensemble.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed predictand data with dimensions (T, Y, X) or (T, M, Y, X).
+        clim_year_start : int or str
+            Start year of the climatology period.
+        clim_year_end : int or str
+            End year of the climatology period.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast data for training with dimensions (T, M, Y, X).
+        hindcast_det_cross : xarray.DataArray
+            Deterministic hindcast data for error estimation with dimensions (T, Y, X).
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the target year with dimensions (T, M, Y, X).
+        best_params : dict, optional
+            Pre-computed best hyperparameters for 'xgb' and 'mlp'. If None, computes internally.
+
+        Returns
+        -------
+        result_da : xarray.DataArray
+            Deterministic forecast with dimensions (T, Y, X).
+        hindcast_prob : xarray.DataArray
+            Tercile probabilities with dimensions (probability, T, Y, X).
+        """
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+        # Standardize Predictor_for_year using hindcast climatology
+        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
+        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
+        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
+
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
+        y_test = Predictant_st.isel(T=[-1])
+
+        # Extract coordinates from X_test
+        time = Predictor_for_year_st['T']
+        lat = Predictor_for_year_st['Y']
+        lon = Predictor_for_year_st['X']
+        n_time = len(Predictor_for_year_st.coords['T'])
+        n_lat = len(Predictor_for_year_st.coords['Y'])
+        n_lon = len(Predictor_for_year_st.coords['X'])
+
+        # Stack training data and remove rows with NaNs
+        X_train_stacked = hindcast_det_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train_stacked = Predictant_st.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
+        X_train_clean = X_train_stacked[~train_nan_mask]
+        y_train_clean = y_train_stacked[~train_nan_mask]
+
+        # Stack testing data
+        X_test_stacked = Predictor_for_year_st.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+
+        # Use provided best_params or compute if None
+        if best_params is None:
+            best_params = self.compute_hyperparameters(X_train_clean, y_train_clean)
+
+        # Initialize base model (XGBoost)
+        xgb = XGBRegressor(**best_params['xgb'], random_state=self.random_state, verbosity=0)
+        base_models = [('xgb', xgb)]
+
+        # Initialize meta-model (MLP)
+        meta_model = MLPRegressor(**best_params['mlp'], max_iter=self.max_iter, random_state=self.random_state)
+
+        # Initialize stacking ensemble
+        self.stacking_model = StackingRegressor(estimators=base_models, final_estimator=meta_model)
+
+        # Fit the stacking model
+        self.stacking_model.fit(X_train_clean, y_train_clean)
+        y_pred = self.stacking_model.predict(X_test_stacked[~test_nan_mask])
+
+        # Reconstruct the prediction array
+        result = np.empty_like(np.squeeze(y_test_stacked))
+        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
+        result[~np.squeeze(test_nan_mask)] = y_pred
+
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        result_da = xr.DataArray(data=predictions_reshaped,
+                                 coords={'T': time, 'Y': lat, 'X': lon},
+                                 dims=['T', 'Y', 'X']) * mask
+
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
+        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        result_da['T'] = result_da['T'].astype('datetime64[ns]')
+
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = len(Predictant_no_m.get_index("T")) - 2
+
+        if self.dist_method == "t":
+            calc_func = self.calculate_tercile_probabilities
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability','T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
+        elif self.dist_method == "weibull_min":
+            calc_func = self.calculate_tercile_probabilities_weibull_min
+            hindcast_prob = xr.apply_ufunc(
+                calc_func,
+                result_da,
+                error_variance,
+                terciles.isel(quantile=0).drop_vars('quantile'),
+                terciles.isel(quantile=1).drop_vars('quantile'),
+                input_core_dims=[('T',), (), (), ()],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask='parallelized',
+                output_core_dims=[('probability', 'T')],
+                output_dtypes=['float'],
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
+            )
         elif self.dist_method == "gamma":
             calc_func = self.calculate_tercile_probabilities_gamma
             hindcast_prob = xr.apply_ufunc(
@@ -9930,7 +9749,7 @@ class WAS_mme_StackXGboost_Ml:
                 dask='parallelized',
                 output_core_dims=[('probability','T')],
                 output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
         elif self.dist_method == "normal":
             calc_func = self.calculate_tercile_probabilities_normal
@@ -9945,7 +9764,7 @@ class WAS_mme_StackXGboost_Ml:
                 dask='parallelized',
                 output_core_dims=[('probability','T')],
                 output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
         elif self.dist_method == "lognormal":
             calc_func = self.calculate_tercile_probabilities_lognormal
@@ -9960,15 +9779,15 @@ class WAS_mme_StackXGboost_Ml:
                 dask='parallelized',
                 output_core_dims=[('probability','T')],
                 output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
             )
         elif self.dist_method == "nonparam":
             calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = Predictant - hindcast_det_cross
-            error_samples = error_samples.rename({'T':'S'})
+            error_samples = Predictant_no_m - hindcast_det_cross
+            error_samples = error_samples.rename({'T': 'S'})
             hindcast_prob = xr.apply_ufunc(
                 calc_func,
-                result_,
+                result_da,
                 error_samples,
                 terciles.isel(quantile=0).drop_vars('quantile'),
                 terciles.isel(quantile=1).drop_vars('quantile'),
@@ -9981,7 +9800,7 @@ class WAS_mme_StackXGboost_Ml:
             )
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}.")
-        
+
         hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_da * mask, mask * hindcast_prob.transpose('probability', 'T', 'Y', 'X')
 
@@ -10479,7 +10298,7 @@ class WAS_mme_RoebberGA:
         X_test : xarray.DataArray
             Testing predictor data with dimensions (T, Y, X, M).
         y_test : xarray.DataArray, optional
-            Test predictand data. Not directly used for prediction, but included for API compatibility. Default is None.
+            Test predictand data.  Default is None.
 
         Returns
         -------
@@ -11174,7 +10993,7 @@ class WAS_mme_NGR_Model:
         self.estimation_method = estimation_method
         self.nb_cores = nb_cores
 
-    def fit_predict(self, X, y, X_test):
+    def fit_predict(self, X, y, X_test, t33, t67):
         """
         Trains the NGR model on (X, y) and predicts tercile class probabilities for X_test.
 
@@ -11205,11 +11024,11 @@ class WAS_mme_NGR_Model:
             y_clean = y[mask]
             X_clean = X[mask, :]
 
-            # Compute terciles from training observations
-            terciles = np.nanpercentile(y_clean, [33, 67])
-            t33, t67 = terciles
+            # # Compute terciles from training observations
+            # terciles = np.nanpercentile(y_clean, [33, 67])
+            # t33, t67 = terciles
 
-            if np.isnan(t33):
+            if np.isnan(t33) or np.isnan(t67):
                 return np.full((3, n_test), np.nan)
 
             # Fit NGR
@@ -11236,7 +11055,7 @@ class WAS_mme_NGR_Model:
         else:
             return np.full((3, n_test), np.nan)
 
-    def compute_model(self, X_train, y_train, X_test):
+    def compute_model(self, X_train, y_train, X_test, Predictant=None, clim_year_start=None, clim_year_end=None):
         """
         Computes NGR-based class probabilities for each grid cell in `y_train`.
 
@@ -11254,6 +11073,23 @@ class WAS_mme_NGR_Model:
         xarray.DataArray
             Class probabilities (3, forecast) for each grid cell.
         """
+
+        if Predictant is not None and clim_year_start is not None and clim_year_end is not None:
+            
+            index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+            index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+            rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+            terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+            T1 = terciles.isel(quantile=0).drop_vars('quantile')
+            T2 = terciles.isel(quantile=1).drop_vars('quantile')
+
+        else:
+
+            terciles = y_train.quantile([0.33, 0.67], dim='T')
+            T1 = terciles.isel(quantile=0).drop_vars('quantile')
+            T2 = terciles.isel(quantile=1).drop_vars('quantile')            
+            
+        
         # Chunk sizes
         chunksize_x = np.round(len(y_train.get_index("X")) / self.nb_cores)
         chunksize_y = np.round(len(y_train.get_index("Y")) / self.nb_cores)
@@ -11277,7 +11113,9 @@ class WAS_mme_NGR_Model:
             X_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             X_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[('T', 'M'), ('T',), ('forecast', 'M')],
+            T1.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            T2.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[('T', 'M'), ('T',), ('forecast', 'M'), (), ()],
             output_core_dims=[('probability', 'forecast')],  
             vectorize=True,
             dask='parallelized',
@@ -11293,7 +11131,7 @@ class WAS_mme_NGR_Model:
 
         return result_
 
-    def forecast(self, Predictant, Predictor, Predictor_for_year):
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, Predictor_for_year):
         """
         Runs the NGR model on a single forecast year.
 
@@ -11312,6 +11150,18 @@ class WAS_mme_NGR_Model:
             Probability of each tercile class (PB, PN, PA) for every grid cell, 
             with the time dimension for the forecast.
         """
+        if "M" in Predictant.coords:
+            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant = Predictant   
+            
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        T1 = terciles.isel(quantile=0).drop_vars('quantile')
+        T2 = terciles.isel(quantile=1).drop_vars('quantile')
+   
         # Chunk sizes
         chunksize_x = np.round(len(Predictant.get_index("X")) / self.nb_cores)
         chunksize_y = np.round(len(Predictant.get_index("Y")) / self.nb_cores)
@@ -11334,7 +11184,9 @@ class WAS_mme_NGR_Model:
             Predictor.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             Predictant.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             Predictor_for_year_.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[('T', 'M'), ('T',), ('forecast', 'M')],
+            T1.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            T2.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[('T', 'M'), ('T',), ('forecast', 'M'), (), ()],
             output_core_dims=[('probability', 'forecast')],
             vectorize=True,
             dask='parallelized',
@@ -11626,7 +11478,7 @@ class WAS_mme_FlexibleNGR_Model:
         self.distribution = distribution
         self.nb_cores = nb_cores
 
-    def fit_predict(self, X, y, X_test):
+    def fit_predict(self, X, y, X_test, t33, t67):
         """
         Trains the FlexibleNGR on (X, y) and predicts tercile class probabilities for X_test.
 
@@ -11657,9 +11509,9 @@ class WAS_mme_FlexibleNGR_Model:
             y_clean = y[mask]
             X_clean = X[mask, :]
 
-            # Compute empirical terciles from training observations
-            terciles = np.nanpercentile(y_clean, [33.333333333333336, 66.66666666666667])
-            t33, t67 = terciles
+            # # Compute empirical terciles from training observations
+            # terciles = np.nanpercentile(y_clean, [33.333333333333336, 66.66666666666667])
+            # t33, t67 = terciles
 
             if np.isnan(t33) or np.isnan(t67):
                 return np.full((3, n_test), np.nan)
@@ -11691,7 +11543,7 @@ class WAS_mme_FlexibleNGR_Model:
         else:
             return np.full((3, n_test), np.nan)
 
-    def compute_model(self, X_train, y_train, X_test):
+    def compute_model(self, X_train, y_train, X_test, Predictant=None, clim_year_start=None, clim_year_end=None):
         """
         Computes Flexible NGR-based class probabilities for each grid cell.
 
@@ -11709,6 +11561,22 @@ class WAS_mme_FlexibleNGR_Model:
         xarray.DataArray
             Class probabilities (probability=3, forecast, Y, X).
         """
+
+        if Predictant is not None and clim_year_start is not None and clim_year_end is not None:
+            
+            index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+            index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+            rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+            terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+            T1 = terciles.isel(quantile=0).drop_vars('quantile')
+            T2 = terciles.isel(quantile=1).drop_vars('quantile')
+
+        else:
+
+            terciles = y_train.quantile([0.33, 0.67], dim='T')
+            T1 = terciles.isel(quantile=0).drop_vars('quantile')
+            T2 = terciles.isel(quantile=1).drop_vars('quantile')
+            
         # Chunk sizes
         chunksize_x = np.round(len(y_train.get_index("X")) / self.nb_cores)
         chunksize_y = np.round(len(y_train.get_index("Y")) / self.nb_cores)
@@ -11731,8 +11599,10 @@ class WAS_mme_FlexibleNGR_Model:
             X_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             X_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[['T', 'M'], ['T'], ['forecast', 'M']],
-            output_core_dims=[['probability', 'forecast']],
+            T1.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            T2.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[('T', 'M'), ('T',), ('forecast', 'M'), (), ()],
+            output_core_dims=[('probability', 'forecast')],
             vectorize=True,
             dask='parallelized',
             output_dtypes=['float'],
@@ -11747,7 +11617,8 @@ class WAS_mme_FlexibleNGR_Model:
 
         return result_.assign_coords(probability=['PB', 'PN', 'PA'])
 
-    def forecast(self, Predictant, Predictor, Predictor_for_year):
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, Predictor_for_year):
+
         """
         Runs the Flexible NGR model for a single forecast period.
 
@@ -11765,6 +11636,18 @@ class WAS_mme_FlexibleNGR_Model:
         xarray.DataArray
             Probabilities (PB, PN, PA, T=1, Y, X) with forecast time.
         """
+        if "M" in Predictant.coords:
+            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant = Predictant
+            
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        T1 = terciles.isel(quantile=0).drop_vars('quantile')
+        T2 = terciles.isel(quantile=1).drop_vars('quantile')
+        
         # Chunk sizes
         chunksize_x = np.round(len(Predictant.get_index("X")) / self.nb_cores)
         chunksize_y = np.round(len(Predictant.get_index("Y")) / self.nb_cores)
@@ -11787,8 +11670,10 @@ class WAS_mme_FlexibleNGR_Model:
             Predictor.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             Predictant.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             Predictor_for_year_.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[['T', 'M'], ['T'], ['forecast', 'M']],
-            output_core_dims=[['probability', 'forecast']],
+            T1.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            T2.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[('T', 'M'), ('T',), ('forecast', 'M'), (), ()],
+            output_core_dims=[('probability', 'forecast')],
             vectorize=True,
             dask='parallelized',
             output_dtypes=['float'],
@@ -11819,15 +11704,15 @@ class WAS_mme_FlexibleNGR_Model:
 ############################### BMA Sloughter modified ###############################
 
 class BMA_Sloughter:
-    def __init__(self, distribution='gaussian'):
+    def __init__(self, distribution='normal'):
         """
         Initialize the BMA model with the specified distribution.
 
         Parameters:
         - distribution: str, one of 'gaussian', 'gamma', 'lognormal', 'weibull', 't' (default: 'gaussian')
         """
-        if distribution not in ['gaussian', 'gamma', 'lognormal', 'weibull', 't']:
-            raise ValueError("Unsupported distribution. Choose from 'gaussian', 'gamma', 'lognormal', 'weibull', 't'.")
+        if distribution not in ['normal', 'gamma', 'lognormal', 'weibull', 't']:
+            raise ValueError("Unsupported distribution. Choose from 'normal', 'gamma', 'lognormal', 'weibull', 't'.")
         self.distribution = distribution
         self.debiasing_models = []
         self.weights = None
@@ -11841,7 +11726,7 @@ class BMA_Sloughter:
 
     def _get_dist_configs(self):
         return {
-            'gaussian': {
+            'normal': {
                 'pdf': lambda y, mu, sigma: norm.pdf(y, loc=mu, scale=sigma),
                 'cdf': lambda q, mu, sigma: norm.cdf(q, loc=mu, scale=sigma),
                 'initial': lambda res: np.std(res) if len(res) > 0 else 1.0,
@@ -11907,7 +11792,7 @@ class BMA_Sloughter:
         disp = np.zeros(m_members)
         for k in range(m_members):
             res_k = observations - μ_train[:, k]
-            if self.distribution in ['gaussian', 't']:
+            if self.distribution in ['normal', 't']:
                 disp[k] = self.config['initial'](res_k)
             else:
                 disp[k] = self.config['initial'](observations, μ_train[:, k])
@@ -12028,7 +11913,7 @@ class BMA_Sloughter:
 
 class WAS_mme_BMA_Sloughter:
     
-    def __init__(self, dist_method='gaussian', nb_cores=1):
+    def __init__(self, dist_method='normal', nb_cores=1):
         
         self.dist_method=dist_method
         self.nb_cores=nb_cores
@@ -12048,7 +11933,7 @@ class WAS_mme_BMA_Sloughter:
         else:
             return np.full((1,), np.nan)
 
-    def predict_proba(self, X, y, X_test):
+    def predict_proba(self, X, y, X_test, t33, t67):
         mask = np.isfinite(y) & np.all(np.isfinite(X), axis=-1)
         
         if np.any(mask):
@@ -12056,9 +11941,9 @@ class WAS_mme_BMA_Sloughter:
             y_clean = y[mask]
             X_clean = X[mask, :]
 
-            # Compute terciles from training observations
-            terciles = np.nanpercentile(y_clean, [33, 67])
-            t33, t67 = terciles
+            # # Compute terciles from training observations
+            # terciles = np.nanpercentile(y_clean, [33, 67])
+            # t33, t67 = terciles
 
             if np.isnan(t33):
                 return np.full(3, np.nan)
@@ -12076,8 +11961,7 @@ class WAS_mme_BMA_Sloughter:
 
     def compute_model(self, X_train, y_train, X_test):
         """
-        Computes NGR-based class probabilities for each grid cell in `y_train`.
-
+        Compute the model for the given training data.
         Parameters
         ----------
         X_train : xarray.DataArray
@@ -12102,7 +11986,12 @@ class WAS_mme_BMA_Sloughter:
         y_train = y_train.transpose('T', 'Y', 'X')
         
         # Squeeze X_test
-        X_test = X_test.transpose('T', 'M', 'Y', 'X')
+        #X_test = X_test.transpose('T', 'M', 'Y', 'X')
+
+        # Handle test dim to avoid conflict
+        if 'T' in X_test.dims:
+            X_test = X_test.rename({'T': 'forecast'})
+        X_test = X_test.transpose('forecast', 'M', 'Y', 'X')
 
         # Dask client
         client = Client(n_workers=self.nb_cores, threads_per_worker=1)
@@ -12112,8 +12001,8 @@ class WAS_mme_BMA_Sloughter:
             X_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             X_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[('T','M'), ('T',), ('T','M')],
-            output_core_dims=[('T',)],  
+            input_core_dims=[('T','M'), ('T',), ('forecast','M')],
+            output_core_dims=[('forecast',)],  
             vectorize=True,
             dask='parallelized',
             output_dtypes=['float']
@@ -12121,12 +12010,12 @@ class WAS_mme_BMA_Sloughter:
         
         result_ = result.compute()
         client.close()
-        return result_
+        return result_.rename({'forecast': 'T'}).transpose('T', 'Y', 'X')
 
 
-    def compute_prob(self, X_train, y_train, X_test):
+    def compute_prob(self, X_train, y_train, X_test, Predictant=None, clim_year_start=None, clim_year_end=None):
         """
-        Computes NGR-based class probabilities for each grid cell in `y_train`.
+        Computes class probabilities for each grid cell in `y_train`.
 
         Parameters
         ----------
@@ -12141,7 +12030,28 @@ class WAS_mme_BMA_Sloughter:
         -------
         xarray.DataArray
             Class probabilities (3) for each grid cell.
+
         """
+
+        if Predictant is not None and clim_year_start is not None and clim_year_end is not None:
+            
+            index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+            index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+            rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+            terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+            T1 = terciles.isel(quantile=0).drop_vars('quantile')
+            T2 = terciles.isel(quantile=1).drop_vars('quantile')
+
+        else:
+            
+            index_start = y_train.get_index("T").get_loc(str(clim_year_start)).start
+            index_end = y_train.get_index("T").get_loc(str(clim_year_end)).stop
+            rainfall_for_tercile = y_train.isel(T=slice(index_start, index_end))
+            terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+            T1 = terciles.isel(quantile=0).drop_vars('quantile')
+            T2 = terciles.isel(quantile=1).drop_vars('quantile')            
+
+        
         # Chunk sizes
         chunksize_x = np.round(len(y_train.get_index("X")) / self.nb_cores)
         chunksize_y = np.round(len(y_train.get_index("Y")) / self.nb_cores)
@@ -12151,8 +12061,10 @@ class WAS_mme_BMA_Sloughter:
         X_train = X_train.transpose('T', 'M', 'Y', 'X')
         y_train = y_train.transpose('T', 'Y', 'X')
         
-        # Squeeze X_test
-        X_test = X_test.transpose('T', 'M', 'Y', 'X')
+        # Handle test dim to avoid conflict
+        if 'T' in X_test.dims:
+            X_test = X_test.rename({'T': 'forecast'})
+        X_test = X_test.transpose('forecast', 'M', 'Y', 'X')
 
         # Dask client
         client = Client(n_workers=self.nb_cores, threads_per_worker=1)
@@ -12162,8 +12074,10 @@ class WAS_mme_BMA_Sloughter:
             X_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
             X_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[('T','M'), ('T',), ('T','M')],
-            output_core_dims=[('probability', 'T')],  
+            T1.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            T2.chunk({'Y': chunksize_y, 'X': chunksize_x}),
+            input_core_dims=[('T','M'), ('T',), ('forecast','M'), (), ()],
+            output_core_dims=[('probability', 'forecast')],  
             vectorize=True,
             dask='parallelized',
             output_dtypes=['float'],
@@ -12172,11 +12086,18 @@ class WAS_mme_BMA_Sloughter:
         
         result_ = result.compute()
         client.close()
-        return result_
+        return result_.rename({'forecast': 'T'}).assign_coords(probability=('probability', ['PB', 'PN', 'PA'])).transpose('probability', 'T', 'Y', 'X')
 
-    def forecast(self, Predictant, Predictor, Predictor_for_year):
-        predict_mean = self.compute_model(Predictant, Predictor, Predictor_for_year)
-        predict_proba = self.compute_prob(Predictant, Predictor, Predictor_for_year)
+    def forecast(self, predictant, clim_year_start, clim_year_end, Predictor, Predictor_for_year):
+        
+        if "M" in predictant.coords:
+            predictant = predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant = Predictant
+            
+        predict_mean = self.compute_model(Predictor, predictant,  Predictor_for_year)
+        predict_proba = self.compute_prob(Predictor, predictant, Predictor_for_year, Predictant=None, clim_year_start=clim_year_start, clim_year_end=clim_year_end)
+        
         return predict_mean, predict_proba
 
 
@@ -12493,7 +12414,7 @@ class WAS_BMA_Sloughter_:
         return result_
 
 
-    def compute_prob(self, X_train, y_train, X_test):
+    def compute_prob(self, X_train, y_train, X_test, Predictant=None, clim_year_start=None, clim_year_end=None):
         """
         Computes NGR-based class probabilities for each grid cell in `y_train`.
 
