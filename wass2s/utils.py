@@ -922,7 +922,7 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
             selected_vars_in_order.extend(matches)        
     return selected_vars_in_order # selected_vars
 
-def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, logo=None, logo_position="lower left", sigma=None, res=None):
+def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, hspace=-0.6, logo=None, logo_position="lower left", sigma=None, res=None):
     """
     Plot probabilistic forecasts with tercile categories.
 
@@ -938,6 +938,12 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
         Labels for the tercile categories (default is ["Below-Normal", "Near-Normal", "Above-Normal"]).
     reverse_cmap : bool, optional
         If True, reverse the colormap order for categories (default is True).
+    hspace : float, optional
+        Height space between the main plot and the colorbar (default is -0.6).
+    sigma : float, optional
+        Standard deviation for Gaussian smoothing of probabilities (default is None, no smoothing).
+    res : float, optional
+        Resolution for interpolation of the forecast probabilities (default is None, no interpolation). 
     logo : str, optional
         Path to the logo image to be added to the plot (default is None).
     logo_size : float, optional

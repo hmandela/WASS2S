@@ -1262,7 +1262,7 @@ class WAS_Download:
                             print(f"Attempt {retries}/{max_retries} failed for {cds_variable} year={year} Part A: {e}")
                             if retries < max_retries:
                                 print(f"Retrying after {retry_delay} seconds...")
-                                time.sleep(retry_delay)
+                                _time.sleep(retry_delay)
                             if zip_file_path.exists():
                                 os.remove(zip_file_path)
                                 print(f"Deleted incomplete ZIP file: {zip_file_path}")
@@ -1319,7 +1319,7 @@ class WAS_Download:
                             print(f"Attempt {retries}/{max_retries} failed for {cds_variable} year={year_next} Part B: {e}")
                             if retries < max_retries:
                                 print(f"Retrying after {retry_delay} seconds...")
-                                time.sleep(retry_delay)
+                                _time.sleep(retry_delay)
                             if zip_file_path.exists():
                                 os.remove(zip_file_path)
                                 print(f"Deleted incomplete ZIP file: {zip_file_path}")
