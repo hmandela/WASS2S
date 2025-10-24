@@ -23,7 +23,7 @@ setup(
         "pykrige",
         "cartopy",
         "xeofs==3.0.4",
-        "numba==0.6.0"
+        "numba==0.6.0",
         "xskillscore==0.0.26",
         "properscoring",
         "minisom",
