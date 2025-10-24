@@ -9,6 +9,7 @@ from scipy.stats import lognorm
 import matplotlib.pyplot as plt
 import xeofs as xe
 from wass2s.utils import *
+import matplotlib.dates as mdates
 
 
 class WAS_CCA_:
@@ -420,7 +421,7 @@ class WAS_CCA_:
 
 
 class WAS_CCA:
-    def __init__(self, n_modes=5, n_pca_modes=10, standardize=False, use_coslat=True, use_pca=True, dist_method="gamma"):
+    def __init__(self, n_modes=4, n_pca_modes=8, standardize=False, use_coslat=True, use_pca=True, dist_method="gamma"):
         """
         Initialize the WAS_CCA class with specified parameters.
 
@@ -1054,8 +1055,8 @@ class WAS_CCA:
             X_score = X_scores.sel(mode=mode)
             Y_score = Y_scores.sel(mode=mode)
             var_Y_X = var_explained_Y_by_X.sel(mode=mode).values * 100
-            ax.plot(X_score['T'], X_score, label='X Score')
-            ax.plot(Y_score['T'], Y_score, label='Y Score')
+            ax.plot(X_score['T'].dt.year.values, X_score, label='X Score')
+            ax.plot(Y_score['T'].dt.year.values, Y_score, label='Y Score')
             ax.axhline(0, linestyle='--', lw=0.8, label="") #### line Canonical Variate = 0
             ax.legend()
             ax.set_title(f'Scores for Mode {mode} ({var_Y_X:.2f}% variance Y explained by X)')
@@ -1068,6 +1069,6 @@ class WAS_CCA:
             Y_mode.plot(ax=ax, vmin=None, vmax=None, cmap= "RdBu_r")
             var_Y = var_explained_Y.sel(mode=mode).values * 100
             ax.set_title(f'Y Mode {mode} ({var_Y:.2f}% variance explained)')
-
+            
         plt.tight_layout()
         plt.show()

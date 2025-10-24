@@ -9,6 +9,8 @@ from pathlib import Path
 from scipy import stats
 from scipy.stats import lognorm, gamma
 import os
+import matplotlib as mpl                     
+from matplotlib import colors as mcolors
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -16,6 +18,7 @@ import properscoring
 import xskillscore as xs
 from wass2s.utils import *
 from matplotlib.colors import ListedColormap
+
 
 class WAS_Verification:
     """
@@ -33,21 +36,23 @@ class WAS_Verification:
 
     def __init__(self, dist_method="gamma"):
         self.scores = {
-            "KGE": ("Kling Gupta Efficiency", -1, 1, "det_score", "RdBu_r", self.kling_gupta_efficiency),
-            "Pearson": ("Pearson Correlation", -1, 1, "det_score", "RdBu_r", self.pearson_corr),
-            "IOA": ("Index Of Agreement", 0, 1, "det_score", "RdBu_r", self.index_of_agreement),
-            "MAE": ("Mean Absolute Error", 0, 200, "det_score", "viridis", self.mean_absolute_error),
-            "RMSE": ("Root Mean Square Error", 0, 200, "det_score", "viridis", self.root_mean_square_error),
-            "NSE": ("Nash Sutcliffe Efficiency", None, 1, "det_score", "RdBu_r", self.nash_sutcliffe_efficiency),
+            "KGE": ("Kling Gupta Efficiency", -1, 1, "det_score", "RdBu_r", self.kling_gupta_efficiency, ""),
+            "Pearson": ("Pearson Correlation", -1, 1, "det_score", "RdBu_r", self.pearson_corr, ""),
+            "IOA": ("Index Of Agreement", 0, 1, "det_score", "RdBu_r", self.index_of_agreement, ""),
+            "MAE": ("Mean Absolute Error", 0, 500, "det_score", "viridis", self.mean_absolute_error, "[mm]"),
+            "RMSE": ("Root Mean Square Error", 0, 500, "det_score", "viridis", self.root_mean_square_error, "[mm]"),
+            "NSE": ("Nash Sutcliffe Efficiency", None, 1, "det_score", "RdBu_r", self.nash_sutcliffe_efficiency, ""),
             "TAYLOR_DIAGRAM": ("Taylor Diagram", None, None, "all_grid_det_score", None, self.taylor_diagram),
-            "GROC": ("Generalized Discrimination Score", 0, 1, "prob_score", "RdBu_r", self.calculate_groc),
-            "RPSS": ("Ranked Probability Skill Score", -1, 1, "prob_score", "RdBu_r", self.calculate_rpss),
-            "IGS": ("Ignorance Score", 0, None, "prob_score", "RdBu", self.ignorance_score),
-            "RES": ("Resolution", 0, None, "prob_score", "RdBu", self.resolution_score_grid),
-            "REL": ("Reliability", None, None, "prob_score", None, self.reliability_score_grid),
-            "RELIABILITY_DIAGRAM": ("Reliability Diagram", None, None, "all_grid_prob_score", None, self.reliability_diagram),
-            "ROC_CURVE": ("ROC CURVE", None, None, "all_grid_prob_score", None, self.plot_roc_curves),
-            "CRPS": ("Continuous Ranked Probability Score with the ensemble distribution", 0, 100, "ensemble_score", "RdBu", self.compute_crps)
+            "GROC": ("Generalized Discrimination Score", 0, 1, "prob_score", "RdBu_r", self.calculate_groc, ""),
+            "RPSS": ("Ranked Probability Skill Score", -1, 1, "prob_score", "RdBu_r", self.calculate_rpss, ""),
+            "IGS": ("Ignorance Score", 0, None, "prob_score", "RdBu", self.ignorance_score, ""),
+            "RES": ("Resolution", 0, None, "prob_score", "RdBu", self.resolution_score_grid, ""),
+            "REL": ("Reliability", None, None, "prob_score", None, self.reliability_score_grid, ""),
+            "RELIABILITY_DIAGRAM": ("Reliability Diagram", None, None, "all_grid_prob_score", None, self.reliability_diagram, ""),
+            "BS": ("Brier Score", 0, 1, "prob_score", "viridis", self.brier_score, ""),
+            "BSS": ("Brier Skill Score vs climatology", -1, 1, "prob_score", "RdBu_r", self.brier_skill_score, ""),
+            "ROC_CURVE": ("ROC CURVE", None, None, "all_grid_prob_score", None, self.plot_roc_curves, ""),
+            "CRPS": ("Continuous Ranked Probability Score with the ensemble distribution", 0, 100, "ensemble_score", "RdBu", self.compute_crps, "[mm]")
         }
         self.dist_method = dist_method
 
@@ -122,6 +127,32 @@ class WAS_Verification:
         else:
             return np.nan
 
+    def spearman_corr(self, y_true, y_pred):
+        """
+        Compute Spearman rank correlation coefficient.
+    
+        Parameters
+        ----------
+        y_true : array-like
+            Observed values (1D).
+        y_pred : array-like
+            Predicted values (1D).
+    
+        Returns
+        -------
+        float
+            Spearman's rho in [-1, 1]; np.nan if insufficient valid data.
+        """
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        if np.any(mask) and np.sum(mask) > 2:
+            y_true_clean = y_true[mask]
+            y_pred_clean = y_pred[mask]
+            # Use scipy.stats via `stats` already imported above
+            return stats.spearmanr(y_true_clean, y_pred_clean).correlation
+        else:
+            return np.nan
+
+    
     def index_of_agreement(self, y_true, y_pred):
         """
         Compute Index of Agreement (IOA).
@@ -150,6 +181,7 @@ class WAS_Verification:
             return 1 - (numerator / denominator)
         else:
             return np.nan
+
 
     def mean_absolute_error(self, y_true, y_pred):
         """
@@ -235,24 +267,284 @@ class WAS_Verification:
         else:
             return np.nan
 
-    def taylor_diagram(self, y_true, y_pred):
+    def taylor_diagram(
+        self,
+        obs,
+        models,
+        *,
+        normalize: bool = True,
+        correlation: str = "pearson",
+        labels: dict | None = None,
+        title: str | None = "Taylor diagram",
+        figsize=(7, 6),
+        savepath: str | None = None,
+        hide_rms_numbers: bool = True,
+    ):
         """
-        Placeholder for Taylor Diagram visualization.
-
-        Visualizes model performance in terms of correlation, standard deviation, and RMSE.
-
+        Plot a Taylor diagram comparing one or more model series against observations.
+    
         Parameters
         ----------
-        y_true : array-like
-            Observed values.
-        y_pred : array-like
-            Predicted values.
-
-        Notes
-        -----
-        Implementation pending.
+        obs : xarray.DataArray or np.ndarray
+            Observations. If xarray, can be (T), (T,Y,X), etc.
+        models : dict[str, xarray.DataArray | np.ndarray]
+            Mapping of model name -> forecast array (same shape as obs or broadcastable).
+        normalize : bool, optional
+            If True (default), normalize std and CRMSD by std(obs).
+        correlation : {"pearson","spearman"}, optional
+            Correlation metric used on paired, finite values.
+        labels : dict[str,str], optional
+            Custom display labels for model markers. Defaults to model keys.
+        title : str or None, optional
+            Figure title.
+        figsize : tuple, optional
+            Matplotlib figure size.
+        savepath : str or None, optional
+            If provided, save figure to this path.
+    
+        Returns
+        -------
+        (fig, ax) : matplotlib Figure and Axes
         """
-        pass
+   
+        try:
+            import skill_metrics as sm
+        except Exception as e:
+            raise ImportError("SkillMetrics is required. Install with: pip install SkillMetrics") from e
+    
+        def _to_aligned_1d(o, f):
+            if hasattr(o, "dims") or hasattr(f, "dims"):
+                o_al, f_al = xr.align(o, f, join="inner")
+                o_vals = np.asarray(o_al).ravel()
+                f_vals = np.asarray(f_al).ravel()
+            else:
+                o_vals = np.asarray(o).ravel()
+                f_vals = np.asarray(f).ravel()
+            m = np.isfinite(o_vals) & np.isfinite(f_vals)
+            return o_vals[m], f_vals[m]
+    
+        model_names = list(models.keys())
+        if labels is None:
+            labels = {k: k for k in model_names}
+    
+        sdev_list, crmsd_list, corr_list, used_names = [], [], [], []
+        std_obs_plot = None
+    
+        for name in model_names:
+            o, f = _to_aligned_1d(obs, models[name])
+            if o.size < 3:
+                continue
+            r = stats.spearmanr(o, f).correlation if correlation.lower() == "spearman" else np.corrcoef(o, f)[0, 1]
+            std_o = np.std(o, ddof=0)
+            std_f = np.std(f, ddof=0)
+            cr = np.sqrt(std_o**2 + std_f**2 - 2.0 * std_o * std_f * r)
+            if normalize and std_o > 0:
+                std_o_plot, std_f_plot, cr_plot = 1.0, std_f / std_o, cr / std_o
+            else:
+                std_o_plot, std_f_plot, cr_plot = std_o, std_f, cr
+            if std_obs_plot is None:
+                std_obs_plot = std_o_plot
+            sdev_list.append(std_f_plot)
+            crmsd_list.append(cr_plot)
+            corr_list.append(r)
+            used_names.append(name)
+    
+        if not used_names:
+            raise ValueError("No model had ≥3 paired finite values w.r.t. observations.")
+    
+        sdev  = np.concatenate(([std_obs_plot], np.asarray(sdev_list)))
+        crmsd = np.concatenate(([0.0],        np.asarray(crmsd_list)))
+        ccoef = np.concatenate(([1.0],        np.asarray(corr_list)))
+        marker_labels = ["OBS"] + [labels[n] for n in used_names]
+        axis_max = 1.25 * max(np.nanmax(sdev), np.nanmax(crmsd), 1.0)
+    
+        fig, ax = plt.subplots(figsize=figsize)
+        _ = sm.taylor_diagram(
+            sdev, crmsd, ccoef,
+            numberPanels=1,
+            axisMax=axis_max,
+            markerDisplayed="marker",
+            markerLabel=marker_labels,
+            markerLegend="on",
+            styleOBS="-",
+            colOBS="k",
+            markerObs="*",
+            titleOBS="obs",
+            labelRMS="CRMSD" if not normalize else "CRMSD (norm.)",
+            titleSTD="on",
+            titleCOR="on",
+            colCOR="tab:blue",
+            colSTD="black",
+            colRMS="tab:green",
+        )
+    
+        if hide_rms_numbers:
+            green = mcolors.to_rgba("tab:green")
+            for txt in fig.findobj(mpl.text.Text):
+                s = (txt.get_text() or "").strip()
+                if not s:
+                    continue
+                # Remove green numeric labels on RMS arcs
+                try:
+                    if np.allclose(mcolors.to_rgba(txt.get_color()), green, atol=1e-3):
+                        txt.remove()
+                except Exception:
+                    pass
+    
+        if title:
+            ax.set_title(title)
+        if savepath:
+            fig.savefig(savepath, dpi=300, bbox_inches="tight")
+        return fig, ax
+
+    # def taylor_diagram_(
+    #     self,
+    #     obs,
+    #     models,
+    #     *,
+    #     normalize: bool = True,
+    #     correlation: str = "pearson",   # "pearson" or "spearman"
+    #     labels: dict | None = None,     # optional pretty labels per model key
+    #     title: str | None = "Taylor diagram",
+    #     figsize=(7, 6),
+    #     savepath: str | None = None,
+    # ):
+    #     """
+    #     Plot a Taylor diagram comparing one or more model series against observations.
+    
+    #     Parameters
+    #     ----------
+    #     obs : xarray.DataArray or np.ndarray
+    #         Observations. If xarray, can be (T), (T,Y,X), etc.
+    #     models : dict[str, xarray.DataArray | np.ndarray]
+    #         Mapping of model name -> forecast array (same shape as obs or broadcastable).
+    #     normalize : bool, optional
+    #         If True (default), normalize std and CRMSD by std(obs).
+    #     correlation : {"pearson","spearman"}, optional
+    #         Correlation metric used on paired, finite values.
+    #     labels : dict[str,str], optional
+    #         Custom display labels for model markers. Defaults to model keys.
+    #     title : str or None, optional
+    #         Figure title.
+    #     figsize : tuple, optional
+    #         Matplotlib figure size.
+    #     savepath : str or None, optional
+    #         If provided, save figure to this path.
+    
+    #     Returns
+    #     -------
+    #     (fig, ax) : matplotlib Figure and Axes
+    #     """
+    #     try:
+    #         import skill_metrics as sm
+    #     except Exception as e:
+    #         raise ImportError(
+    #             "SkillMetrics is required. Install with: pip install SkillMetrics"
+    #         ) from e
+    
+    #     def _to_aligned_1d(o, f):
+    #         # Align xarray objects on shared coords; otherwise just np.asarray.
+    #         if hasattr(o, "dims") or hasattr(f, "dims"):
+    #             o_al, f_al = xr.align(o, f, join="inner")
+    #             o_vals = np.asarray(o_al).ravel()
+    #             f_vals = np.asarray(f_al).ravel()
+    #         else:
+    #             o_vals = np.asarray(o).ravel()
+    #             f_vals = np.asarray(f).ravel()
+    #         m = np.isfinite(o_vals) & np.isfinite(f_vals)
+    #         return o_vals[m], f_vals[m]
+    
+    #     # Prepare labels
+    #     model_names = list(models.keys())
+    #     if labels is None:
+    #         labels = {k: k for k in model_names}
+    
+    #     # Compute stats for each model
+    #     sdev_list, crmsd_list, corr_list, used_names = [], [], [], []
+    #     std_obs_plot = None  # will hold reference STD on diagram scale
+    
+    #     # We compute obs std using the first model's mask (pairwise); then re-compute per model.
+    #     # For normalization, each model uses its *own* paired-data obs std to be consistent.
+    #     for name in model_names:
+    #         o, f = _to_aligned_1d(obs, models[name])
+    #         if o.size < 3:
+    #             continue
+    
+    #         # correlation
+    #         if correlation.lower() == "spearman":
+    #             r = stats.spearmanr(o, f).correlation
+    #         else:
+    #             r = np.corrcoef(o, f)[0, 1]
+    
+    #         # standard deviations (population)
+    #         std_o = np.std(o, ddof=0)
+    #         std_f = np.std(f, ddof=0)
+    
+    #         # centered RMS difference
+    #         cr = np.sqrt(std_o**2 + std_f**2 - 2.0 * std_o * std_f * r)
+    
+    #         # normalize if requested
+    #         if normalize and std_o > 0:
+    #             std_o_plot = 1.0
+    #             std_f_plot = std_f / std_o
+    #             cr_plot = cr / std_o
+    #         else:
+    #             std_o_plot = std_o
+    #             std_f_plot = std_f
+    #             cr_plot = cr
+    
+    #         if std_obs_plot is None:
+    #             std_obs_plot = std_o_plot
+    
+    #         sdev_list.append(std_f_plot)
+    #         crmsd_list.append(cr_plot)
+    #         corr_list.append(r)
+    #         used_names.append(name)
+    
+    #     if not used_names:
+    #         raise ValueError("No model had ≥3 paired finite values w.r.t. observations.")
+    
+    #     # Build inputs for SkillMetrics (first entry is OBS reference)
+    #     sdev  = np.concatenate(([std_obs_plot], np.asarray(sdev_list)))
+    #     crmsd = np.concatenate(([0.0],        np.asarray(crmsd_list)))
+    #     ccoef = np.concatenate(([1.0],        np.asarray(corr_list)))
+    #     marker_labels = ["OBS"] + [labels[n] for n in used_names]
+    
+    #     # Axis extent
+    #     axis_max = 1.25 * max(sdev.max(), crmsd.max(), 1.0)
+    
+    #     # Plot
+    #     fig, ax = plt.subplots(figsize=figsize)
+    #     sm.taylor_diagram(
+    #         sdev,
+    #         crmsd,
+    #         ccoef,
+    #         numberPanels=1,
+    #         axisMax=axis_max,
+    #         markerDisplayed="marker",
+    #         markerLabel=marker_labels,
+    #         markerLegend="on",
+    #         styleOBS="-",
+    #         colOBS="k",
+    #         markerObs="*",
+    #         titleOBS="obs",
+    #         labelRMS="CRMSD" if not normalize else "CRMSD (norm.)",
+    #         # Note: SkillMetrics has no 'labelSTD' option; showing default titles:
+    #         titleSTD="on",
+    #         titleCOR="on",
+    #         colCOR="tab:blue",
+    #         colSTD="black",
+    #         colRMS="tab:green",
+    #     )
+    
+    #     if title:
+    #         ax.set_title(title)
+    
+    #     if savepath:
+    #         fig.savefig(savepath, dpi=300, bbox_inches="tight")
+    
+    #     return fig, ax
+
 
     def compute_deterministic_score(self, score_func, obs, pred):
         """
@@ -502,6 +794,96 @@ class WAS_Verification:
             return ignorance_sum / n if n > 0 else np.nan
         else:
             return np.nan
+
+
+    def brier_score(self, y_true, y_probs, index_start, index_end, event="PA"):
+        """
+        BS for a single tercile event (PB/PN/PA). y_probs has shape (3, N).
+        """
+        
+        mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
+        if np.sum(mask) < 3:
+            return np.nan
+        y = y_true[mask]
+        p = y_probs[:, mask]
+    
+        # terciles from calibration slice
+        T1, T2 = np.nanpercentile(y[index_start:index_end], [33, 67])
+        y_class = np.digitize(y, bins=[T1, T2], right=True)  # 0,1,2
+    
+        emap = {"PB": 0, "PN": 1, "PA": 2, 0: 0, 1: 1, 2: 2}
+        k = emap.get(event, 2)
+    
+        o   = (y_class == k).astype(float)
+        p_k = p[k, :]
+        return float(np.mean((p_k - o)**2))
+    
+    
+    def brier_skill_score(self,
+                            y_true,
+                            y_probs,
+                            index_start,
+                            index_end,
+                            event="PA",
+                            reference="uniform"):
+        """
+        Event-wise Brier Skill Score (BSS) for tercile forecasts.
+    
+        Parameters
+        ----------
+        y_true : 1D array-like
+            Observed values (time series for one grid point).
+        y_probs : 2D array-like, shape (3, N)
+            Forecast probabilities for PB/PN/PA over time.
+        index_start, index_end : int
+            Indices delimiting the calibration slice inside the *masked* series.
+        event : {"PB","PN","PA",0,1,2}, optional
+            Event to score (default "PA" = above-normal).
+        reference : {"uniform","empirical"}, optional
+            - "uniform": climatology is [1/3,1/3,1/3]
+            - "empirical": base rate computed from calibration slice
+    
+        Returns
+        -------
+        float
+            BSS = 1 - BS / BS_ref (np.nan if not computable).
+        """
+
+        bs = self.brier_score_event(y_true, y_probs, index_start, index_end, event=event)
+        if not np.isfinite(bs):
+            return np.nan
+    
+        mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
+        if np.sum(mask) < 3:
+            return np.nan
+        y = y_true[mask]
+        p = y_probs[:, mask]
+    
+
+        T1, T2 = np.nanpercentile(y[index_start:index_end], [33, 67])
+        y_class_all = np.digitize(y, bins=[T1, T2], right=True)  # 0,1,2
+    
+
+        emap = {"PB": 0, "PN": 1, "PA": 2, 0: 0, 1: 1, 2: 2}
+        k = emap.get(event, 2)
+    
+
+        o_all = (y_class_all == k).astype(float)
+    
+
+        ref = str(reference).lower()
+        if ref in ("uniform", "unif", "1/3", "13"):
+            p_ref = 1.0 / 3.0
+        elif ref in ("empirical", "base", "clim", "climatology"):
+
+            p_ref = float(np.mean(o_all[index_start:index_end]))
+        else:
+            raise ValueError("reference must be 'uniform' or 'empirical'")
+    
+        bs_ref = float(np.mean((p_ref - o_all) ** 2))
+        return np.nan if bs_ref == 0 else float(1.0 - bs / bs_ref)
+
+
 
     def resolution_score_grid(self, y_true, y_probs, index_start, index_end,
                              bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
@@ -883,7 +1265,7 @@ class WAS_Verification:
     # Probabilistic Scoring
     # ------------------------
 
-    def compute_probabilistic_score(self, score_func, obs, prob_pred, clim_year_start, clim_year_end):
+    def compute_probabilistic_score(self, score_func, obs, prob_pred,clim_year_start, clim_year_end, **score_kwargs):
         """
         Apply a probabilistic scoring function over xarray DataArrays.
 
@@ -907,8 +1289,9 @@ class WAS_Verification:
         xarray.DataArray
             Score values with dimensions (Y, X).
         """
+        
         index_start = obs.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = obs.get_index("T").get_loc(str(clim_year_end)).stop
+        index_end   = obs.get_index("T").get_loc(str(clim_year_end)).stop
         obs, prob_pred = xr.align(obs, prob_pred)
         return xr.apply_ufunc(
             score_func,
@@ -916,12 +1299,54 @@ class WAS_Verification:
             prob_pred,
             input_core_dims=[('T',), ('probability', 'T')],
             vectorize=True,
-            kwargs={'index_start': index_start, 'index_end': index_end},
+            kwargs={'index_start': index_start, 'index_end': index_end, **score_kwargs},
             dask='parallelized',
             output_core_dims=[()],
             output_dtypes=['float'],
             dask_gufunc_kwargs={"allow_rechunk": True},
         )
+
+    # def compute_probabilistic_score(self, score_func, obs, prob_pred, clim_year_start, clim_year_end):
+    #     """
+    #     Apply a probabilistic scoring function over xarray DataArrays.
+
+    #     Computes the specified probabilistic metric across the time dimension for each grid point.
+
+    #     Parameters
+    #     ----------
+    #     score_func : callable
+    #         Probabilistic scoring function to apply (e.g., calculate_rpss, calculate_groc).
+    #     obs : xarray.DataArray
+    #         Observed data with dimensions (T, Y, X).
+    #     prob_pred : xarray.DataArray
+    #         Forecast probabilities with dimensions (probability, T, Y, X).
+    #     clim_year_start : int or str
+    #         Start year of the climatology period.
+    #     clim_year_end : int or str
+    #         End year of the climatology period.
+
+    #     Returns
+    #     -------
+    #     xarray.DataArray
+    #         Score values with dimensions (Y, X).
+    #     """
+    #     index_start = obs.get_index("T").get_loc(str(clim_year_start)).start
+    #     index_end = obs.get_index("T").get_loc(str(clim_year_end)).stop
+    #     obs, prob_pred = xr.align(obs, prob_pred)
+    #     return xr.apply_ufunc(
+    #         score_func,
+    #         obs,
+    #         prob_pred,
+    #         input_core_dims=[('T',), ('probability', 'T')],
+    #         vectorize=True,
+    #         kwargs={'index_start': index_start, 'index_end': index_end},
+    #         dask='parallelized',
+    #         output_core_dims=[()],
+    #         output_dtypes=['float'],
+    #         dask_gufunc_kwargs={"allow_rechunk": True},
+    #     )
+
+
 
     # ------------------------
     # Plotting Utilities
@@ -958,14 +1383,18 @@ class WAS_Verification:
         )
         ax.coastlines(resolution='10m')
         ax.add_feature(cfeature.BORDERS, linestyle='--')
-        ax.set_title(f"{figure_name} {score_meta_data[0]}")
+        ax.set_title(f"{score} {figure_name}")
         gl = ax.gridlines(draw_labels=True, linewidth=0.1, color='gray', alpha=0.5)
         gl.top_labels = False
         gl.right_labels = False
         cbar = fig.colorbar(im, ax=ax, orientation='horizontal', pad=0.05, shrink=0.5)
         cbar.ax.set_position([ax.get_position().x0, ax.get_position().y0 - 0.1,
                               ax.get_position().width, 0.039])
-        cbar.set_label(score_meta_data[0])
+
+        name, _, _, _, _, _, unit = self.scores[score]
+        label = f"{name} {unit}".rstrip()
+        cbar.set_label(label)
+        
         plt.savefig(dir_save_score / f"{figure_name}_{score}.png", dpi=300, bbox_inches='tight')
         plt.show()
         plt.close()
@@ -1009,14 +1438,16 @@ class WAS_Verification:
             )
             ax.coastlines(resolution='10m')
             ax.add_feature(cfeature.BORDERS, linestyle='--')
-            ax.set_title(f"{center} {score_meta_data[0]}")
+            ax.set_title(f"{score} {center[:-1]}")
             gl = ax.gridlines(draw_labels=True, linewidth=0.1, color='gray', alpha=0.5)
             gl.top_labels = False
             gl.right_labels = False
             cbar = fig.colorbar(im, ax=ax, orientation='horizontal', pad=0.15, shrink=0.7)
             cbar.ax.set_position([ax.get_position().x0, ax.get_position().y0 - 0.12,
                                   ax.get_position().width, 0.03])
-            cbar.set_label(score_meta_data[0])
+            name, _, _, _, _, _, unit = self.scores[score]
+            label = f"{name} {unit}".rstrip()  
+            cbar.set_label(label)
         for j in range(i + 1, len(axes)):
             fig.delaxes(axes[j])
         plt.subplots_adjust(wspace=0.3, hspace=0.3)

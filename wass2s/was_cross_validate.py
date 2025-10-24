@@ -169,11 +169,8 @@ class WAS_Cross_Validator:
         same_prob_method = [WAS_Ridge_Model, WAS_Lasso_Model, WAS_LassoLars_Model, WAS_ElasticNet_Model, WAS_MARS_Model,
                             WAS_LinearRegression_Model, WAS_SVR, WAS_PolynomialRegression, WAS_PoissonRegression]
         # same_kind_model1 = [WAS_mme_xcELM]
-        same_kind_model2 = [WAS_mme_MLP, WAS_mme_GradientBoosting, WAS_mme_XGBoosting, WAS_mme_AdaBoost,
-                            WAS_mme_Stack_RF_MLP, WAS_mme_hpELM, WAS_mme_RF_hpELM, WAS_mme_StackXGboost_hpELM,
-                            WAS_mme_RF, WAS_mme_StackXGboost_MLP, WAS_mme_GA]
-        same_kind_model3 = [WAS_RandomForest_XGBoost_ML_Stacking, WAS_MLP, WAS_Stacking_Ridge,
-                            WAS_RandomForest_XGBoost_Stacking_MLP]
+        same_kind_model2 = [WAS_mme_MLP, WAS_mme_XGBoosting, WAS_mme_LightGBM, WAS_mme_hpELM, WAS_mme_RF, WAS_mme_Stacking, WAS_mme_MLP_, WAS_mme_XGBoosting_, WAS_mme_hpELM_, WAS_mme_RF_, WAS_mme_Stacking_, WAS_mme_GA]
+        same_kind_model3 = [WAS_RandomForest_XGBoost_ML_Stacking, WAS_MLP, WAS_Stacking_Ridge, WAS_RandomForest_XGBoost_Stacking_MLP]
 
         if isinstance(model, WAS_CCA):
             mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
@@ -276,6 +273,17 @@ class WAS_Cross_Validator:
                 X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
                 y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
                 pred_det = model.compute_model(X_train, y_train, X_test, Predictant=Predictant, clim_year_start=clim_year_start, clim_year_end=clim_year_end)
+            #     pred_prob = model.compute_prob(X_train, y_train, X_test, Predictant=Predictant, clim_year_start=clim_year_start, clim_year_end=clim_year_end)[0]
+            #     hindcast_det.append(pred_det)
+            #     hindcast_prob.append(pred_prob)
+
+            # hindcast_det = xr.concat(hindcast_det, dim="T")
+            # hindcast_prob = xr.concat(hindcast_prob, dim="T")
+            # hindcast_det['T'] = Predictant['T']
+            # hindcast_prob['T'] = Predictant['T']
+            # return hindcast_det, hindcast_prob
+
+                
                 hindcast_det.append(pred_det)
 
             hindcast_det = xr.concat(hindcast_det, dim="T")
@@ -326,6 +334,7 @@ class WAS_Cross_Validator:
 
         elif any(isinstance(model, i) for i in same_kind_model2):
             mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+            Predictor['T'] = Predictant['T']
             Predictor_st = standardize_timeseries(Predictor, clim_year_start, clim_year_end)
             Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
 

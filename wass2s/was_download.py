@@ -412,6 +412,7 @@ class WAS_Download:
             "DSWR": "surface_solar_radiation_downwards",
             "DLWR": "surface_thermal_radiation_downwards",
             "NOLR": "top_thermal_radiation",
+            "RUNOFF":"mean_surface_runoff_rate"
         }
 
         variables_2 = {
@@ -634,6 +635,25 @@ class WAS_Download:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
                             else:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
+
+                        if k =="RUNOFF":
+                            ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
+                            ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            ds = ds.where(lambda x: x >= 0, other=0)
+                            if "indexing_time" in ds.coords: 
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
+                            else:
+                                ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
+                            lat = ds.lat
+                            lon = ds.lon
+                            dlon = np.deg2rad(0.1)
+                            dlat = np.deg2rad(0.1)
+                            r = 6371000 # Earth radius in meters
+                            # Area for each grid cell
+                            area_ = (r ** 2) * dlon * np.cos(np.deg2rad(lat)) * dlat
+                            # Perform the conversion to m^3/s
+                            ds = (ds * area_) 
+                        
 
                         if k == "SLP":
                             ds = ds/100
@@ -950,6 +970,7 @@ class WAS_Download:
             "DSWR": "surface_solar_radiation_downwards",
             "DLWR": "surface_thermal_radiation_downwards",
             "NOLR": "top_net_thermal_radiation",
+            "RUNOFF": "surface_runoff"
             
         }
         variables_2 = {
@@ -1072,18 +1093,32 @@ class WAS_Download:
                     ##########################################################
                     
                     ds = xr.open_dataset(temp_file)
-                    if 'forecast_reference_time' in ds.coords:
-                        time = (ds['forecast_reference_time'] + ds['forecast_period']).data
-                        ds = ds.assign_coords(time=(('forecast_reference_time', 'forecast_period'), time))
-                        ds = ds.stack(time=('forecast_reference_time', 'forecast_period'))
-                        ds = ds.drop_vars(['forecast_reference_time', 'forecast_period'])
-                        ds = ds.rename({"valid_time":"time"})
+                    if 'forecast_reference_time' in ds.coords:                     
+                        time = (ds['forecast_reference_time'][0] + ds['forecast_period']).data
+                        ds = ds.isel(forecast_reference_time=0)
+                        ds['forecast_period'] = time
+                        ds = ds.rename({"forecast_period":"time"})
+                        ds = ds.drop_vars(['forecast_reference_time', 'valid_time', 'number'])
+
+                    # elif 'forecast_reference_time' in ds.coords:
+                    #     time = (ds['forecast_reference_time'] + ds['forecast_period']).data
+                    #     ds = ds.assign_coords(time=(('forecast_reference_time', 'forecast_period'), time))
+                    #     ds = ds.stack(time=('forecast_reference_time', 'forecast_period'))
+                    #     ds = ds.drop_vars(['forecast_reference_time', 'forecast_period'])
+                    #     ds = ds.rename({"valid_time":"time"})
+
                     else:
-                        time = (ds['indexing_time'] + ds['forecast_period']).data
-                        ds = ds.assign_coords(time=(('indexing_time', 'forecast_period'), time))
-                        ds = ds.stack(time=('indexing_time', 'forecast_period'))
-                        ds = ds.drop_vars(['indexing_time', 'forecast_period'])
-                        ds = ds.rename({"valid_time":"time"})                    
+                        time = (ds['indexing_time'][0] + ds['forecast_period']).data
+                        ds = ds.isel(forecast_reference_time=0)
+                        ds['forecast_period'] = time
+                        ds = ds.rename({"forecast_period":"time"})
+                        ds = ds.drop_vars(['indexing_time', 'valid_time', 'number'])
+                        
+                        # time = (ds['indexing_time']  + ds['forecast_period']).data
+                        # ds = ds.assign_coords(time=(('indexing_time', 'forecast_period'), time)).isel(indexing_time=0)
+                        # ds = ds.stack(time=('indexing_time', 'forecast_period'))
+                        # ds = ds.drop_vars(['indexing_time', 'forecast_period'])
+                        # ds = ds.rename({"valid_time":"time"})                    
         
                     # If there's an ensemble dimension, apply ensemble mean/median if requested
                     if ensemble_mean in ["mean", "median"] and "number" in ds.dims:
@@ -1112,6 +1147,20 @@ class WAS_Download:
                             differences['time'] = yearly_ds['time'].isel(time=slice(1,None))
                             tampon.append(differences)
                         ds = (xr.concat(tampon, dim="time") * 1000).where(lambda x: x >= 0, other=0)
+
+                    if v=="RUNOFF":
+                        ds['time'] = ds['time'].to_index()
+                        diffs = ds.groupby('time.year').apply(lambda x: x.diff('time'))
+                        ds = diffs.where(lambda x: x >= 0, other=0)
+                        lat = ds.latitude
+                        lon = ds.longitude
+                        dlon = np.deg2rad(0.1)
+                        dlat = np.deg2rad(0.1)
+                        r = 6371000 # Earth radius in meters
+                        # Area for each grid cell
+                        area_= (r ** 2) * dlon * np.cos(np.deg2rad(lat)) * dlat
+                        # Perform the conversion to m^3/s
+                        ds = (ds * area_) / 86400                        
 
                     if v in ["DSWR","DLWR","OLR"]:
                         ds['time'] = ds['time'].to_index()
@@ -1457,9 +1506,12 @@ class WAS_Download:
 
         if any(x in var_name for x in ["TEMP","TMIN","TMAX","SST","SLP"]):
             ds_out = ds.groupby("season_year").mean("time")
-        elif any(x in var_name for x in ["PRCP","DSWR","DLWR","NOLR"]):
+        elif any(x in var_name for x in ["PRCP","DSWR","DLWR","NOLR","RUNOFF"]):
             # For precipitation and radiation, we sum over time
-            ds_out = ds.groupby("season_year").sum("time")
+            # ds_out = ds.groupby("season_year").sum("time")
+            ds_out = ds.groupby("season_year").mean("time")
+        # elif var_name == "RUNOFF":
+        #     ds_out = xr.diff(ds, dim="time").mean("time")
         else:
             ds_out = ds.groupby("season_year").mean("time")
     
@@ -1620,7 +1672,7 @@ class WAS_Download:
                             "month": base_str,
                             "time": ["00:00"],
                             "area": area,
-                            "format": "netcdf",
+                            "data_format": "netcdf",
                         }
                     else:
                         dataset = "reanalysis-era5-single-levels-monthly-means"
@@ -1631,7 +1683,7 @@ class WAS_Download:
                             "month": base_str,
                             "time": ["00:00"],
                             "area": area,
-                            "format": "netcdf",
+                            "data_format": "netcdf",
                         }
 
                     # Download
@@ -1666,7 +1718,7 @@ class WAS_Download:
                             "month": next_str,
                             "time": ["00:00"],
                             "area": area,
-                            "format": "netcdf",
+                            "data_format": "netcdf",
                         }
                     else:
                         dataset = "reanalysis-era5-single-levels-monthly-means"
@@ -1677,7 +1729,8 @@ class WAS_Download:
                             "month": next_str,
                             "time": ["00:00"],
                             "area": area,
-                            "format": "netcdf",
+                            "data_format": "netcdf",
+                            
                         }
 
                     # Download
@@ -1710,12 +1763,11 @@ class WAS_Download:
                 )
                 
                 if v == "PRCP":
-                    # nbjour = len(season_months)*30
-                    dsC = 1000*dsC  # !!!!! Convert to mm/month
+                    nbjour = len(season_months)*30
+                    dsC = 1000*ds*nbjour  # !!!!! Convert to mm/month
                 
                 if v in ["DSWR", "DLWR","NOLR"]:
-                    nbjour = len(season_months)*30
-                    dsC = dsC/(nbjour*86400)  # Convert to W/m2
+                    dsC = dsC/86400  # Convert to W/m2
 
                 if v == "SLP":
                     dsC = dsC / 100  # Convert to hPa(mb)
@@ -1729,6 +1781,477 @@ class WAS_Download:
                 print(f"Saved final reanalysis file: {out_file}")
             else:
                 print(f"No data found for {c}/{v}.")
+
+    def WAS_Download_ERA5Land(
+        self,
+        dir_to_save,
+        center_variable,
+        year_start,
+        year_end,
+        area,
+        seas=["01", "02", "03"],  # e.g. NDJ = ["11","12","01"]
+        force_download=False,
+    ):
+        """
+        Download ERA5-Land reanalysis data for specified variable combinations, years, and months,
+        handling cross-year seasons (e.g., NDJ).
+        Parameters:
+            dir_to_save (str): Directory to save the downloaded files.
+            center_variable (list): List of center-variable identifiers (e.g., ["ERA5Land.PRCP", "ERA5Land.TEMP"]).
+            year_start (int): Start year for the data.
+            year_end (int): End year for the data.
+            area (list): Bounding box as [North, West, South, East].
+            seas (list): List of months (e.g., ["11","12","01"] for NDJ).
+            force_download (bool): If True, forces download even if file exists.
+        """
+        dir_to_save = Path(dir_to_save)
+        dir_to_save.mkdir(parents=True, exist_ok=True)
+        # Parse center and variable strings
+        centers = [cv.split(".")[0] for cv in center_variable]
+        vars_ = [cv.split(".")[1] for cv in center_variable]
+        # ERA5-Land does not have pressure levels, only single-level variables
+        variables_1 = {
+            "PRCP": "total_precipitation",
+            "TEMP": "2m_temperature",
+            "TDEW": "2m_dewpoint_temperature",
+            "UGRD10": "10m_u_component_of_wind",
+            "VGRD10": "10m_v_component_of_wind",
+            "DSWR": "surface_solar_radiation_downwards",
+            "DLWR": "surface_thermal_radiation_downwards",
+            "NOLR": "surface_net_thermal_radiation_downwards",  # Adjusted for ERA5-Land
+            "RUNOFF": "surface_runoff"
+            
+        }
+        # Helper for zero-padded month strings
+        def m2str(m: int):
+            return f"{m:02d}"
+        # Convert months to integers
+        season_months = [int(m) for m in seas]
+        pivot = season_months[0]
+        # For naming
+        season_str = "".join([calendar.month_abbr[m] for m in season_months])
+        for c, v in zip(centers, vars_):
+            if c != "ERA5Land":
+                print(f"This function is for ERA5Land only. Skipping {c}.")
+                continue
+            if v not in variables_1:
+                print(f"Unknown variable for ERA5Land: {v}. Skipping.")
+                continue
+            cds_var = variables_1[v]
+            # if cds_var == "surface_runoff":
+            #     pivot_int = pivot
+            #     previous = pivot_int - 1
+            #     previous = str(previous).zfill(2) if previous > 0 else 12
+            #     season_months = [previous] + season_months
+            #     pivot = previous
+            
+            out_file = dir_to_save / f"{c}_{v}_{year_start}_{year_end}_{season_str}.nc"
+            if not force_download and out_file.exists():
+                print(f"{out_file} already exists. Skipping.")
+                continue
+            combined_datasets = []
+            for year in range(year_start, year_end + 1):
+                base_months = [m for m in season_months if m >= pivot]
+                next_months = [m for m in season_months if m < pivot]
+                # (A) Base-year
+                if base_months:
+                    base_str = [m2str(m) for m in base_months]
+                    partA = dir_to_save / f"{c}_{v}_{year}_{season_str}_partA.nc"
+                    dataset = "reanalysis-era5-land-monthly-means"
+                    request = {
+                        "product_type": "monthly_averaged_reanalysis",
+                        "variable": cds_var,
+                        "year": str(year),
+                        "month": base_str,
+                        "time": "00:00",
+                        "area": area,
+                        "data_format": "netcdf",
+                    }
+                    try:
+                        client = cdsapi.Client()
+                        print(f"Downloading {c}/{v}: {year}, months={base_str}")
+                        client.retrieve(dataset, request).download(str(partA))
+                    except Exception as e:
+                        print(f"Download error for {c}/{v}, year={year} partA: {e}")
+                        continue
+                    with xr.open_dataset(partA) as dsA:
+                        dsA = dsA.load()
+                        dsA = self._postprocess_reanalysis(dsA, v)
+                        combined_datasets.append(dsA)
+                    os.remove(partA)
+                # (B) Next-year
+                if next_months and (year < year_end + 1):
+                    year_next = year + 1
+                    next_str = [m2str(m) for m in next_months]
+                    partB = dir_to_save / f"{c}_{v}_{year}_{season_str}_partB_{year_next}.nc"
+                    request["year"] = str(year_next)
+                    request["month"] = next_str
+                    try:
+                        client = cdsapi.Client()
+                        print(f"Downloading {c}/{v}: {year_next}, months={next_str}")
+                        client.retrieve(dataset, request).download(str(partB))
+                    except Exception as e:
+                        print(f"Download error for {c}/{v}, year={year_next} partB: {e}")
+                        continue
+                    with xr.open_dataset(partB) as dsB:
+                        dsB = dsB.load()
+                        dsB = self._postprocess_reanalysis(dsB, v)
+                        combined_datasets.append(dsB)
+                    os.remove(partB)
+            if combined_datasets:
+                dsC = xr.concat(combined_datasets, dim="time")
+                # Unit conversions
+                if v in ["TEMP", "TDEW"]:
+                    dsC = dsC - 273.15
+                # Aggregate
+                dsC = self._aggregate_crossyear(
+                    ds=dsC,
+                    season_months=season_months,
+                    var_name=v
+                )
+                if v == "PRCP":
+                    dsC = 1000 * dsC * len(season_months) * 30  # Convert to mm (approximate, as in existing code)
+                if v == "RUNOFF":
+                    #dsC = dsC * len(season_months) * 30 # Convert to mm (approximate, as in existing code)
+                    lat = dsC.Y
+                    lon = dsC.X
+                    dlon = np.deg2rad(0.1)
+                    dlat = np.deg2rad(0.1)
+                    r = 6371000 # Earth radius in meters
+                    # Area for each grid cell
+                    area_ = (r ** 2) * dlon * np.cos(np.deg2rad(lat)) * dlat
+                    # Perform the conversion to m^3/s
+                    dsC = (dsC * area_) / 86400
+                    
+                if v in ["DSWR", "DLWR", "NOLR"]:
+                    # nbjour = len(season_months) * 30
+                    dsC = dsC / 86400  # Convert to W/m2 (approximate)
+                dsC["time"] = [f"{year}-{seas[1]}-01" for year in dsC["time"].astype(str).values]
+                dsC["time"] = dsC["time"].astype("datetime64[ns]")
+                dsC = dsC.rename({"time": "T"})
+                # Save final
+                dsC.to_netcdf(out_file)
+                print(f"Saved final ERA5-Land file: {out_file}")
+            else:
+                print(f"No data found for {c}/{v}.")
+
+    def WAS_Download_ERA5Land_daily(
+            self,
+            dir_to_save,
+            center_variable,
+            year_start,
+            year_end,
+            area,
+            force_download=False,
+            max_retries=3,
+            retry_delay=5,
+        ):
+        """
+        Download daily ERA5-Land reanalysis data from the Copernicus Data Store (CDS)
+        for specified variables and years, with retries for failed downloads.
+        Parameters
+        ----------
+        dir_to_save : str or pathlib.Path
+            Directory path where the downloaded NetCDF files will be saved.
+            The directory will be created if it does not exist.
+        center_variable : list of str
+            List of center-variable identifiers (e.g., ["ERA5Land.PRCP", "ERA5Land.TEMP"]).
+        year_start : int
+            Start year for the data to download (inclusive).
+        year_end : int
+            End year for the data to download (inclusive).
+        area : list of float
+            Bounding box for spatial subsetting in the format [North, West, South, East].
+        force_download : bool, optional
+            If True, forces download even if the output file exists. Default is False.
+        max_retries : int, optional
+            Maximum number of retry attempts for failed downloads. Default is 3.
+        retry_delay : int, optional
+            Seconds to wait between retry attempts. Default is 5.
+        Returns
+        -------
+        None
+            The function saves NetCDF files to `dir_to_save` but does not return a value.
+            Output files are named as `Daily_<variable>_<year_start>_<year_end>.nc`.
+        Notes
+        -----
+        - The function downloads hourly data from the CDS dataset "reanalysis-era5-land" 
+          and aggregates it to daily resolution.
+        - Aggregation: sum for accumulative variables (e.g., PRCP, radiation), mean for others (e.g., TEMP).
+        - Unit conversions: PRCP to mm/day, TEMP to °C, radiation to W/m² (daily average).
+        - Coordinates are renamed to "X" (longitude), "Y" (latitude), and "T" (time),
+          with latitude flipped.
+        - Downloads are performed month-by-month due to API limitations.
+        - Requires a valid CDS API key configured in `~/.cdsapirc`.
+        """
+        dir_to_save = Path(dir_to_save)
+        dir_to_save.mkdir(parents=True, exist_ok=True)
+        days = [f"{day:02}" for day in range(1, 32)]
+        months = [f"{month:02}" for month in range(1, 13)]
+        hours = [f"{h:02}:00" for h in range(24)]
+        variables_1 = {
+            "PRCP": "total_precipitation",
+            "TEMP": "temperature_2m",
+            "TDEW": "dewpoint_temperature_2m",
+            "UGRD10": "u_component_of_wind_10m",
+            "VGRD10": "v_component_of_wind_10m",
+            "DSWR": "surface_solar_radiation_downwards",
+            "DLWR": "surface_thermal_radiation_downwards",
+            "NOLR": "surface_net_thermal_radiation_downwards",
+            "RUNOFF": "surface_runoff",
+        }
+        centers = [cv.split(".")[0] for cv in center_variable]
+        vars_short = [cv.split(".")[1] for cv in center_variable]
+        for c, v in zip(centers, vars_short):
+            if c != "ERA5Land":
+                print(f"Invalid center for this function: {c}. Must be 'ERA5Land'. Skipping.")
+                continue
+            if v not in variables_1:
+                print(f"Unknown variable: {v}. Skipping.")
+                continue
+            cds_variable = variables_1[v]
+            output_path = dir_to_save / f"Daily_{v}_{year_start}_{year_end}.nc"
+            if not force_download and output_path.exists():
+                print(f"{output_path} already exists. Skipping download.")
+                continue
+            combined_datasets = []
+            all_years_downloaded = True
+            for year in range(year_start, year_end + 1):
+                for month in range(1, 13):
+                    nc_file_path = dir_to_save / f"hourly_{v}_{year}_{month:02d}.nc"
+                    success = False
+                    retries = 0
+                    while retries < max_retries and not success:
+                        try:
+                            client = cdsapi.Client()
+                            dataset = "reanalysis-era5-land"
+                            request = {
+                                "variable": cds_variable,
+                                "year": str(year),
+                                "month": f"{month:02}",
+                                "day": days,
+                                "time": hours,
+                                "area": area,
+                                "data_format": "netcdf",
+                                "download_format": "unarchived"
+                            }
+                            print(f"Attempt {retries + 1}/{max_retries}: Downloading {cds_variable} data for {year}-{month:02d}...")
+                            client.retrieve(dataset, request).download(str(nc_file_path))
+                            print(f"Downloaded: {nc_file_path}")
+                            success = True
+                        except Exception as e:
+                            retries += 1
+                            print(f"Attempt {retries}/{max_retries} failed for {cds_variable} data for {year}-{month:02d}: {e}")
+                            if retries < max_retries:
+                                print(f"Retrying after {retry_delay} seconds...")
+                                _time.sleep(retry_delay)
+                            if nc_file_path.exists():
+                                os.remove(nc_file_path)
+                                print(f"Deleted incomplete file: {nc_file_path}")
+                    if not success:
+                        print(f"Failed to download {cds_variable} data for {year}-{month:02d} after {max_retries} attempts.")
+                        all_years_downloaded = False
+                        continue
+                    try:
+                        ds_month = xr.open_dataset(nc_file_path)
+                        ds_daily = self._postprocess_reanalysis(ds_month, v)
+                        if v == "PRCP":
+                            ds_daily = ds_daily.sel(time=ds_daily.time.dt.hour == 0) * 1000
+                            ds_daily_0 = ds_daily.isel(time=0)
+                            ds_daily_0.coords['time'] = pd.Timestamp(f"{year}-{month}-{calendar.monthrange(year, month)[1]}")
+                            ds_daily = ds_daily.shift(time=-1).dropna(dim="time")
+                            ds_daily = xr.concat([ds_daily_0, ds_daily], dim="time")
+                        if v == "RUNOFF":
+                            ds_daily = ds_daily.sel(time=ds_daily.time.dt.hour == 0)
+                            ds_daily_0 = ds_daily.isel(time=0)
+                            ds_daily_0.coords['time'] = pd.Timestamp(f"{year}-{month}-{calendar.monthrange(year, month)[1]}")
+                            ds_daily = ds_daily.shift(time=-1).dropna(dim="time")
+                            ds_daily = xr.concat([ds_daily_0, ds_daily], dim="time")
+                            lat = ds_daily.Y
+                            lon = ds_daily.X
+                            dlon = np.deg2rad(0.1)
+                            dlat = np.deg2rad(0.1)
+                            r = 6371000 # Earth radius in meters
+                            # Area for each grid cell
+                            area_= (r ** 2) * dlon * np.cos(np.deg2rad(lat)) * dlat
+                            # Perform the conversion to m^3/s
+                            ds_daily = (ds_daily * area_) / 86400
+                        if v in ["DSWR", "DLWR", "NOLR"]:
+                            ds_daily = ds_daily.sel(time=ds_daily.time.dt.hour == 0) / 86400
+                            ds_daily_0 = ds_daily.isel(time=0)
+                            ds_daily_0.coords['time'] = pd.Timestamp(f"{year}-{month}-{calendar.monthrange(year, month)[1]}")
+                            ds_daily = ds_daily.shift(time=-1).dropna(dim="time")
+                            ds_daily = xr.concat([ds_daily_0, ds_daily], dim="time")
+                        if v in ["TEMP", "TDEW"]:
+                            ds_daily = ds_daily - 273.15  # K to °C
+                        combined_datasets.append(ds_daily)
+                    except Exception as e:
+                        print(f"Failed to process {nc_file_path}: {e}")
+                        all_years_downloaded = False
+                    if nc_file_path.exists():
+                        os.remove(nc_file_path)
+                        print(f"Deleted hourly file: {nc_file_path}")
+            if combined_datasets and all_years_downloaded:
+                try:
+                    combined_ds = xr.concat(combined_datasets, dim="time")
+                    combined_ds = combined_ds.rename({"time": "T"})
+                    combined_ds.to_netcdf(output_path)
+                    combined_ds.close()
+                    print(f"Combined dataset for ERA5Land.{v} saved to {output_path}")
+                except Exception as e:
+                    print(f"Failed to process or save combined dataset for ERA5Land.{v}: {e}")
+            else:
+                print(f"Skipping save for ERA5Land.{v} due to incomplete downloads.")
+
+    def WAS_Download_CHIRPSv3_Daily(
+            self,
+            dir_to_save,
+            year_start,
+            year_end,
+            blend_type="ERA5",
+            area=None,
+            force_download=False,
+            max_retries=3,
+            retry_delay=5,
+        ):
+        """
+        Download daily CHIRPS v3.0 precipitation (blended with ERA5 or IMERGlate-v07) from the Copernicus Data Store (CDS)
+        for specified years, with retries for failed downloads.
+        Parameters
+        ----------
+        dir_to_save : str or pathlib.Path
+            Directory path where the downloaded NetCDF files will be saved.
+            The directory will be created if it does not exist.
+        year_start : int
+            Start year for the data to download (inclusive).
+        year_end : int
+            End year for the data to download (inclusive).
+        blend_type : str
+            Blend type, either "ERA5" or "IMERGlate-v07" (default: "ERA5").
+            Note: IMERGlate-v07 availability starts from ~2000; earlier years may fail.
+        area : list of float
+            Bounding box for spatial subsetting in the format [North, West, South, East].
+        force_download : bool, optional
+            If True, forces download even if the output file exists. Default is False.
+        max_retries : int, optional
+            Maximum number of retry attempts for failed downloads. Default is 3.
+        retry_delay : int, optional
+            Seconds to wait between retry attempts. Default is 5.
+        Returns
+        -------
+        None
+            The function saves NetCDF files to `dir_to_save` but does not return a value.
+            Output files are named as `Daily_PRCP_{blend_type}_{year_start}_{year_end}.nc`.
+        Notes
+        -----
+        - Downloads individual daily TIFF files, processes them with rioxarray, clips if area specified,
+          and combines into a single NetCDF with daily time dimension.
+        - Units: precipitation in mm/day.
+        - Coordinates renamed to "X" (longitude), "Y" (latitude), "T" (time), with Y flipped if needed.
+        - Deletes temporary TIFF files after processing.
+        - Skips invalid dates (e.g., Feb 30) automatically.
+        """
+        dir_to_save = Path(dir_to_save)
+        dir_to_save.mkdir(parents=True, exist_ok=True)
+
+        output_path = dir_to_save / f"Daily_PRCP_{year_start}_{year_end}.nc"
+        if not force_download and output_path.exists():
+            print(f"{output_path} already exists. Skipping download.")
+            
+        combined_datasets = []
+        all_years_downloaded = True
+        for year in range(year_start, year_end + 1):
+            for month in range(1, 13):
+                ndays = calendar.monthrange(year, month)[1]
+                for day in range(1, ndays + 1):
+                    tif_file_path = dir_to_save / f"chirps-v3.0.{year}.{month:02d}.{day:02d}.tif"
+                    success = False
+                    retries = 0
+                    while retries < max_retries and not success:
+                        try:
+                            da = self._fetch_chirps_daily(
+                                year=year,
+                                month=month,
+                                day=day,
+                                dir_to_save=dir_to_save,
+                                blend_type=blend_type,
+                                force_download=force_download,
+                                area=area
+                            )
+                            if da is not None:
+                                combined_datasets.append(da)
+                                success = True
+                        except Exception as e:
+                            retries += 1
+                            print(f"Attempt {retries}/{max_retries} failed for {year}-{month:02d}-{day:02d}: {e}")
+                            if retries < max_retries:
+                                print(f"Retrying after {retry_delay} seconds...")
+                                _time.sleep(retry_delay)
+                            if tif_file_path.exists():
+                                os.remove(tif_file_path)
+                                print(f"Deleted incomplete TIFF: {tif_file_path}")
+                    if not success:
+                        print(f"Failed to download/process {year}-{month:02d}-{day:02d} after {max_retries} attempts.")
+                        # Continue to next day; don't set all_years_downloaded=False to allow partial data
+                    if tif_file_path.exists():
+                        os.remove(tif_file_path)
+                        print(f"Deleted TIFF: {tif_file_path}")
+        if combined_datasets:
+            try:
+                combined_ds = xr.concat(combined_datasets, dim="time").to_dataset(name="precip")
+                combined_ds = combined_ds.rename({"x": "X", "y": "Y", "time": "T"})
+                combined_ds = combined_ds.isel(Y=slice(None, None, -1))
+                combined_ds.to_netcdf(output_path)
+                combined_ds.close()
+                print(f"Combined daily dataset for CHIRPS ({blend_type}) saved to {output_path}")
+            except Exception as e:
+                print(f"Failed to process or save combined dataset for CHIRPS ({blend_type}): {e}")
+        else:
+            print(f"No data downloaded for CHIRPS ({blend_type}).")
+    
+    def _fetch_chirps_daily(self, year, month, day, dir_to_save, blend_type, force_download, area):
+            """
+            Construct the CHIRPS v3.0 daily TIF URL for (year, month, day),
+            download if needed, open as xarray, and optionally clip to 'area'.
+           
+            File format is: chirps-v3.0.YYYY.MM.DD.tif
+            """
+            base_url = f"https://data.chc.ucsb.edu/products/CHIRPS/v3.0/daily/final/{blend_type}/{year}"
+            fname = f"chirps-v3.0.{year}.{month:02d}.{day:02d}.tif"
+            url = f"{base_url}/{fname}"
+            local_path = Path(dir_to_save) / fname
+            if not local_path.exists() or force_download:
+                try:
+                    with requests.get(url, stream=True, timeout=120) as r:
+                        r.raise_for_status()
+                        with open(local_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                except Exception as e:
+                    print(f"[ERROR] Could not download {url}: {e}")
+                    return None
+            else:
+                print(f"[SKIP] {fname} is already present. (Use force_download=True to overwrite)")
+            # Open as xarray via rioxarray
+            try:
+                da = rioxr.open_rasterio(local_path, masked=True).squeeze()
+                time_coord = pd.to_datetime(f"{year}-{month:02d}-{day:02d}")
+                da = da.expand_dims(time=[time_coord])
+                da.name = "precip"
+                # If area is provided, clip
+                if area and len(area) == 4:
+                    north, west, south, east = area
+                    da = da.rio.clip_box(
+                        minx=west,
+                        miny=south,
+                        maxx=east,
+                        maxy=north
+                    )
+                return da
+            except Exception as e:
+                print(f"[ERROR] Could not open/parse {local_path}: {e}")
+                return None
+                
 
     def WAS_Download_CHIRPSv3_Seasonal(
         self,
@@ -1919,398 +2442,404 @@ class WAS_Download:
         ds_out = ds_out.assign_coords(time=pd.to_datetime(new_times))
 
         return ds_out
-
-    def WAS_Download_TAMSATv31_Seasonal(
-        self,
-        dir_to_save: Union[str, Path],
-        variables: Sequence[str] = ("rfe",),
-        year_start: int = 1983,
-        year_end: int = 2025,
-        area: Optional[List[float]] = None,
-        season_months: Sequence[str] = ("03", "04", "05"),
-        force_download: bool = False,
-    ) -> Path:
-        """Download and aggregate TAMSAT RFE v3.1 monthly rainfall data for a specified season.
-
-        This method retrieves monthly rainfall estimate (RFE) data from the TAMSAT v3.1 dataset,
-        optionally clips to a spatial bounding box, and aggregates the data into seasonal totals.
-        The data is sourced from the JASMIN GWS access point and saved as a NetCDF file.
-
-        Args:
-            dir_to_save (Union[str, Path]): Directory to save downloaded and processed files.
-            variables (Sequence[str], optional): NetCDF variable names to extract. Defaults to ("rfe",).
-            year_start (int, optional): First year of the season (year of the pivot month). Defaults to 1983.
-            year_end (int, optional): Last year of the season (inclusive). Defaults to 2025.
-            area (Optional[List[float]], optional): Bounding box [north, west, south, east] in degrees.
-                If None, the full spatial domain is retained. Defaults to None.
-            season_months (Sequence[str], optional): Months defining the season, e.g., ("11", "12", "01") for NDJ.
-                Defaults to ("03", "04", "05").
-            force_download (bool, optional): If True, re-download files even if they exist locally.
-                Defaults to False.
-
-        Returns:
-            Path: Path to the aggregated seasonal NetCDF file.
-
-        Raises:
-            RuntimeError: If no valid TAMSAT data is retrieved during the download process.
-            ValueError: If input parameters (e.g., years, months, or area) are invalid.
-
-        Examples:
-            >>> downloader = WAS_Download()
-            >>> path = downloader.WAS_Download_TAMSATv31_Seasonal(
-            ...     dir_to_save="data",
-            ...     year_start=2020,
-            ...     year_end=2021,
-            ...     season_months=("12", "01", "02"),
-            ...     area=[20, -20, -20, 20]
-            ... )
-            [INFO] Saved seasonal TAMSAT data → data/Obs_TAMSAT_2020_2021_DecJanFeb.nc
-        """
-        # Normalize and validate inputs
-        dir_to_save = Path(dir_to_save)
-        dir_to_save.mkdir(parents=True, exist_ok=True)
-
-        if year_start < 1983 or year_end > 2025 or year_start > year_end:
-            raise ValueError("Year range must be between 1983 and 2025, with year_start <= year_end.")
-
-        area_tuple: Optional[Tuple[float, float, float, float]] = (
-            tuple(map(float, area)) if area else None
-        )
-        season_months_int: List[int] = [int(m) for m in season_months]
-        if not all(1 <= m <= 12 for m in season_months_int):
-            raise ValueError("Season months must be valid month numbers (1-12).")
-
-        season_str = "".join(calendar.month_abbr[m] for m in season_months_int)
-        pivot = season_months_int[0]
-
-        # Define output file
-        out_nc = dir_to_save / f"Obs_TAMSAT_{year_start}_{year_end}_{season_str}.nc"
-        if out_nc.exists() and not force_download:
-            print(f"[INFO] {out_nc} already exists – skip download.")
-            return out_nc
-
-        # Gather monthly DataArrays
-        da_list: List[xr.DataArray] = []
-        for season_year in range(year_start, year_end + 1):
-            # Part A: Base-year months (>= pivot)
-            for m in (m for m in season_months_int if m >= pivot):
-                da = self._fetch_tamsat_monthly(
-                    year=season_year,
-                    month=m,
-                    dir_to_save=dir_to_save,
-                    force_download=force_download,
-                    area=area_tuple,
-                    keep_vars=variables,
-                )
-                if da is not None:
-                    da_list.append(da)
-
-            # Part B: Next-year months (< pivot)
-            if any(m < pivot for m in season_months_int) and season_year < year_end:
-                next_year = season_year + 1
-                for m in (m for m in season_months_int if m < pivot):
+####
+    def WAS_Download_TAMSAT_Seasonal(
+            self,
+            dir_to_save: Union[str, Path],
+            product: Literal["rfe", "soil_moisture"] = "rfe",
+            variables: Optional[Sequence[str]] = None,
+            year_start: int = 1983,
+            year_end: int = 2025,
+            area: Optional[List[float]] = None,
+            season_months: List[str] = ["03", "04", "05"],
+            version: Optional[str] = None,
+            force_download: bool = False,
+            agg: Optional[Literal["sum", "mean"]] = None,
+        ) -> Path:
+            """
+            Download and aggregate TAMSAT monthly data (RFE v3.1 or Soil Moisture v2.3.1) for a specified season.
+            Parameters
+            ----------
+            dir_to_save : str | Path
+                Directory where monthly files and the seasonal output will be saved.
+            product : {"rfe", "soil_moisture"}, default "rfe"
+                Dataset to download: "rfe" (precipitation) or "soil_moisture".
+            variables : sequence of str, optional
+                Names of variables to extract from NetCDF. If None, chosen by product.
+                - rfe: defaults to ("rfe",)
+                - soil_moisture: defaults to ("sm",)
+            year_start : int, default 1983
+                First seasonal year (pivot year) to include.
+            year_end : int, default 2025
+                Last year for which data is included (inclusive). For seasons spanning calendar years, the last pivot year processed will be year_end - 1 to ensure no data from year_end + 1 is fetched.
+            area : list[float], optional
+                Bounding box [north, west, south, east] in degrees.
+            season_months : sequence[str], default ("03","04","05")
+                Months defining the season, e.g. ("11","12","01") for NDJ.
+            version : str, optional
+                Product version. Defaults to:
+                - rfe: "v3.1"
+                - soil_moisture: "v2.3.1"
+            force_download : bool, default False
+                Re-download monthly files even if present locally.
+            agg : {"sum","mean"}, optional
+                Seasonal aggregation. Defaults to:
+                - rfe: "sum"
+                - soil_moisture: "mean"
+            Returns
+            -------
+            Path
+                Path to the seasonal aggregated NetCDF file.
+            """
+            dir_to_save = Path(dir_to_save)
+            dir_to_save.mkdir(parents=True, exist_ok=True)
+            season_months = tuple(season_months)
+            # ---- sensible defaults by product ----
+            if product == "rfe":
+                variables = variables or ("rfe")
+                version = version or "v3.1"
+                agg = agg or "sum"
+                std_name = "precip"
+            elif product == "soilmoisture":
+                variables = variables or ("smc_avail_top",)
+                version = version or "v2.3.1"
+                agg = agg or "mean"
+                std_name = "soil_moisture"
+            else:
+                raise ValueError("product must be 'rfe' or 'soilmoisture'")
+            # ---- validate inputs ----
+            if year_start > year_end:
+                raise ValueError("year_start must be <= year_end.")
+            season_months_int: List[int] = [int(m) for m in season_months]
+            if not all(1 <= m <= 12 for m in season_months_int):
+                raise ValueError("Season months must be valid month numbers (1-12).")
+            area_tuple: Optional[Tuple[float, float, float, float]] = (
+                tuple(map(float, area)) if area else None
+            )
+            season_str = "".join(calendar.month_abbr[m] for m in season_months_int)
+            pivot = season_months_int[0]
+            # ---- output filename ----
+            out_nc = dir_to_save / f"Obs_{product.upper()}_{year_start}_{year_end}_{season_str}.nc"
+            if out_nc.exists() and not force_download:
+                print(f"[INFO] {out_nc} already exists – skip download.")
+                return out_nc
+            # ---- determine if season spans years ----
+            spanning = any(m < pivot for m in season_months_int)
+            last_season_year = year_end if not spanning else year_end - 1
+            if year_start > last_season_year:
+                raise ValueError("No seasons to process based on year_start and year_end.")
+            # ---- build seasonal series (aggregate per season_year then stack) ----
+            seasonal_list: List[xr.DataArray] = []
+            for season_year in range(year_start, last_season_year + 1):
+                monthly_das: List[xr.DataArray] = []
+                # Part A: base-year months (>= pivot)
+                for m in (m for m in season_months_int if m >= pivot):
                     da = self._fetch_tamsat_monthly(
-                        year=next_year,
+                        product=product,
+                        version=version,
+                        year=season_year,
                         month=m,
                         dir_to_save=dir_to_save,
                         force_download=force_download,
                         area=area_tuple,
                         keep_vars=variables,
+                        std_name=std_name,
                     )
                     if da is not None:
-                        da_list.append(da)
+                        monthly_das.append(da)
+                # Part B: next-year months (< pivot)
+                if spanning:
+                    next_year = season_year + 1
+                    for m in (m for m in season_months_int if m < pivot):
+                        da = self._fetch_tamsat_monthly(
+                            product=product,
+                            version=version,
+                            year=next_year,
+                            month=m,
+                            dir_to_save=dir_to_save,
+                            force_download=force_download,
+                            area=area_tuple,
+                            keep_vars=variables,
+                            std_name=std_name,
+                        )
+                        if da is not None:
+                            monthly_das.append(da)
+                if not monthly_das:
+                    # nothing for this season_year → skip
+                    continue
+                # stack months then aggregate for this season
+                season_stack = xr.concat(monthly_das, dim="time")
+                if agg == "sum":
+                    season_da = season_stack.sum(dim="time", keep_attrs=True)
+                elif agg == "mean":
+                    season_da = season_stack.mean(dim="time", keep_attrs=True)
+                else:
+                    raise ValueError("agg must be 'sum' or 'mean'.")
+                # give a representative time stamp (pivot-year)
+                season_time = pd.to_datetime(f"{season_year}-{pivot:02d}-15")
+                season_da = season_da.expand_dims(time=[season_time])
+                seasonal_list.append(season_da)
+            if not seasonal_list:
+                raise RuntimeError("No TAMSAT files were downloaded or opened for any season.")
+            # ---- concat seasons and save ----
+            da_all = xr.concat(seasonal_list, dim="time")
+            ds_out = da_all.to_dataset(name=std_name)
 
-        if not da_list:
-            raise RuntimeError("No TAMSAT files were downloaded or opened.")
-
-        # Aggregate and save
-        ds_all = xr.concat(da_list, dim="time").to_dataset(name="precip")
-        ds_season = self._aggregate_chirps(ds_all, season_months_int)
-        ds_season = ds_season.rename({"lon": "X", "lat": "Y", "time": "T"}, errors="ignore")
-        ds_season.to_netcdf(out_nc)
-        print(f"[INFO] Saved seasonal TAMSAT data → {out_nc}")
-
-        return out_nc
-
+            # harmonize dims if needed
+            rename_dict = {k: v for k, v in {"lon": "X", "lat": "Y", "time": "T"}.items() if k in ds_out.dims}
+            ds_out = ds_out.rename(rename_dict)
+            ds_out.to_netcdf(out_nc)
+            print(f"[INFO] Saved seasonal {product.upper()} data → {out_nc}")
+            return out_nc
     def _fetch_tamsat_monthly(
         self,
+        product: Literal["rfe", "soilmoisture"],
+        version: str,
         year: int,
         month: int,
         dir_to_save: Path,
         force_download: bool,
         area: Optional[Tuple[float, float, float, float]],
         keep_vars: Sequence[str],
+        std_name: str,
     ) -> Optional[xr.DataArray]:
-        """Download and process a single TAMSAT v3.1 monthly NetCDF file.
-
-        This helper method retrieves a monthly NetCDF file, extracts the specified variable,
-        optionally clips to a spatial bounding box, and returns the data as an xarray DataArray.
-
-        Args:
-            year (int): Year of the data to download.
-            month (int): Month of the data to download (1-12).
-            dir_to_save (Path): Directory to save the downloaded file.
-            force_download (bool): If True, re-download the file even if it exists locally.
-            area (Optional[Tuple[float, float, float, float]]): Bounding box [north, west, south, east].
-                If None, no spatial filtering is applied.
-            keep_vars (Sequence[str]): NetCDF variable names to retain.
-
-        Returns:
-            Optional[xr.DataArray]: DataArray containing the monthly data with the variable named "precip",
-                or None if the download or file opening fails.
         """
-        base = (
-            "https://gws-access.jasmin.ac.uk/public/tamsat/rfe/data/v3.1/"
-            "monthly/{year}/{month:02d}/rfe{year}_{month:02d}.v3.1.nc"
-        )
+        Download & open a single monthly TAMSAT file (RFE v3.1 or Soil Moisture v2.3.1),
+        clip to bbox if provided, and return a standardized DataArray.
+        Returns
+        -------
+        xr.DataArray | None
+        """
+        if product == "rfe":
+            # e.g. .../tamsat/rfe/data/v3.1/monthly/1983/01/rfe1983_01.v3.1.nc
+            base = (
+                "https://gws-access.jasmin.ac.uk/public/tamsat/rfe/data/"
+                f"{version}/monthly/{{year}}/{{month:02d}}/rfe{{year}}_{{month:02d}}.{version}.nc"
+            )
+        else: # soil_moisture
+            # e.g. .../tamsat/soil_moisture/data/v2.3.1/monthly/1983/01/sm1983_01.v2.3.1.nc
+            base = (
+                "https://gws-access.jasmin.ac.uk/public/tamsat/soil_moisture/data/"
+                f"{version}/monthly/{{year}}/{{month:02d}}/sm{{year}}_{{month:02d}}.{version}.nc"
+            )
         url = base.format(year=year, month=month)
         fname = dir_to_save / url.split("/")[-1]
-
-        # Download if needed
+        # download if needed
         if not fname.exists() or force_download:
             try:
                 print(f"[DL ] {url}")
-                with requests.get(url, stream=True, timeout=120) as r:
+                with requests.get(url, stream=True, timeout=180) as r:
                     r.raise_for_status()
                     with open(fname, "wb") as f:
                         for chunk in r.iter_content(chunk_size=8192):
-                            f.write(chunk)
+                            if chunk:
+                                f.write(chunk)
             except Exception as exc:
                 print(f"[ERR] Download failed: {exc}")
                 return None
         else:
             print(f"[SKP] {fname.name} already present.")
-
-        # Open with xarray
+        # open & standardize
         try:
             ds = xr.open_dataset(fname)
-            var = next(v for v in keep_vars if v in ds.data_vars)
+            var = next((v for v in keep_vars if v in ds.data_vars), None)
+            if var is None:
+                raise KeyError(f"None of {keep_vars} found in {fname.name}; available: {list(ds.data_vars)}")
+            # make a 1-step time axis for this month
             da = ds[var].assign_coords(time=[pd.to_datetime(f"{year}-{month:02d}-01")]).astype("float32")
-
+            # spatial clip if requested
             if area:
                 n, w, s, e = area
+                # TAMSAT is lat/lon naming; ensure correct orientation
+                latn = "lat" if "lat" in da.coords else "latitude"
+                lonn = "lon" if "lon" in da.coords else "longitude"
                 da = da.where(
-                    (da["lat"] <= n) & (da["lat"] >= s) & (da["lon"] >= w) & (da["lon"] <= e),
+                    (da[latn] <= n) & (da[latn] >= s) & (da[lonn] >= w) & (da[lonn] <= e),
                     drop=True,
                 )
-
-            da.name = "precip"
+            da.name = std_name
             return da
         except Exception as exc:
             print(f"[ERR] Failed to open dataset: {exc}")
             return None
 
-####
-    def WAS_Download_TAMSATv31_daily(
-        self,
-        dir_to_save: Union[str, Path],
-        variables: Sequence[str] = ("rfe",),
-        year_start: int = 1983,
-        year_end: int = 2025,
-        area: Optional[List[float]] = None,
-        season_months: Sequence[str] = ("03", "04", "05"),
-        days: Optional[List[int]] = None,
-        force_download: bool = False,
-        aggregate: bool = True,
-    ) -> Optional[Path]:
-        """Download and process daily TAMSAT RFE v3.1 files for a specified season across multiple years.
 
-        This method retrieves daily rainfall estimate (RFE) data from the TAMSAT v3.1 dataset,
-        optionally filters by spatial area and specific days, and aggregates the data into
-        seasonal totals if requested. The data is sourced from the JASMIN GWS access point.
-
-        Args:
-            dir_to_save (Union[str, Path]): Directory to save downloaded and processed files.
-            variables (Sequence[str], optional): NetCDF variable names to extract. Defaults to ("rfe",).
-            year_start (int, optional): First year of the season (year of the pivot month). Defaults to 1983.
-            year_end (int, optional): Last year of the season (inclusive). Defaults to 2025.
-            area (Optional[List[float]], optional): Bounding box [north, west, south, east] in degrees.
-                If None, the full spatial domain is retained. Defaults to None.
-            season_months (Sequence[str], optional): Months defining the season, e.g., ("11", "12", "01") for NDJ.
-                Defaults to ("03", "04", "05").
-            days (Optional[List[int]], optional): Specific days of the month to download (1-based).
-                If None, all days in the season months are included. Defaults to None.
-            force_download (bool, optional): If True, re-download files even if they exist locally.
-                Defaults to False.
-            aggregate (bool, optional): If True, sum daily rainfall over each season and save as a single NetCDF file.
-                If False, retain individual daily files. Defaults to True.
-
-        Returns:
-            Optional[Path]: Path to the aggregated seasonal NetCDF file if `aggregate` is True,
-                otherwise None if `aggregate` is False or no data is retrieved.
-
-        Raises:
-            RuntimeError: If no valid TAMSAT data is retrieved during the download process.
-            ValueError: If input parameters (e.g., years, months, or area) are invalid.
-
-        Examples:
-            >>> downloader = WAS_Download()
-            >>> path = downloader.WAS_Download_TAMSATv31_daily(
-            ...     dir_to_save="data",
-            ...     year_start=2020,
-            ...     year_end=2021,
-            ...     season_months=("12", "01", "02"),
-            ...     area=[20, -20, -20, 20],
-            ...     days=[1, 15]
-            ... )
-            [INFO] Saved seasonal-total daily TAMSAT → data/Obs_TAMSAT_daily_2020_2021_DecJanFeb.nc
-        """
-        # Normalize inputs
-        dir_to_save = Path(dir_to_save)
-        dir_to_save.mkdir(parents=True, exist_ok=True)
-
-        if year_start < 1983 or year_end > 2025 or year_start > year_end:
-            raise ValueError("Year range must be between 1983 and 2025, with year_start <= year_end.")
-
-        area_tuple: Optional[Tuple[float, float, float, float]] = (
-            tuple(map(float, area)) if area else None
-        )
-        months_int: List[int] = [int(m) for m in season_months]
-        if not all(1 <= m <= 12 for m in months_int):
-            raise ValueError("Season months must be valid month numbers (1-12).")
-
-        months_abbr = "".join(calendar.month_abbr[m] for m in months_int)
-        pivot = months_int[0]
-        day_set: Optional[List[int]] = sorted({int(d) for d in days}) if days else None
-
-        # Define output file for aggregation
-        out_nc = dir_to_save / f"Obs_TAMSAT_daily_{year_start}_{year_end}_{months_abbr}.nc"
-        if aggregate and out_nc.exists() and not force_download:
-            print(f"[INFO] {out_nc} already exists – skipping download.")
-            return out_nc
-
-        # Download data for each season
-        da_all: List[xr.DataArray] = []
-        for season_year in range(year_start, year_end + 1):
-            # Part A: Months in the base season year
-            for mm in (m for m in months_int if m >= pivot):
-                da_all.extend(
-                    self._fetch_tamsat_daily_month(
-                        year=season_year,
-                        month=mm,
-                        dir_to_save=dir_to_save,
-                        keep_vars=variables,
-                        area=area_tuple,
-                        days=day_set,
-                        force_download=force_download,
-                    )
+    def WAS_Download_TAMSAT_Daily(
+            self,
+            dir_to_save: Union[str, Path],
+            product: Literal["rfe", "soilmoisture"] = "rfe",
+            variables: Optional[Sequence[str]] = None,
+            year_start: str = "1983",
+            year_end: str = "2024",
+            area: Optional[List[float]] = None,
+            version: Optional[str] = None,
+            force_download: bool = False,
+        ) -> Path:
+            """
+            Download TAMSAT daily data (RFE v3.1 or Soil Moisture v2.3.1) and combine into a single NetCDF file.
+            Parameters
+            ----------
+            dir_to_save : str | Path
+                Directory where daily files and the combined output will be saved.
+            product : {"rfe", "soil_moisture"}, default "rfe"
+                Dataset to download: "rfe" (precipitation) or "soil_moisture".
+            variables : sequence of str, optional
+                Names of variables to extract from NetCDF. If None, chosen by product.
+                - rfe: defaults to ("rfe",)
+                - soil_moisture: defaults to ("sm",)
+            start_date : str, default "1983-01-01"
+                Start date in "YYYY-MM-DD" format.
+            end_date : str, default "2025-10-20"
+                End date in "YYYY-MM-DD" format (inclusive).
+            area : list[float], optional
+                Bounding box [north, west, south, east] in degrees.
+            version : str, optional
+                Product version. Defaults to:
+                - rfe: "v3.1"
+                - soil_moisture: "v2.3.1"
+            force_download : bool, default False
+                Re-download daily files even if present locally.
+            Returns
+            -------
+            Path
+                Path to the combined daily NetCDF file.
+            """
+            dir_to_save = Path(dir_to_save)
+            dir_to_save.mkdir(parents=True, exist_ok=True)
+            start_date = f"{year_start}-01-01"
+            end_date = f"{year_end}-12-31"
+            # ---- sensible defaults by product ----
+            if product == "rfe":
+                variables = variables or ("rfe",)
+                version = version or "v3.1"
+                prefix = "rfe"
+                std_name = "precip"
+            elif product == "soilmoisture":
+                variables = variables or ("smc_avail_top",)
+                version = version or "v2.3.1"
+                prefix = "sm"
+                std_name = "soil_moisture"
+            else:
+                raise ValueError("product must be 'rfe' or 'soilmoisture'")
+            # ---- validate inputs ----
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(end_date)
+            if start_dt > end_dt:
+                raise ValueError("start_date must be <= end_date.")
+            dates = pd.date_range(start_dt, end_dt, freq="D")
+            area_tuple: Optional[Tuple[float, float, float, float]] = (
+                tuple(map(float, area)) if area else None
+            )
+            # ---- output filename ----
+            sdate_str = start_date.replace("-", "")
+            edate_str = end_date.replace("-", "")
+            out_nc = dir_to_save / f"Obs_{product.upper()}_daily_{sdate_str}_{edate_str}.nc"
+            if out_nc.exists() and not force_download:
+                print(f"[INFO] {out_nc} already exists – skip download.")
+                return out_nc
+            # ---- build daily series ----
+            daily_list: List[xr.DataArray] = []
+            for date in dates:
+                y = date.year
+                m = date.month
+                d = date.day
+                da = self._fetch_tamsat_daily(
+                    product=product,
+                    version=version,
+                    year=y,
+                    month=m,
+                    day=d,
+                    dir_to_save=dir_to_save,
+                    force_download=force_download,
+                    area=area_tuple,
+                    keep_vars=variables,
+                    std_name=std_name,
+                    prefix=prefix,
                 )
+                if da is not None:
+                    daily_list.append(da)
+            if not daily_list:
+                raise RuntimeError("No TAMSAT files were downloaded or opened.")
+            # ---- concat days and save ----
+            da_all = xr.concat(daily_list, dim="time")
+            ds_out = da_all.to_dataset(name=std_name)
 
-            # Part B: Spill-over months in the next calendar year
-            if any(m < pivot for m in months_int) and season_year < year_end:
-                next_year = season_year + 1
-                for mm in (m for m in months_int if m < pivot):
-                    da_all.extend(
-                        self._fetch_tamsat_daily_month(
-                            year=next_year,
-                            month=mm,
-                            dir_to_save=dir_to_save,
-                            keep_vars=variables,
-                            area=area_tuple,
-                            days=day_set,
-                            force_download=force_download,
-                        )
-                    )
-
-        if not da_all:
-            raise RuntimeError("No daily TAMSAT data were retrieved.")
-
-        # Handle aggregation or return
-        if not aggregate:
-            print("[INFO] Daily files downloaded – aggregation disabled.")
-            return None
-
-        # Aggregate and save
-        ds_all = xr.concat(da_all, dim="time").to_dataset(name="precip")
-        ds_season = self._aggregate_chirps(ds_all, months_int)
-        ds_season = ds_season.rename({"lon": "X", "lat": "Y", "time": "T"}, errors="ignore")
-        ds_season.to_netcdf(out_nc)
-        print(f"[INFO] Saved seasonal-total daily TAMSAT → {out_nc}")
-
-        # Clean up daily files
-        for f in dir_to_save.glob("rfe*.v3.1.nc"):
-            try:
-                f.unlink()
-            except Exception:
-                pass
-
-        return out_nc
-
-    def _fetch_tamsat_daily_month(
+            # harmonize dims if needed
+            rename_dict = {k: v for k, v in {"lon": "X", "lat": "Y", "time": "T"}.items() if k in ds_out.dims}
+            ds_out = ds_out.rename(rename_dict)
+            ds_out.to_netcdf(out_nc)
+            print(f"[INFO] Saved daily {product.upper()} data → {out_nc}")
+            return out_nc
+    def _fetch_tamsat_daily(
         self,
+        product: Literal["rfe", "soilmoisture"],
+        version: str,
         year: int,
         month: int,
+        day: int,
         dir_to_save: Path,
-        keep_vars: Sequence[str],
-        area: Optional[Tuple[float, float, float, float]],
-        days: Optional[List[int]],
         force_download: bool,
-    ) -> List[xr.DataArray]:
-        """Download and process daily TAMSAT v3.1 files for a single month.
-
-        This helper method retrieves daily NetCDF files for a specified month, filters
-        by requested variables, spatial area, and days, and returns the data as a list
-        of xarray DataArrays.
-
-        Args:
-            year (int): Year of the data to download.
-            month (int): Month of the data to download (1-12).
-            dir_to_save (Path): Directory to save downloaded files.
-            keep_vars (Sequence[str]): NetCDF variable names to retain.
-            area (Optional[Tuple[float, float, float, float]]): Bounding box [north, west, south, east].
-                If None, no spatial filtering is applied.
-            days (Optional[List[int]]): Specific days to download (1-based).
-                If None, all days in the month are included.
-            force_download (bool): If True, re-download files even if they exist locally.
-
-        Returns:
-            List[xr.DataArray]: List of DataArrays containing the downloaded and processed daily data.
-                Each DataArray represents one day's data, with the variable named "precip".
-
+        area: Optional[Tuple[float, float, float, float]],
+        keep_vars: Sequence[str],
+        std_name: str,
+        prefix: str,
+    ) -> Optional[xr.DataArray]:
         """
-        da_month: List[xr.DataArray] = []
-        last_day = calendar.monthrange(year, month)[1]
-        day_iter = [d for d in (days or range(1, last_day + 1)) if 1 <= d <= last_day]
-
-        for day in day_iter:
-            url = (
-                "https://gws-access.jasmin.ac.uk/public/tamsat/rfe/data/v3.1/"
-                f"daily/{year}/{month:02d}/rfe{year}_{month:02d}_{day:02d}.v3.1.nc"
-            )
-            fname = dir_to_save / url.split("/")[-1]
-
-            if not fname.exists() or force_download:
-                try:
-                    with requests.get(url, stream=True, timeout=120) as r:
-                        if r.status_code == 404:
-                            continue
-                        r.raise_for_status()
-                        with open(fname, "wb") as f:
-                            for chunk in r.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                except Exception:
-                    continue
-
+        Download & open a single daily TAMSAT file (RFE v3.1 or Soil Moisture v2.3.1),
+        clip to bbox if provided, and return a standardized DataArray.
+        Returns
+        -------
+        xr.DataArray | None
+        """
+        if product == "soilmoisture":
+            product_ = "soil_moisture"
+        else:
+            product_ = product
+        base = (
+            f"https://gws-access.jasmin.ac.uk/public/tamsat/{product_}/data/"
+            f"{version}/daily/{{year}}/{{month:02d}}/{prefix}{{year}}_{{month:02d}}_{{day:02d}}.{version}.nc"
+        )
+        url = base.format(year=year, month=month, day=day)
+        fname = dir_to_save / url.split("/")[-1]
+        # download if needed
+        if not fname.exists() or force_download:
             try:
-                ds = xr.open_dataset(fname)
-                var = next(v for v in keep_vars if v in ds.data_vars)
-                da = ds[var]
-                time_val = pd.to_datetime(f"{year}-{month:02d}-{day:02d}")
-                da = da.assign_coords(time=[time_val]) if "time" in da.coords else da.expand_dims(time=[time_val])
+                print(f"[DL ] {url}")
+                with requests.get(url, stream=True, timeout=180) as r:
+                    r.raise_for_status()
+                    with open(fname, "wb") as f:
+                        for chunk in r.iter_content(8192):
+                            if chunk:
+                                f.write(chunk)
+            except Exception as exc:
+                print(f"[ERR] Download failed: {exc}")
+                return None
+        else:
+            print(f"[SKP] {fname.name} already present.")
+        # open & standardize
+        try:
+            ds = xr.open_dataset(fname)
+            var = next((v for v in keep_vars if v in ds.data_vars), None)
+            if var is None:
+                raise KeyError(f"None of {keep_vars} found in {fname.name}; available: {list(ds.data_vars)}")
+            # make a 1-step time axis for this day
+            da = ds[var].assign_coords(time=[pd.to_datetime(f"{year}-{month:02d}-{day:02d}")]).astype("float32")
+            # spatial clip if requested
+            if area:
+                n, w, s, e = area
+                # TAMSAT is lat/lon naming; ensure correct orientation
+                latn = "lat" if "lat" in da.coords else "latitude"
+                lonn = "lon" if "lon" in da.coords else "longitude"
+                da = da.where(
+                    (da[latn] <= n) & (da[latn] >= s) & (da[lonn] >= w) & (da[lonn] <= e),
+                    drop=True,
+                )
+            da.name = std_name
+            return da
+        except Exception as exc:
+            print(f"[ERR] Failed to open dataset: {exc}")
+            return None
 
-                if area:
-                    n, w, s, e = area
-                    da = da.where(
-                        (da["lat"] <= n) & (da["lat"] >= s) & (da["lon"] >= w) & (da["lon"] <= e),
-                        drop=True,
-                    )
-
-                da.name = "precip"
-                da_month.append(da)
-            except Exception:
-                continue
-
-        return da_month
 
 
 

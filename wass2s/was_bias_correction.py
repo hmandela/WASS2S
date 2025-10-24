@@ -4,6 +4,9 @@ from scipy import stats
 from scipy.interpolate import interp1d, PchipInterpolator
 from scipy.optimize import minimize
 from scipy.stats import norm, lognorm, gamma, weibull_min
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 
 class WAS_Qmap:
     """
@@ -821,7 +824,7 @@ class WAS_Qmap:
             ext_mod = mod.quantile(extreme_quantiles, dim='T')
             ext_corr = corrected.quantile(extreme_quantiles, dim='T')
             
-            ds = xr.Dataset({
+            ds_dry_wet = xr.Dataset({
                 'dry_fraction_obs': dry_obs,
                 'dry_fraction_mod': dry_mod,
                 'dry_fraction_corr': dry_corr,
@@ -830,12 +833,15 @@ class WAS_Qmap:
                 'wet_fraction_corr': wet_corr,
                 'mean_wet_obs': mean_wet_obs,
                 'mean_wet_mod': mean_wet_mod,
-                'mean_wet_corr': mean_wet_corr,
+                'mean_wet_corr': mean_wet_corr
+            })
+
+            ds_extreme = xr.Dataset({
                 'extreme_quantiles_obs': ext_obs,
                 'extreme_quantiles_mod': ext_mod,
                 'extreme_quantiles_corr': ext_corr
             })
-            return ds
+            return ds_dry_wet, ds_extreme
         else:
             # For numpy arrays, compute scalar metrics
             obs = np.asarray(obs).flatten()
@@ -873,8 +879,120 @@ class WAS_Qmap:
                 'extreme_quantiles_corr': ext_corr,
                 'extreme_quantiles': extreme_quantiles
             }
+    @staticmethod
+    def _add_basemap(ax, extent=None):
+        ax.coastlines()
+        ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+        ax.add_feature(cfeature.LAKES, linewidth=0.3, edgecolor='k', facecolor='none')
+        if extent is not None:
+            ax.set_extent(extent, crs=ccrs.PlateCarree())
+    @staticmethod
+    def _collect_vars(ds, prefix):
+        return [v for v in ds.data_vars if v.startswith(prefix)]
+        
+    @staticmethod    
+    def plot_fraction_group(ds, group_prefix, extent=None, robust=True):
+        """Plots dry/wet fraction groups (e.g., 'dry_fraction_' or 'wet_fraction_')."""
+        vars_ = WAS_Qmap._collect_vars(ds, group_prefix)
+        if not vars_:
+            print(f"No variables found for prefix '{group_prefix}'")
+            return
+        n = len(vars_)
+        ncols = min(3, n)
+        nrows = (n + ncols - 1) // ncols
+    
+        fig, axes = plt.subplots(
+            nrows=nrows, ncols=ncols,
+            subplot_kw={"projection": ccrs.PlateCarree()},
+            figsize=(5*ncols, 4*nrows),
+            squeeze=False
+        )
+        for i, name in enumerate(vars_):
+            r, c = divmod(i, ncols)
+            ax = axes[r][c]
+            da = ds[name]
+            im = da.plot(ax=ax, transform=ccrs.PlateCarree(), robust=robust, add_colorbar=True)
+            WAS_Qmap._add_basemap(ax, extent)
+            ax.set_title(name)
+        # hide any empty axes
+        for j in range(i+1, nrows*ncols):
+            r, c = divmod(j, ncols)
+            axes[r][c].axis('off')
+        fig.suptitle(f"{group_prefix} variables", fontsize=14)
+        plt.tight_layout()
+        plt.show()
+        
+    @staticmethod
+    def plot_mean_wet_group(ds, extent=None, robust=True):
+        """Plots mean_wet_* variables."""
+        vars_ = WAS_Qmap._collect_vars(ds, "mean_wet_")
+        if not vars_:
+            print("No 'mean_wet_' variables found")
+            return
+        n = len(vars_)
+        ncols = min(3, n)
+        nrows = (n + ncols - 1) // ncols
+    
+        fig, axes = plt.subplots(
+            nrows=nrows, ncols=ncols,
+            subplot_kw={"projection": ccrs.PlateCarree()},
+            figsize=(5*ncols, 4*nrows),
+            squeeze=False
+        )
+        for i, name in enumerate(vars_):
+            r, c = divmod(i, ncols)
+            ax = axes[r][c]
+            da = ds[name]
+            da.plot(ax=ax, transform=ccrs.PlateCarree(), robust=robust, add_colorbar=True)
+            WAS_Qmap._add_basemap(ax, extent)
+            ax.set_title(name)
+        for j in range(i+1, nrows*ncols):
+            r, c = divmod(j, ncols)
+            axes[r][c].axis('off')
+        fig.suptitle("mean_wet_* variables", fontsize=14)
+        plt.tight_layout()
+        plt.show()
 
-
+    @staticmethod
+    def plot_extreme_quantiles_group(ds, extent=None, robust=True):
+        """
+        Plots extreme_quantiles_* variables, faceting by variable (columns) and quantile (rows).
+        Assumes dims ('quantile', 'Y', 'X').
+        """
+        vars_ = WAS_Qmap._collect_vars(ds, "extreme_quantiles_")
+        if not vars_:
+            print("No 'extreme_quantiles_' variables found")
+            return
+    
+        qvals = ds.coords.get("quantile")
+        if qvals is None:
+            raise ValueError("Dataset has no 'quantile' coordinate required for extreme_quantiles_* variables.")
+    
+        nrows = len(qvals)
+        ncols = len(vars_)
+    
+        fig, axes = plt.subplots(
+            nrows=nrows, ncols=ncols,
+            subplot_kw={"projection": ccrs.PlateCarree()},
+            figsize=(5*ncols, 4*nrows),
+            squeeze=False
+        )
+    
+        for c, var in enumerate(vars_):
+            da = ds[var]
+            for r, q in enumerate(qvals.values):
+                ax = axes[r][c]
+                slice_da = da.sel(quantile=q)
+                slice_da.plot(ax=ax, transform=ccrs.PlateCarree(), robust=robust, add_colorbar=True)
+                WAS_Qmap._add_basemap(ax, extent)
+                ttl = f"{var} – q={q}"
+                ax.set_title(ttl)
+        # Column supertitles
+        for c, var in enumerate(vars_):
+            axes[0][c].set_title(var, fontsize=12)
+        fig.suptitle("extreme_quantiles_* by quantile", fontsize=14)
+        plt.tight_layout()
+        plt.show()
 
 
 class WAS_bias_correction:

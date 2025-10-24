@@ -21,6 +21,7 @@ import requests
 import rioxarray as rioxr
 from tqdm import tqdm
 from wass2s.was_compute_predictand import *
+from wass2s.was_bias_correction import *
 from scipy.ndimage import gaussian_filter
 from fitter import Fitter
 from matplotlib.colors import ListedColormap, BoundaryNorm
@@ -409,7 +410,7 @@ def trend_data(data):
     """
     try:
         data_filled = data.fillna(data.mean(dim="T", skipna=True))
-        eeof = xe.single.ExtendedEOF(n_modes=2, tau=1, embedding=3, n_pca_modes=20)
+        eeof = xe.single.ExtendedEOF(n_modes=2, tau=1, embedding=3, n_pca_modes=22)
         eeof.fit(data_filled, dim="T")
         scores_ext = eeof.scores()
         data_trends = eeof.inverse_transform(scores_ext.sel(mode=1))
@@ -822,7 +823,7 @@ def plot_map(extent, title="Map", sst_indices=None, fig_size=(10, 8)):
     plt.tight_layout()
     plt.show()
 
-def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n=6, gcm=False, agroparam=False):
+def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n=6, gcm=False, agroparam=False, hydro=False):
 
     # 1. Provide default thresholds if none given
     if threshold is None:
@@ -895,6 +896,19 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
             
             # Extend the list by all matches (or pick just the first one, depending on your needs)
             selected_vars_in_order.extend(matches)
+    elif hydro:
+        for key in top_n_models:
+            # Key looks like "eccc_5_JanIc_"; we take only "dwd21"
+            key_prefix = key.split(".")[0].lower().replace("_","")
+            
+            # Find all matching variables for this key
+            matches = [            
+                var for var in center_variable
+                if normalize_var(var).startswith(key_prefix)
+            ]
+            
+            # Extend the list by all matches (or pick just the first one, depending on your needs)
+            selected_vars_in_order.extend(matches)
     elif agroparam:
         for key in top_n_models:
             # Key looks like "eccc_5_JanIc_"; we take only "dwd21"
@@ -922,7 +936,7 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
             selected_vars_in_order.extend(matches)        
     return selected_vars_in_order # selected_vars
 
-def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, hspace=-0.6, logo=None, logo_position="lower left", sigma=None, res=None):
+def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, hspace=None, logo=None, logo_size=(None,None), logo_position="lower left", sigma=None, res=None):
     """
     Plot probabilistic forecasts with tercile categories.
 
@@ -948,6 +962,14 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
         Path to the logo image to be added to the plot (default is None).
     logo_size : float, optional
         Size of the logo image in the plot (default is 0.5).    
+    logo_position : str, optional
+        Position of the logo image in the plot (default is "lower left").       
+    logo_size : tuple, optional
+        Size of the logo image in the plot as (width, height) in inches (default is (None, None)).
+
+    Returns
+    -------
+    None
 
     Notes
     -----
@@ -1005,17 +1027,31 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     
     # Step 3: Define custom colormaps
     if reverse_cmap:
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ["#ffffe5", "#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ["#f0f0f0","#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252"])
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ["#f7fcfd", "#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"])  
+        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ["#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]) 
+        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ["#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252"])
+        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ["#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"])  
     else:
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ["#ffffe5", "#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ["#f0f0f0","#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252"])
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ["#f7fcfd", "#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"])          
+        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ["#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]) 
+        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ["#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252"])
+        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ["#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"])          
     
     # Create a figure with GridSpec
     fig = plt.figure(figsize=(10, 8))
-    gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2], hspace=-0.6, wspace=0.2)
+
+    if hspace is None:
+        hspace = -0.6  # Default height space if not provided
+    else:
+        hspace = hspace  # Use the provided height space
+
+    if logo is not None:
+        logo_size=  ("7%","21%")  # Default logo size if not provided
+    else:
+        logo_size = logo_size  # Use the provided logo size
+
+    # Define the GridSpec layout
+    import matplotlib.gridspec as gridspec
+
+    gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2], hspace=hspace, wspace=0.2)
 
     # Main map axis
     ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
@@ -1125,8 +1161,8 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     
     if logo is not None:
         ax_logo = inset_axes(ax,
-                            width="7%",          
-                            height="21%",         
+                            width=logo_size[0],  # Width of the logo    
+                            height=logo_size[1],  # Height of the logo        
                             loc=logo_position,
                             borderpad=0.1)        
         ax_logo.imshow(mpimg.imread(logo))
@@ -1628,8 +1664,6 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
             dims=["T", "Y", "X"]
         ) * mask
     else:
-        # da_noleap = obs_hdcst.sel(T=~((obs_hdcst['T'].dt.month == 2) & (obs_hdcst['T'].dt.day == 29)))
-        # daily_climatology = da_noleap.groupby('T.dayofyear').mean(dim='T')
         daily_climatology = obs_hdcst.groupby('T.dayofyear').mean(dim='T')
         daily_climatology = daily_climatology.sel(dayofyear=~((daily_climatology['dayofyear'] == 60)))
         data = daily_climatology.to_numpy()
@@ -1898,6 +1932,50 @@ cessation_dryspell_criteria = {
 }
 
 ########################## Extended seasonal forecast ##########################################
+qmap = WAS_Qmap()
+qmap_ = WAS_bias_correction()
+def proceed_seasonal_daily_bias_correction(dir_to_save_model, observation, hindcast_files, forecast_files, varname="PRCP", wet_day=0.1):
+    hindcast_files_={}
+    forecast_files_={}
+    os.makedirs(f"{dir_to_save_model}/corrected", exist_ok=True)
+    for i in hindcast_files.keys():
+        hcst = xr.open_dataset(hindcast_files[i])[varname]
+        fcst = xr.open_dataset(forecast_files[i])[varname]
+        corrected_hcst = []
+        corrected_fcst = []
+        save_path_hcst = f"{dir_to_save_model}/corrected/{os.path.basename(hindcast_files[i])}"
+        save_path_fcst = f"{dir_to_save_model}/corrected/{os.path.basename(forecast_files[i])}"
+        if not os.path.exists(save_path_hcst):
+            for month in range(1, 13):
+                obs_month = observation.sel(T=observation['T'].dt.month == month).interp(Y=hcst.Y, X=hcst.X, method="linear", kwargs={"fill_value": "extrapolate"})
+                mask = xr.where(~np.isnan(obs_month.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+                hcst_month = hcst.sel(T=hcst['T'].dt.month == month)
+                obs_month, hcst_month = xr.align(obs_month, hcst_month, join='inner')
+                fcst_month = fcst.sel(T=fcst['T'].dt.month == month)
+                if varname == "PRCP":
+                    fobj_quant = qmap.fitQmap(obs_month, hcst_month, method='QUANT', wet_day=0.1,  qstep=0.0001)
+                    hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant, type='linear')
+                    fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant, type='linear')
+                else:
+                    fobj_quant = qmap_.fitBC(obs_month, hcst_month, method='QUANT', qstep=0.01, nboot=5)
+                    hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant, type='linear')
+                    fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant, type='linear')         
+                corrected_hcst.append(hcst_month_corr)
+                corrected_fcst.append(fcst_month_corr)
+            corrected_hcst_ = xr.concat(corrected_hcst, dim='T').sortby('T').fillna(0) * mask
+            corrected_fcst_ = xr.concat(corrected_fcst, dim='T').sortby('T').fillna(0) * mask
+            corrected_hcst_.to_dataset(name='corrected').to_netcdf(save_path_hcst)
+            corrected_fcst_.to_dataset(name='corrected').to_netcdf(save_path_fcst)
+            hindcast_files_[i] = save_path_hcst
+            forecast_files_[i] = save_path_fcst
+        else:
+            print(f"[SKIP] {save_path_hcst} already exists.")
+            print(f"[SKIP] {save_path_fcst} already exists.")
+            hindcast_files_[i] = save_path_hcst
+            forecast_files_[i] = save_path_fcst 
+    return hindcast_files_, forecast_files_
+
+
 def pre_process_biophysical_model(dir_to_save, hdcst_file_path, 
 fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization,
  year_start, year_end, year_forecast, param="PRCP"):

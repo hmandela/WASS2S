@@ -1,4 +1,4 @@
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from wass2s.was_verification import *
 from wass2s.was_analog import *
@@ -15,3 +15,5 @@ from wass2s.utils import *
 from wass2s.was_cross_validate import *
 from wass2s.was_transformdata import *
 from wass2s.was_bias_correction import *
+# from wass2s.was_hydro_processing import *
+
