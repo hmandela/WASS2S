@@ -64,8 +64,7 @@ dependencies:
   - xeofs=3.0.4
   - minisom
   - properscoring
-  - fitter
-  - hpelm
+
 
   # --- Bayesian / Probabilistic ---
   - pymc=5.22
@@ -114,4 +113,5 @@ dependencies:
       - pymc==5.22.0
       - arviz==0.21.0
       - xskillscore==0.0.26
+
 
