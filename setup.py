@@ -3,7 +3,7 @@ import os
 
 setup(
     name="wass2s",
-    version="0.2.7",
+    version="0.2.8",
     author="HOUNGNIBO C. M. Mandela",
     author_email="hmandelahmadiba@gmail.com",
     description="A Python package for seasonal climate forecast.",
@@ -22,8 +22,9 @@ setup(
         "statsmodels",
         "pykrige",
         "cartopy",
-        "xeofs",
-        "xskillscore",
+        "xeofs==3.0.4",
+        "numba==0.6.0"
+        "xskillscore==0.0.26",
         "properscoring",
         "minisom",
         "rioxarray",
@@ -37,7 +38,7 @@ setup(
         "jupyterlab",
         "hpelm"
     ],
-    python_requires=">=3.11",
+    python_requires=">=3.12",
     license="GPL-3.0",
     license_files=('LICENSE',),
     classifiers=[
