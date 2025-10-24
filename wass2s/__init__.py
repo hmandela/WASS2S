@@ -1,5 +1,10 @@
-__version__ = "0.2.0"
-
+__version__ = "0.2.10"
+# --- SciPy interp patch for legacy dependencies ---
+import numpy as np
+import scipy
+if not hasattr(scipy, "interp"):
+    scipy.interp = np.interp
+# -------------------------------------------------
 from wass2s.was_verification import *
 from wass2s.was_analog import *
 from wass2s.was_cca import *
