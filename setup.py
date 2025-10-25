@@ -3,7 +3,7 @@ import os
 
 setup(
     name="wass2s",
-    version="0.2.10",
+    version="0.2.11",
     author="HOUNGNIBO C. M. Mandela",
     author_email="hmandelahmadiba@gmail.com",
     description="A Python package for seasonal climate forecast.",
@@ -15,6 +15,7 @@ setup(
         "statsmodels",
         "pykrige",
         "cartopy",
+        "matplotlib==3.7.3",
         "xeofs==3.0.4",
         "xskillscore==0.0.26",
         "properscoring",
