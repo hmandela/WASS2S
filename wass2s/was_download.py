@@ -1504,17 +1504,14 @@ class WAS_Download:
     
         # 3) Decide mean or sum based on var_name 
 
-        if any(x in var_name for x in ["TEMP","TMIN","TMAX","SST","SLP"]):
+        if any(x in var_name for x in ["TEMP","TMIN","TMAX","SST","SLP","RUNOFF"]):
             ds_out = ds.groupby("season_year").mean("time")
-        elif any(x in var_name for x in ["PRCP","DSWR","DLWR","NOLR","RUNOFF"]):
+        elif any(x in var_name for x in ["PRCP","DSWR","DLWR","NOLR"]):
             # For precipitation and radiation, we sum over time
-            # ds_out = ds.groupby("season_year").sum("time")
-            ds_out = ds.groupby("season_year").mean("time")
-        # elif var_name == "RUNOFF":
-        #     ds_out = xr.diff(ds, dim="time").mean("time")
+            ds_out = ds.groupby("season_year").sum("time")
+            # ds_out = ds.groupby("season_year").mean("time")
         else:
             ds_out = ds.groupby("season_year").mean("time")
-    
         # 4) Rename "season_year" to "time", 
         #    so we end up with a time dimension (representing each seasonal year).
         ds_out = ds_out.rename({"season_year": "time"})
@@ -1763,8 +1760,8 @@ class WAS_Download:
                 )
                 
                 if v == "PRCP":
-                    nbjour = len(season_months)*30
-                    dsC = 1000*ds*nbjour  # !!!!! Convert to mm/month
+                    # nbjour = len(season_months)*30
+                    dsC = 1000 * ds * 30  # !!!!! Convert to mm/month
                 
                 if v in ["DSWR", "DLWR","NOLR"]:
                     dsC = dsC/86400  # Convert to W/m2
@@ -1910,7 +1907,7 @@ class WAS_Download:
                     var_name=v
                 )
                 if v == "PRCP":
-                    dsC = 1000 * dsC * len(season_months) * 30  # Convert to mm (approximate, as in existing code)
+                    dsC = 1000 * dsC * 30  # Convert to mm 
                 if v == "RUNOFF":
                     #dsC = dsC * len(season_months) * 30 # Convert to mm (approximate, as in existing code)
                     lat = dsC.Y
