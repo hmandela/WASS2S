@@ -1530,7 +1530,7 @@ def plot_prob_forecasts2(dir_to_save, forecast_prob, model_name, labels=["Below-
     plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.png", dpi=300, bbox_inches='tight')
     plt.show()
 
-def plot_tercile(A):
+def plot_tercile(A, save_dir=None, colors=None):
     """
     Plot a tercile map with categories: Below, Normal, Above.
 
@@ -1543,9 +1543,12 @@ def plot_tercile(A):
     -----
     Uses a custom colormap and displays a legend for tercile categories.
     """
-    fig = plt.figure(figsize=(8, 6))
+    fig = plt.figure(figsize=(9, 7))
     ax = plt.axes(projection=ccrs.PlateCarree())
-    colors = ['#fc8d59', '#ffffbf', '#99d594']
+    if colors is None:
+        colors = ['#fc8d59', '#bdbdbd', '#99d594']
+    else:
+        colors
     cmap = ListedColormap(colors)
     bounds = [-0.5, 0.5, 1.5, 2.5]
     norm = BoundaryNorm(bounds, cmap.N)
@@ -1555,15 +1558,20 @@ def plot_tercile(A):
     ax.add_feature(cfeature.BORDERS, linewidth=1)
     ax.add_feature(cfeature.COASTLINE, linewidth=1)
     ax.set_extent([lon.min(), lon.max(), lat.min(), lat.max()], crs=ccrs.PlateCarree())
-    plt.title("Terciles MAP", fontsize=16, weight='bold')
+    plt.title("Observed terciles", fontsize=16, weight='bold')
     legend_elements = [
-        mpatches.Patch(color='#99d594', label='ABOVE'),
-        mpatches.Patch(color='#ffffbf', label='NORMAL'),
-        mpatches.Patch(color='#fc8d59', label='BELOW')
+        mpatches.Patch(color=colors[2], label='ABOVE AVERAGE'),
+        mpatches.Patch(color=colors[1], label='NEAR AVERAGE'),
+        mpatches.Patch(color=colors[0], label='BELOW AVERAGE')
     ]
     plt.legend(handles=legend_elements, loc='lower left')
     plt.tight_layout()
-    plt.show()
+    if save_dir is None:
+        plt.show()
+    else:
+        plt.savefig(f"{save_dir}.png")
+        plt.show()
+
 
 def find_best_distribution_grid(rainfall, distribution_map=None):
     """

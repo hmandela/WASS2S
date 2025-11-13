@@ -98,7 +98,7 @@ class WAS_Analog:
         'reanalysis_name', 'model_name', 'variable', and 'area'.
         Default is a list with NOAA SST and ERA5 SP, VGRD_850 variables.
     method_analog : str, optional
-        Analog method to use ("som", "cor_based", "pca_based", "kmeans_based", "agglomerative_based"). Default is "som".
+        Analog method to use ("som", "cor_based", "bias_based, "pca_based", "kmeans_based", "agglomerative_based"). Default is "som".
     month_of_initialization : int, optional
         Month of initialization for forecasts (1-12). If None, uses previous month.
     lead_time : list, optional
@@ -784,6 +784,40 @@ class WAS_Analog:
         print(f"Similar years for {reference_year}: {similar_years}")
         return np.array(similar_years)
 
+
+    def Bias_Based(self, predictant, itrain, ireference_year):
+        """Identify similar years using bias-based analog method."""
+        _, ddd = self.download_and_process()
+        ddd = ddd.get(self.predictor_vars[0]['variable'])
+        if ddd is None:
+            raise ValueError(f"Variable {self.predictor_vars[0]['variable']} not found in downloaded data.")
+       
+        predictant = predictant.copy()
+        predictant['T'] = predictant['T'].astype('datetime64[ns]')
+        if ireference_year==2100:
+            reference_year = self.year_forecast
+            predictant_ = xr.concat([predictant.isel(T=itrain)], dim="T")
+        else:
+            reference_year = int(np.unique(predictant.isel(T=ireference_year)['T'].dt.year))
+            predictant_ = xr.concat([predictant.isel(T=itrain)], dim="T")
+        unique_years = np.append(np.unique(predictant_['T'].dt.year),reference_year)
+        sst_reference = ddd.sel(T=str(reference_year))
+       
+        biases = []
+        for year in unique_years:
+            tmp = ddd.sel(T=str(year))
+            tmp['T'] = sst_reference['T'] 
+            bias = np.abs(tmp - sst_reference).mean(dim="T")
+            biases.append(bias)
+       
+        similar = xr.concat(biases, dim='T').assign_coords(T=unique_years).compute()
+        similar = xr.where(similar < 0.5, 1, 0).sum(dim=["X", "Y"])
+        similar = similar.sortby(similar, ascending=False)
+        top_2 = similar.isel(T=slice(1, 3))
+        similar_years = top_2['T'].to_numpy()
+        print(f"Similar years for {reference_year}: {similar_years}")
+        return similar_years
+    
     def Corr_Based(self, predictant, itrain, ireference_year):
         """Identify similar years using correlation-based analog method."""
 
@@ -822,49 +856,97 @@ class WAS_Analog:
         return similar_years
 
 
+    # def Pca_Based(self, predictant, itrain, ireference_year):
+    #     """Identify similar years using PCA-based analog method."""
+    #     _, ddd = self.download_and_process()
+    #     ddd = ddd.get(self.predictor_vars[0]['variable'])
+    #     if ddd is None:
+    #         raise ValueError(f"Variable {self.predictor_vars[0]['variable']} not found in downloaded data.")
+        
+    #     # predictor_ = ddd.fillna(ddd.groupby("T.month").mean("T", skipna=True))
+    #     # predictor_detrend = sig.detrend(predictor_, axis=0)
+    #     # ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
+
+    #     if self.detrend:
+    #         ddd, _ = self._detrended_da(ddd)
+    #     # ddd = ddd.rename({"X": "lon", "Y": "lat"})
+    #     # eof = xe.single.EOF(n_modes=50, use_coslat=True, center=False)
+    #     # eof.fit(ddd.fillna(ddd.mean(dim="T", skipna=True)), dim="T")
+    #     # scores = eof.scores()
+    #     scores = self.compute_eofs(ddd)
+        
+    #     predictant = predictant.copy()
+    #     predictant['T'] = predictant['T'].astype('datetime64[ns]')
+
+    #     if ireference_year==2100:
+    #         reference_year = self.year_forecast
+    #         predictant_ = xr.concat([predictant.isel(T=itrain)], dim="T")
+    #     else:
+    #         reference_year = int(np.unique(predictant.isel(T=ireference_year)['T'].dt.year))
+    #         predictant_ = xr.concat([predictant.isel(T=itrain)], dim="T")
+
+    #     sst_ref = scores.sel(T=str(reference_year)).stack(score=('mode', 'T'))       
+    #     unique_years = np.append(np.unique(predictant_['T'].dt.year),reference_year)
+
+    #     correlations = []
+    #     for year in unique_years:
+    #         tmp = scores.sel(T=str(year)).stack(score=('mode', 'T'))
+    #         correlation = xr.corr(tmp, sst_ref, dim="score").compute()
+    #         correlations.append(correlation)
+        
+    #     similar = xr.concat(correlations, dim='T').assign_coords(T=unique_years)
+    #     similar = similar.sortby(similar, ascending=False)
+    #     top_2 = similar.isel(T=slice(1,3))
+    #     similar_years = top_2['T'].to_numpy()
+    #     print(f"Similar years for {reference_year}: {similar_years}")
+    #     return similar_years
+
     def Pca_Based(self, predictant, itrain, ireference_year):
-        """Identify similar years using PCA-based analog method."""
-        _, ddd = self.download_and_process()
-        ddd = ddd.get(self.predictor_vars[0]['variable'])
-        if ddd is None:
-            raise ValueError(f"Variable {self.predictor_vars[0]['variable']} not found in downloaded data.")
-        
-        # predictor_ = ddd.fillna(ddd.groupby("T.month").mean("T", skipna=True))
-        # predictor_detrend = sig.detrend(predictor_, axis=0)
-        # ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
-
-        if self.detrend:
-            ddd, _ = self._detrended_da(ddd)
-        
-        eof = xe.single.EOF(n_modes=50, use_coslat=True, center=False)
-        eof.fit(ddd.fillna(ddd.mean(dim="T", skipna=True)), dim="T")
-        scores = eof.scores()
-        
-        predictant = predictant.copy()
-        predictant['T'] = predictant['T'].astype('datetime64[ns]')
-
-        if ireference_year==2100:
-            reference_year = self.year_forecast
-            predictant_ = xr.concat([predictant.isel(T=itrain)], dim="T")
-        else:
-            reference_year = int(np.unique(predictant.isel(T=ireference_year)['T'].dt.year))
-            predictant_ = xr.concat([predictant.isel(T=itrain)], dim="T")
-
-        sst_ref = scores.sel(T=str(reference_year)).stack(score=('mode', 'T'))       
-        unique_years = np.append(np.unique(predictant_['T'].dt.year),reference_year)
-
-        correlations = []
-        for year in unique_years:
-            tmp = scores.sel(T=str(year)).stack(score=('mode', 'T'))
-            correlation = xr.corr(tmp, sst_ref, dim="score").compute()
-            correlations.append(correlation)
-        
-        similar = xr.concat(correlations, dim='T').assign_coords(T=unique_years)
-        similar = similar.sortby(similar, ascending=False)
-        top_2 = similar.isel(T=slice(1,3))
-        similar_years = top_2['T'].to_numpy()
-        print(f"Similar years for {reference_year}: {similar_years}")
-        return similar_years
+            """Identify similar years using PCA-based analog method."""
+            _, ddd = self.download_and_process()
+            ddd = ddd.get(self.predictor_vars[0]['variable'])
+            if ddd is None:
+                raise ValueError(f"Variable {self.predictor_vars[0]['variable']} not found in downloaded data.")
+           
+            # predictor_ = ddd.fillna(ddd.groupby("T.month").mean("T", skipna=True))
+            # predictor_detrend = sig.detrend(predictor_, axis=0)
+            # ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
+            if self.detrend:
+                ddd, _ = self._detrended_da(ddd)
+            # ddd = ddd.rename({"X": "lon", "Y": "lat"})
+            # eof = xe.single.EOF(n_modes=50, use_coslat=True, center=False)
+            # eof.fit(ddd.fillna(ddd.mean(dim="T", skipna=True)), dim="T")
+            # scores = eof.scores()
+            scores = self.compute_eofs(ddd)
+           
+            predictant = predictant.copy()
+            predictant['T'] = predictant['T'].astype('datetime64[ns]')
+            if ireference_year==2100:
+                reference_year = self.year_forecast
+                predictant_ = xr.concat([predictant.isel(T=itrain)], dim="T")
+            else:
+                reference_year = int(np.unique(predictant.isel(T=ireference_year)['T'].dt.year))
+                predictant_ = xr.concat([predictant.isel(T=itrain)], dim="T")
+            unique_years = np.append(np.unique(predictant_['T'].dt.year),reference_year)
+            
+            ref_scores = scores.sel(T=slice(f"{reference_year}-01-01", f"{reference_year}-12-31"))
+            ref_scores = ref_scores.assign_coords(T=np.arange(ref_scores.sizes['T']))
+            sst_ref = ref_scores.stack(score=('mode', 'T'))
+           
+            correlations = []
+            for year in unique_years:
+                tmp_scores = scores.sel(T=slice(f"{year}-01-01", f"{year}-12-31"))
+                tmp_scores = tmp_scores.assign_coords(T=np.arange(tmp_scores.sizes['T']))
+                tmp = tmp_scores.stack(score=('mode', 'T'))
+                correlation = xr.corr(tmp, sst_ref, dim="score").compute()
+                correlations.append(correlation)
+           
+            similar = xr.concat(correlations, dim='T').assign_coords(T=unique_years)
+            similar = similar.sortby(similar, ascending=False)
+            top_2 = similar.isel(T=slice(1,3))
+            similar_years = top_2['T'].to_numpy()
+            print(f"Similar years for {reference_year}: {similar_years}")
+            return similar_years
 
     def KMeans_Based(self, predictant, itrain, ireference_year):
         """Identify similar years using K-Means clustering."""
@@ -1049,57 +1131,328 @@ class WAS_Analog:
             data_var_concatenated[var] = concatenated_ds_st.to_array().drop_vars(['variable'], errors='ignore').squeeze()
         return data_var_concatenated, data_var_shifted
 
+    def compute_model(self, predictant, itrain, itest):
+        """Compute deterministic hindcast using the specified analog method."""
+        method_map = {
+            "som": self.SOM,
+            "bias_based": self.Bias_Based,
+            "cor_based": self.Corr_Based,
+            "pca_based": self.Pca_Based,
+            "kmeans_based": self.KMeans_Based,
+            "agglomerative_based": self.Agglomerative_Based
+        }
+        if self.method_analog not in method_map:
+            raise ValueError(f"Invalid analog method: {self.method_analog}. Choose 'som', 'bias_based', 'cor_based', 'pca_based', 'kmeans_based', or 'agglomerative_based'.")
+
+        similar_years = method_map[self.method_analog](predictant, itrain, itest)
+        predictant = predictant.copy()
+        predictant['T'] = predictant['T'].astype('datetime64[ns]')
+        
+        sim_obs = [predictant.sel(T=str(year)) for year in similar_years if year in predictant['T'].dt.year.values]
+        if not sim_obs:
+            raise ValueError("No valid similar years found for hindcast.")
+        
+        hindcast_det = xr.concat(sim_obs, dim="T").mean(dim="T").expand_dims({'T': predictant.isel(T=itest)['T'].values})
+        return hindcast_det
+
+    # ------------------ Probability Calculation Methods ------------------
 
     @staticmethod
-    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
-        """Calculate tercile probabilities using Student's t-distribution."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=np.float64)
+    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
+        """
+        Return tercile thresholds (T1, T2) from best-fit distribution parameters.
+    
+        dist_code:
+            1: norm
+            2: lognorm
+            3: expon
+            4: gamma
+            5: weibull_min
+            6: t
+            7: poisson
+            8: nbinom
+        """
+        if np.isnan(dist_code):
+            return np.nan, np.nan
+    
+        code = int(dist_code)
+        try:
+            if code == 1:
+                return (
+                    norm.ppf(0.33, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
+                )
+            elif code == 2:
+                return (
+                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                )
+            elif code == 3:
+                return (
+                    expon.ppf(0.33, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
+                )
+            elif code == 4:
+                return (
+                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                )
+            elif code == 5:
+                return (
+                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                )
+            elif code == 6:
+                # Note: Renamed 't_dist' to 't' for standard scipy.stats
+                return (
+                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                )
+            elif code == 7:
+                # Poisson: poisson.ppf(q, mu, loc=0)
+                # ASSUMPTION: 'mu' (mean) is passed as 'shape'
+                #             'loc' is passed as 'loc'
+                #             'scale' is unused
+                return (
+                    poisson.ppf(0.33, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
+                )
+            elif code == 8:
+                # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
+                # ASSUMPTION: 'n' (successes) is passed as 'shape'
+                #             'p' (probability) is passed as 'scale'
+                #             'loc' is passed as 'loc'
+                return (
+                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                )
+        except Exception:
+            return np.nan, np.nan
+    
+        # Fallback if code is not 1-8
+        return np.nan, np.nan
         
-        if np.all(np.isnan(best_guess)) or np.all(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        
-        error_std = np.sqrt(error_variance)
-        first_t = (first_tercile - best_guess) / error_std
-        second_t = (second_tercile - best_guess) / error_std
-        
-        pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-        pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-        pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-        return pred_prob
+    @staticmethod
+    def weibull_shape_solver(k, M, V):
+        """
+        Function to find the root of the Weibull shape parameter 'k'.
+        We find 'k' such that the theoretical variance/mean^2 ratio
+        matches the observed V/M^2 ratio.
+        """
+        # Guard against invalid 'k' values during solving
+        if k <= 0:
+            return -np.inf
+        try:
+            g1 = gamma_function(1 + 1/k)
+            g2 = gamma_function(1 + 2/k)
+            
+            # This is the V/M^2 ratio *implied by k*
+            implied_v_over_m_sq = (g2 / (g1**2)) - 1
+            
+            # This is the *observed* ratio
+            observed_v_over_m_sq = V / (M**2)
+            
+            # Return the difference (we want this to be 0)
+            return observed_v_over_m_sq - implied_v_over_m_sq
+        except ValueError:
+            return -np.inf # Handle math errors
 
     @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2):
-        """Calculate tercile probabilities using Gamma distribution."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=np.float64)
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
+    ):
+        """
+        Generic tercile probabilities using best-fit family per grid cell.
+
+        Inputs (per grid cell):
+        - best_guess : 1D array over T (hindcast_det or forecast_det)
+        - T1, T2     : scalar terciles from climatological best-fit distribution
+        - dist_code  : int, as in _ppf_terciles_from_code
+        - shape, loc, scale : scalars from climatology fit
+
+        Strategy:
+        - For each time step, build a predictive distribution of the same family:
+            * Use best_guess[t] to adjust mean / location;
+            * Keep shape parameters from climatology.
+        - Then compute probabilities:
+            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+        """
         
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
+        best_guess = np.asarray(best_guess, float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        # T1 = np.asarray(T1, dtype=float)
+        # T2 = np.asarray(T2, dtype=float)
+        n_time = best_guess.size
+        out = np.full((3, n_time), np.nan, float)
+
+        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
+            return out
+
+        code = int(dist_code)
+
+        # Normal: loc = forecast; scale from clim
+        if code == 1:
+            error_std = np.sqrt(error_variance)
+            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
+
+        # Lognormal: shape = sigma from clim; enforce mean = best_guess
+        elif code == 2:
+            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
+            mu = np.log(best_guess) - sigma**2 / 2
+            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
+
+
+        # Exponential: keep scale from clim; shift loc so mean = best_guess
+        elif code == 3:
+            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
+            c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        # Gamma: use shape from clim; set scale so mean = best_guess
+        elif code == 4:
+            alpha = (best_guess ** 2) / error_variance
+            theta = error_variance / best_guess
+            c1 = gamma.cdf(T1, a=alpha, scale=theta)
+            c2 = gamma.cdf(T2, a=alpha, scale=theta)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 5: # Assuming 5 is for Weibull   
         
-        best_guess = np.asarray(best_guess, dtype=np.float64)
-        error_variance = np.asarray(error_variance, dtype=np.float64)
-        T1 = np.asarray(T1, dtype=np.float64)
-        T2 = np.asarray(T2, dtype=np.float64)
+            for i in range(n_time):
+                # Get the scalar values for this specific element (e.g., grid cell)
+                M = best_guess[i]
+                print(M)
+                V = error_variance
+                print(V)
+                
+                # Handle cases with no variance to avoid division by zero
+                if V <= 0 or M <= 0:
+                    out[0, i] = np.nan
+                    out[1, i] = np.nan
+                    out[2, i] = np.nan
+                    continue # Skip to the next element
         
-        alpha = (best_guess**2) / error_variance
-        theta = error_variance / best_guess
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
+                # --- 1. Numerically solve for shape 'k' ---
+                # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
+                initial_guess = 2.0
+                
+                # fsolve finds the root of our helper function
+                k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
         
-        pred_prob[0, :] = cdf_t1
-        pred_prob[1, :] = cdf_t2 - cdf_t1
-        pred_prob[2, :] = 1.0 - cdf_t2
-        return pred_prob
+                # --- 2. Check for bad solution and calculate scale 'lambda' ---
+                if k <= 0:
+                    # Solver failed
+                    out[0, i] = np.nan
+                    out[1, i] = np.nan
+                    out[2, i] = np.nan
+                    continue
+                
+                # With 'k' found, we can now algebraically find scale 'lambda'
+                # In scipy.stats, scale is 'scale'
+                lambda_scale = M / gamma_function(1 + 1/k)
+        
+                # --- 3. Calculate Probabilities ---
+                # In scipy.stats, shape 'k' is 'c'
+                # Use the T1 and T2 values for this specific element
+                
+                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
+                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
+        
+                out[0, i] = c1
+                out[1, i] = c2 - c1
+                out[2, i] = 1.0 - c2
+
+        # Student-t: df from clim; scale from clim; loc = best_guess
+        elif code == 6:       
+            # Check if df is valid for variance calculation
+            if dof <= 2:
+                # Cannot calculate scale, fill with NaNs
+                out[0, :] = np.nan
+                out[1, :] = np.nan
+                out[2, :] = np.nan
+            else:
+                # 1. Calculate t-distribution parameters
+                # 'loc' (mean) is just the best_guess
+                loc = best_guess
+                # 'scale' is calculated from the variance and df
+                # Variance = scale**2 * (df / (df - 2))
+                scale = np.sqrt(error_variance * (dof - 2) / dof)
+                
+                # 2. Calculate probabilities
+                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
+                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
+
+                out[0, :] = c1
+                out[1, :] = c2 - c1
+                out[2, :] = 1.0 - c2
+
+        elif code == 7: # Assuming 7 is for Poisson
+            
+            # --- 1. Set the Poisson parameter 'mu' ---
+            # The 'mu' parameter is the mean.
+            
+            # A warning is strongly recommended if error_variance is different from best_guess
+            if not np.allclose(best_guess, error_variance, atol=0.5):
+                print("Warning: 'error_variance' is not equal to 'best_guess'.")
+                print("Poisson model assumes mean=variance and is likely inappropriate.")
+                print("Consider using Negative Binomial.")
+            
+            mu = best_guess
+        
+            # --- 2. Calculate Probabilities ---
+            # poisson.cdf(k, mu) calculates P(X <= k)
+            
+            c1 = poisson.cdf(T1, mu=mu)
+            c2 = poisson.cdf(T2, mu=mu)
+            
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 8: # Assuming 8 is for Negative Binomial
+            
+            # --- 1. Calculate Negative Binomial Parameters ---
+            # This model is ONLY valid for overdispersion (Variance > Mean).
+            # We will use np.where to set parameters to NaN if V <= M.
+            
+            # p = Mean / Variance
+            p = np.where(error_variance > best_guess, 
+                         best_guess / error_variance, 
+                         np.nan)
+            
+            # n = Mean^2 / (Variance - Mean)
+            n = np.where(error_variance > best_guess, 
+                         (best_guess**2) / (error_variance - best_guess), 
+                         np.nan)
+            
+            # --- 2. Calculate Probabilities ---
+            # The nbinom.cdf function will propagate NaNs, correctly
+            # handling the cases where the model was invalid.
+            
+            c1 = nbinom.cdf(T1, n=n, p=p)
+            c2 = nbinom.cdf(T2, n=n, p=p)
+            
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+            
+        else:
+            raise ValueError(f"Invalid distribution")
+
+        return out
 
     @staticmethod
     def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Calculate tercile probabilities using a non-parametric method."""
+        """Non-parametric method using historical error samples."""
         n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=np.float64)
-        
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
         for t in range(n_time):
             if np.isnan(best_guess[t]):
                 continue
@@ -1113,109 +1466,147 @@ class WAS_Analog:
             pred_prob[0, t] = p_below
             pred_prob[1, t] = p_between
             pred_prob[2, t] = p_above
-        
         return pred_prob
 
-    @staticmethod
-    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
-        """Calculate tercile probabilities using Normal distribution."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=np.float64)
-        
-        if np.all(np.isnan(best_guess)) or np.all(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        
-        error_std = np.sqrt(error_variance)
-        pred_prob[0, :] = stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-        pred_prob[1, :] = stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std) - \
-                          stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-        pred_prob[2, :] = 1 - stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std)
-        return pred_prob
 
-    @staticmethod
-    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
-        """Calculate tercile probabilities using Lognormal distribution."""
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=np.float64)
-        
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        
-        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-        mu = np.log(best_guess) - sigma**2 / 2
-        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - \
-                          lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
-        return pred_prob
 
-    def compute_model(self, predictant, itrain, itest):
-        """Compute deterministic hindcast using the specified analog method."""
-        method_map = {
-            "som": self.SOM,
-            "cor_based": self.Corr_Based,
-            "pca_based": self.Pca_Based,
-            "kmeans_based": self.KMeans_Based,
-            "agglomerative_based": self.Agglomerative_Based
-        }
-        if self.method_analog not in method_map:
-            raise ValueError(f"Invalid analog method: {self.method_analog}. Choose 'som', 'cor_based', 'pca_based', 'kmeans_based', or 'agglomerative_based'.")
+    def compute_prob(
+        self,
+        Predictant: xr.DataArray,
+        clim_year_start,
+        clim_year_end,
+        hindcast_det: xr.DataArray,
+        best_code_da: xr.DataArray = None,
+        best_shape_da: xr.DataArray = None,
+        best_loc_da: xr.DataArray = None,
+        best_scale_da: xr.DataArray = None
+    ) -> xr.DataArray:
+        """
+        Compute tercile probabilities for deterministic hindcasts.
 
-        similar_years = method_map[self.method_analog](predictant, itrain, itest)
-        predictant = predictant.copy()
-        predictant['T'] = predictant['T'].astype('datetime64[ns]')
-        
-        sim_obs = [predictant.sel(T=str(year)) for year in similar_years if year in predictant['T'].dt.year.values]
-        if not sim_obs:
-            raise ValueError("No valid similar years found for hindcast.")
-        
-        hindcast_det = xr.concat(sim_obs, dim="T").mean(dim="T").expand_dims({'T': predictant.isel(T=itest)['T'].values})
-        return hindcast_det
+        If dist_method == 'bestfit':
+            - Use cluster-based best-fit distributions to:
+                * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
+                * compute predictive probabilities using the same family.
 
-    def compute_prob(self, predictant, clim_year_start, clim_year_end, hindcast_det):
-        """Compute tercile probabilities for the hindcast."""
-        index_start = predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        T1 = terciles.isel(quantile=0).drop_vars('quantile')
-        T2 = terciles.isel(quantile=1).drop_vars('quantile')
+        Otherwise:
+            - Use empirical terciles from Predictant climatology and the selected
+              parametric / nonparametric method.
+
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Observed data (T, Y, X) or (T, Y, X, M).
+        clim_year_start, clim_year_end : int or str
+            Climatology period (inclusive) for thresholds.
+        hindcast_det : xarray.DataArray
+            Deterministic hindcast (T, Y, X).
+        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
+            Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
+
+        Returns
+        -------
+        hindcast_prob : xarray.DataArray
+            Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
+        """
+        # Handle member dimension if present
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+
+        # Ensure dimension order
+        Predictant = Predictant.transpose("T", "Y", "X")
+
+        # Spatial mask
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+
+        # Climatology subset
+        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+        if clim.sizes.get("T", 0) < 3:
+            raise ValueError("Not enough years in climatology period for terciles.")
+
+        # Error variance for predictive distributions
+        error_variance = (Predictant - hindcast_det).var(dim="T")
+        dof = max(int(clim.sizes["T"]) - 1, 2)
+
+        # Empirical terciles (used by non-bestfit methods)
+        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
+        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
-        calc_func_map = {
-            "t": (self.calculate_tercile_probabilities, {"dof": len(predictant.get_index("T")) - 2}),
-            "gamma": (self.calculate_tercile_probabilities_gamma, {}),
-            "normal": (self.calculate_tercile_probabilities_normal, {}),
-            "lognormal": (self.calculate_tercile_probabilities_lognormal, {}),
-            "nonparam": (self.calculate_tercile_probabilities_nonparametric, {})
-        }
-        
-        if self.dist_method not in calc_func_map:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}. Choose 't', 'gamma', 'normal', 'lognormal', or 'nonparam'.")
-        
-        calc_func, kwargs = calc_func_map[self.dist_method]
-        error_input = (predictant - hindcast_det).var(dim='T') if self.dist_method != "nonparam" else (predictant - hindcast_det).rename({'T': 'S'})
-        input_core_dims = [('T',), (), (), ()] if self.dist_method != "nonparam" else [('T',), ('S',), (), ()]
-        
-        hindcast_prob = xr.apply_ufunc(
-            calc_func,
-            hindcast_det,
-            error_input,
-            T1,
-            T2,
-            input_core_dims=input_core_dims,
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('probability', 'T')],
-            output_dtypes=[np.float64],
-            dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True},
-            kwargs=kwargs
+
+        dm = self.dist_method
+
+        # ---------- BESTFIT: zone-wise optimal distributions ----------
+        if dm == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+                raise ValueError(
+                    "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
+                )
+
+            # T1, T2 from best-fit distributions (per grid)
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code,
+                best_code_da,
+                best_shape_da,
+                best_loc_da,
+                best_scale_da,
+                input_core_dims=[(), (), (), ()],
+                output_core_dims=[(), ()],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float, float],
+            )
+
+            # Predictive probabilities using same family
+            hindcast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_bestfit,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                best_code_da,
+                input_core_dims=[("T",), (), (), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
+            )
+
+        # ---------- Nonparametric ----------
+        elif dm == "nonparam":
+            error_samples = Predictant - hindcast_det
+            hindcast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_nonparametric,
+                hindcast_det,
+                error_samples,
+                T1_emp,
+                T2_emp,
+                input_core_dims=[("T",), ("T",), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
+            )
+
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
+
+        hindcast_prob = hindcast_prob.assign_coords(
+            probability=("probability", ["PB", "PN", "PA"])
         )
-        
-        return hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA'])).transpose('probability', 'T', 'Y', 'X')
+        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
 
-    def forecast(self, predictant, clim_year_start, clim_year_end, hindcast_det):
+
+    def forecast(self, predictant, clim_year_start, clim_year_end, hindcast_det, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         """Generate deterministic and probabilistic forecasts for the target year."""
         predictant = predictant.copy()
         predictant['T'] = predictant['T'].astype('datetime64[ns]')
@@ -1224,13 +1615,14 @@ class WAS_Analog:
         
         method_map = {
             "som": self.SOM,
+            "bias_based": self.Bias_Based,
             "cor_based": self.Corr_Based,
             "pca_based": self.Pca_Based,
             "kmeans_based": self.KMeans_Based,
             "agglomerative_based": self.Agglomerative_Based
         }
         if self.method_analog not in method_map:
-            raise ValueError(f"Invalid analog method: {self.method_analog}. Choose 'som', 'cor_based', 'pca_based', 'kmeans_based', or 'agglomerative_based'.")
+            raise ValueError(f"Invalid analog method: {self.method_analog}. Choose 'som','bias_based', 'cor_based', 'pca_based', 'kmeans_based', or 'agglomerative_based'.")
 
         itrain = [i for i, year in enumerate(predictant['T'].dt.year.values) if year in unique_years and year != reference_year]
         ireference_year = 2100
@@ -1257,45 +1649,85 @@ class WAS_Analog:
         index_end = predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = predictant.isel(T=slice(index_start, index_end))
         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        T1 = terciles.isel(quantile=0).drop_vars('quantile')
-        T2 = terciles.isel(quantile=1).drop_vars('quantile')
+        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
+        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
+        error_variance = (predictant - hindcast_det).var(dim='T')
         
-        calc_func_map = {
-            "t": (self.calculate_tercile_probabilities, {"dof": len(predictant.get_index("T")) - 2}),
-            "gamma": (self.calculate_tercile_probabilities_gamma, {}),
-            "normal": (self.calculate_tercile_probabilities_normal, {}),
-            "lognormal": (self.calculate_tercile_probabilities_lognormal, {}),
-            "nonparam": (self.calculate_tercile_probabilities_nonparametric, {})
-        }
-        
-        calc_func, kwargs = calc_func_map[self.dist_method]
-        error_input = (predictant - hindcast_det).var(dim='T') if self.dist_method != "nonparam" else (predictant - hindcast_det).rename({'T': 'S'})
-        input_core_dims = [('T',), (), (), ()] if self.dist_method != "nonparam" else [('T',), ('S',), (), ()]
-        
-        forecast_prob = xr.apply_ufunc(
-            calc_func,
-            forecast_det,
-            error_input,
-            T1,
-            T2,
-            input_core_dims=input_core_dims,
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('probability', 'T')],
-            output_dtypes=[np.float64],
-            dask_gufunc_kwargs={'output_sizes': {'probability': 3}, 'allow_rechunk': True},
-            kwargs=kwargs
-        )
+        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
+
+        dm = self.dist_method
+
+        # ---------- BESTFIT ----------
+        if dm == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+                raise ValueError(
+                    "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
+                )
+            
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code,
+                best_code_da,
+                best_shape_da,
+                best_loc_da,
+                best_scale_da,
+                input_core_dims=[(), (), (), ()],
+                output_core_dims=[(), ()],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float, float],
+            )
+
+            forecast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_bestfit,
+                forecast_det,
+                error_variance,
+                T1,
+                T2,
+                best_code_da,
+                input_core_dims=[("T",), (), (), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                dask="parallelized",
+                kwargs={"dof": dof},
+                output_dtypes=[float],
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
+            )
+
+        # ---------- Nonparametric ----------
+        elif dm == "nonparam":
+            error_samples = Predictant - hindcast_det
+            forecast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_nonparametric,
+                forecast_det,
+                error_samples,
+                T1_emp,
+                T2_emp,
+                input_core_dims=[("T",), ("T",), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
+            )
+
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
         
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA'])).transpose('probability', 'T', 'Y', 'X')
         print(f"Similar years for {reference_year}: {similar_years}")
         return similar_years, forecast_det, forecast_prob
 
-    def composite_plot(self, predictant, clim_year_start, clim_year_end, hindcast_det, plot_predictor=True, variable="SST"):
+    def composite_plot(self, predictant, clim_year_start, clim_year_end, hindcast_det, plot_predictor=True, variable="SST",best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         """Create composite plots of predictors or predictands."""
         clim_slice = slice(str(clim_year_start), str(clim_year_end))
         clim_mean = predictant.sel(T=clim_slice).mean(dim='T', skipna=True)
-        similar_years, result_, _ = self.forecast(predictant, clim_year_start, clim_year_end, hindcast_det)
+        similar_years, result_, _ = self.forecast(predictant, clim_year_start, clim_year_end, hindcast_det, best_code_da, best_shape_da, best_loc_da, best_scale_da)
         result_ = result_.drop_vars('T', errors='ignore').squeeze()
         reference_year = self.year_forecast
         _, ddd = self.download_and_process()

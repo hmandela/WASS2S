@@ -989,7 +989,7 @@ class WAS_Verification:
                         reliability_sum += (n_kb / n_instances) * (term1 + term2)
         return reliability_sum
 
-    def resolution_and_reliability_over_all_grid(self, dir_to_save_score, y_true, y_probs, clim_year_start, clim_year_end,
+    def resolution_and_reliability_over_all_grid(self, y_true_class, y_probs, 
                                                 bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
                                                                0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
                                                                0.550, 0.600, 0.650, 0.700, 0.750, 0.800,
@@ -1001,16 +1001,10 @@ class WAS_Verification:
 
         Parameters
         ----------
-        dir_to_save_score : str or Path
-            Directory to save score outputs.
-        y_true : xarray.DataArray
+        y_true_class : xarray.DataArray
             Observed data with dimensions (T, Y, X).
         y_probs : xarray.DataArray
             Forecast probabilities with dimensions (probability, T, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
         bins : array-like, optional
             Probability bins for discretizing forecast probabilities.
 
@@ -1022,8 +1016,8 @@ class WAS_Verification:
             - reliability_sum : float
                 Aggregated reliability score.
         """
-        y_true, y_probs = xr.align(y_true, y_probs)
-        y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
+        y_true_class, y_probs = xr.align(y_true_class, y_probs)
+        # y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
         observed_outcomes = y_true_class.stack(flat_dim=("T", "Y", "X")).values
         predicted_probs = y_probs.stack(flat_dim=("T", "Y", "X")).values
         mask = ~np.isnan(observed_outcomes) & np.isfinite(predicted_probs).all(axis=0)
@@ -1060,7 +1054,7 @@ class WAS_Verification:
                         reliability_sum += (n_kb / n_instances) * (term1 + term2)
         return resolution_sum, reliability_sum
 
-    def reliability_diagram(self, modelname, dir_to_save_score, y_true, y_probs, clim_year_start, clim_year_end,
+    def reliability_diagram(self, modelname, dir_to_save_score, y_true_class, y_probs,
                            bins=np.array([0.100, 0.150, 0.200, 0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
                                           0.550, 0.600, 0.650, 0.700])):
         """
@@ -1085,16 +1079,16 @@ class WAS_Verification:
         bins : array-like, optional
             Probability bins for discretizing forecast probabilities.
         """
-        labels = ["Below-normal", "Near-normal", "Above-normal"]
-        y_true, y_probs = xr.align(y_true, y_probs)
-        y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
+        labels = ["BELOW AVERAGE", "NEAR AVERAGE", "ABOVE AVERAGE"]
+        y_true_class, y_probs = xr.align(y_true_class, y_probs)
+        # y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
         observed_outcomes = y_true_class.stack(flat_dim=("T", "Y", "X")).values
         predicted_probs = y_probs.stack(flat_dim=("T", "Y", "X")).values
         mask = ~np.isnan(observed_outcomes) & np.isfinite(predicted_probs).all(axis=0)
         observed_classes = observed_outcomes[mask]
         predicted_probabilities = predicted_probs[:, mask]
         resolution, reliability = self.resolution_and_reliability_over_all_grid(
-            dir_to_save_score, y_true, y_probs, clim_year_start, clim_year_end, bins
+             y_true_class, y_probs, bins
         )
         n_bins = len(bins) - 1
         observed_freqs = {0: np.zeros(n_bins), 1: np.zeros(n_bins), 2: np.zeros(n_bins)}
@@ -1117,8 +1111,8 @@ class WAS_Verification:
                 out=np.zeros_like(observed_freqs[tercile]),
                 where=forecast_counts[tercile] != 0
             )
-        fig, axs = plt.subplots(1, 3, figsize=(18, 6))
-        titles = ["Below-normal", "Near-normal", "Above-normal"]
+        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+        titles = ["BELOW AVERAGE", "NEAR AVERAGE", "ABOVE AVERAGE"]
         for idx, tercile in enumerate(range(3)):
             ax = axs[idx]
             ax.plot(bins[:-1] * 100, observed_freqs[tercile] * 100, 'k-', lw=2, color="black", label="Reliability Curve")
@@ -1139,20 +1133,22 @@ class WAS_Verification:
                             color='gray', alpha=0.2)
             ax.fill_between(no_skill_x, no_skill_y, 100, where=(no_skill_x >= relative_frequency),
                             color='gray', alpha=0.2)
-            ax.text(0.05, 0.78, f"REL: {reliability:.2f}", transform=ax.transAxes, fontsize=10)
-            ax.text(0.05, 0.71, f"RES: {resolution:.2f}", transform=ax.transAxes, fontsize=10)
+            ax.text(0.05, 0.78, f"REL= {reliability:.2f}", transform=ax.transAxes, fontsize=12)
+            ax.text(0.05, 0.71, f"RES= {resolution:.2f}", transform=ax.transAxes, fontsize=12)
             ax.bar(bins[:-1] * 100, (forecast_counts[tercile] / total_forecasts) * 100, width=5, color="grey", alpha=0.5, align="edge")
             ax.set_title(titles[tercile])
             ax.set_xlim([0, 100])
             ax.set_ylim([0, 100])
-            ax.set_xlabel("Forecast Probability (%)")
-            ax.set_ylabel("Observed Relative Frequency (%)")
-        fig.suptitle("Reliability Diagrams", fontsize=16)
+            ax.set_xlabel("Forecast Probability (%)", fontsize=14)
+            ax.set_ylabel("Observed Relative Frequency (%)", fontsize=13)
+            ax.tick_params(axis="both", labelsize=12)
+        fig.suptitle(f"Reliability Diagrams {modelname}", fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
+        os.makedirs(f"{dir_to_save_score}", exist_ok=True)
         plt.savefig(f"{dir_to_save_score}/RELIABILITY_{modelname}_.png", dpi=300, bbox_inches='tight')
         plt.show()
 
-    def plot_roc_curves(self, modelname, dir_to_save_score, y_true, y_probs, clim_year_start, clim_year_end,
+    def plot_roc_curves(self, modelname, dir_to_save_score, y_true_class, y_probs,
                         n_bootstraps=200, ci=0.95):
         """
         Plot ROC Curves with Confidence Intervals for probabilistic forecasts.
@@ -1165,7 +1161,7 @@ class WAS_Verification:
             Name of the model for labeling the plot.
         dir_to_save_score : str or Path
             Directory to save the plot.
-        y_true : xarray.DataArray
+        y_true_class : xarray.DataArray
             Observed data with dimensions (T, Y, X).
         y_probs : xarray.DataArray
             Forecast probabilities with dimensions (probability, T, Y, X).
@@ -1178,15 +1174,15 @@ class WAS_Verification:
         ci : float, optional
             Confidence interval level (e.g., 0.95 for 95%). Default is 0.95.
         """
-        labels = ["Below-normal", "Near-normal", "Above-normal"]
-        y_true, y_probs = xr.align(y_true, y_probs)
-        y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
+        labels = ["BELOW AVERAGE", "NEAR AVERAGE", "ABOVE AVERAGE"]
+        y_true_class, y_probs = xr.align(y_true_class, y_probs)
+        # y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
         observed_outcomes = y_true_class.stack(flat_dim=("T", "Y", "X")).values
         predicted_probs = y_probs.stack(flat_dim=("T", "Y", "X")).values
         mask = ~np.isnan(observed_outcomes) & np.isfinite(predicted_probs).all(axis=0)
         observed_outcomes = observed_outcomes[mask]
         predicted_probs = predicted_probs[:, mask]
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
+        fig, axes = plt.subplots(1, 3, figsize=(12, 5), sharey=True)
         for i, ax in enumerate(axes):
             binary_labels = (observed_outcomes == i).astype(int)
             fpr, tpr, _ = roc_curve(binary_labels, predicted_probs[i, :])
@@ -1211,9 +1207,9 @@ class WAS_Verification:
             mean_tpr[-1] = 1.0
             lower_tpr = np.percentile(tprs_bootstrap, (1 - ci) / 2 * 100, axis=0)
             upper_tpr = np.percentile(tprs_bootstrap, (1 + ci) / 2 * 100, axis=0)
-            ax.plot(fpr, tpr, color='red', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
-            ax.fill_between(mean_fpr, lower_tpr, upper_tpr, color='red', alpha=0.2,
-                            label=f'{int(ci*100)}% CI')
+            ax.plot(fpr, tpr, color='blue', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+            # ax.fill_between(mean_fpr, lower_tpr, upper_tpr, color='blue', alpha=0.2,
+            #                 label=f'{int(ci*100)}% CI')
             ax.plot([0, 1], [0, 1], 'k--', lw=2, label='No Skill')
             for spine in ax.spines.values():
                 spine.set_edgecolor('black')
@@ -1221,14 +1217,16 @@ class WAS_Verification:
                 spine.set_visible(True)
             ax.set_xlim([0, 1])
             ax.set_ylim([0, 1])
-            ax.set_title(f'ROC Curve for {labels[i]} Category')
-            ax.set_xlabel('False Positive Rate')
+            ax.set_title(f'ROC Curve for {labels[i]} Category',fontsize=12)
+            ax.set_xlabel('False Positive Rate', fontsize=14)
             if i == 0:
-                ax.set_ylabel('True Positive Rate')
-            ax.legend(loc="lower right")
+                ax.set_ylabel('True Positive Rate', fontsize=14)
+            ax.legend(fontsize=10,loc="lower right")
+            ax.tick_params(axis="both", labelsize=12)
             ax.grid(True)
-        fig.suptitle(f"ROC Curves for {modelname}", fontsize=16)
+        fig.suptitle(f"ROC Curves for {modelname}", fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
+        os.makedirs(f"{dir_to_save_score}", exist_ok=True)
         plt.savefig(f"{dir_to_save_score}/ROC_{modelname}_.png", dpi=300, bbox_inches='tight')
         plt.show()
 
@@ -1455,147 +1453,302 @@ class WAS_Verification:
         plt.show()
         plt.close()
 
-    # ------------------------
-    # GCM Validation
-    # ------------------------
+    # ------------------ Probability Calculation Methods ------------------
 
     @staticmethod
-    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
+    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
         """
-        Calculate tercile probabilities using Student's t-distribution.
-
-        Computes probabilities for below-normal, normal, and above-normal categories.
-
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_variance : array-like
-            Variance of forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : int
-            Degrees of freedom for the t-distribution.
-
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
+        Return tercile thresholds (T1, T2) from best-fit distribution parameters.
+    
+        dist_code:
+            1: norm
+            2: lognorm
+            3: expon
+            4: gamma
+            5: weibull_min
+            6: t
+            7: poisson
+            8: nbinom
         """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            first_t = (first_tercile - best_guess) / error_std
-            second_t = (second_tercile - best_guess) / error_std
-            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-        return pred_prob
+        if np.isnan(dist_code):
+            return np.nan, np.nan
+    
+        code = int(dist_code)
+        try:
+            if code == 1:
+                return (
+                    norm.ppf(0.33, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
+                )
+            elif code == 2:
+                return (
+                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                )
+            elif code == 3:
+                return (
+                    expon.ppf(0.33, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
+                )
+            elif code == 4:
+                return (
+                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                )
+            elif code == 5:
+                return (
+                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                )
+            elif code == 6:
+                # Note: Renamed 't_dist' to 't' for standard scipy.stats
+                return (
+                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                )
+            elif code == 7:
+                # Poisson: poisson.ppf(q, mu, loc=0)
+                # ASSUMPTION: 'mu' (mean) is passed as 'shape'
+                #             'loc' is passed as 'loc'
+                #             'scale' is unused
+                return (
+                    poisson.ppf(0.33, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
+                )
+            elif code == 8:
+                # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
+                # ASSUMPTION: 'n' (successes) is passed as 'shape'
+                #             'p' (probability) is passed as 'scale'
+                #             'loc' is passed as 'loc'
+                return (
+                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                )
+        except Exception:
+            return np.nan, np.nan
+    
+        # Fallback if code is not 1-8
+        return np.nan, np.nan
+        
+    @staticmethod
+    def weibull_shape_solver(k, M, V):
+        """
+        Function to find the root of the Weibull shape parameter 'k'.
+        We find 'k' such that the theoretical variance/mean^2 ratio
+        matches the observed V/M^2 ratio.
+        """
+        # Guard against invalid 'k' values during solving
+        if k <= 0:
+            return -np.inf
+        try:
+            g1 = gamma_function(1 + 1/k)
+            g2 = gamma_function(1 + 2/k)
+            
+            # This is the V/M^2 ratio *implied by k*
+            implied_v_over_m_sq = (g2 / (g1**2)) - 1
+            
+            # This is the *observed* ratio
+            observed_v_over_m_sq = V / (M**2)
+            
+            # Return the difference (we want this to be 0)
+            return observed_v_over_m_sq - implied_v_over_m_sq
+        except ValueError:
+            return -np.inf # Handle math errors
 
     @staticmethod
-    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
+    ):
         """
-        Calculate tercile probabilities using Weibull minimum distribution.
+        Generic tercile probabilities using best-fit family per grid cell.
 
-        Assumes `best_guess` as the location, `error_std` as the scale, and `dof` as the shape parameter.
+        Inputs (per grid cell):
+        - best_guess : 1D array over T (hindcast_det or forecast_det)
+        - T1, T2     : scalar terciles from climatological best-fit distribution
+        - dist_code  : int, as in _ppf_terciles_from_code
+        - shape, loc, scale : scalars from climatology fit
 
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_variance : array-like
-            Variance of forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
+        Strategy:
+        - For each time step, build a predictive distribution of the same family:
+            * Use best_guess[t] to adjust mean / location;
+            * Keep shape parameters from climatology.
+        - Then compute probabilities:
+            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
         """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2):
-        """
-        Calculate tercile probabilities using Gamma distribution.
-
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_variance : array-like
-            Variance of forecast errors.
-        T1 : array-like
-            First tercile threshold values.
-        T2 : array-like
-            Second tercile threshold values.
-
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=float)
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        best_guess = np.asarray(best_guess, dtype=float)
+        
+        best_guess = np.asarray(best_guess, float)
         error_variance = np.asarray(error_variance, dtype=float)
-        T1 = np.asarray(T1, dtype=float)
-        T2 = np.asarray(T2, dtype=float)
-        alpha = (best_guess**2) / error_variance
-        theta = error_variance / best_guess
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
-        pred_prob[0, :] = cdf_t1
-        pred_prob[1, :] = cdf_t2 - cdf_t1
-        pred_prob[2, :] = 1.0 - cdf_t2
-        return pred_prob
+        # T1 = np.asarray(T1, dtype=float)
+        # T2 = np.asarray(T2, dtype=float)
+        n_time = best_guess.size
+        out = np.full((3, n_time), np.nan, float)
+
+        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
+            return out
+
+        code = int(dist_code)
+
+        # Normal: loc = forecast; scale from clim
+        if code == 1:
+            error_std = np.sqrt(error_variance)
+            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
+
+        # Lognormal: shape = sigma from clim; enforce mean = best_guess
+        elif code == 2:
+            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
+            mu = np.log(best_guess) - sigma**2 / 2
+            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
+
+
+        # Exponential: keep scale from clim; shift loc so mean = best_guess
+        elif code == 3:
+            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
+            c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        # Gamma: use shape from clim; set scale so mean = best_guess
+        elif code == 4:
+            alpha = (best_guess ** 2) / error_variance
+            theta = error_variance / best_guess
+            c1 = gamma.cdf(T1, a=alpha, scale=theta)
+            c2 = gamma.cdf(T2, a=alpha, scale=theta)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 5: # Assuming 5 is for Weibull   
+        
+            for i in range(n_time):
+                # Get the scalar values for this specific element (e.g., grid cell)
+                M = best_guess[i]
+                print(M)
+                V = error_variance
+                print(V)
+                
+                # Handle cases with no variance to avoid division by zero
+                if V <= 0 or M <= 0:
+                    out[0, i] = np.nan
+                    out[1, i] = np.nan
+                    out[2, i] = np.nan
+                    continue # Skip to the next element
+        
+                # --- 1. Numerically solve for shape 'k' ---
+                # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
+                initial_guess = 2.0
+                
+                # fsolve finds the root of our helper function
+                k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
+        
+                # --- 2. Check for bad solution and calculate scale 'lambda' ---
+                if k <= 0:
+                    # Solver failed
+                    out[0, i] = np.nan
+                    out[1, i] = np.nan
+                    out[2, i] = np.nan
+                    continue
+                
+                # With 'k' found, we can now algebraically find scale 'lambda'
+                # In scipy.stats, scale is 'scale'
+                lambda_scale = M / gamma_function(1 + 1/k)
+        
+                # --- 3. Calculate Probabilities ---
+                # In scipy.stats, shape 'k' is 'c'
+                # Use the T1 and T2 values for this specific element
+                
+                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
+                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
+        
+                out[0, i] = c1
+                out[1, i] = c2 - c1
+                out[2, i] = 1.0 - c2
+
+        # Student-t: df from clim; scale from clim; loc = best_guess
+        elif code == 6:       
+            # Check if df is valid for variance calculation
+            if dof <= 2:
+                # Cannot calculate scale, fill with NaNs
+                out[0, :] = np.nan
+                out[1, :] = np.nan
+                out[2, :] = np.nan
+            else:
+                # 1. Calculate t-distribution parameters
+                # 'loc' (mean) is just the best_guess
+                loc = best_guess
+                # 'scale' is calculated from the variance and df
+                # Variance = scale**2 * (df / (df - 2))
+                scale = np.sqrt(error_variance * (dof - 2) / dof)
+                
+                # 2. Calculate probabilities
+                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
+                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
+
+                out[0, :] = c1
+                out[1, :] = c2 - c1
+                out[2, :] = 1.0 - c2
+
+        elif code == 7: # Assuming 7 is for Poisson
+            
+            # --- 1. Set the Poisson parameter 'mu' ---
+            # The 'mu' parameter is the mean.
+            
+            # A warning is strongly recommended if error_variance is different from best_guess
+            if not np.allclose(best_guess, error_variance, atol=0.5):
+                print("Warning: 'error_variance' is not equal to 'best_guess'.")
+                print("Poisson model assumes mean=variance and is likely inappropriate.")
+                print("Consider using Negative Binomial.")
+            
+            mu = best_guess
+        
+            # --- 2. Calculate Probabilities ---
+            # poisson.cdf(k, mu) calculates P(X <= k)
+            
+            c1 = poisson.cdf(T1, mu=mu)
+            c2 = poisson.cdf(T2, mu=mu)
+            
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 8: # Assuming 8 is for Negative Binomial
+            
+            # --- 1. Calculate Negative Binomial Parameters ---
+            # This model is ONLY valid for overdispersion (Variance > Mean).
+            # We will use np.where to set parameters to NaN if V <= M.
+            
+            # p = Mean / Variance
+            p = np.where(error_variance > best_guess, 
+                         best_guess / error_variance, 
+                         np.nan)
+            
+            # n = Mean^2 / (Variance - Mean)
+            n = np.where(error_variance > best_guess, 
+                         (best_guess**2) / (error_variance - best_guess), 
+                         np.nan)
+            
+            # --- 2. Calculate Probabilities ---
+            # The nbinom.cdf function will propagate NaNs, correctly
+            # handling the cases where the model was invalid.
+            
+            c1 = nbinom.cdf(T1, n=n, p=p)
+            c2 = nbinom.cdf(T2, n=n, p=p)
+            
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+            
+        else:
+            raise ValueError(f"Invalid distribution")
+
+        return out
 
     @staticmethod
     def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """
-        Calculate tercile probabilities using a non-parametric method.
-
-        Uses historical error samples to estimate probabilities empirically.
-
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_samples : array-like
-            Historical error samples.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
-        """
+        """Non-parametric method using historical error samples."""
         n_time = len(best_guess)
         pred_prob = np.full((3, n_time), np.nan, dtype=float)
         for t in range(n_time):
@@ -1613,362 +1766,140 @@ class WAS_Verification:
             pred_prob[2, t] = p_above
         return pred_prob
 
-    @staticmethod
-    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+    def gcm_compute_prob(
+        self,
+        Predictant: xr.DataArray,
+        clim_year_start,
+        clim_year_end,
+        hindcast_det: xr.DataArray,
+        best_code_da: xr.DataArray = None,
+        best_shape_da: xr.DataArray = None,
+        best_loc_da: xr.DataArray = None,
+        best_scale_da: xr.DataArray = None
+    ) -> xr.DataArray:
         """
-        Calculate tercile probabilities using Normal distribution.
+        Compute tercile probabilities for deterministic hindcasts.
 
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_variance : array-like
-            Variance of forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
+        If dist_method == 'bestfit':
+            - Use cluster-based best-fit distributions to:
+                * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
+                * compute predictive probabilities using the same family.
 
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std) - \
-                              stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
-        """
-        Calculate tercile probabilities using Lognormal distribution.
-
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_variance : array-like
-            Variance of forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-        mu = np.log(best_guess) - sigma**2 / 2
-        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - \
-                          lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
-        return pred_prob
-
-    def gcm_compute_prob_ensemble_method(self, Obs_data, clim_year_start, clim_year_end, model_data, ensemble="mean"):
-        """
-        Compute probabilistic forecasts for GCM ensemble data.
-
-        Uses the specified ensemble statistic to derive best-guess forecasts and computes
-        tercile probabilities.
-
-        Parameters
-        ----------
-        Obs_data : xarray.DataArray
-            Observed data with dimensions (T, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
-        model_data : xarray.DataArray
-            Model ensemble data with dimensions (T, number, Y, X).
-        ensemble : str, optional
-            Ensemble statistic to use ('mean' or other supported methods). Default is 'mean'.
-
-        Returns
-        -------
-        xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X).
-        """
-        index_start = Obs_data.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Obs_data.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Obs_data.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
-        best_guess_member = getattr(model_data, ensemble)(dim="number")
-        error_variance_member = (Obs_data - model_data).var(dim='number')
-        model_data_prob = xr.apply_ufunc(
-            self.calculate_tercile_probabilities_gamma,
-            best_guess_member,
-            error_variance_member,
-            terciles.isel(quantile=0).drop_vars('quantile'),
-            terciles.isel(quantile=1).drop_vars('quantile'),
-            input_core_dims=[('T',), ('T',), (), ()],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('probability', 'T')],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
-        )
-        model_data_prob = model_data_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA'])).transpose('probability', 'T', 'Y', 'X')
-        return model_data_prob
-
-    def gcm_compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
-        """
-        Compute tercile probabilities for GCM hindcasts.
-
-        Supports multiple distribution methods for calculating probabilities.
+        Otherwise:
+            - Use empirical terciles from Predictant climatology and the selected
+              parametric / nonparametric method.
 
         Parameters
         ----------
         Predictant : xarray.DataArray
-            Observed data with dimensions (T, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
+            Observed data (T, Y, X) or (T, Y, X, M).
+        clim_year_start, clim_year_end : int or str
+            Climatology period (inclusive) for thresholds.
         hindcast_det : xarray.DataArray
-            Deterministic hindcast data with dimensions (T, Y, X).
+            Deterministic hindcast (T, Y, X).
+        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
+            Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
 
         Returns
         -------
-        xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where
-            'probability' includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
+        hindcast_prob : xarray.DataArray
+            Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
         """
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        T1 = terciles.isel(quantile=0).drop_vars('quantile')
-        T2 = terciles.isel(quantile=1).drop_vars('quantile')
-        dof = len(Predictant.get_index("T")) - 2
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            error_variance = (Predictant - hindcast_det).var(dim='T')
+        # Handle member dimension if present
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+
+        # Ensure dimension order
+        Predictant = Predictant.transpose("T", "Y", "X")
+
+        # Spatial mask
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+
+        # Climatology subset
+        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+        if clim.sizes.get("T", 0) < 3:
+            raise ValueError("Not enough years in climatology period for terciles.")
+
+        # Error variance for predictive distributions
+        error_variance = (Predictant - hindcast_det).var(dim="T")
+        dof = max(int(clim.sizes["T"]) - 1, 2)
+
+        # Empirical terciles (used by non-bestfit methods)
+        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
+        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
+        
+
+        dm = self.dist_method
+
+        # ---------- BESTFIT: zone-wise optimal distributions ----------
+        if dm == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+                raise ValueError(
+                    "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
+                )
+
+            # T1, T2 from best-fit distributions (per grid)
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code,
+                best_code_da,
+                best_shape_da,
+                best_loc_da,
+                best_scale_da,
+                input_core_dims=[(), (), (), ()],
+                output_core_dims=[(), ()],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float, float],
+            )
+
+            # Predictive probabilities using same family
             hindcast_prob = xr.apply_ufunc(
-                calc_func,
+                self.calculate_tercile_probabilities_bestfit,
                 hindcast_det,
                 error_variance,
                 T1,
                 T2,
-                input_core_dims=[('T',), (), (), ()],
+                best_code_da,
+                input_core_dims=[("T",), (), (), (), ()],
+                output_core_dims=[("probability", "T")],
                 vectorize=True,
                 kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
             )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            error_variance = (Predictant - hindcast_det).var(dim='T')
+
+        # ---------- Nonparametric ----------
+        elif dm == "nonparam":
+            error_samples = Predictant - hindcast_det
             hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            error_variance = (Predictant - hindcast_det).var(dim='T')
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            error_variance = (Predictant - hindcast_det).var(dim='T')
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            error_variance = (Predictant - hindcast_det).var(dim='T')
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
+                self.calculate_tercile_probabilities_nonparametric,
                 hindcast_det,
                 error_samples,
-                T1,
-                T2,
-                input_core_dims=[('T',), ('T',), (), ()],
-                output_core_dims=[('probability', 'T')],
+                T1_emp,
+                T2_emp,
+                input_core_dims=[("T",), ("T",), (), ()],
+                output_core_dims=[("probability", "T")],
                 vectorize=True,
-                dask='parallelized',
+                dask="parallelized",
                 output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
             )
+
         else:
-            raise ValueError(f"Invalid method: {self.dist_method}. Choose 't', 'gamma', 'normal', 'lognormal', or 'nonparam'.")
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
 
-    def gcm_validation_compute_(self, center_variable, month_of_initialization, lead_time,
-                               dir_model, Obs, year_start, year_end, clim_year_start, clim_year_end, area, score,
-                               dir_to_save_roc_reliability, ensemble_mean=None, gridded=True):
-        """
-        Validate GCM forecasts using specified metrics.
-
-        Computes deterministic, probabilistic, or ensemble scores for GCM hindcasts.
-
-        Parameters
-        ----------
-        center_variable : list of str
-            List of model identifiers (e.g., 'center.variable').
-        month_of_initialization : int
-            Month of forecast initialization (1-12).
-        lead_time : list of int
-            Lead times in months for the forecast season.
-        dir_model : str or Path
-            Directory containing model hindcast files.
-        Obs : xarray.DataArray
-            Observed data with dimensions (T, Y, X).
-        year_start : int
-            Start year of the validation period.
-        year_end : int
-            End year of the validation period.
-        clim_year_start : int
-            Start year of the climatology period.
-        clim_year_end : int
-            End year of the climatology period.
-        area : str
-            Geographical area for validation (not used in current implementation).
-        score : str
-            Score to compute (e.g., 'Pearson', 'RPSS', 'ROC_CURVE').
-        dir_to_save_roc_reliability : str or Path
-            Directory to save ROC and reliability plots.
-        ensemble_mean : str, optional
-            Ensemble statistic to use if needed (e.g., 'mean'). Default is None.
-        gridded : bool, optional
-            Whether to perform gridded validation. Default is True.
-
-        Returns
-        -------
-        dict or None
-            Dictionary of model scores with keys as model identifiers and values as xarray.DataArray,
-            or None for plotting scores (e.g., ROC_CURVE, RELIABILITY_DIAGRAM).
-        """
-        abb_mont_ini = calendar.month_abbr[int(month_of_initialization)]
-        season_months = [((int(month_of_initialization) + int(l) - 1) % 12) + 1 for l in lead_time]
-        season = "".join([calendar.month_abbr[month] for month in season_months])
-        variables = center_variable[0].split(".")[1]
-        x_metric = {}
-        if gridded:
-            Obs_data_ = Obs
-            Obs_data_['T'] = Obs_data_['T'].astype('datetime64[ns]')
-            mean_rainfall = Obs_data_.mean(dim="T").squeeze()
-            mask_ = xr.where(mean_rainfall <= 20, np.nan, 1)
-            mask_ = mask_.where(abs(mask_.Y) <= 22, np.nan)
-            for i in center_variable:
-                score_type = self.scores[score][3]
-                center = i.split(".")[0].lower().replace("_", "")
-                model_file = f"{dir_model}/hindcast_{center}_{variables}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
-                model_data_ = xr.open_dataset(model_file)
-                model_data_['T'] = model_data_['T'].astype('datetime64[ns]')
-                year_start_ = np.unique(model_data_['T'].dt.year)[0]
-                year_end_ = np.unique(model_data_['T'].dt.year)[-1]
-                Obs_data = Obs_data_.sel(T=slice(str(year_start_), str(year_end_))).interp(
-                    Y=model_data_.Y, X=model_data_.X, method="nearest", kwargs={"fill_value": "extrapolate"}
-                )
-                mask = mask_.interp(Y=model_data_.Y, X=model_data_.X, method="nearest", kwargs={"fill_value": "extrapolate"})
-                Obs_data = Obs_data.where(mask == 1, np.nan)
-                model_data = model_data_.where(mask == 1, np.nan).to_array().drop_vars("variable").squeeze()
-                model_data['T'] = Obs_data['T']
-                if score_type == "det_score":
-                    if (ensemble_mean is None) or ("number" in model_data.coords):
-                        model_data = model_data.mean(dim="number", skipna=True)
-                    score_result = self.compute_deterministic_score(
-                        self.scores[score][5], Obs_data, model_data
-                    )
-                    x_metric[f"{center}_{abb_mont_ini}Ic_{season}"] = score_result
-                elif score_type == "prob_score":
-                    if (ensemble_mean is None) or ("number" in model_data.coords):
-                        model_data = model_data.mean(dim="number", skipna=True)
-                    proba_forecast = self.gcm_compute_prob(Obs_data, clim_year_start, clim_year_end, model_data)
-                    score_result = self.compute_probabilistic_score(
-                        self.scores[score][5], Obs_data, proba_forecast, clim_year_start, clim_year_end,
-                    )
-                    x_metric[f"{center}_{abb_mont_ini}Ic_{season}"] = score_result
-                elif score_type == "ensemble_score":
-                    if ensemble_mean is not None:
-                        print("Ensemble score does not require an ensemble mean or median.")
-                    else:
-                        score_result = self.compute_crps(Obs_data, model_data, member_dim='number', dim="T")
-                        x_metric[f"{center}_{abb_mont_ini}Ic_{season}"] = score_result
-                elif score_type == "all_grid_prob_score":
-                    if (ensemble_mean is None) or ("number" in model_data.coords):
-                        model_data = model_data.mean(dim="number", skipna=True)
-                    proba_forecast = self.gcm_compute_prob(Obs_data, clim_year_start, clim_year_end, model_data)
-                    if score == "ROC_CURVE":
-                        self.plot_roc_curves(center, dir_to_save_roc_reliability, Obs_data, proba_forecast,
-                                             clim_year_start, clim_year_end, n_bootstraps=1000, ci=0.95)
-                    elif score == "RELIABILITY_DIAGRAM":
-                        self.reliability_diagram(center, dir_to_save_roc_reliability, Obs_data, proba_forecast,
-                                                clim_year_start, clim_year_end)
-                    else:
-                        print(f"Plotting for score {score} is not implemented.")
-                elif score_type == "all_grid_det_score":
-                    pass
-        else:
-            print("Non-gridded data validation is not implemented yet.")
-        return x_metric if self.scores[score][3] in ["det_score", "prob_score", "ensemble_score"] else None
+        hindcast_prob = hindcast_prob.assign_coords(
+            probability=("probability", ["PB", "PN", "PA"])
+        )
+        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
 
     def gcm_validation_compute(self, models_files_path, Obs, score, month_of_initialization, clim_year_start,
                               clim_year_end, dir_to_save_roc_reliability, lead_time=None, ensemble_mean=None, gridded=True):
@@ -2037,6 +1968,7 @@ class WAS_Verification:
                 Obs_data = Obs_data_.sel(T=slice(str(year_start_), str(year_end_))).interp(
                     Y=model_data_.Y, X=model_data_.X, method="linear", kwargs={"fill_value": "extrapolate"}
                 )
+                
                 model_data = model_data_.to_array().drop_vars("variable").squeeze()
                 model_data['T'] = Obs_data['T']
                 if score_type == "det_score":
@@ -2047,6 +1979,7 @@ class WAS_Verification:
                     )
                     x_metric[f"{i}_{abb_mont_ini}Ic_{season}"] = score_result
                 elif score_type == "prob_score":
+                    ### A revoir aussi
                     if 'number' in model_data.dims:
                         model_data = model_data.mean(dim="number")
                     proba_forecast = self.gcm_compute_prob(Obs_data, clim_year_start, clim_year_end, model_data)
@@ -2058,9 +1991,11 @@ class WAS_Verification:
                     if ensemble_mean is not None:
                         print("Ensemble score does not require an ensemble mean or median.")
                     else:
+                        #### A revoir
                         score_result = self.compute_crps(Obs_data, model_data, member_dim='number', dim="T")
                         x_metric[f"{i}_{abb_mont_ini}Ic_{season}"] = score_result
                 elif score_type == "all_grid_prob_score":
+                    #### A revoir
                     if (ensemble_mean is None) or ("number" in model_data.coords):
                         model_data = model_data.mean(dim="number", skipna=True)
                     proba_forecast = self.gcm_compute_prob(Obs_data, clim_year_start, clim_year_end, model_data)

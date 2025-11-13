@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from scipy.stats import (norm, lognorm, expon, gamma as gamma_dist, weibull_min, t as t_dist, poisson, nbinom,)
 
 def inv_boxcox(y, lmbda):
     """
@@ -97,7 +98,7 @@ class WAS_TransformData:
         If `data` is not an xarray.DataArray or lacks required dimensions.
     """
 
-    def __init__(self, data, distribution_map=None, n_clusters=5):
+    def __init__(self, data, distribution_map=None, n_clusters=1000):
         if not isinstance(data, xr.DataArray):
             raise ValueError("`data` must be an xarray.DataArray")
         if not all(dim in data.dims for dim in ('T', 'Y', 'X')):
@@ -109,7 +110,12 @@ class WAS_TransformData:
             'lognorm': 2,
             'expon': 3,
             'gamma': 4,
-            'weibull_min': 5
+            'weibull_min': 5,
+            "t_dist": 6,
+            "poisson":7,
+            "nbinom":8
+        
+            
         }
         self.n_clusters = n_clusters
         self.transformed_data = None
@@ -485,7 +491,665 @@ class WAS_TransformData:
             output_dtypes=[float]
         )
 
-    def find_best_distribution_grid(self, use_transformed=False):
+
+
+
+    def fit_best_distribution_grid_onlycluster(self, use_transformed=False):
+        """
+        Fit best distributions by homogeneous zones (clusters) and map to each grid cell.
+    
+        Clustering:
+            - Done on simple distributional features per grid cell (mean, std over T).
+            - Produces n_clusters homogeneous zones.
+    
+        For each cluster:
+            - Pool all time series values from its grid cells.
+            - For each candidate distribution in self.distribution_map:
+                * Fit parameters by MLE (SciPy).
+                * Compute AIC = 2k - 2 logL on that cluster sample.
+            - Select distribution with minimum AIC.
+            - Assign its (code, shape, loc, scale) to all grid cells in that cluster.
+    
+        Supports (if present in distribution_map):
+            - 'norm'        -> code 1
+            - 'lognorm'     -> code 2
+            - 'expon'       -> code 3
+            - 'gamma'       -> code 4
+            - 'weibull_min' -> code 5
+            - 't'           -> code 6
+            - 'poisson'     -> code 7
+            - 'nbinom'      -> code 8
+    
+        Parameters
+        ----------
+        use_transformed : bool, optional
+            If True, use self.transformed_data; otherwise use original self.data.
+    
+        Returns
+        -------
+        best_code  : xarray.DataArray, shape (Y, X)
+            Code of best distribution per grid cell.
+        best_shape : xarray.DataArray, shape (Y, X)
+            Primary shape param (e.g., 'a' in gamma, 'mu' in poisson, 'n' in nbinom).
+        best_loc   : xarray.DataArray, shape (Y, X)
+            Location parameter.
+        best_scale : xarray.DataArray, shape (Y, X)
+            Scale parameter (e.g., 'p' in nbinom).
+    
+        Notes
+        -----
+        - Continuous (precip-like):
+            * 'lognorm', 'gamma', 'weibull_min', 'expon' are fitted on non-negative values with loc=0.
+        - Continuous (unbounded):
+            * 'norm' and 't' are fitted on all finite values (no non-negativity constraint).
+        - Discrete (counts):
+            * 'poisson', 'nbinom' are fitted on non-negative INTEGER values with loc=0.
+        - Requires enough valid data per cluster; if not, affected cells get NaNs.
+        """
+        import numpy as np
+        import xarray as xr
+        from sklearn.cluster import KMeans
+        from scipy.stats import (
+            norm,
+            lognorm,
+            expon,
+            gamma as gamma_dist,
+            weibull_min,
+            t as t_dist,
+            poisson,
+            nbinom,
+        )
+    
+        # -------- Select working data --------
+        data = self.transformed_data if (use_transformed and self.transformed_data is not None) else self.data
+    
+        if not isinstance(data, xr.DataArray):
+            raise ValueError("Internal error: data must be an xarray.DataArray")
+    
+        if not all(dim in data.dims for dim in ("T", "Y", "X")):
+            raise ValueError("`data` must have dimensions ('T', 'Y', 'X')")
+    
+        Y = data.sizes["Y"]
+        X = data.sizes["X"]
+        coords = {"Y": data.Y, "X": data.X}
+    
+        # Map distribution names to scipy objects
+        dist_objs = {
+            "norm": norm,
+            "lognorm": lognorm,
+            "expon": expon,
+            "gamma": gamma_dist,
+            "weibull_min": weibull_min,
+            "t": t_dist,
+            "poisson": poisson,
+            "nbinom": nbinom,
+        }
+    
+        # -------- 1. Build clustering features (mean, std) per grid cell --------
+        mean_da = data.mean("T", skipna=True)
+        std_da = data.std("T", skipna=True)
+    
+        feat_ds = xr.Dataset({"mean": mean_da, "std": std_da})
+        feat_df = feat_ds.to_dataframe().dropna()  # index: (Y, X), cols: mean, std
+    
+        if feat_df.shape[0] < self.n_clusters:
+            # Not enough valid cells for the requested clusters
+            print("Warning: insufficient valid grid cells for clustering; returning NaNs.")
+            nan_arr = np.full((Y, X), np.nan, float)
+            return (
+                xr.DataArray(nan_arr, coords=coords, dims=("Y", "X")),
+                xr.DataArray(nan_arr, coords=coords, dims=("Y", "X")),
+                xr.DataArray(nan_arr, coords=coords, dims=("Y", "X")),
+                xr.DataArray(nan_arr, coords=coords, dims=("Y", "X")),
+            )
+    
+        # Run KMeans on [mean, std]
+        features = feat_df[["mean", "std"]].values
+        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
+        feat_df["cluster"] = kmeans.fit_predict(features)
+    
+        # -------- 2. Map cluster labels back to full (Y, X) grid --------
+        cluster_da = (
+            feat_df["cluster"]
+            .to_xarray()
+            .reindex(Y=data.Y, X=data.X)
+        )
+        # Note: Removed the .where(valid_mask) as it was redundant with .dropna()
+    
+        # -------- 3. For each cluster, fit best distribution on pooled values --------
+        best_params_by_cluster = {}  # cl -> (code, shape, loc, scale)
+    
+        unique_clusters = np.unique(cluster_da.values)
+        unique_clusters = unique_clusters[np.isfinite(unique_clusters)]
+    
+        for cl_val in unique_clusters:
+            cl = int(cl_val)
+    
+            # Extract pooled values for this cluster
+            mask_cl = (cluster_da == cl)
+            cl_vals = data.where(mask_cl).values
+            cl_vals = cl_vals[np.isfinite(cl_vals)]
+    
+            if cl_vals.size < 30:
+                best_params_by_cluster[cl] = None
+                continue
+    
+            # Create specific subsets for different distribution families
+            cl_vals_pos = cl_vals[cl_vals >= 0]
+            cl_vals_int = cl_vals_pos[(cl_vals_pos == np.floor(cl_vals_pos))]
+    
+            best_aic = np.inf
+            best_choice = None # Will store (code, (shape, loc, scale))
+    
+            for name, code in self.distribution_map.items():
+                if name not in dist_objs:
+                    continue
+    
+                dist = dist_objs[name]
+                is_discrete = False
+                
+                # Choose appropriate sample for this distribution
+                if name in ("poisson", "nbinom"):
+                    sample = cl_vals_int
+                    is_discrete = True
+                elif name in ("lognorm", "gamma", "weibull_min", "expon"):
+                    sample = cl_vals_pos
+                else:
+                    # 'norm' and 't' work on full sample
+                    sample = cl_vals
+    
+                if sample.size < 30:
+                    continue
+    
+                try:
+                    # --- Fit parameters and get k (number of estimated params) ---
+                    if name == "poisson":
+                        # Manual MLE fit for Poisson (mu=mean), loc is fixed
+                        mu = sample.mean()
+                        loc = 0
+                        params = (mu, loc)
+                        k = 1  # Only mu is estimated
+                    
+                    elif name in ("lognorm", "gamma", "weibull_min", "expon", "nbinom"):
+                        # Fit with fixed location at 0
+                        params = dist.fit(sample, floc=0)
+                        k = len(params) - 1  # loc is fixed, not estimated
+                    
+                    else:
+                        # 'norm' and 't' (and any others with free loc)
+                        params = dist.fit(sample)
+                        k = len(params) # All params (loc, scale, shapes) are estimated
+    
+                    # --- Calculate Log-Likelihood ---
+                    if is_discrete:
+                        if name == "poisson":
+                            logL = np.sum(dist.logpmf(sample, mu=params[0], loc=params[1]))
+                        else: # nbinom
+                            logL = np.sum(dist.logpmf(sample, *params))
+                    else:
+                        logL = np.sum(dist.logpdf(sample, *params))
+    
+                    if not np.isfinite(logL):
+                        continue
+                        
+                    aic = 2 * k - 2 * logL
+    
+                    if aic < best_aic:
+                        best_aic = aic
+                        # --- Standardize parameters to (shape, loc, scale) ---
+                        if name == "poisson":
+                            # params = (mu, loc)
+                            best_choice = (code, (params[0], params[1], np.nan))
+                        elif name == "nbinom":
+                            # params = (n, p, loc)
+                            # Store as (shape=n, loc=loc, scale=p)
+                            best_choice = (code, (params[0], params[2], params[1]))
+                        elif name in ("norm", "expon"):
+                            # params = (loc, scale)
+                            # Store as (shape=nan, loc=loc, scale=scale)
+                            best_choice = (code, (np.nan, params[0], params[1]))
+                        else: 
+                            # 't', 'gamma', 'lognorm', 'weibull_min'
+                            # params = (shape, loc, scale)
+                            best_choice = (code, (params[0], params[1], params[2]))
+    
+                except Exception:
+                    continue # Fitting failed
+    
+            if best_choice is None:
+                best_params_by_cluster[cl] = None
+            else:
+                code, params_tuple = best_choice
+                # params_tuple is already (shape, loc, scale)
+                best_params_by_cluster[cl] = (code, params_tuple[0], params_tuple[1], params_tuple[2])
+    
+        # -------- 4. Broadcast cluster-level params to each grid cell (Vectorized) --------
+        
+        # Create empty arrays with the correct coordinates and NaNs
+        best_code_da = xr.DataArray(np.full((Y, X), np.nan, dtype=float), coords=coords, dims=("Y", "X"))
+        best_shape_da = best_code_da.copy()
+        best_loc_da = best_code_da.copy()
+        best_scale_da = best_code_da.copy()
+    
+        # Loop over the few clusters, not the millions of pixels
+        for cl, params in best_params_by_cluster.items():
+            if params is None:
+                continue # Leave these cells as NaN
+    
+            # Create a boolean mask for all cells belonging to this cluster
+            mask = (cluster_da == cl)
+            
+            # Unpack the parameters
+            code, shape, loc, scale = params
+            
+            # "Paint" the values onto the grid where the mask is True
+            best_code_da = best_code_da.where(~mask, code)
+            best_shape_da = best_shape_da.where(~mask, shape)
+            best_loc_da = best_loc_da.where(~mask, loc)
+            best_scale_da = best_scale_da.where(~mask, scale)
+    
+        return best_code_da, best_shape_da, best_loc_da, best_scale_da, cluster_da
+        
+   
+    
+    def fit_best_distribution_grid_onlygrid(self, use_transformed=False):
+        """
+        Fit candidate distributions per grid cell and select best by AIC.
+    
+        Parameters
+        ----------
+        use_transformed : bool, optional
+            If True, use self.transformed_data; otherwise use original data.
+    
+        Returns
+        -------
+        best_code  : xarray.DataArray  (Y, X)
+            Code of best distribution per grid (per self.distribution_map).
+        best_shape : xarray.DataArray  (Y, X)
+        best_loc   : xarray.DataArray  (Y, X)
+        best_scale : xarray.DataArray  (Y, X)
+    
+        Notes
+        -----
+        - Fits are done independently per grid cell (no clustering).
+        - For precip-like variables:
+            * 'lognorm', 'gamma', 'weibull_min', 'expon' are fitted on positive values with loc=0.
+            * 'norm' and 't' are fitted on all finite values.
+        - AIC = 2k - 2 ln(L) is used for model selection.
+        """
+        import numpy as np
+        import xarray as xr
+        from scipy.stats import norm, lognorm, expon, gamma as gamma_dist, weibull_min, t as t_dist
+    
+        data = self.transformed_data if (use_transformed and self.transformed_data is not None) else self.data
+    
+        if not isinstance(data, xr.DataArray):
+            raise ValueError("`data` must be an xarray.DataArray")
+        if not all(dim in data.dims for dim in ("T", "Y", "X")):
+            raise ValueError("`data` must have dimensions ('T', 'Y', 'X')")
+    
+        # Map distribution names to scipy.stats objects
+        dist_objs = {
+            "norm": norm,
+            "lognorm": lognorm,
+            "expon": expon,
+            "gamma": gamma_dist,
+            "weibull_min": weibull_min,
+            "t": t_dist,
+        }
+    
+        Y = data.sizes["Y"]
+        X = data.sizes["X"]
+    
+        best_code = np.full((Y, X), np.nan, dtype=float)
+        best_shape = np.full((Y, X), np.nan, dtype=float)
+        best_loc = np.full((Y, X), np.nan, dtype=float)
+        best_scale = np.full((Y, X), np.nan, dtype=float)
+    
+        for iy in range(Y):
+            for ix in range(X):
+                vals = data[:, iy, ix].values
+                vals = vals[np.isfinite(vals)]
+                if vals.size < 10:
+                    continue
+    
+                # Positive subset for positive-support distributions
+                vals_pos = vals[vals > 0]
+    
+                best_aic = np.inf
+                best = None
+    
+                for name, code in self.distribution_map.items():
+                    if name not in dist_objs:
+                        continue
+    
+                    dist = dist_objs[name]
+    
+                    # Choose sample depending on support
+                    if name in ("lognorm", "gamma", "weibull_min", "expon"):
+                        sample = vals_pos
+                        if sample.size < 10:
+                            continue
+                    else:  # 'norm', 't', or any other real-line distribution
+                        sample = vals
+                        if sample.size < 10:
+                            continue
+    
+                    try:
+                        # Fit parameters
+                        if name in ("lognorm", "gamma", "weibull_min", "expon"):
+                            params = dist.fit(sample, floc=0)
+                        else:
+                            # norm, t: free loc/scale; t has (df, loc, scale)
+                            params = dist.fit(sample)
+    
+                        # Compute AIC
+                        k = len(params)
+                        logL = np.sum(dist.logpdf(sample, *params))
+                        aic = 2 * k - 2.0 * logL
+    
+                        if np.isfinite(aic) and aic < best_aic:
+                            best_aic = aic
+                            best = (code, params)
+                    except Exception:
+                        # Skip distributions that fail to fit at this grid
+                        continue
+    
+                if best is not None:
+                    code, params = best
+                    # Normalise to (shape, loc, scale)
+                    if len(params) == 2:
+                        # e.g. norm, expon when not forcing shape
+                        shape, loc, scale = (np.nan, params[0], params[1])
+                    else:
+                        # e.g. gamma (k, loc, scale), t (df, loc, scale), etc.
+                        shape, loc, scale = params[0], params[1], params[2]
+    
+                    best_code[iy, ix] = code
+                    best_shape[iy, ix] = shape
+                    best_loc[iy, ix] = loc
+                    best_scale[iy, ix] = scale
+    
+        coords = {"Y": data.Y, "X": data.X}
+        best_code_da = xr.DataArray(best_code, coords=coords, dims=("Y", "X"))
+        best_shape_da = xr.DataArray(best_shape, coords=coords, dims=("Y", "X"))
+        best_loc_da = xr.DataArray(best_loc, coords=coords, dims=("Y", "X"))
+        best_scale_da = xr.DataArray(best_scale, coords=coords, dims=("Y", "X"))
+    
+        return best_code_da, best_shape_da, best_loc_da, best_scale_da
+
+
+    def fit_best_distribution_grid_two_options(self, use_transformed=False, mode="cluster"):
+        """
+        Fit best distributions either by:
+          - homogeneous zones (mode='cluster'), or
+          - per grid cell (mode='grid').
+    
+        Uses AIC for model selection and supports:
+          'norm', 'lognorm', 'expon', 'gamma', 'weibull_min', 't', 'poisson', 'nbinom'
+        (if present in self.distribution_map).
+    
+        Parameters
+        ----------
+        use_transformed : bool, optional
+            If True, use self.transformed_data, else self.data.
+        mode : {'cluster', 'grid'}, optional
+            'cluster' : KMeans on (mean,std) → one distribution per cluster.
+            'grid'    : independent fit at each (Y,X) via xr.apply_ufunc.
+    
+        Returns
+        -------
+        best_code  : xarray.DataArray (Y, X)
+        best_shape : xarray.DataArray (Y, X)
+        best_loc   : xarray.DataArray (Y, X)
+        best_scale : xarray.DataArray (Y, X)
+        cluster_da : xarray.DataArray (Y, X)
+            Cluster labels for mode='cluster'; all-NaN for mode='grid'.
+        """
+    
+        # ------------------------------------------------------------------
+        # Select data
+        # ------------------------------------------------------------------
+        data = self.transformed_data if (use_transformed and self.transformed_data is not None) else self.data
+    
+        if not isinstance(data, xr.DataArray):
+            raise ValueError("`data` must be an xarray.DataArray")
+        if not all(dim in data.dims for dim in ("T", "Y", "X")):
+            raise ValueError("`data` must have dimensions ('T', 'Y', 'X')")
+    
+        if not hasattr(self, "distribution_map") or not isinstance(self.distribution_map, dict):
+            raise ValueError("`self.distribution_map` must be a dict of {name: code}")
+    
+        Y = data.sizes["Y"]
+        X = data.sizes["X"]
+        coords = {"Y": data.Y, "X": data.X}
+    
+        # ------------------------------------------------------------------
+        # Map distribution names in distribution_map to scipy.stats objects
+        # (allow aliases like 't_dist' → t)
+        # ------------------------------------------------------------------
+        name_to_dist = {
+            "norm": norm,
+            "lognorm": lognorm,
+            "expon": expon,
+            "gamma": gamma_dist,
+            "weibull_min": weibull_min,
+            "t": t_dist,
+            "t_dist": t_dist,
+            "poisson": poisson,
+            "nbinom": nbinom,
+        }
+    
+        # Helper: filter only supported distributions
+        dist_candidates = {
+            name: (name_to_dist[name], code)
+            for name, code in self.distribution_map.items()
+            if name in name_to_dist
+        }
+        if not dist_candidates:
+            raise ValueError("No valid distributions found in distribution_map")
+    
+        # ------------------------------------------------------------------
+        # Core 1D fitter using AIC
+        # ------------------------------------------------------------------
+        def _fit_best(sample_1d, min_n):
+            """
+            Fit all candidate distributions to a 1D sample; return (code, shape, loc, scale)
+            for the best by AIC. If no fit, return NaNs.
+            """
+            vals = np.asarray(sample_1d, float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size < min_n:
+                return np.nan, np.nan, np.nan, np.nan
+    
+            vals_pos = vals[vals > 0]
+            vals_int = vals_pos[(vals_pos == np.floor(vals_pos))]
+    
+            best_aic = np.inf
+            best = None  # (code, (shape, loc, scale))
+    
+            for name, (dist, code) in dist_candidates.items():
+                is_discrete = name in ("poisson", "nbinom")
+    
+                # respect support
+                if name in ("poisson", "nbinom"):
+                    sample = vals_int
+                elif name in ("lognorm", "gamma", "weibull_min", "expon"):
+                    sample = vals_pos
+                else:  # norm, t, etc.
+                    sample = vals
+    
+                if sample.size < min_n:
+                    continue
+    
+                try:
+                    # ---- fit parameters ----
+                    if name == "poisson":
+                        # MLE: mu = mean, loc=0
+                        mu = sample.mean()
+                        if mu <= 0 or not np.isfinite(mu):
+                            continue
+                        params = (mu, 0.0)
+                        k = 1  # only mu
+    
+                    elif name == "nbinom":
+                        # fit (n, p, loc=0)
+                        params = dist.fit(sample, floc=0)
+                        # (n, p, loc) with loc fixed
+                        k = len(params) - 1
+    
+                    elif name in ("lognorm", "gamma", "weibull_min", "expon"):
+                        # positive-support, loc=0 fixed
+                        params = dist.fit(sample, floc=0)
+                        k = len(params) - 1
+    
+                    else:
+                        # norm, t: all params free
+                        params = dist.fit(sample)
+                        k = len(params)
+    
+                    # ---- log-likelihood ----
+                    if is_discrete:
+                        if name == "poisson":
+                            mu, loc = params
+                            logL = np.sum(dist.logpmf(sample, mu, loc=loc))
+                        else:  # nbinom
+                            logL = np.sum(dist.logpmf(sample, *params))
+                    else:
+                        logL = np.sum(dist.logpdf(sample, *params))
+    
+                    if not np.isfinite(logL):
+                        continue
+    
+                    aic = 2.0 * k - 2.0 * logL
+                    if aic < best_aic:
+                        best_aic = aic
+    
+                        # normalize to (shape, loc, scale)
+                        if name == "poisson":
+                            mu, loc = params
+                            best = (code, (mu, loc, np.nan))
+                        elif name == "nbinom":
+                            n_, p_, loc_ = params  # (n, p, loc)
+                            best = (code, (n_, loc_, p_))  # shape=n, loc=loc, scale=p
+                        elif name in ("norm", "expon"):
+                            loc_, scale_ = params
+                            best = (code, (np.nan, loc_, scale_))
+                        else:
+                            # (shape, loc, scale): t, gamma, lognorm, weibull_min
+                            shape_, loc_, scale_ = params
+                            best = (code, (shape_, loc_, scale_))
+    
+                except Exception:
+                    continue
+    
+            if best is None:
+                return np.nan, np.nan, np.nan, np.nan
+    
+            code, (shape, loc, scale) = best
+            return float(code), float(shape), float(loc), float(scale)
+    
+        # ------------------------------------------------------------------
+        # Mode: per-grid using xr.apply_ufunc
+        # ------------------------------------------------------------------
+        if mode == "grid":
+            min_n_grid = 15
+    
+            def _fit_best_grid(cell_ts):
+                return _fit_best(cell_ts, min_n_grid)
+    
+            best_code_da, best_shape_da, best_loc_da, best_scale_da = xr.apply_ufunc(
+                _fit_best_grid,
+                data,
+                input_core_dims=[["T"]],
+                output_core_dims=[[], [], [], []],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float, float, float, float],
+            )
+    
+            cluster_da = xr.full_like(best_code_da, np.nan)
+            return (
+                best_code_da,
+                best_shape_da,
+                best_loc_da,
+                best_scale_da,
+                cluster_da,
+            )
+    
+        # ------------------------------------------------------------------
+        # Mode: homogeneous zones via KMeans clustering
+        # ------------------------------------------------------------------
+        if mode == "cluster":
+            if not hasattr(self, "n_clusters"):
+                raise ValueError("For mode='cluster', self.n_clusters must be defined.")
+    
+            min_n_cluster = 30
+
+            kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
+            data_dropna = data.to_dataframe().reset_index().dropna().drop(columns=['T'])
+            variable_column = data_dropna.columns[2]
+            data_dropna['cluster'] = kmeans.fit_predict(
+               data_dropna[[variable_column]]
+            )
+            
+            # Convert cluster assignments back into an xarray structure
+            df_unique = data_dropna.drop_duplicates(subset=['Y', 'X'])
+            dataset = df_unique.set_index(['Y', 'X']).to_xarray()
+            mask = xr.where(~np.isnan(data.isel(T=0)), 1, np.nan)
+            Cluster = (dataset['cluster'] * mask)
+                   
+            # Align cluster array with the predictand array
+            xarray1, xarray2 = xr.align(data, Cluster, join="outer")
+            
+            # Identify unique cluster labels
+            clusters = np.unique(xarray2)
+            unique_clusters = clusters[~np.isnan(clusters)]
+            cluster_da = xarray2
+    
+    
+            # 4) Fit best distribution for each cluster (pooled values)
+            best_params_by_cluster = {}
+    
+            for cl_val in unique_clusters:
+                cl = int(cl_val)
+                mask_cl = (cluster_da == cl).expand_dims({'T': data['T']})
+                cl_vals = data.where(mask_cl).stack(sample=('T', 'Y', 'X')).values.ravel()
+                cl_vals = cl_vals[np.isfinite(cl_vals)]
+                code, shape, loc, scale = _fit_best(cl_vals, min_n_cluster)
+                if np.isnan(code):
+                    best_params_by_cluster[cl] = None
+                else:
+                    best_params_by_cluster[cl] = (code, shape, loc, scale)
+    
+            # 5) Broadcast cluster-level params back to (Y,X) using xarray masks
+            cluster_da_ = cluster_da.drop_vars("T")
+            best_code_da = xr.full_like(cluster_da_, np.nan, dtype=float)
+            best_shape_da = xr.full_like(cluster_da_, np.nan, dtype=float)
+            best_loc_da = xr.full_like(cluster_da_, np.nan, dtype=float)
+            best_scale_da = xr.full_like(cluster_da_, np.nan, dtype=float)
+    
+            for cl, params in best_params_by_cluster.items():
+                if params is None:
+                    continue
+                code, shape, loc, scale = params
+                mask_cl_ = (cluster_da_ == cl)
+    
+                best_code_da = best_code_da.where(~mask_cl_, code)
+                best_shape_da = best_shape_da.where(~mask_cl_, shape)
+                best_loc_da = best_loc_da.where(~mask_cl_, loc)
+                best_scale_da = best_scale_da.where(~mask_cl_, scale)
+    
+            return best_code_da, best_shape_da, best_loc_da, best_scale_da, cluster_da_
+    
+        # ------------------------------------------------------------------
+        # Invalid mode
+        # ------------------------------------------------------------------
+        raise ValueError("mode must be 'cluster' or 'grid'")
+
+    
+
+    def find_best_distribution_grid___(self, use_transformed=False):
         """
         Fit distributions to data using KMeans clustering.
 
