@@ -8908,7 +8908,7 @@ class WAS_mme_XGBoosting_:
         }
 
         # Initialize XGBRegressor base model
-        model = XGBRegressor(random_state=self.random_state, verbosity=0)
+        model = XGBRegressor(random_state=self.random_state, verbosity=0, n_jobs=-1)
 
         # Randomized search
         random_search = RandomizedSearchCV(
@@ -10602,7 +10602,7 @@ class WAS_mme_RF_:
         }
 
         # Initialize RandomForestRegressor base model
-        model = RandomForestRegressor(random_state=self.random_state)
+        model = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
 
         # Randomized search
         random_search = RandomizedSearchCV(

@@ -387,8 +387,7 @@ class WAS_Cross_Validator:
                 key: value for key, value in all_params.items() 
                 if key not in keys_to_exclude_prob
             } 
-            print(all_params)
-            print(params_prob)
+
             mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
             Predictor['T'] = Predictant['T']
             Predictor_st = standardize_timeseries(Predictor, clim_year_start, clim_year_end)
