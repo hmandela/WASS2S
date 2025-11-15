@@ -72,6 +72,7 @@ class WAS_Download:
             "GFDL_1": "gfdl",
             "NASA_1": "nasa",
             "NCAR_CCSM4_1": "ncar_ccsm4",
+            "NCAR_CESM1_1": "ncar_cesm1",
             "NMME_1" : "nmme"
         },
         variables_1={
@@ -228,25 +229,22 @@ class WAS_Download:
                 progress.update(len(data))
                 f.write(data)
 
-    
     def days_in_month(self, year, month):
         a = calendar.monthrange(year, month)[1]
         return a
-         
+
     def parse_cpt_data_optimized(self, file_path):
-        from datetime import datetime
-        
         times = []
         times_start = []
         data_list = []
         lons = None
         lats = None
         days_in_month_values = []
-    
+
         # Read all lines into memory once
         with open(file_path, 'r') as f:
             lines = f.readlines()
-    
+
         i = 0
         while i < len(lines):
             line = lines[i].strip()
@@ -255,29 +253,50 @@ class WAS_Download:
                 while i < len(lines) and lines[i].startswith('cpt:'):
                     if 'cpt:T=' in lines[i]:
                         t_str = lines[i].split('cpt:T=')[1].split()[0]
-                        year, pot_months = t_str.split('-')
+                        t_str = t_str.rstrip(',')
+                        year_str, pot_months = t_str.split('-', 1)
+                        start_year = int(year_str)
                         if '/' in pot_months:
                             start_str, end_str = pot_months.split("/")
                             start_month = int(start_str)
-                            end_month = int(end_str[0:2])
-                            if start_month <= end_month:
-                                months = list(range(start_month, end_month + 1))
+                            if '-' in end_str:
+                                end_year_str, end_month_str = end_str.split('-')
+                                end_year = int(end_year_str)
+                                end_month = int(end_month_str)
                             else:
-                                # Wrap around: from start_month to December, then January to end_month
-                                months = list(range(start_month, 13)) + list(range(1, end_month + 1))
-                            month = months[1]
-                            days_in_mon = self.days_in_month(int(year), months[0]) + self.days_in_month(int(year), months[1]) + self.days_in_month(int(year), months[2])
+                                end_year = start_year
+                                end_month = int(end_str)
+                            # Generate list of (year, month) pairs
+                            months_list = []
+                            current_year = start_year
+                            current_month = start_month
+                            while True:
+                                months_list.append((current_year, current_month))
+                                if current_year == end_year and current_month == end_month:
+                                    break
+                                current_month += 1
+                                if current_month > 12:
+                                    current_month = 1
+                                    current_year += 1
+                            if len(months_list) != 3:
+                                raise ValueError("Expected 3-month season")
+                            # Use middle month and its year for time
+                            time_year, month = months_list[1]
+                            days_in_mon = sum(self.days_in_month(y, m) for y, m in months_list)
                         else:
-                            month = int(pot_months[0:2])
-                            days_in_mon = self.days_in_month(int(year), month)
-                        
+                            month = int(pot_months)
+                            time_year = start_year
+                            days_in_mon = self.days_in_month(start_year, month)
+                            months_list = [(start_year, month)]
+
                         days_in_month_values.append(days_in_mon)
-                        times.append(datetime(int(year), int(month), 1))
-                        
+                        times.append(datetime.datetime(time_year, month, 1))
+
                         #### Retrieve init start
                         start_str = lines[i].split('cpt:S=')[1].split()[0]
+                        start_str = start_str.rstrip(',')
                         yearstart, monthstart, daystart = start_str.split('-')
-                        times_start.append(datetime(int(yearstart), int(monthstart), 1))
+                        times_start.append(datetime.datetime(int(yearstart), int(monthstart), 1))
                     i += 1
                 # Parse longitudes (assumed to be the next line)
                 if i < len(lines):
@@ -305,11 +324,10 @@ class WAS_Download:
                     break
             else:
                 i += 1
-                
 
         # Stack data into a 3D array (time, latitude, longitude)
         data_3d = np.stack(data_list, axis=0)
-    
+
         # Create an xarray DataArray for convenient analysis
         da = xr.DataArray(
             data_3d,
@@ -319,18 +337,118 @@ class WAS_Download:
                 'Y': lats,
                 'X': lons
             },
-            # attrs={
-            #     'units': 'mm/day',
-            #     'long_name': 'precipitation'
-            # }
         )
-
+        
         days_in_month_da = xr.DataArray(
             days_in_month_values,
             dims=['T'],
             coords={'T': da['T']}
-        ) 
+        )
         return da, days_in_month_da, times_start
+    
+    # def days_in_month(self, year, month):
+    #     a = calendar.monthrange(year, month)[1]
+    #     return a
+         
+    # def parse_cpt_data_optimized(self, file_path):
+    #     from datetime import datetime
+        
+    #     times = []
+    #     times_start = []
+    #     data_list = []
+    #     lons = None
+    #     lats = None
+    #     days_in_month_values = []
+    
+    #     # Read all lines into memory once
+    #     with open(file_path, 'r') as f:
+    #         lines = f.readlines()
+    
+    #     i = 0
+    #     while i < len(lines):
+    #         line = lines[i].strip()
+    #         if line.startswith('cpt:field'):
+    #             # Parse metadata (e.g., time)
+    #             while i < len(lines) and lines[i].startswith('cpt:'):
+    #                 if 'cpt:T=' in lines[i]:
+    #                     t_str = lines[i].split('cpt:T=')[1].split()[0]
+    #                     year, pot_months = t_str.split('-')
+    #                     if '/' in pot_months:
+    #                         start_str, end_str = pot_months.split("/")
+    #                         start_month = int(start_str)
+    #                         end_month = int(end_str[0:2])
+    #                         if start_month <= end_month:
+    #                             months = list(range(start_month, end_month + 1))
+    #                         else:
+    #                             # Wrap around: from start_month to December, then January to end_month
+    #                             months = list(range(start_month, 13)) + list(range(1, end_month + 1))
+    #                         month = months[1]
+    #                         days_in_mon = self.days_in_month(int(year), months[0]) + self.days_in_month(int(year), months[1]) + self.days_in_month(int(year), months[2])
+    #                     else:
+    #                         month = int(pot_months[0:2])
+    #                         days_in_mon = self.days_in_month(int(year), month)
+                        
+    #                     days_in_month_values.append(days_in_mon)
+    #                     times.append(datetime(int(year), int(month), 1))
+                        
+    #                     #### Retrieve init start
+    #                     start_str = lines[i].split('cpt:S=')[1].split()[0]
+    #                     yearstart, monthstart, daystart = start_str.split('-')
+    #                     times_start.append(datetime(int(yearstart), int(monthstart), 1))
+    #                 i += 1
+    #             # Parse longitudes (assumed to be the next line)
+    #             if i < len(lines):
+    #                 lons = np.array([float(x) for x in lines[i].split()])
+    #                 i += 1
+    #             # Read the next 181 lines as a data block
+    #             if i + 181 <= len(lines):
+    #                 # Join the 181 lines into a single string
+    #                 data_block = '\n'.join(lines[i:i + 181])
+    #                 # Parse the block into a 2D array using np.loadtxt
+    #                 data_array = np.loadtxt(io.StringIO(data_block), dtype=float)
+    #                 if data_array.shape[1] == 361:  # 1 latitude + 360 longitudes
+    #                     # Extract latitudes only once (assuming they’re consistent)
+    #                     if lats is None:
+    #                         lats = data_array[:, 0]
+    #                     # Extract data (excluding latitude column)
+    #                     data = data_array[:, 1:]
+    #                     # Replace missing values (e.g., -999.0) with NaN
+    #                     data[data == -999.0] = np.nan
+    #                     data_list.append(data)
+    #                     i += 181
+    #                 else:
+    #                     raise ValueError("Unexpected number of columns in data block")
+    #             else:
+    #                 break
+    #         else:
+    #             i += 1
+                
+
+    #     # Stack data into a 3D array (time, latitude, longitude)
+    #     data_3d = np.stack(data_list, axis=0)
+    #     print(data_3d)
+    
+    #     # Create an xarray DataArray for convenient analysis
+    #     da = xr.DataArray(
+    #         data_3d,
+    #         dims=['T', 'Y', 'X'],
+    #         coords={
+    #             'T': times,
+    #             'Y': lats,
+    #             'X': lons
+    #         },
+    #         # attrs={
+    #         #     'units': 'mm/day',
+    #         #     'long_name': 'precipitation'
+    #         # }
+    #     )
+
+    #     days_in_month_da = xr.DataArray(
+    #         days_in_month_values,
+    #         dims=['T'],
+    #         coords={'T': da['T']}
+    #     ) 
+    #     return da, days_in_month_da, times_start
     
     def WAS_Download_Models(
         self,
@@ -397,6 +515,7 @@ class WAS_Download:
             "GFDL_1": "gfdl",
             "NASA_1": "nasa",
             "NCAR_CCSM4_1": "ncar_ccsm4",
+            "NCAR_CESM1_1": "ncar_cesm1",
             "NMME_1" : "nmme"
         }
 
@@ -456,11 +575,12 @@ class WAS_Download:
             "GFDL_1": "1",
             "NASA_1": "1",
             "NCAR_CCSM4_1": "1",
+            "NCAR_CESM1_1": "1",
             "NMME_1" : "1"
 
         }
         
-        nmme = ["cfsv2", "cmc1", "cmc2", "gfdl",  "nasa", "ncar_ccsm4", "nmme"]
+        nmme = ["cfsv2", "cmc1", "cmc2", "gfdl",  "nasa", "ncar_ccsm4", "ncar_cesm1", "nmme"]
         
         selected_centre = [centre[k] for k in center]
         selected_system = [system[k] for k in center]
@@ -495,13 +615,18 @@ class WAS_Download:
                         if len(lead_time) == 3:
                             # Build lead time string using min and max lead time values.
                             lead_str = f"{season_months[0]}-{season_months[-1]}"
+                            crosses_year = season_months[0] > season_months[-1]
                             
                             if year_forecast:
                                 base_url = "https://ftp.cpc.ncep.noaa.gov/International/nmme/seasonal_nmme_forecast_in_cpt_format/"
-                                year_range = f"{year_forecast}-{year_forecast}"
+                                year_range = f"{year_forecast}-{year_forecast + 1}" if crosses_year else f"{year_forecast}-{year_forecast}"
                             else:
                                 base_url = "https://ftp.cpc.ncep.noaa.gov/International/nmme/seasonal_nmme_hindcast_in_cpt_format/"
-                                year_range = f"{1991}-{2020}"
+                                # CPC archive: seasons that cross year (NDJ/DJF) start in 1991; others in 1992
+                                hind_start = 1991 if crosses_year else 1992
+                                hind_end   = 2021
+                                year_range = f"{hind_start}-{hind_end}"
+        
                             file_name = f"{cent}_{k}_{tag}_{init_str}_{lead_str}_{year_range}.txt"
                             full_url = base_url + file_name
                             file_txt_path = dir_to_save / file_name
@@ -523,6 +648,7 @@ class WAS_Download:
                             ds = ds.assign_coords(X=((ds.X + 180) % 360 - 180))
                             ds = ds.sortby("X")
                             ds = ds.sel(X=slice(area[1],area[3]),Y=slice(area[2], area[0])).transpose('T', 'Y', 'X') 
+
                             ds.to_netcdf(file_path)
                             print(f"Download finished for {cent} {syst} {k} to {file_path}")
                             ds.close()
@@ -534,7 +660,7 @@ class WAS_Download:
                                 year_range = f"{year_forecast}"
                             else:
                                 base_url = "https://ftp.cpc.ncep.noaa.gov/International/nmme/monthly_nmme_hindcast_in_cpt_format/"
-                                year_range = f"{1991}"
+                                year_range = f"{1992}"
                             all_da = []
                             for i in season_months:
                                 file_name = f"{cent}_{k}_{tag}_{init_str}_{i}_{year_range}.txt"
@@ -2471,8 +2597,8 @@ class WAS_Download:
                 Last year for which data is included (inclusive). For seasons spanning calendar years, the last pivot year processed will be year_end - 1 to ensure no data from year_end + 1 is fetched.
             area : list[float], optional
                 Bounding box [north, west, south, east] in degrees.
-            season_months : sequence[str], default ("03","04","05")
-                Months defining the season, e.g. ("11","12","01") for NDJ.
+            season_months : sequence[str], default ["03","04","05"]
+                Months defining the season, e.g. ["11","12","01"] for NDJ.
             version : str, optional
                 Product version. Defaults to:
                 - rfe: "v3.1"
@@ -2639,7 +2765,8 @@ class WAS_Download:
         # open & standardize
         try:
             ds = xr.open_dataset(fname)
-            var = next((v for v in keep_vars if v in ds.data_vars), None)
+            
+            var = keep_vars # next((v for v in keep_vars if v in ds.data_vars), None)
             if var is None:
                 raise KeyError(f"None of {keep_vars} found in {fname.name}; available: {list(ds.data_vars)}")
             # make a 1-step time axis for this month
@@ -2816,7 +2943,7 @@ class WAS_Download:
         # open & standardize
         try:
             ds = xr.open_dataset(fname)
-            var = next((v for v in keep_vars if v in ds.data_vars), None)
+            var = keep_vars #next((v for v in keep_vars if v in ds.data_vars), None)
             if var is None:
                 raise KeyError(f"None of {keep_vars} found in {fname.name}; available: {list(ds.data_vars)}")
             # make a 1-step time axis for this day
