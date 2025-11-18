@@ -437,34 +437,34 @@ class WAS_SVR:
         try:
             if code == 1:
                 return (
-                    norm.ppf(0.33, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
+                    norm.ppf(0.3, loc=loc, scale=scale),
+                    norm.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
-                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
-                    expon.ppf(0.33, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
+                    expon.ppf(0.3, loc=loc, scale=scale),
+                    expon.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
-                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
-                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
-                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.3, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -472,8 +472,8 @@ class WAS_SVR:
                 #             'loc' is passed as 'loc'
                 #             'scale' is unused
                 return (
-                    poisson.ppf(0.33, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
+                    poisson.ppf(0.3, mu=shape, loc=loc),
+                    poisson.ppf(0.7, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -481,8 +481,8 @@ class WAS_SVR:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -787,7 +787,7 @@ class WAS_SVR:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -959,7 +959,7 @@ class WAS_SVR:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -1245,34 +1245,34 @@ class WAS_PolynomialRegression:
         try:
             if code == 1:
                 return (
-                    norm.ppf(0.33, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
+                    norm.ppf(0.3, loc=loc, scale=scale),
+                    norm.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
-                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
-                    expon.ppf(0.33, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
+                    expon.ppf(0.3, loc=loc, scale=scale),
+                    expon.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
-                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
-                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
-                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.3, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -1280,8 +1280,8 @@ class WAS_PolynomialRegression:
                 #             'loc' is passed as 'loc'
                 #             'scale' is unused
                 return (
-                    poisson.ppf(0.33, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
+                    poisson.ppf(0.3, mu=shape, loc=loc),
+                    poisson.ppf(0.7, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -1289,8 +1289,8 @@ class WAS_PolynomialRegression:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -1595,7 +1595,7 @@ class WAS_PolynomialRegression:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -1743,7 +1743,7 @@ class WAS_PolynomialRegression:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -1997,34 +1997,34 @@ class WAS_PoissonRegression:
         try:
             if code == 1:
                 return (
-                    norm.ppf(0.33, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
+                    norm.ppf(0.3, loc=loc, scale=scale),
+                    norm.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
-                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
-                    expon.ppf(0.33, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
+                    expon.ppf(0.3, loc=loc, scale=scale),
+                    expon.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
-                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
-                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
-                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.3, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -2032,8 +2032,8 @@ class WAS_PoissonRegression:
                 #             'loc' is passed as 'loc'
                 #             'scale' is unused
                 return (
-                    poisson.ppf(0.33, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
+                    poisson.ppf(0.3, mu=shape, loc=loc),
+                    poisson.ppf(0.7, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -2041,8 +2041,8 @@ class WAS_PoissonRegression:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -2347,7 +2347,7 @@ class WAS_PoissonRegression:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -2495,7 +2495,7 @@ class WAS_PoissonRegression:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -2874,34 +2874,34 @@ class WAS_RandomForest_XGBoost_ML_Stacking:
         try:
             if code == 1:
                 return (
-                    norm.ppf(0.33, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
+                    norm.ppf(0.3, loc=loc, scale=scale),
+                    norm.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
-                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
-                    expon.ppf(0.33, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
+                    expon.ppf(0.3, loc=loc, scale=scale),
+                    expon.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
-                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
-                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
-                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.3, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -2909,8 +2909,8 @@ class WAS_RandomForest_XGBoost_ML_Stacking:
                 #             'loc' is passed as 'loc'
                 #             'scale' is unused
                 return (
-                    poisson.ppf(0.33, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
+                    poisson.ppf(0.3, mu=shape, loc=loc),
+                    poisson.ppf(0.7, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -2918,8 +2918,8 @@ class WAS_RandomForest_XGBoost_ML_Stacking:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -3224,7 +3224,7 @@ class WAS_RandomForest_XGBoost_ML_Stacking:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -3394,7 +3394,7 @@ class WAS_RandomForest_XGBoost_ML_Stacking:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -3780,34 +3780,34 @@ class WAS_MLP:
         try:
             if code == 1:
                 return (
-                    norm.ppf(0.33, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
+                    norm.ppf(0.3, loc=loc, scale=scale),
+                    norm.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
-                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
-                    expon.ppf(0.33, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
+                    expon.ppf(0.3, loc=loc, scale=scale),
+                    expon.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
-                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
-                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
-                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.3, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -3815,8 +3815,8 @@ class WAS_MLP:
                 #             'loc' is passed as 'loc'
                 #             'scale' is unused
                 return (
-                    poisson.ppf(0.33, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
+                    poisson.ppf(0.3, mu=shape, loc=loc),
+                    poisson.ppf(0.7, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -3824,8 +3824,8 @@ class WAS_MLP:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -4130,7 +4130,7 @@ class WAS_MLP:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -4304,7 +4304,7 @@ class WAS_MLP:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -4679,34 +4679,34 @@ class WAS_RandomForest_XGBoost_Stacking_MLP:
         try:
             if code == 1:
                 return (
-                    norm.ppf(0.33, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
+                    norm.ppf(0.3, loc=loc, scale=scale),
+                    norm.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
-                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
-                    expon.ppf(0.33, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
+                    expon.ppf(0.3, loc=loc, scale=scale),
+                    expon.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
-                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
-                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
-                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.3, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -4714,8 +4714,8 @@ class WAS_RandomForest_XGBoost_Stacking_MLP:
                 #             'loc' is passed as 'loc'
                 #             'scale' is unused
                 return (
-                    poisson.ppf(0.33, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
+                    poisson.ppf(0.3, mu=shape, loc=loc),
+                    poisson.ppf(0.7, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -4723,8 +4723,8 @@ class WAS_RandomForest_XGBoost_Stacking_MLP:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -5029,7 +5029,7 @@ class WAS_RandomForest_XGBoost_Stacking_MLP:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -5196,7 +5196,7 @@ class WAS_RandomForest_XGBoost_Stacking_MLP:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -5566,34 +5566,34 @@ class WAS_Stacking_Ridge:
         try:
             if code == 1:
                 return (
-                    norm.ppf(0.33, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
+                    norm.ppf(0.3, loc=loc, scale=scale),
+                    norm.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
-                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
-                    expon.ppf(0.33, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
+                    expon.ppf(0.3, loc=loc, scale=scale),
+                    expon.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
-                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
-                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
-                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.3, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -5601,8 +5601,8 @@ class WAS_Stacking_Ridge:
                 #             'loc' is passed as 'loc'
                 #             'scale' is unused
                 return (
-                    poisson.ppf(0.33, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
+                    poisson.ppf(0.3, mu=shape, loc=loc),
+                    poisson.ppf(0.7, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -5610,8 +5610,8 @@ class WAS_Stacking_Ridge:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -5916,7 +5916,7 @@ class WAS_Stacking_Ridge:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -6073,7 +6073,7 @@ class WAS_Stacking_Ridge:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
         T1 = terciles.isel(quantile=0).drop_vars('quantile')
         T2 = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -6744,34 +6744,34 @@ class WAS_MARS_Model:
         try:
             if code == 1:
                 return (
-                    norm.ppf(0.33, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
+                    norm.ppf(0.3, loc=loc, scale=scale),
+                    norm.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
-                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
-                    expon.ppf(0.33, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
+                    expon.ppf(0.3, loc=loc, scale=scale),
+                    expon.ppf(0.7, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
-                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
-                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
-                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.3, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -6779,8 +6779,8 @@ class WAS_MARS_Model:
                 #             'loc' is passed as 'loc'
                 #             'scale' is unused
                 return (
-                    poisson.ppf(0.33, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
+                    poisson.ppf(0.3, mu=shape, loc=loc),
+                    poisson.ppf(0.7, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -6788,8 +6788,8 @@ class WAS_MARS_Model:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -7094,7 +7094,7 @@ class WAS_MARS_Model:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -7242,7 +7242,7 @@ class WAS_MARS_Model:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
