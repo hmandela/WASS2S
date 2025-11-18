@@ -528,6 +528,7 @@ class WAS_Download:
         
                             file_name = f"{cent}_{k}_{tag}_{init_str}_{lead_str}_{year_range}.txt"
                             full_url = base_url + file_name
+                            # print(full_url)
                             file_txt_path = dir_to_save / file_name
                             if os.path.exists(file_txt_path):
                                 da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path)
