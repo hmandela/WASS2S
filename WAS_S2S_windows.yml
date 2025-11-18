@@ -6,7 +6,7 @@ channels:
 
 dependencies:
   # --- Core ---
-  - python=3.12
+  - python=3.11
   - pip
   - numpy=1.26.*
   - scipy>=1.13,<1.14
@@ -42,8 +42,6 @@ dependencies:
   - pyproj
   - rasterio
   - rioxarray
-  - xesmf
-  - esmpy
   - cf_xarray
   - magics
   - cdo
@@ -97,11 +95,6 @@ dependencies:
   - yaml
   - pyyaml
   - pip
-
-  # --- Optional: For documentation ---
-  - sphinx
-  - sphinx-rtd-theme
-  - twine
 
   - pip:
       - xeofs==3.0.4
