@@ -9,7 +9,7 @@ dependencies:
   - python=3.11
   - pip
   - numpy=1.26.*
-  - scipy>=1.13,<1.14
+  - scipy==1.11.3
   - pandas=2.2.*
   - scikit-learn=1.5.*
   - numba>=0.59,<0.61
@@ -42,7 +42,6 @@ dependencies:
   - pyproj
   - rasterio
   - rioxarray
-  - mapclassify
   - pykrige
 
   # (REMOVED: magics, cdo, python-cdo, esmf, esmpy, xesmf, netcdf-fortran, parallelio → incompatible Windows)
