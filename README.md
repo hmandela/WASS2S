@@ -33,15 +33,13 @@ It helps forecaster to download data, build models, verify the models, and forec
 2. Create an environment and activate
 - For Windows: download yaml [here](https://github.com/hmandela/WASS2S/blob/main/WAS_S2S_windows.yml) and run
 ```bash
-conda install -n base -c conda-forge mamba
-mamba env create -f WAS_S2S_windows.yml
-mamba activate WASS2S
+conda env create -f WAS_S2S_windows.yml
+conda activate WASS2S
 ```
 - For Linux: download yaml [here](https://github.com/hmandela/WASS2S/blob/main/WAS_S2S_linux.yml) and run
 ```bash
-conda install -n base -c conda-forge mamba
-mamba env create -f WAS_S2S_linux.yml
-mamba activate WASS2S
+conda env create -f WAS_S2S_linux.yml
+conda activate WASS2S
 ```
 
 3. Install wass2s
