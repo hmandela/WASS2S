@@ -888,7 +888,7 @@ class WAS_Verification:
     def resolution_score_grid(self, y_true, y_probs, index_start, index_end,
                              bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
                                             0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-                                            0.550, 0.600, 0.650, 0.700, 0.750, 0.800,
+                                            0.550, 0.600, 0.650, 0.6700, 0.6750, 0.800,
                                             0.850, 0.900, 0.950, 0.975, 1.000])):
         """
         Compute Resolution Score on a grid based on Weijs (2010).
@@ -940,7 +940,7 @@ class WAS_Verification:
     def reliability_score_grid(self, y_true, y_probs, index_start, index_end,
                               bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
                                              0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-                                             0.550, 0.600, 0.650, 0.700, 0.750, 0.800,
+                                             0.550, 0.600, 0.650, 0.6700, 0.6750, 0.800,
                                              0.850, 0.900, 0.950, 0.975, 1.000])):
         """
         Compute Reliability Score on a grid based on Weijs (2010).
@@ -992,7 +992,7 @@ class WAS_Verification:
     def resolution_and_reliability_over_all_grid(self, y_true_class, y_probs, 
                                                 bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
                                                                0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-                                                               0.550, 0.600, 0.650, 0.700, 0.750, 0.800,
+                                                               0.550, 0.600, 0.650, 0.6700, 0.6750, 0.800,
                                                                0.850, 0.900, 0.950, 0.975, 1.000])):
         """
         Compute Resolution and Reliability scores over all grid points.
@@ -1056,7 +1056,7 @@ class WAS_Verification:
 
     def reliability_diagram(self, modelname, dir_to_save_score, y_true_class, y_probs,
                            bins=np.array([0.100, 0.150, 0.200, 0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-                                          0.550, 0.600, 0.650, 0.700])):
+                                          0.550, 0.600, 0.650, 0.6700])):
         """
         Plot Reliability Diagrams for probabilistic forecasts.
 
@@ -1134,7 +1134,7 @@ class WAS_Verification:
             ax.fill_between(no_skill_x, no_skill_y, 100, where=(no_skill_x >= relative_frequency),
                             color='gray', alpha=0.2)
             ax.text(0.05, 0.78, f"REL= {reliability:.2f}", transform=ax.transAxes, fontsize=12)
-            ax.text(0.05, 0.71, f"RES= {resolution:.2f}", transform=ax.transAxes, fontsize=12)
+            ax.text(0.05, 0.671, f"RES= {resolution:.2f}", transform=ax.transAxes, fontsize=12)
             ax.bar(bins[:-1] * 100, (forecast_counts[tercile] / total_forecasts) * 100, width=5, color="grey", alpha=0.5, align="edge")
             ax.set_title(titles[tercile])
             ax.set_xlim([0, 100])
@@ -1477,33 +1477,33 @@ class WAS_Verification:
         try:
             if code == 1:
                 return (
-                    norm.ppf(0.33, loc=loc, scale=scale),
+                    norm.ppf(0.3, loc=loc, scale=scale),
                     norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
-                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
                     lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
-                    expon.ppf(0.33, loc=loc, scale=scale),
+                    expon.ppf(0.3, loc=loc, scale=scale),
                     expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
-                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
                     gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
-                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
                     weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
-                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.3, df=shape, loc=loc, scale=scale),
                     t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
@@ -1512,7 +1512,7 @@ class WAS_Verification:
                 #             'loc' is passed as 'loc'
                 #             'scale' is unused
                 return (
-                    poisson.ppf(0.33, mu=shape, loc=loc),
+                    poisson.ppf(0.3, mu=shape, loc=loc),
                     poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
@@ -1521,7 +1521,7 @@ class WAS_Verification:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
                     nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
@@ -1825,7 +1825,7 @@ class WAS_Verification:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         

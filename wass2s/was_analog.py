@@ -1010,126 +1010,256 @@ class WAS_Analog:
         print(f"Similar years for {reference_year} (Agglomerative): {similar_years}")
         return np.array(similar_years)
 
-    def download_and_process(self):
-        """Download and process reanalysis and forecast data.
+    # def download_and_process(self):
+    #     """Download and process reanalysis and forecast data.
 
-        Combines reanalysis and forecast data, applies standardization or anomaly calculation,
-        and optionally applies a rolling mean.
+    #     Combines reanalysis and forecast data, applies standardization or anomaly calculation,
+    #     and optionally applies a rolling mean.
 
-        Returns
-        -------
-        data_var_concatenated : dict
-            Dictionary of concatenated, processed datasets.
-        data_var_shifted : dict
-            Dictionary of time-shifted, processed datasets.
-        """
-        lead_time = [1, 2, 3, 4, 5] if self.lead_time is None else self.lead_time
-        month_of_initialization = (datetime.now() - relativedelta(months=1)).month if self.month_of_initialization is None else self.month_of_initialization
+    #     Returns
+    #     -------
+    #     data_var_concatenated : dict
+    #         Dictionary of concatenated, processed datasets.
+    #     data_var_shifted : dict
+    #         Dictionary of time-shifted, processed datasets.
+    #     """
+    #     lead_time = [1, 2, 3, 4, 5] if self.lead_time is None else self.lead_time
+    #     month_of_initialization = (datetime.now() - relativedelta(months=1)).month if self.month_of_initialization is None else self.month_of_initialization
         
-        sst_hist = self.download_reanalysis(force_download=False)
-        sst_hdcst, sst_for = self.download_models(force_download=False)
+    #     sst_hist = self.download_reanalysis(force_download=False)
+    #     sst_hdcst, sst_for = self.download_models(force_download=False)
 
-        variables = [item['variable'] for item in self.predictor_vars]
-        print(f"Processing variables: {variables}")
-        data_var_concatenated = {}
-        data_var_shifted = {}
+    #     variables = [item['variable'] for item in self.predictor_vars]
+    #     print(f"Processing variables: {variables}")
+    #     data_var_concatenated = {}
+    #     data_var_shifted = {}
 
-        for var in variables:
-            if var not in sst_hist or var not in sst_for:
-                print(f"Skipping {var}: data not available.")
-                continue  
+    #     for var in variables:
+    #         if var not in sst_hist or var not in sst_for:
+    #             print(f"Skipping {var}: data not available.")
+    #             continue  
 
-            sst_hist_ = sst_hist[var]
-            sst_hdcst_ = sst_hdcst[var]
-            sst_for_ = sst_for[var]
+    #         sst_hist_ = sst_hist[var]
+    #         sst_hdcst_ = sst_hdcst[var]
+    #         sst_for_ = sst_for[var]
 
-            # process hindcast data
-            hindcast = []
-            for i in sst_hdcst_['T']:
-                sst_hdcst_i = sst_hdcst_.sel(T=i)
-                base_times = pd.Timestamp(sst_hdcst_i['T'].values)
-                new_times = [base_times + pd.DateOffset(months=int(m)) for m in sst_hdcst_i['forecastMonth'].values]
-                sst_hdcst_i = sst_hdcst_i.assign_coords(forecastMonth=("forecastMonth", new_times))
-                sst_hdcst_i = sst_hdcst_i.drop_vars('T', errors='ignore').squeeze().rename({'forecastMonth': 'T'})
-                hindcast.append(sst_hdcst_i)
-            sst_hdcst_ = xr.concat(hindcast, dim='T')          
-            sst_hdcst_ = sst_hdcst_.interp(Y=sst_hist_.Y, X=sst_hist_.X, method="linear", kwargs={"fill_value": "extrapolate"})
- 
+    #         # process hindcast data
+    #         hindcast = []
+    #         for i in sst_hdcst_['T']:
+    #             sst_hdcst_i = sst_hdcst_.sel(T=i)
+    #             base_times = pd.Timestamp(sst_hdcst_i['T'].values)
+    #             new_times = [base_times + pd.DateOffset(months=int(m)) for m in sst_hdcst_i['forecastMonth'].values]
+    #             sst_hdcst_i = sst_hdcst_i.assign_coords(forecastMonth=("forecastMonth", new_times))
+    #             sst_hdcst_i = sst_hdcst_i.drop_vars('T', errors='ignore').squeeze().rename({'forecastMonth': 'T'})
+    #             hindcast.append(sst_hdcst_i)
+    #         sst_hdcst_ = xr.concat(hindcast, dim='T')          
+    #         sst_hdcst_ = sst_hdcst_.interp(Y=sst_hist_.Y, X=sst_hist_.X, method="linear", kwargs={"fill_value": "extrapolate"})
 
-            # process forecast data
-            sst_for_ = sst_for_.interp(Y=sst_hist_.Y, X=sst_hist_.X, method="linear", kwargs={"fill_value": "extrapolate"})
-            if (isinstance(sst_for_['T'].values, np.ndarray)):
-                base_time = pd.Timestamp(sst_for_['T'].values[-1])
-            else:
-                base_time = pd.Timestamp(sst_for_['T'].values)
-            new_times = [base_time + pd.DateOffset(months=int(m)) for m in sst_for_['forecastMonth'].values]
-            sst_for_ = sst_for_.assign_coords(forecastMonth=("forecastMonth", new_times))
-            sst_for_ = sst_for_.drop_vars('T', errors='ignore').squeeze().rename({'forecastMonth': 'T'})
+            
+    #         # process forecast data
+    #         sst_for_ = sst_for_.interp(Y=sst_hist_.Y, X=sst_hist_.X, method="linear", kwargs={"fill_value": "extrapolate"})
+    #         if (isinstance(sst_for_['T'].values, np.ndarray)):
+    #             base_time = pd.Timestamp(sst_for_['T'].values[-1])
+    #         else:
+    #             base_time = pd.Timestamp(sst_for_['T'].values)
+    #         new_times = [base_time + pd.DateOffset(months=int(m)) for m in sst_for_['forecastMonth'].values]
+    #         sst_for_ = sst_for_.assign_coords(forecastMonth=("forecastMonth", new_times))
+    #         sst_for_ = sst_for_.drop_vars('T', errors='ignore').squeeze().rename({'forecastMonth': 'T'})
 
-            # Correct forecast systematic bias
-            biasr = WAS_bias_correction()
+    #         # Correct forecast systematic bias
+    #         biasr = WAS_bias_correction()
 
-            sst_for_bias_corrected = []
-            for m in lead_time:
-                m = m + base_time.month
-                sst_hist_mean = sst_hist_.sel(T=slice(str(self.clim_year_start), str(self.clim_year_end))).where(sst_hist_['T'].dt.month.isin(m), drop=True)#.mean(dim="T",skipna=True)
-                sst_hist_mean = sst_hist_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+    #         sst_for_bias_corrected = []
+    #         for m in lead_time:
+    #             target_time = base_time + pd.DateOffset(months=m)
+    #             current_target_month = target_time.month
 
+    #             sst_hist_mean = sst_hist_.where(sst_hist_['T'].dt.month.isin(current_target_month), drop=True)
+    #             sst_hist_mean = sst_hist_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze()
 
-                sst_hdcst_mean = sst_hdcst_.sel(T=slice(str(self.clim_year_start), str(self.clim_year_end))).where(sst_hdcst_['T'].dt.month.isin(m), drop=True)#.mean(dim="T",skipna=True)
-                sst_hdcst_mean = sst_hdcst_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+    #             sst_hdcst_mean = sst_hdcst_.where(sst_hdcst_['T'].dt.month.isin(current_target_month), drop=True)
+    #             sst_hdcst_mean = sst_hdcst_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+    #             sst_hist_mean, sst_hdcst_mean  = xr.align(sst_hist_mean, sst_hdcst_mean, join="inner")
+    #             sst_for_mean = sst_for_.where(sst_for_['T'].dt.month.isin(current_target_month), drop=True)
+    #             sst_for_mean = sst_for_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze('variable', drop=True)
                 
-                sst_for_mean = sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True)
-                sst_for_mean = sst_for_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze('variable', drop=True)
-                
-                if var in ["TMIN", "TEMP", "TMAX", "SST", "HUSS_1000", "HUSS_925", "HUSS_850", "SLP", "UGRD10", "VGRD10", "UGRD_1000", "UGRD_925", "UGRD_850", "VGRD_1000", "VGRD_925", "VGRD_850"]:
-                    fobj_quant_da = biasr.fitBC(sst_hist_mean, sst_hdcst_mean, method='QUANT', qstep=0.01, nboot=10)
-                    sst_for_bias_corrected.append(biasr.doBC(sst_for_mean, fobj_quant_da, type='linear'))
-                    # sst_for_bias_corrected.append(sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True) - sst_hdcst_mean + sst_hist_mean)
-                # if var in ["PRCP", "DSWR", "DLWR", "NOLR"]:
-                    # fobj_quant = qmap.fitQmap(sst_hist_mean, sst_hdcst_mean, method='QUANT', wet_day=0.1,  qstep=0.001)
-                    # sst_for_bias_corrected.append(sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True) * sst_hist_mean / sst_hdcst_mean)
-            sst_for_ = xr.concat(sst_for_bias_corrected, dim='T').sortby("T")
+    #             if var in ["TMIN", "TEMP", "TMAX", "SST", "HUSS_1000", "HUSS_925", "HUSS_850", "SLP", "UGRD10", "VGRD10", "UGRD_1000", "UGRD_925", "UGRD_850", "VGRD_1000", "VGRD_925", "VGRD_850"]:
+    #                 fobj_quant_da = biasr.fitBC(sst_hist_mean, sst_hdcst_mean, method='QUANT', qstep=0.01, nboot=10)
+    #                 sst_for_bias_corrected.append(biasr.doBC(sst_for_mean, fobj_quant_da, type='linear'))
+    #                 # sst_for_bias_corrected.append(sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True) - sst_hdcst_mean + sst_hist_mean)
+    #             # if var in ["PRCP", "DSWR", "DLWR", "N.OLR"]:
+    #                 # fobj_quant = qmap.fitQmap(sst_hist_mean, sst_hdcst_mean, method='QUANT', wet_day=0.1,  qstep=0.001)
+    #                 # sst_for_bias_corrected.append(sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True) * sst_hist_mean / sst_hdcst_mean)
+    #         sst_for_ = xr.concat(sst_for_bias_corrected, dim='T').sortby("T")
 
-            # Concatenate hist and forecast data
-            sst_hist_ = sst_hist_.sel(T=slice(f"{self.year_start}-01", f"{base_time.year}-{base_time.month:02d}"))
-            sst_hist_ = sst_hist_.to_array().drop_vars(['variable'], errors='ignore').squeeze()
-            concatenated_ds = xr.concat([sst_hist_, sst_for_], dim='T')
-            concatenated_ds = concatenated_ds.sortby("T")
-            concatenated_ds = concatenated_ds.to_dataset(name=var)
+    #         # Concatenate hist and forecast data
+    #         sst_hist_ = sst_hist_.sel(T=slice(f"{self.year_start}-01", f"{base_time.year}-{base_time.month:02d}"))
+    #         sst_hist_ = sst_hist_.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+    #         concatenated_ds = xr.concat([sst_hist_, sst_for_], dim='T')
+    #         concatenated_ds = concatenated_ds.sortby("T")
+    #         concatenated_ds = concatenated_ds.to_dataset(name=var)
 
-            if isinstance(self.rolling, int) and self.rolling > 1:
-               print(f"Applied rolling mean with window size {self.rolling} for {var}.")
-               concatenated_ds = concatenated_ds.rolling(T=self.rolling, center=False, min_periods=self.rolling).mean()
+    #         if isinstance(self.rolling, int) and self.rolling > 1:
+    #            print(f"Applied rolling mean with window size {self.rolling} for {var}.")
+    #            concatenated_ds = concatenated_ds.rolling(T=self.rolling, center=False, min_periods=self.rolling).mean()
 
-            if self.standardize:
-                print(f"Standardizing timeseries for {var}.")
-                concatenated_ds_st = self.standardize_timeseries(concatenated_ds)
-            else:
-                print(f"Computing anomalies for {var}.")
-                concatenated_ds_st = self.anomaly_timeseries(concatenated_ds)
+    #         if self.standardize:
+    #             print(f"Standardizing timeseries for {var}.")
+    #             concatenated_ds_st = self.standardize_timeseries(concatenated_ds)
+    #         else:
+    #             print(f"Computing anomalies for {var}.")
+    #             concatenated_ds_st = self.anomaly_timeseries(concatenated_ds)
 
-            first_year = concatenated_ds_st.isel(T=0).T.dt.year.item()
-            last_month = concatenated_ds_st.isel(T=-1).T.dt.month.item()
+    #         # first_year = concatenated_ds_st.isel(T=0).T.dt.year.item()
+    #         # last_month = concatenated_ds_st.isel(T=-1).T.dt.month.item()
 
-            if last_month == 12:
-                start_month = 1
-                first_year += 1
-            else:
-                start_month = last_month + 1
+    #         select_parts = concatenated_ds_st['T'].size - (self.year_forecast - self.year_start) * 12 
 
-            concatenated_ds_st = concatenated_ds_st.sel(T=slice(f"{first_year}-{start_month:02d}", f"{self.year_forecast}-{last_month:02d}"))
-            new_time = pd.DatetimeIndex([pd.to_datetime(f"{first_year+1}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))])
-            # ds_shifted = concatenated_ds_st.assign_coords(T=new_time, month=('T', new_time.month))
-            # start_date = pd.to_datetime(f"{first_year}-{last_month:02d}")
-            # concatenated_ds_st = concatenated_ds_st.sel(T=slice(start_date, None))
-            # new_time = pd.DatetimeIndex([pd.to_datetime(f"{first_year+1}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))])
-            # ds_shifted = concatenated_ds_st.assign_coords(T=new_time, month=('T', new_time.month))
-            ds_shifted = concatenated_ds_st.assign_coords(T=new_time)
+    #         # if last_month == 12:
+    #         #     start_month = 1
+    #         #     first_year += 1
+    #         # else:
+    #         #     start_month = last_month + 1
+            
+    #         concatenated_ds_st = concatenated_ds_st.isel(T=slice(select_parts, None))
+            
+    #         # concatenated_ds_st = concatenated_ds_st.sel(T=slice(f"{first_year}-{start_month:02d}", f"{self.year_forecast}-{last_month:02d}"))
+    #         # if last_month == 12:
+    #         #     new_time = pd.DatetimeIndex([pd.to_datetime(f"{first_year}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))])
+    #         # else:
+    #         #     new_time = pd.DatetimeIndex([pd.to_datetime(f"{first_year+1}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))])    
+
+    #         new_time = pd.DatetimeIndex([pd.to_datetime(f"{self.year_start+1}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))]) 
+
+    #         ds_shifted = concatenated_ds_st.assign_coords(T=new_time)
     
-            data_var_shifted[var] = ds_shifted.to_array().drop_vars(['variable'], errors='ignore').squeeze()
-            data_var_concatenated[var] = concatenated_ds_st.to_array().drop_vars(['variable'], errors='ignore').squeeze()
-        return data_var_concatenated, data_var_shifted
+    #         data_var_shifted[var] = ds_shifted.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+    #         data_var_concatenated[var] = concatenated_ds_st.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+    #     return data_var_concatenated, data_var_shifted
+
+
+    def download_and_process(self):
+            """Download and process reanalysis and forecast data."""
+            
+            lead_time = [1, 2, 3, 4, 5] if self.lead_time is None else self.lead_time
+            month_of_initialization = (datetime.now() - relativedelta(months=1)).month if self.month_of_initialization is None else self.month_of_initialization
+            
+            sst_hist = self.download_reanalysis(force_download=False)
+            sst_hdcst, sst_for = self.download_models(force_download=False)
+    
+            variables = [item['variable'] for item in self.predictor_vars]
+            print(f"Processing variables: {variables}")
+            data_var_concatenated = {}
+            data_var_shifted = {}
+    
+            for var in variables:
+                if var not in sst_hist or var not in sst_for:
+                    print(f"Skipping {var}: data not available.")
+                    continue  
+    
+                sst_hist_ = sst_hist[var]
+                sst_hdcst_ = sst_hdcst[var]
+                sst_for_ = sst_for[var]
+    
+                # --- Process Hindcast Data ---
+                hindcast = []
+                for i in sst_hdcst_['T']:
+                    sst_hdcst_i = sst_hdcst_.sel(T=i)
+                    base_times = pd.Timestamp(sst_hdcst_i['T'].values)
+                    new_times = [base_times + pd.DateOffset(months=int(m)) for m in sst_hdcst_i['forecastMonth'].values]
+                    sst_hdcst_i = sst_hdcst_i.assign_coords(forecastMonth=("forecastMonth", new_times))
+                    sst_hdcst_i = sst_hdcst_i.drop_vars('T', errors='ignore').squeeze().rename({'forecastMonth': 'T'})
+                    hindcast.append(sst_hdcst_i)
+                
+                sst_hdcst_ = xr.concat(hindcast, dim='T')           
+                sst_hdcst_ = sst_hdcst_.interp(Y=sst_hist_.Y, X=sst_hist_.X, method="linear", kwargs={"fill_value": "extrapolate"})
+    
+                # --- Process Forecast Data ---
+                sst_for_ = sst_for_.interp(Y=sst_hist_.Y, X=sst_hist_.X, method="linear", kwargs={"fill_value": "extrapolate"})
+                
+                if isinstance(sst_for_['T'].values, np.ndarray):
+                    base_time = pd.Timestamp(sst_for_['T'].values[-1])
+                else:
+                    base_time = pd.Timestamp(sst_for_['T'].values)
+                    
+                new_times = [base_time + pd.DateOffset(months=int(m)) for m in sst_for_['forecastMonth'].values]
+                sst_for_ = sst_for_.assign_coords(forecastMonth=("forecastMonth", new_times))
+                sst_for_ = sst_for_.drop_vars('T', errors='ignore').squeeze().rename({'forecastMonth': 'T'})
+    
+                # --- Bias Correction ---
+                biasr = WAS_bias_correction()
+                sst_for_bias_corrected = []
+                
+                for m in lead_time:
+                    # 1. Calcul correct du mois cible (gestion du cycle 12 -> 1)
+                    target_time = base_time + pd.DateOffset(months=m)
+                    current_target_month = target_time.month
+    
+                    # 2. Filtrage
+                    sst_hist_mean = sst_hist_.where(sst_hist_['T'].dt.month == current_target_month, drop=True)
+                    sst_hist_mean = sst_hist_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+    
+                    sst_hdcst_mean = sst_hdcst_.where(sst_hdcst_['T'].dt.month == current_target_month, drop=True)
+                    sst_hdcst_mean = sst_hdcst_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+                    
+                    # 3. Alignement
+                    # Create a set of unique years from the hindcast data
+                    years_to_keep = sst_hdcst_mean['T'].dt.year.to_numpy()
+                    
+                    # Filter the historical data based on this set of years
+                    sst_hist_mean = sst_hist_mean.where(sst_hist_mean['T'].dt.year.isin(years_to_keep), drop=True)
+                    sst_hdcst_mean['T'] = sst_hist_mean['T']
+                    sst_hist_aligned, sst_hdcst_aligned  = xr.align(sst_hist_mean, sst_hdcst_mean, join="inner")
+                    
+                    # 4. SÉCURITÉ CRITIQUE : Vérifier si les données sont vides après alignement
+                    if sst_hist_aligned.sizes['T'] == 0 or sst_hdcst_aligned.sizes['T'] == 0:
+                        print(f"WARNING: No overlapping data found for month {current_target_month} (lead {m}). Skipping bias correction for this step.")
+                        continue # Passe à l'itération suivante pour éviter le crash
+    
+                    sst_for_mean = sst_for_.where(sst_for_['T'].dt.month == current_target_month, drop=True)
+                    sst_for_mean = sst_for_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze('variable', drop=True)
+                    
+                    if var in ["TMIN", "TEMP", "TMAX", "SST", "HUSS_1000", "HUSS_925", "HUSS_850", "SLP", "UGRD10", "VGRD10", "UGRD_1000", "UGRD_925", "UGRD_850", "VGRD_1000", "VGRD_925", "VGRD_850"]:
+                        # Utilisation des variables alignées (_aligned)
+                        fobj_quant_da = biasr.fitBC(sst_hist_aligned, sst_hdcst_aligned, method='QUANT', qstep=0.01, nboot=10)
+                        sst_for_bias_corrected.append(biasr.doBC(sst_for_mean, fobj_quant_da, type='linear'))
+                
+                # --- Concatenation & Post-Processing ---
+                if not sst_for_bias_corrected:
+                    print(f"ERROR: Bias correction failed for all lead times for variable {var}.")
+                    continue
+    
+                sst_for_ = xr.concat(sst_for_bias_corrected, dim='T').sortby("T")
+    
+                sst_hist_ = sst_hist_.sel(T=slice(f"{self.year_start}-01", f"{base_time.year}-{base_time.month:02d}"))
+                sst_hist_ = sst_hist_.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+                
+                concatenated_ds = xr.concat([sst_hist_, sst_for_], dim='T')
+                concatenated_ds = concatenated_ds.sortby("T")
+                concatenated_ds = concatenated_ds.to_dataset(name=var)
+    
+                if isinstance(self.rolling, int) and self.rolling > 1:
+                    print(f"Applied rolling mean with window size {self.rolling} for {var}.")
+                    concatenated_ds = concatenated_ds.rolling(T=self.rolling, center=False, min_periods=self.rolling).mean()
+    
+                if self.standardize:
+                    print(f"Standardizing timeseries for {var}.")
+                    concatenated_ds_st = self.standardize_timeseries(concatenated_ds)
+                else:
+                    print(f"Computing anomalies for {var}.")
+                    concatenated_ds_st = self.anomaly_timeseries(concatenated_ds)
+    
+                select_parts = concatenated_ds_st['T'].size - (self.year_forecast - self.year_start) * 12 
+                concatenated_ds_st = concatenated_ds_st.isel(T=slice(select_parts, None))
+                
+                new_time = pd.DatetimeIndex([pd.to_datetime(f"{self.year_start+1}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))]) 
+    
+                ds_shifted = concatenated_ds_st.assign_coords(T=new_time)
+        
+                data_var_shifted[var] = ds_shifted.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+                data_var_concatenated[var] = concatenated_ds_st.to_array().drop_vars(['variable'], errors='ignore').squeeze()
+                
+            return data_var_concatenated, data_var_shifted
 
     def compute_model(self, predictant, itrain, itest):
         """Compute deterministic hindcast using the specified analog method."""
@@ -1180,33 +1310,33 @@ class WAS_Analog:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.68, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.68, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.68, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.68, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.68, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.68, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -1215,7 +1345,7 @@ class WAS_Analog:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.68, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -1223,8 +1353,8 @@ class WAS_Analog:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.68, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -1529,7 +1659,7 @@ class WAS_Analog:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.33, 0.68], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -1648,7 +1778,7 @@ class WAS_Analog:
         index_start = predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end = predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.68], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (predictant - hindcast_det).var(dim='T')

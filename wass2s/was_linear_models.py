@@ -193,33 +193,33 @@ class WAS_LinearRegression_Model:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -228,7 +228,7 @@ class WAS_LinearRegression_Model:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -237,7 +237,7 @@ class WAS_LinearRegression_Model:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -542,7 +542,7 @@ class WAS_LinearRegression_Model:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -689,7 +689,7 @@ class WAS_LinearRegression_Model:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -1040,33 +1040,33 @@ class WAS_Ridge_Model:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -1075,7 +1075,7 @@ class WAS_Ridge_Model:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -1084,7 +1084,7 @@ class WAS_Ridge_Model:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -1389,7 +1389,7 @@ class WAS_Ridge_Model:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -1546,7 +1546,7 @@ class WAS_Ridge_Model:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -1860,33 +1860,33 @@ class WAS_Lasso_Model:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -1895,7 +1895,7 @@ class WAS_Lasso_Model:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -1904,7 +1904,7 @@ class WAS_Lasso_Model:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -2209,7 +2209,7 @@ class WAS_Lasso_Model:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -2363,7 +2363,7 @@ class WAS_Lasso_Model:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -2687,33 +2687,33 @@ class WAS_LassoLars_Model:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -2722,7 +2722,7 @@ class WAS_LassoLars_Model:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -2731,7 +2731,7 @@ class WAS_LassoLars_Model:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -3036,7 +3036,7 @@ class WAS_LassoLars_Model:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -3191,7 +3191,7 @@ class WAS_LassoLars_Model:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -3290,7 +3290,7 @@ class WAS_ElasticNet_Model:
         Default is from 10^-6 to 10^2.
     l1_ratio_range : list
         Range of l1 ratio values (mixing between L1 and L2 penalties). 
-        Default is [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1].
+        Default is [0.1, 0.5, 0.67, 0.9, 0.95, 0.99, 1].
     n_clusters : int
         Number of clusters for KMeans-based spatial grouping. Default is 5.
     nb_cores : int
@@ -3332,7 +3332,7 @@ class WAS_ElasticNet_Model:
         if alpha_range is None:
             alpha_range = np.array([10**i for i in range(-6, 3)])
         if l1_ratio_range is None:
-            l1_ratio_range = [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
+            l1_ratio_range = [0.1, 0.5, 0.67, 0.9, 0.95, 0.99, 1.0]
         self.alpha_range = alpha_range
         self.l1_ratio_range = l1_ratio_range
         self.n_clusters = n_clusters
@@ -3537,33 +3537,33 @@ class WAS_ElasticNet_Model:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -3572,7 +3572,7 @@ class WAS_ElasticNet_Model:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -3581,7 +3581,7 @@ class WAS_ElasticNet_Model:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -3886,7 +3886,7 @@ class WAS_ElasticNet_Model:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -4051,7 +4051,7 @@ class WAS_ElasticNet_Model:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')

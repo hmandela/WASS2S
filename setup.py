@@ -3,7 +3,7 @@ import os
 
 setup(
     name="wass2s",
-    version="0.2.19",
+    version="0.2.20",
     author="HOUNGNIBO C. M. Mandela",
     author_email="hmandelahmadiba@gmail.com",
     description="A Python package for seasonal climate forecast.",
@@ -24,7 +24,8 @@ setup(
         "rasterio",
         "geopandas",
         "shapely",
-        "rioxarray"
+        "rioxarray",
+        "SkillMetrics"
     ],
     python_requires=">=3.12",
     license="GPL-3.0",
