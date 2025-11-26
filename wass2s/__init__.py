@@ -1,4 +1,4 @@
-__version__ = "0.2.19"
+__version__ = "0.3.1"
 # --- SciPy interp patch for legacy dependencies ---
 import numpy as _np
 import scipy as _scipy
