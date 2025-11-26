@@ -672,33 +672,33 @@ class WAS_mme_Weighted:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -707,7 +707,7 @@ class WAS_mme_Weighted:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -716,7 +716,7 @@ class WAS_mme_Weighted:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -1021,7 +1021,7 @@ class WAS_mme_Weighted:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -1115,7 +1115,7 @@ class WAS_mme_Weighted:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -1362,7 +1362,7 @@ class WAS_mme_GA:
     max_iter : int, optional
         Maximum number of generations for the GA. Default is 50.
     crossover_rate : float, optional
-        Probability of performing crossover. Default is 0.7.
+        Probability of performing crossover. Default is 0.67.
     mutation_rate : float, optional
         Probability of mutating a gene. Default is 0.01.
     random_state : int, optional
@@ -1375,7 +1375,7 @@ class WAS_mme_GA:
     def __init__(self,
                  population_size=20,
                  max_iter=50,
-                 crossover_rate=0.7,
+                 crossover_rate=0.67,
                  mutation_rate=0.01,
                  random_state=42,
                  dist_method="nonparam"):
@@ -1717,33 +1717,33 @@ class WAS_mme_GA:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -1752,7 +1752,7 @@ class WAS_mme_GA:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -1761,7 +1761,7 @@ class WAS_mme_GA:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -2066,7 +2066,7 @@ class WAS_mme_GA:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         
@@ -2257,7 +2257,7 @@ class WAS_mme_GA:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det_cross).var(dim='T')
@@ -2720,33 +2720,33 @@ class WAS_mme_BMA:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -2755,7 +2755,7 @@ class WAS_mme_BMA:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -2764,7 +2764,7 @@ class WAS_mme_BMA:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -3069,7 +3069,7 @@ class WAS_mme_BMA:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -3186,7 +3186,7 @@ class WAS_mme_BMA:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant - hindcast_det).var(dim='T')
@@ -4087,33 +4087,33 @@ class WAS_mme_xcELM:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -4122,7 +4122,7 @@ class WAS_mme_xcELM:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -4131,7 +4131,7 @@ class WAS_mme_xcELM:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -4436,7 +4436,7 @@ class WAS_mme_xcELM:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -4578,7 +4578,7 @@ class WAS_mme_xcELM:
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         error_variance = (Predictant - hindcast_det_cross_val).var(dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
@@ -5058,7 +5058,7 @@ class HPELMWrapper(BaseEstimator, RegressorMixin):
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(rainfall_for_tercile.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -5288,7 +5288,7 @@ class HPELMWrapper(BaseEstimator, RegressorMixin):
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -5674,33 +5674,33 @@ class WAS_mme_hpELM:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -5709,7 +5709,7 @@ class WAS_mme_hpELM:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -5718,7 +5718,7 @@ class WAS_mme_hpELM:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -6023,7 +6023,7 @@ class WAS_mme_hpELM:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -6231,7 +6231,7 @@ class WAS_mme_hpELM:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
@@ -6491,33 +6491,33 @@ class WAS_mme_hpELM_:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -6526,7 +6526,7 @@ class WAS_mme_hpELM_:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -6535,7 +6535,7 @@ class WAS_mme_hpELM_:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -6840,7 +6840,7 @@ class WAS_mme_hpELM_:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -7039,7 +7039,7 @@ class WAS_mme_hpELM_:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
@@ -7318,33 +7318,33 @@ class WAS_mme_MLP_:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -7353,7 +7353,7 @@ class WAS_mme_MLP_:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -7362,7 +7362,7 @@ class WAS_mme_MLP_:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -7667,7 +7667,7 @@ class WAS_mme_MLP_:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -7868,7 +7868,7 @@ class WAS_mme_MLP_:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
@@ -8189,33 +8189,33 @@ class WAS_mme_MLP:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -8224,7 +8224,7 @@ class WAS_mme_MLP:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -8233,7 +8233,7 @@ class WAS_mme_MLP:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -8538,7 +8538,7 @@ class WAS_mme_MLP:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -8740,7 +8740,7 @@ class WAS_mme_MLP:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
@@ -9021,33 +9021,33 @@ class WAS_mme_XGBoosting_:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -9056,7 +9056,7 @@ class WAS_mme_XGBoosting_:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -9065,7 +9065,7 @@ class WAS_mme_XGBoosting_:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -9370,7 +9370,7 @@ class WAS_mme_XGBoosting_:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -9567,7 +9567,7 @@ class WAS_mme_XGBoosting_:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
@@ -9891,33 +9891,33 @@ class WAS_mme_XGBoosting:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -9926,7 +9926,7 @@ class WAS_mme_XGBoosting:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -9935,7 +9935,7 @@ class WAS_mme_XGBoosting:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -10240,7 +10240,7 @@ class WAS_mme_XGBoosting:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -10441,7 +10441,7 @@ class WAS_mme_XGBoosting:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
@@ -10714,33 +10714,33 @@ class WAS_mme_RF_:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -10749,7 +10749,7 @@ class WAS_mme_RF_:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -10758,7 +10758,7 @@ class WAS_mme_RF_:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -11063,7 +11063,7 @@ class WAS_mme_RF_:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -11258,7 +11258,7 @@ class WAS_mme_RF_:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
@@ -11576,33 +11576,33 @@ class WAS_mme_RF:
             if code == 1:
                 return (
                     norm.ppf(0.3, loc=loc, scale=scale),
-                    norm.ppf(0.7, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
                     lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.7, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
                     expon.ppf(0.3, loc=loc, scale=scale),
-                    expon.ppf(0.7, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
                     gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.7, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
                     weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
                     t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.7, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -11611,7 +11611,7 @@ class WAS_mme_RF:
                 #             'scale' is unused
                 return (
                     poisson.ppf(0.3, mu=shape, loc=loc),
-                    poisson.ppf(0.7, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -11620,7 +11620,7 @@ class WAS_mme_RF:
                 #             'loc' is passed as 'loc'
                 return (
                     nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.7, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -11925,7 +11925,7 @@ class WAS_mme_RF:
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
         # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
         
@@ -12123,7 +12123,7 @@ class WAS_mme_RF:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
@@ -12552,28 +12552,28 @@ class WAS_mme_Stacking:
         code = int(dist_code)
         try:
             if code == 1:
-                return norm.ppf(0.3, loc=loc, scale=scale), norm.ppf(0.7, loc=loc, scale=scale)
+                return norm.ppf(0.3, loc=loc, scale=scale), norm.ppf(0.67, loc=loc, scale=scale)
             elif code == 2:
                 return (lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                        lognorm.ppf(0.7, s=shape, loc=loc, scale=scale))
+                        lognorm.ppf(0.67, s=shape, loc=loc, scale=scale))
             elif code == 3:
                 return (expon.ppf(0.3, loc=loc, scale=scale),
-                        expon.ppf(0.7, loc=loc, scale=scale))
+                        expon.ppf(0.67, loc=loc, scale=scale))
             elif code == 4:
                 return (gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                        gamma.ppf(0.7, a=shape, loc=loc, scale=scale))
+                        gamma.ppf(0.67, a=shape, loc=loc, scale=scale))
             elif code == 5:
                 return (weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                        weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale))
+                        weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale))
             elif code == 6:
                 return (t.ppf(0.3, df=shape, loc=loc, scale=scale),
-                        t.ppf(0.7, df=shape, loc=loc, scale=scale))
+                        t.ppf(0.67, df=shape, loc=loc, scale=scale))
             elif code == 7:
                 return (poisson.ppf(0.3, mu=shape, loc=loc),
-                        poisson.ppf(0.7, mu=shape, loc=loc))
+                        poisson.ppf(0.67, mu=shape, loc=loc))
             elif code == 8:
                 return (nbinom.ppf(0.3, n=shape, p=scale, loc=loc),
-                        nbinom.ppf(0.7, n=shape, p=scale, loc=loc))
+                        nbinom.ppf(0.67, n=shape, p=scale, loc=loc))
         except Exception:
             return np.nan, np.nan
         return np.nan, np.nan
@@ -12729,7 +12729,7 @@ class WAS_mme_Stacking:
         error_variance = (Predictant - hindcast_det).var(dim="T")
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
 
@@ -12937,7 +12937,7 @@ class WAS_mme_Stacking:
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_clim = Predictant_no_m.isel(T=slice(index_start, index_end))
 
-        terciles = rainfall_clim.quantile([0.3, 0.7], dim="T")
+        terciles = rainfall_clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles.isel(quantile=1).drop_vars("quantile")
 
@@ -13203,24 +13203,24 @@ class WAS_mme_Stacking_:
         code = int(dist_code)
         try:
             if code == 1:
-                return norm.ppf(0.3, loc=loc, scale=scale), norm.ppf(0.7, loc=loc, scale=scale)
+                return norm.ppf(0.3, loc=loc, scale=scale), norm.ppf(0.67, loc=loc, scale=scale)
             elif code == 2:
                 return (lognorm.ppf(0.3, s=shape, loc=loc, scale=scale),
-                        lognorm.ppf(0.7, s=shape, loc=loc, scale=scale))
+                        lognorm.ppf(0.67, s=shape, loc=loc, scale=scale))
             elif code == 3:
-                return expon.ppf(0.3, loc=loc, scale=scale), expon.ppf(0.7, loc=loc, scale=scale)
+                return expon.ppf(0.3, loc=loc, scale=scale), expon.ppf(0.67, loc=loc, scale=scale)
             elif code == 4:
                 return (gamma.ppf(0.3, a=shape, loc=loc, scale=scale),
-                        gamma.ppf(0.7, a=shape, loc=loc, scale=scale))
+                        gamma.ppf(0.67, a=shape, loc=loc, scale=scale))
             elif code == 5:
                 return (weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale),
-                        weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale))
+                        weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale))
             elif code == 6:
-                return t.ppf(0.3, df=shape, loc=loc, scale=scale), t.ppf(0.7, df=shape, loc=loc, scale=scale)
+                return t.ppf(0.3, df=shape, loc=loc, scale=scale), t.ppf(0.67, df=shape, loc=loc, scale=scale)
             elif code == 7:
-                return poisson.ppf(0.3, mu=shape, loc=loc), poisson.ppf(0.7, mu=shape, loc=loc)
+                return poisson.ppf(0.3, mu=shape, loc=loc), poisson.ppf(0.67, mu=shape, loc=loc)
             elif code == 8:
-                return nbinom.ppf(0.3, n=shape, p=scale, loc=loc), nbinom.ppf(0.7, n=shape, p=scale, loc=loc)
+                return nbinom.ppf(0.3, n=shape, p=scale, loc=loc), nbinom.ppf(0.67, n=shape, p=scale, loc=loc)
         except Exception:
             return np.nan, np.nan
         return np.nan, np.nan
@@ -13391,7 +13391,7 @@ class WAS_mme_Stacking_:
         error_variance = (Predictant - hindcast_det).var(dim="T")
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
-        terciles_emp = clim.quantile([0.3, 0.7], dim="T")
+        terciles_emp = clim.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
 
@@ -13559,7 +13559,7 @@ class WAS_mme_Stacking_:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim="T")
+        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim="T")
         T1_emp = terciles.isel(quantile=0).drop_vars("quantile")
         T2_emp = terciles.isel(quantile=1).drop_vars("quantile")
 
@@ -14010,28 +14010,28 @@ def _ppf_terciles_from_code(dist_code, shape, loc, scale):
     try:
         if code == 1:
             return (float(norm.ppf(0.3, loc=loc, scale=scale)),
-                    float(norm.ppf(0.7, loc=loc, scale=scale)))
+                    float(norm.ppf(0.67, loc=loc, scale=scale)))
         elif code == 2:
             return (float(lognorm.ppf(0.3, s=shape, loc=loc, scale=scale)),
-                    float(lognorm.ppf(0.7, s=shape, loc=loc, scale=scale)))
+                    float(lognorm.ppf(0.67, s=shape, loc=loc, scale=scale)))
         elif code == 3:
             return (float(expon.ppf(0.3, loc=loc, scale=scale)),
-                    float(expon.ppf(0.7, loc=loc, scale=scale)))
+                    float(expon.ppf(0.67, loc=loc, scale=scale)))
         elif code == 4:
             return (float(gamma.ppf(0.3, a=shape, loc=loc, scale=scale)),
-                    float(gamma.ppf(0.7, a=shape, loc=loc, scale=scale)))
+                    float(gamma.ppf(0.67, a=shape, loc=loc, scale=scale)))
         elif code == 5:
             return (float(weibull_min.ppf(0.3, c=shape, loc=loc, scale=scale)),
-                    float(weibull_min.ppf(0.7, c=shape, loc=loc, scale=scale)))
+                    float(weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale)))
         elif code == 6:
             return (float(t.ppf(0.3, df=shape, loc=loc, scale=scale)),
-                    float(t.ppf(0.7, df=shape, loc=loc, scale=scale)))
+                    float(t.ppf(0.67, df=shape, loc=loc, scale=scale)))
         elif code == 7:
             return (float(poisson.ppf(0.3, mu=shape, loc=loc)),
-                    float(poisson.ppf(0.7, mu=shape, loc=loc)))
+                    float(poisson.ppf(0.67, mu=shape, loc=loc)))
         elif code == 8:
             return (float(nbinom.ppf(0.3, n=shape, p=scale, loc=loc)),
-                    float(nbinom.ppf(0.7, n=shape, p=scale, loc=loc)))
+                    float(nbinom.ppf(0.67, n=shape, p=scale, loc=loc)))
     except Exception:
         return np.nan, np.nan
     return np.nan, np.nan
@@ -15195,7 +15195,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -15277,7 +15277,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 #         forecast_det_for_prob = forecast_det.copy()  # Use the det for best_guess
@@ -15490,7 +15490,7 @@ class WAS_mme_MVA:
 #         n_lat = len(lat)
 #         n_lon = len(lon)
 #         # Compute terciles from training data
-#         terciles = y_train.quantile([0.3, 0.7], dim='T')
+#         terciles = y_train.quantile([0.3, 0.67], dim='T')
 #         T1 = terciles.isel(quantile=0).drop_vars('quantile')
 #         T2 = terciles.isel(quantile=1).drop_vars('quantile')
 #         # Use provided best_params and cluster_da or compute if None
@@ -15594,7 +15594,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         T1 = terciles.isel(quantile=0).drop_vars('quantile')
 #         T2 = terciles.isel(quantile=1).drop_vars('quantile')
 #         # Use provided best_params and cluster_da or compute if None
@@ -15826,9 +15826,9 @@ class WAS_mme_MVA:
 
 #         # terciles from **raw y_train** over climatology years
 #         y_clim_slice = y_train.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-#         Tq = y_clim_slice.quantile([0.3, 0.7], dim="T", skipna=True)  # (quantile,Y,X)
+#         Tq = y_clim_slice.quantile([0.3, 0.67], dim="T", skipna=True)  # (quantile,Y,X)
 #         T1 = Tq.sel(quantile=0.3)  # (Y,X)
-#         T2 = Tq.sel(quantile=0.7)
+#         T2 = Tq.sel(quantile=0.67)
 
 #         # ensure params/clusters
 #         if best_params is None or cluster_da is None:
@@ -16199,7 +16199,7 @@ class WAS_mme_MVA:
 #     max_iter : int, optional
 #         Maximum number of generations for the GA. Default is 100 (increased for better search).
 #     crossover_rate : float, optional
-#         Probability of performing crossover. Default is 0.7.
+#         Probability of performing crossover. Default is 0.67.
 #     mutation_rate : float, optional
 #         Probability of mutating a gene. Default is 0.05 (slightly increased for more exploration).
 #     random_state : int, optional
@@ -16213,7 +16213,7 @@ class WAS_mme_MVA:
 #     def __init__(self,
 #                  population_size=50,
 #                  max_iter=100,
-#                  crossover_rate=0.7,
+#                  crossover_rate=0.67,
 #                  mutation_rate=0.05,
 #                  random_state=42,
 #                  dist_method="gamma",
@@ -16709,7 +16709,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
         
@@ -16835,7 +16835,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
         
@@ -17455,9 +17455,9 @@ class WAS_mme_MVA:
 #             idx = Predictant.get_index("T")
 #             sl = idx.slice_indexer(str(clim_year_start), str(clim_year_end))
 #             hist = Predictant.isel(T=sl)
-#             qs = hist.quantile([0.3, 0.7], dim='T', skipna=True)
+#             qs = hist.quantile([0.3, 0.67], dim='T', skipna=True)
 #         else:
-#             qs = y_train.quantile([0.3, 0.7], dim='T', skipna=True)
+#             qs = y_train.quantile([0.3, 0.67], dim='T', skipna=True)
 #         T1 = qs.isel(quantile=0).drop_vars('quantile')
 #         T2 = qs.isel(quantile=1).drop_vars('quantile')
 
@@ -17513,7 +17513,7 @@ class WAS_mme_MVA:
 #         idx = Predictant.get_index("T")
 #         sl = idx.slice_indexer(str(clim_year_start), str(clim_year_end))
 #         hist = Predictant.isel(T=sl)
-#         qs = hist.quantile([0.3, 0.7], dim='T', skipna=True)
+#         qs = hist.quantile([0.3, 0.67], dim='T', skipna=True)
 #         T1 = qs.isel(quantile=0).drop_vars('quantile')
 #         T2 = qs.isel(quantile=1).drop_vars('quantile')
 
@@ -17918,13 +17918,13 @@ class WAS_mme_MVA:
 #             index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #             index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #             rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#             terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#             terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #             T1 = terciles.isel(quantile=0).drop_vars('quantile')
 #             T2 = terciles.isel(quantile=1).drop_vars('quantile')
 
 #         else:
 
-#             terciles = y_train.quantile([0.3, 0.7], dim='T')
+#             terciles = y_train.quantile([0.3, 0.67], dim='T')
 #             T1 = terciles.isel(quantile=0).drop_vars('quantile')
 #             T2 = terciles.isel(quantile=1).drop_vars('quantile')
             
@@ -17995,7 +17995,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         T1 = terciles.isel(quantile=0).drop_vars('quantile')
 #         T2 = terciles.isel(quantile=1).drop_vars('quantile')
         
@@ -18388,7 +18388,7 @@ class WAS_mme_MVA:
 #             index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #             index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #             rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#             terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#             terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #             T1 = terciles.isel(quantile=0).drop_vars('quantile')
 #             T2 = terciles.isel(quantile=1).drop_vars('quantile')
 
@@ -18397,7 +18397,7 @@ class WAS_mme_MVA:
 #             index_start = y_train.get_index("T").get_loc(str(clim_year_start)).start
 #             index_end = y_train.get_index("T").get_loc(str(clim_year_end)).stop
 #             rainfall_for_tercile = y_train.isel(T=slice(index_start, index_end))
-#             terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#             terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #             T1 = terciles.isel(quantile=0).drop_vars('quantile')
 #             T2 = terciles.isel(quantile=1).drop_vars('quantile')            
 
@@ -19149,7 +19149,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
 
@@ -19373,7 +19373,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 
@@ -19839,7 +19839,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -20061,7 +20061,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -20490,7 +20490,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
 
@@ -20714,7 +20714,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 
@@ -21190,7 +21190,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -21410,7 +21410,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -21845,7 +21845,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
 
@@ -22067,7 +22067,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 
@@ -22548,7 +22548,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -22768,7 +22768,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -23214,7 +23214,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -23434,7 +23434,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -23864,7 +23864,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
 
@@ -24088,7 +24088,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 
@@ -24563,7 +24563,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant - hindcast_det).var(dim='T')
 #         dof = len(Predictant.get_index("T")) - 2
 #         if self.dist_method == "t":
@@ -24781,7 +24781,7 @@ class WAS_mme_MVA:
 #         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
 #         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
 #         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-#         terciles = rainfall_for_tercile.quantile([0.3, 0.7], dim='T')
+#         terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
 #         error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
 #         dof = len(Predictant_no_m.get_index("T")) - 2
 #         if self.dist_method == "t":

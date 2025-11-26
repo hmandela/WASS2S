@@ -2227,10 +2227,12 @@ class WAS_Download:
                 combined_ds.to_netcdf(output_path)
                 combined_ds.close()
                 print(f"Combined daily dataset for CHIRPS ({blend_type}) saved to {output_path}")
+                return output_path
             except Exception as e:
                 print(f"Failed to process or save combined dataset for CHIRPS ({blend_type}): {e}")
         else:
             print(f"No data downloaded for CHIRPS ({blend_type}).")
+
     
     def _fetch_chirps_daily(self, year, month, day, dir_to_save, blend_type, force_download, area):
             """
@@ -2287,6 +2289,7 @@ class WAS_Download:
         season_months=["03", "04", "05"],
         force_download=False        
     ):
+        
         """
         Download CHIRPS v3.0 monthly precipitation for a specified cross-year season
         from year_start to year_end, optionally clipped to 'area',
@@ -2372,7 +2375,7 @@ class WAS_Download:
         if "time" in ds_season.dims:
             ds_season = ds_season.rename({"time": "T"})
         # Write to NetCDF
-        ds_season.to_netcdf(out_nc)
+        ds_season.drop_vars(['band','spatial_ref']).squeeze().to_netcdf(out_nc)
         print(f"[INFO] Saved seasonal CHIRPS data to {out_nc}")
         # Delete individual monthly TIF files
         for tif_file in dir_to_save.glob("chirps-v3.0.*.tif"):
@@ -2381,6 +2384,7 @@ class WAS_Download:
                 print(f"[CLEANUP] Deleted {tif_file}")
             except Exception as e:
                 print(f"[ERROR] Could not delete {tif_file}: {e}")
+        return out_nc
 
 
 
