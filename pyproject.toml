@@ -8,8 +8,9 @@ version = "0.3.0"
 description = "A Python package for seasonal climate forecast."
 readme = "README.md"
 authors = [
-    {name = "HOUNGNIBO Mandela", email = "hmandelahmadiba@gmail.com"},
+    {name = "HOUNGNIBO C. M. Mandela", email = "hmandelahmadiba@gmail.com"},
 ]
+author = "HOUNGNIBO C. M. Mandela"
 license = "GPL-3.0-or-later"
 keywords = [
     "climate",
