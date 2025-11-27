@@ -2180,58 +2180,61 @@ class WAS_Download:
         output_path = dir_to_save / f"Daily_PRCP_{year_start}_{year_end}.nc"
         if not force_download and output_path.exists():
             print(f"{output_path} already exists. Skipping download.")
-            
-        combined_datasets = []
-        all_years_downloaded = True
-        for year in range(year_start, year_end + 1):
-            for month in range(1, 13):
-                ndays = calendar.monthrange(year, month)[1]
-                for day in range(1, ndays + 1):
-                    tif_file_path = dir_to_save / f"chirps-v3.0.{year}.{month:02d}.{day:02d}.tif"
-                    success = False
-                    retries = 0
-                    while retries < max_retries and not success:
-                        try:
-                            da = self._fetch_chirps_daily(
-                                year=year,
-                                month=month,
-                                day=day,
-                                dir_to_save=dir_to_save,
-                                blend_type=blend_type,
-                                force_download=force_download,
-                                area=area
-                            )
-                            if da is not None:
-                                combined_datasets.append(da)
-                                success = True
-                        except Exception as e:
-                            retries += 1
-                            print(f"Attempt {retries}/{max_retries} failed for {year}-{month:02d}-{day:02d}: {e}")
-                            if retries < max_retries:
-                                print(f"Retrying after {retry_delay} seconds...")
-                                _time.sleep(retry_delay)
-                            if tif_file_path.exists():
-                                os.remove(tif_file_path)
-                                print(f"Deleted incomplete TIFF: {tif_file_path}")
-                    if not success:
-                        print(f"Failed to download/process {year}-{month:02d}-{day:02d} after {max_retries} attempts.")
-                        # Continue to next day; don't set all_years_downloaded=False to allow partial data
-                    if tif_file_path.exists():
-                        os.remove(tif_file_path)
-                        print(f"Deleted TIFF: {tif_file_path}")
-        if combined_datasets:
-            try:
-                combined_ds = xr.concat(combined_datasets, dim="time").to_dataset(name="precip")
-                combined_ds = combined_ds.rename({"x": "X", "y": "Y", "time": "T"})
-                combined_ds = combined_ds.isel(Y=slice(None, None, -1))
-                combined_ds.to_netcdf(output_path)
-                combined_ds.close()
-                print(f"Combined daily dataset for CHIRPS ({blend_type}) saved to {output_path}")
-                return output_path
-            except Exception as e:
-                print(f"Failed to process or save combined dataset for CHIRPS ({blend_type}): {e}")
+            return output_path
+
         else:
-            print(f"No data downloaded for CHIRPS ({blend_type}).")
+            
+            combined_datasets = []
+            all_years_downloaded = True
+            for year in range(year_start, year_end + 1):
+                for month in range(1, 13):
+                    ndays = calendar.monthrange(year, month)[1]
+                    for day in range(1, ndays + 1):
+                        tif_file_path = dir_to_save / f"chirps-v3.0.{year}.{month:02d}.{day:02d}.tif"
+                        success = False
+                        retries = 0
+                        while retries < max_retries and not success:
+                            try:
+                                da = self._fetch_chirps_daily(
+                                    year=year,
+                                    month=month,
+                                    day=day,
+                                    dir_to_save=dir_to_save,
+                                    blend_type=blend_type,
+                                    force_download=force_download,
+                                    area=area
+                                )
+                                if da is not None:
+                                    combined_datasets.append(da)
+                                    success = True
+                            except Exception as e:
+                                retries += 1
+                                print(f"Attempt {retries}/{max_retries} failed for {year}-{month:02d}-{day:02d}: {e}")
+                                if retries < max_retries:
+                                    print(f"Retrying after {retry_delay} seconds...")
+                                    _time.sleep(retry_delay)
+                                if tif_file_path.exists():
+                                    os.remove(tif_file_path)
+                                    print(f"Deleted incomplete TIFF: {tif_file_path}")
+                        if not success:
+                            print(f"Failed to download/process {year}-{month:02d}-{day:02d} after {max_retries} attempts.")
+                            # Continue to next day; don't set all_years_downloaded=False to allow partial data
+                        if tif_file_path.exists():
+                            os.remove(tif_file_path)
+                            print(f"Deleted TIFF: {tif_file_path}")
+            if combined_datasets:
+                try:
+                    combined_ds = xr.concat(combined_datasets, dim="time").to_dataset(name="precip")
+                    combined_ds = combined_ds.rename({"x": "X", "y": "Y", "time": "T"})
+                    combined_ds = combined_ds.isel(Y=slice(None, None, -1))
+                    combined_ds.to_netcdf(output_path)
+                    combined_ds.close()
+                    print(f"Combined daily dataset for CHIRPS ({blend_type}) saved to {output_path}")
+                    return output_path
+                except Exception as e:
+                    print(f"Failed to process or save combined dataset for CHIRPS ({blend_type}): {e}")
+            else:
+                print(f"No data downloaded for CHIRPS ({blend_type}).")
 
     
     def _fetch_chirps_daily(self, year, month, day, dir_to_save, blend_type, force_download, area):
@@ -2317,37 +2320,24 @@ class WAS_Download:
         out_nc = dir_to_save / f"Obs_PRCP_{year_start}_{year_end}_{season_str}.nc"
         if out_nc.exists() and not force_download:
             print(f"[INFO] {out_nc} already exists. Skipping.")
-            return
+            return out_nc
 
-        # We'll store monthly DataArrays here
-        all_data_arrays = []
-
-        # Loop over years
-        for year in range(year_start, year_end + 1):
-            # Base-year months (>= pivot)
-            base_months = [m for m in season_months if m >= pivot]
-            # Next-year months (< pivot)
-            next_months = [m for m in season_months if m < pivot]
-
-            # Part A: Base-year months
-            for m in base_months:
-                da = self._fetch_chirps_monthly(
-                    year=year,
-                    month=m,
-                    dir_to_save=dir_to_save,
-                    region=region,
-                    force_download=force_download,
-                    area=area
-                )
-                if da is not None:
-                    all_data_arrays.append(da)
-
-            # Part B: Next-year months
-            if next_months and (year < year_end + 1):
-                year_next = year + 1
-                for m in next_months:
+        else:
+            
+            # We'll store monthly DataArrays here
+            all_data_arrays = []
+    
+            # Loop over years
+            for year in range(year_start, year_end + 1):
+                # Base-year months (>= pivot)
+                base_months = [m for m in season_months if m >= pivot]
+                # Next-year months (< pivot)
+                next_months = [m for m in season_months if m < pivot]
+    
+                # Part A: Base-year months
+                for m in base_months:
                     da = self._fetch_chirps_monthly(
-                        year=year_next,
+                        year=year,
                         month=m,
                         dir_to_save=dir_to_save,
                         region=region,
@@ -2356,35 +2346,54 @@ class WAS_Download:
                     )
                     if da is not None:
                         all_data_arrays.append(da)
-
-        if len(all_data_arrays) == 0:
-            print("[WARNING] No CHIRPS data arrays were opened/downloaded.")
-            return
-
-        # Concatenate along time
-        ds_all = xr.concat(all_data_arrays, dim="time").to_dataset(name="precip")
-
-        # Aggregate across the cross-year season (summing monthly precipitation)
-        ds_season = self._aggregate_chirps(ds_all, season_months)
-
-        # Rename dims if desired
-        if "x" in ds_season.dims:
-            ds_season = ds_season.rename({"x": "X"})
-        if "y" in ds_season.dims:
-            ds_season = ds_season.rename({"y": "Y"})
-        if "time" in ds_season.dims:
-            ds_season = ds_season.rename({"time": "T"})
-        # Write to NetCDF
-        ds_season.drop_vars(['band','spatial_ref']).squeeze().to_netcdf(out_nc)
-        print(f"[INFO] Saved seasonal CHIRPS data to {out_nc}")
-        # Delete individual monthly TIF files
-        for tif_file in dir_to_save.glob("chirps-v3.0.*.tif"):
-            try:
-                os.remove(tif_file)
-                print(f"[CLEANUP] Deleted {tif_file}")
-            except Exception as e:
-                print(f"[ERROR] Could not delete {tif_file}: {e}")
-        return out_nc
+    
+                # Part B: Next-year months
+                if next_months and (year < year_end + 1):
+                    year_next = year + 1
+                    for m in next_months:
+                        da = self._fetch_chirps_monthly(
+                            year=year_next,
+                            month=m,
+                            dir_to_save=dir_to_save,
+                            region=region,
+                            force_download=force_download,
+                            area=area
+                        )
+                        if da is not None:
+                            all_data_arrays.append(da)
+    
+            if len(all_data_arrays) == 0:
+                print("[WARNING] No CHIRPS data arrays were opened/downloaded.")
+                return
+    
+            # Concatenate along time
+            ds_all = xr.concat(all_data_arrays, dim="time").to_dataset(name="precip")
+    
+            # Aggregate across the cross-year season (summing monthly precipitation)
+            ds_season = self._aggregate_chirps(ds_all, season_months)
+    
+            # Rename dims if desired
+            if "x" in ds_season.dims:
+                ds_season = ds_season.rename({"x": "X"})
+            if "y" in ds_season.dims:
+                ds_season = ds_season.rename({"y": "Y"})
+            if "time" in ds_season.dims:
+                ds_season = ds_season.rename({"time": "T"})
+                
+            ds_season["T"] = [f"{year}-{season_months[1]:02d}-01" for year in ds_season["T"].dt.year.astype(str).values]
+            ds_season["T"] = ds_season["T"].astype("datetime64[ns]")
+            
+            # Write to NetCDF
+            ds_season.drop_vars(['band','spatial_ref']).squeeze().to_netcdf(out_nc)
+            print(f"[INFO] Saved seasonal CHIRPS data to {out_nc}")
+            # Delete individual monthly TIF files
+            for tif_file in dir_to_save.glob("chirps-v3.0.*.tif"):
+                try:
+                    os.remove(tif_file)
+                    print(f"[CLEANUP] Deleted {tif_file}")
+                except Exception as e:
+                    print(f"[ERROR] Could not delete {tif_file}: {e}")
+            return out_nc
 
 
 
@@ -2550,38 +2559,22 @@ class WAS_Download:
             if out_nc.exists() and not force_download:
                 print(f"[INFO] {out_nc} already exists – skip download.")
                 return out_nc
-            # ---- determine if season spans years ----
-            spanning = any(m < pivot for m in season_months_int)
-            last_season_year = year_end if not spanning else year_end - 1
-            if year_start > last_season_year:
-                raise ValueError("No seasons to process based on year_start and year_end.")
-            # ---- build seasonal series (aggregate per season_year then stack) ----
-            seasonal_list: List[xr.DataArray] = []
-            for season_year in range(year_start, last_season_year + 1):
-                monthly_das: List[xr.DataArray] = []
-                # Part A: base-year months (>= pivot)
-                for m in (m for m in season_months_int if m >= pivot):
-                    da = self._fetch_tamsat_monthly(
-                        product=product,
-                        version=version,
-                        year=season_year,
-                        month=m,
-                        dir_to_save=dir_to_save,
-                        force_download=force_download,
-                        area=area_tuple,
-                        keep_vars=variables,
-                        std_name=std_name,
-                    )
-                    if da is not None:
-                        monthly_das.append(da)
-                # Part B: next-year months (< pivot)
-                if spanning:
-                    next_year = season_year + 1
-                    for m in (m for m in season_months_int if m < pivot):
+            else:
+                # ---- determine if season spans years ----
+                spanning = any(m < pivot for m in season_months_int)
+                last_season_year = year_end if not spanning else year_end - 1
+                if year_start > last_season_year:
+                    raise ValueError("No seasons to process based on year_start and year_end.")
+                # ---- build seasonal series (aggregate per season_year then stack) ----
+                seasonal_list: List[xr.DataArray] = []
+                for season_year in range(year_start, last_season_year + 1):
+                    monthly_das: List[xr.DataArray] = []
+                    # Part A: base-year months (>= pivot)
+                    for m in (m for m in season_months_int if m >= pivot):
                         da = self._fetch_tamsat_monthly(
                             product=product,
                             version=version,
-                            year=next_year,
+                            year=season_year,
                             month=m,
                             dir_to_save=dir_to_save,
                             force_download=force_download,
@@ -2591,33 +2584,53 @@ class WAS_Download:
                         )
                         if da is not None:
                             monthly_das.append(da)
-                if not monthly_das:
-                    # nothing for this season_year → skip
-                    continue
-                # stack months then aggregate for this season
-                season_stack = xr.concat(monthly_das, dim="time")
-                if agg == "sum":
-                    season_da = season_stack.sum(dim="time", keep_attrs=True)
-                elif agg == "mean":
-                    season_da = season_stack.mean(dim="time", keep_attrs=True)
-                else:
-                    raise ValueError("agg must be 'sum' or 'mean'.")
-                # give a representative time stamp (pivot-year)
-                season_time = pd.to_datetime(f"{season_year}-{pivot:02d}-15")
-                season_da = season_da.expand_dims(time=[season_time])
-                seasonal_list.append(season_da)
-            if not seasonal_list:
-                raise RuntimeError("No TAMSAT files were downloaded or opened for any season.")
-            # ---- concat seasons and save ----
-            da_all = xr.concat(seasonal_list, dim="time")
-            ds_out = da_all.to_dataset(name=std_name)
-
-            # harmonize dims if needed
-            rename_dict = {k: v for k, v in {"lon": "X", "lat": "Y", "time": "T"}.items() if k in ds_out.dims}
-            ds_out = ds_out.rename(rename_dict)
-            ds_out.to_netcdf(out_nc)
-            print(f"[INFO] Saved seasonal {product.upper()} data → {out_nc}")
-            return out_nc
+                    # Part B: next-year months (< pivot)
+                    if spanning:
+                        next_year = season_year + 1
+                        for m in (m for m in season_months_int if m < pivot):
+                            da = self._fetch_tamsat_monthly(
+                                product=product,
+                                version=version,
+                                year=next_year,
+                                month=m,
+                                dir_to_save=dir_to_save,
+                                force_download=force_download,
+                                area=area_tuple,
+                                keep_vars=variables,
+                                std_name=std_name,
+                            )
+                            if da is not None:
+                                monthly_das.append(da)
+                    if not monthly_das:
+                        # nothing for this season_year → skip
+                        continue
+                    # stack months then aggregate for this season
+                    season_stack = xr.concat(monthly_das, dim="time")
+                    if agg == "sum":
+                        season_da = season_stack.sum(dim="time", keep_attrs=True)
+                    elif agg == "mean":
+                        season_da = season_stack.mean(dim="time", keep_attrs=True)
+                    else:
+                        raise ValueError("agg must be 'sum' or 'mean'.")
+                    # give a representative time stamp (pivot-year)
+                    season_time = pd.to_datetime(f"{season_year}-{pivot:02d}-15")
+                    season_da = season_da.expand_dims(time=[season_time])
+                    seasonal_list.append(season_da)
+                if not seasonal_list:
+                    raise RuntimeError("No TAMSAT files were downloaded or opened for any season.")
+                # ---- concat seasons and save ----
+                da_all = xr.concat(seasonal_list, dim="time")
+                ds_out = da_all.to_dataset(name=std_name)
+    
+                # harmonize dims if needed
+                rename_dict = {k: v for k, v in {"lon": "X", "lat": "Y", "time": "T"}.items() if k in ds_out.dims}
+                ds_out = ds_out.rename(rename_dict)
+                ds_out["T"] = [f"{year}-{season_months[1]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
+                ds_out["T"] = ds_out["T"].astype("datetime64[ns]")
+                ds_out.to_netcdf(out_nc)
+                print(f"[INFO] Saved seasonal {product.upper()} data → {out_nc}")
+                return out_nc
+                
     def _fetch_tamsat_monthly(
         self,
         product: Literal["rfe", "soilmoisture"],
@@ -2765,39 +2778,40 @@ class WAS_Download:
             if out_nc.exists() and not force_download:
                 print(f"[INFO] {out_nc} already exists – skip download.")
                 return out_nc
-            # ---- build daily series ----
-            daily_list: List[xr.DataArray] = []
-            for date in dates:
-                y = date.year
-                m = date.month
-                d = date.day
-                da = self._fetch_tamsat_daily(
-                    product=product,
-                    version=version,
-                    year=y,
-                    month=m,
-                    day=d,
-                    dir_to_save=dir_to_save,
-                    force_download=force_download,
-                    area=area_tuple,
-                    keep_vars=variables,
-                    std_name=std_name,
-                    prefix=prefix,
-                )
-                if da is not None:
-                    daily_list.append(da)
-            if not daily_list:
-                raise RuntimeError("No TAMSAT files were downloaded or opened.")
-            # ---- concat days and save ----
-            da_all = xr.concat(daily_list, dim="time")
-            ds_out = da_all.to_dataset(name=std_name)
-
-            # harmonize dims if needed
-            rename_dict = {k: v for k, v in {"lon": "X", "lat": "Y", "time": "T"}.items() if k in ds_out.dims}
-            ds_out = ds_out.rename(rename_dict)
-            ds_out.to_netcdf(out_nc)
-            print(f"[INFO] Saved daily {product.upper()} data → {out_nc}")
-            return out_nc
+            else:
+                # ---- build daily series ----
+                daily_list: List[xr.DataArray] = []
+                for date in dates:
+                    y = date.year
+                    m = date.month
+                    d = date.day
+                    da = self._fetch_tamsat_daily(
+                        product=product,
+                        version=version,
+                        year=y,
+                        month=m,
+                        day=d,
+                        dir_to_save=dir_to_save,
+                        force_download=force_download,
+                        area=area_tuple,
+                        keep_vars=variables,
+                        std_name=std_name,
+                        prefix=prefix,
+                    )
+                    if da is not None:
+                        daily_list.append(da)
+                if not daily_list:
+                    raise RuntimeError("No TAMSAT files were downloaded or opened.")
+                # ---- concat days and save ----
+                da_all = xr.concat(daily_list, dim="time")
+                ds_out = da_all.to_dataset(name=std_name)
+    
+                # harmonize dims if needed
+                rename_dict = {k: v for k, v in {"lon": "X", "lat": "Y", "time": "T"}.items() if k in ds_out.dims}
+                ds_out = ds_out.rename(rename_dict)
+                ds_out.to_netcdf(out_nc)
+                print(f"[INFO] Saved daily {product.upper()} data → {out_nc}")
+                return out_nc
     def _fetch_tamsat_daily(
         self,
         product: Literal["rfe", "soilmoisture"],
