@@ -36,15 +36,10 @@ dependencies:
 
   # --- Spatial / Geo ---
   - gdal=3.9.*
-  - geopandas
-  - shapely
-  - cartopy=0.23.*
   - pyproj
-  - rasterio
-  - rioxarray
   - pykrige
 
-  # (REMOVED: magics, cdo, python-cdo, esmf, esmpy, xesmf, netcdf-fortran, parallelio → incompatible Windows)
+ 
 
   # --- Visualization ---
   - matplotlib==3.7.3
@@ -52,14 +47,7 @@ dependencies:
   - bokeh
   - folium
   - xhistogram
-  - xskillscore
 
-  # --- ML / AI / Forecasting ---
-  - xgboost=2.1.*
-  - lightgbm=4.6.*
-  - xeofs=3.0.4
-  - minisom
-  - properscoring
 
   # --- Bayesian ---
   - pymc=5.22
@@ -88,10 +76,10 @@ dependencies:
   - pip:
       - xeofs==3.0.4
       - hpelm==1.0.10
-      - ibicus==1.1.3
       - fitter==1.7.1
       - minisom==2.3.5
       - properscoring
+      - xgboost=2.1.*
       - lightgbm==4.6.0
       - pymc==5.22.0
       - arviz==0.21.0

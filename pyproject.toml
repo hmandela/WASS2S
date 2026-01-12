@@ -32,13 +32,10 @@ classifiers = [
 requires-python = ">=3.11"
 dependencies = [
     "statsmodels",
-    "pykrige",
-    "cartopy",
+    "cartopy=0.23.*",
     "scipy==1.11.3",
     "matplotlib==3.7.3",
     "xeofs==3.0.4",
-    "xskillscore==0.0.26",
-    "properscoring",
     "cdsapi==0.7.4",
     "rasterio",
     "geopandas",
