@@ -42,10 +42,7 @@ dependencies = [
     "shapely",
     "rioxarray",
     "SkillMetrics",
-    "optuna"
-    # "torch",
-    # "lightning",
-    # "cca-zoo"
+    "optuna"    
 ]
 
 [project.urls]
