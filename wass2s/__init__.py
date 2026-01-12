@@ -1,4 +1,4 @@
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 # --- SciPy interp patch for legacy dependencies ---
 import numpy as _np
 import scipy as _scipy
@@ -21,4 +21,5 @@ from wass2s.was_cross_validate import *
 from wass2s.was_transformdata import *
 from wass2s.was_bias_correction import *
 # from wass2s.was_hydro_processing import *
+# from wass2s.was_cca_2 import *
 

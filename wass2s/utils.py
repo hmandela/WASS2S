@@ -1170,7 +1170,7 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
 
     # plt.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.03, wspace=0.03)
     plt.subplots_adjust(top=0.95, bottom=0.08, left=0.06, right=0.94, hspace=-0.6, wspace=0.2)
-    plt.savefig(f"{dir_to_save}", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.pdf", dpi=300, bbox_inches='tight')
     plt.show()
 
 
@@ -1530,7 +1530,7 @@ def plot_prob_forecasts2(dir_to_save, forecast_prob, model_name, labels=["Below-
     plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.png", dpi=300, bbox_inches='tight')
     plt.show()
 
-def plot_tercile(A, save_dir=None, colors=None):
+def plot_tercile(A, save_dir=None, colors=None, year=None):
     """
     Plot a tercile map with categories: Below, Normal, Above.
 
@@ -1558,7 +1558,11 @@ def plot_tercile(A, save_dir=None, colors=None):
     ax.add_feature(cfeature.BORDERS, linewidth=1)
     ax.add_feature(cfeature.COASTLINE, linewidth=1)
     ax.set_extent([lon.min(), lon.max(), lat.min(), lat.max()], crs=ccrs.PlateCarree())
-    plt.title("Observed terciles", fontsize=16, weight='bold')
+    if year is None:
+        title = "Observed terciles"
+    else:
+        title = f"Observed terciles {year}"
+    plt.title(title, fontsize=16, weight='bold')
     legend_elements = [
         mpatches.Patch(color=colors[2], label='ABOVE AVERAGE'),
         mpatches.Patch(color=colors[1], label='NEAR AVERAGE'),
@@ -1569,7 +1573,7 @@ def plot_tercile(A, save_dir=None, colors=None):
     if save_dir is None:
         plt.show()
     else:
-        plt.savefig(f"{save_dir}.png")
+        plt.savefig(f"{save_dir}.pdf", dpi=300, bbox_inches='tight')
         plt.show()
 
 
@@ -1958,14 +1962,15 @@ def proceed_seasonal_daily_bias_correction(dir_to_save_model, observation, hindc
                 obs_month = observation.sel(T=observation['T'].dt.month == month).interp(Y=hcst.Y, X=hcst.X, method="linear", kwargs={"fill_value": "extrapolate"})
                 mask = xr.where(~np.isnan(obs_month.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
                 hcst_month = hcst.sel(T=hcst['T'].dt.month == month)
-                obs_month, hcst_month = xr.align(obs_month, hcst_month, join='inner')
+                obs_month['T'] = hcst_month['T']
+                # obs_month, hcst_month = xr.align(obs_month, hcst_month, join='inner')
                 fcst_month = fcst.sel(T=fcst['T'].dt.month == month)
                 if varname == "PRCP":
                     fobj_quant = qmap.fitQmap(obs_month, hcst_month, method='QUANT', wet_day=0.1,  qstep=0.0001)
                     hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant, type='linear')
                     fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant, type='linear')
                 else:
-                    fobj_quant = qmap_.fitBC(obs_month, hcst_month, method='QUANT', qstep=0.01, nboot=5)
+                    fobj_quant = qmap_.fitBC(obs_month, hcst_month, method='QUANT', qstep=0.0001, nboot=5)
                     hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant, type='linear')
                     fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant, type='linear')         
                 corrected_hcst.append(hcst_month_corr)

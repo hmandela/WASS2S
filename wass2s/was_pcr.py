@@ -1,164 +1,208 @@
-from sklearn import linear_model
-from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import GridSearchCV
-import statsmodels.api as sm
-from statsmodels.stats.outliers_influence import variance_inflation_factor as VIF
-from statsmodels.stats.anova import anova_lm
-import xarray as xr 
-import numpy as np
-import pandas as pd
-from scipy import stats
-from sklearn.cluster import KMeans
-import xeofs as xe
 import xarray as xr
 import numpy as np
-import scipy.signal as sig
-from scipy.interpolate import CubicSpline
-from multiprocessing import cpu_count
-from dask.distributed import Client
-import dask.array as da
+import pandas as pd
 from wass2s.was_linear_models import *
 from wass2s.was_eof import *
 from wass2s.was_machine_learning import *
 
-### Complete WAS_PCR with PCR with multiple eof zone!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
 class WAS_PCR:
-
     """
-    A class for performing Principal Component Regression (PCR) using EOF analysis and variable regression models.
-
-    This class integrates the WAS_EOF for dimensionality reduction through Empirical Orthogonal Function (EOF)
-    analysis and allows the use of different regression models for predicting a target variable based on the
-    principal components.
-
-    Attributes
+    A class for Principal Component Regression (PCR) integrating EOF analysis
+    with flexible regression models.
+    
+    Parameters
     ----------
-    eof_model : WAS_EOF
-        The EOF analysis model used for dimensionality reduction.
-    reg_model : object
-        A regression model (e.g., WAS_LinearRegression_Model, WAS_Ridge_Model, etc.) used for regression on the PCs.
+    regression_model : object
+        An instance of a WAS regression model class.
+    n_modes : int, optional
+        Number of EOF modes to retain.
+    use_coslat : bool, default=True
+        Apply cosine latitude weighting in EOF analysis.
+    standardize : bool, default=False
+        Standardize the input data.
+    detrend : bool, default=True
+        Detrend the input data.
+    opti_explained_variance : float, optional
+        Target cumulative explained variance to determine number of EOF modes.
+    L2norm : bool, default=False
+        Normalize EOF components and scores to have L2 norm.
     """
 
     def __init__(self, regression_model, n_modes=None, use_coslat=True, standardize=False,
-                 detrend=True, 
-                 opti_explained_variance=None, L2norm=False):
+                 detrend=True, opti_explained_variance=None, L2norm=False):
         """
-        Initializes the WAS_PCR class with EOF and a flexible regression model.
+        Initializes the PCR class using a WAS_EOF instance and a flexible regression model.
+        """
+        self.eof_model = WAS_EOF(
+            n_modes=n_modes, 
+            use_coslat=use_coslat, 
+            standardize=standardize, 
+            detrend=detrend,
+            opti_explained_variance=opti_explained_variance, 
+            L2norm=L2norm
+        )
+        self.reg_model = regression_model
 
+    def _prepare_pcs(self, X_train, X_test):
+        """
+        Helper to fit EOF on train and transform test data.
+        
         Parameters
         ----------
-        regression_model : object
-            An instance of any regression model class (e.g., WAS_Ridge_Model, WAS_Lasso_Model).
-        n_modes : int, optional
-            Number of EOF modes to retain, passed to WAS_EOF.
-        use_coslat : bool, optional
-            Whether to apply cosine latitude weighting in EOF analysis, passed to WAS_EOF.
-        standardize : bool, optional
-            Whether to standardize the input data, passed to WAS_EOF.
-        detrend : bool, optional
-            Whether to detrend the input data, passed to WAS_EOF.
-        opti_explained_variance : float, optional
-            Target cumulative explained variance to determine the number of EOF modes.
-        L2norm : bool, optional
-            Whether to normalize EOF components and scores to have L2 norm, passed to WAS_EOF.
-        compute_individual : bool, optional
-            Whether to compute separate EOFs for each variable in a multivariate list.
+        X_train : xarray.DataArray
+            Training predictor data with time dimension 'T'
+        X_test : xarray.DataArray
+            Test predictor data with time dimension 'T'
+            
+        Returns
+        -------
+        X_train_pcs : xarray.DataArray
+            Principal components for training data
+        X_test_pcs : xarray.DataArray
+            Principal components for test data
         """
-        #self.n_modes = n_modes
-        #self.use_coslat = use_coslat
-        #self.standardize = standardize
-        #self.detrend = detrend
-        #self.opti_explained_variance = opti_explained_variance
-        #self.L2norm = L2norm
-        #self.regression_model = regression_model
-        
-        #self.eof_model = WAS_EOF(n_modes=self.n_modes, use_coslat=self.use_coslat, 
-        #standardize=self.standardize, detrend=self.detrend,
-        #opti_explained_variance=self.opti_explained_variance, L2norm=self.L2norm)
-
-        self.eof_model = WAS_EOF(n_modes=n_modes, use_coslat=use_coslat, standardize=standardize, detrend=detrend,
-                                 opti_explained_variance=opti_explained_variance, L2norm=L2norm)
-        
-        self.reg_model = regression_model  # Set the regression model passed as an argument
-        
-    def compute_model(self, X_train, y_train, X_test, y_test=None, alpha=None, l1_ratio=None, **kwargs):
-        s_eofs, s_pcs, _, _ = self.eof_model.fit(X_train, dim="T")
-        X_test = X_test.fillna(X_train.mean())
-        X_test = X_test.drop_vars('T').squeeze().expand_dims({'T': ["1991-01-01"]})
+        # Fit EOF on training data
+        _, s_pcs, _, _ = self.eof_model.fit(X_train, dim="T")
         X_train_pcs = s_pcs.rename({"mode": "features"}).transpose('T', 'features')
-        X_test_pcs = self.eof_model.transform(X_test).drop_vars('T').squeeze().rename({"mode": "features"})#.transpose('T', 'features')
         
-        if isinstance(self.reg_model, (WAS_MARS_Model, WAS_LinearRegression_Model, WAS_PoissonRegression, WAS_PolynomialRegression)): 
-            result = self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test)
-        if isinstance(self.reg_model, (WAS_Ridge_Model, WAS_Lasso_Model, WAS_LassoLars_Model)):
-            result = self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test, alpha)
-        if isinstance(self.reg_model, WAS_ElasticNet_Model): 
-            result = self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test, alpha, l1_ratio)
-        if isinstance(self.reg_model, WAS_LogisticRegression_Model): 
-            result = self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test, alpha)
-        if isinstance(self.reg_model, WAS_SVR): 
-            result = self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test, epsilon, C, degree_array=None)
-        if isinstance(self.reg_model, WAS_RandomForest_XGBoost_ML_Stacking):
-            result = self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test, best_param_da)
-        if isinstance(self.reg_model, WAS_MLP):
-            result = self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test, hl_array, act_array, lr_array, maxiter_array)
-        if isinstance(self.reg_model, WAS_Stacking_Ridge):
-            result = self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test, best_param_da)
-        if isinstance(self.reg_model, WAS_RandomForest_XGBoost_Stacking_MLP):
-            result = self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test, best_param_da)
-        return result
-
-    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
-        same_probb = [WAS_LinearRegression_Model, WAS_Ridge_Model, WAS_Lasso_Model, WAS_LassoLars_Model, WAS_ElasticNet_Model,
-                     WAS_RandomForest_XGBoost_ML_Stacking, WAS_MLP, WAS_Stacking_Ridge, WAS_RandomForest_XGBoost_Stacking_MLP,
-                     WAS_SVR, WAS_PolynomialRegression, WAS_PoissonRegression, WAS_MARS_Model]
-
-        if any(isinstance(self.reg_model, i) for i in same_probb):
-            result = self.reg_model.compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det)
-        if isinstance(self.reg_model, WAS_LogisticRegression_Model): 
-            result = None
-        # if isinstance(self.reg_model, WAS_QuantileRegression_Model): 
-        #     result = self.reg_model.compute_prob(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det)
-        return result
-
-    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year, alpha=None, l1_ratio=None):
-
-        s_eofs, s_pcs, _, _ = self.eof_model.fit(Predictor, dim="T")
-        Predictor_for_year = Predictor_for_year.fillna(Predictor.mean())
-        # Predictor_for_year = Predictor_for_year.drop_vars('T').squeeze().expand_dims({'T': ["1991-01-01"]})
-        Predictor_for_year_pcs = self.eof_model.transform(Predictor_for_year).rename({"mode": "features"}).transpose('T', 'features') #.drop_vars('T').squeeze()
-        Predictor = s_pcs.rename({"mode": "features"}).transpose('T', 'features')
+        # Transform test data
+        X_test_filled = X_test.fillna(X_train.mean())
         
-        if isinstance(self.reg_model, (WAS_LinearRegression_Model, WAS_PolynomialRegression, WAS_PoissonRegression, WAS_MARS_Model)): 
-            result = self.reg_model.forecast( Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year_pcs)
+        # Ensure T dimension exists for transform
+        if 'T' not in X_test_filled.dims:
+            X_test_filled = X_test_filled.expand_dims('T')
+             
+        X_test_pcs = self.eof_model.transform(X_test_filled)
+        X_test_pcs = X_test_pcs.rename({"mode": "features"}).transpose('T', 'features')
+        
+        return X_train_pcs, X_test_pcs
+
+    def compute_model(self, X_train, y_train, X_test, y_test, **kwargs):
+        """
+        Fits EOF, transforms predictors, and runs the deterministic regression.
+        
+        Parameters
+        ----------
+        X_train : xarray.DataArray
+            Training predictor data
+        y_train : array-like or xarray.DataArray
+            Training target data
+        X_test : xarray.DataArray
+            Test predictor data
+        **kwargs : dict
+            Additional parameters passed to the regression model's compute_model method
             
-        if isinstance(self.reg_model, (WAS_Ridge_Model, WAS_Lasso_Model, WAS_LassoLars_Model)):
-            result = self.reg_model.forecast( Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year_pcs, alpha)
+        Returns
+        -------
+        result : object
+            Result from the regression model's compute_model method
+        """
+        X_train_pcs, X_test_pcs = self._prepare_pcs(X_train, X_test)
 
-        if isinstance(self.reg_model, WAS_ElasticNet_Model): 
-            result = self.reg_model.forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year_pcs, alpha, l1_ratio)
+        # all_params = {**kwargs}
+        # params_prob = {
+        #     key: value for key, value in all_params.items() 
+        #     if key not in self.reg_model.compute_model.__code__.co_varnames
+        # }
 
-        if isinstance(self.reg_model, WAS_SVR): 
-            result = self.reg_model.forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year_pcs,
-                                             epsilon, C, kernel_array, degree_array, gamma_array)
-
-        if isinstance(self.reg_model, WAS_RandomForest_XGBoost_ML_Stacking): 
-            result = self.reg_model.forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year_pcs, best_param_da)       
+        # params_models = {
+        #     key: value for key, value in all_params.items() 
+        #     if key not in params_prob
+        # } 
         
-        if isinstance(self.reg_model, WAS_MLP): 
-            result = self.reg_model.forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year_pcs, hl_array, act_array, lr_array)  
+        # Forward all parameters to the underlying compute_model
+        if 'y_test' not in self.reg_model.compute_model.__code__.co_varnames:
+            return self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, **kwargs)
+        else:
+            return self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test, **kwargs)
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det, **kwargs):
+        """
+        Computes probabilistic forecasts using the regression model's probability method.
+        
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Target variable data
+        clim_year_start : int
+            Start year for climatology
+        clim_year_end : int
+            End year for climatology
+        hindcast_det : xarray.DataArray
+            Hindcast deterministic predictions
+        **kwargs : dict
+            Additional parameters for the regression model
             
-        if isinstance(self.reg_model, WAS_RandomForest_XGBoost_Stacking_MLP): 
-            result = self.reg_model.forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year_pcs, best_param_da)  
-
-        if isinstance(self.reg_model, WAS_Stacking_Ridge): 
-            result = self.reg_model.forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year_pcs, best_param_da)  
+        Returns
+        -------
+        result : object or None
+            Probabilistic forecast result or None for unsupported models
+        """
+        import inspect
         
-        if isinstance(self.reg_model, WAS_LogisticRegression_Model): 
-            result = None
- 
-        # if isinstance(self.reg_model, WAS_QuantileRegression_Model): 
-        #     result = None
-        #if isinstance():
-        return result
+        # Check if the regression model has a compute_prob method
+        if not hasattr(self.reg_model, 'compute_prob'):
+            return None
+            
+        # # Filter kwargs to only pass what the specific reg_model.compute_prob accepts
+        # sig = inspect.signature(self.reg_model.compute_prob)
+        # valid_params = [p.name for p in sig.parameters.values() 
+        #                if p.name not in ['self', 'Predictant', 'clim_year_start', 
+        #                                 'clim_year_end', 'hindcast_det']]
+        # params_prob = {k: v for k, v in kwargs.items() if k in valid_params}
+        
+        all_params = {**kwargs}
+        params_prob = {
+            key: value for key, value in all_params.items() 
+            if key not in self.reg_model.compute_model.__code__.co_varnames
+        }
+
+        # Handle Logistic Regression (usually returns classes, not tercile probs)
+        if isinstance(self.reg_model, WAS_LogisticRegression_Model):
+            return None
+            
+        return self.reg_model.compute_prob(
+            Predictant, clim_year_start, clim_year_end, hindcast_det, **params_prob
+        )
+
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, 
+                 hindcast_det, Predictor_for_year, **kwargs):
+        """
+        Generates an operational forecast by projecting the forecast year onto EOF space.
+        
+        Parameters
+        ----------
+        Predictant : xarray.DataArray
+            Target variable data
+        clim_year_start : int
+            Start year for climatology
+        clim_year_end : int
+            End year for climatology
+        Predictor : xarray.DataArray
+            Historical predictor data for training
+        hindcast_det : xarray.DataArray
+            Hindcast deterministic predictions
+        Predictor_for_year : xarray.DataArray
+            Predictor data for the forecast year
+        **kwargs : dict
+            Additional parameters for the regression model
+            
+        Returns
+        -------
+        result : object
+            Forecast result from the regression model
+        """
+        # Fit EOF on historical predictors
+        _, s_pcs, _, _ = self.eof_model.fit(Predictor, dim="T")
+        Predictor_pcs = s_pcs.rename({"mode": "features"}).transpose('T', 'features')
+        
+        # Transform predictor for forecast year
+        Predictor_for_year_filled = Predictor_for_year.fillna(Predictor.mean())
+        Predictor_for_year_pcs = self.eof_model.transform(Predictor_for_year_filled)
+        Predictor_for_year_pcs = Predictor_for_year_pcs.rename({"mode": "features"}).transpose('T', 'features')
+
+        # Run the underlying model's forecast method
+        return self.reg_model.forecast(
+            Predictant, clim_year_start, clim_year_end, 
+            Predictor_pcs, hindcast_det, Predictor_for_year_pcs, **kwargs
+        )

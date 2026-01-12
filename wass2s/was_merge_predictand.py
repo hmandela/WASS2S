@@ -428,7 +428,7 @@ class WAS_Merging:
             if merged_df.empty:
                 continue
 
-            X = merged_df[[estim_var]].fillna(0)
+            X = merged_df[['X', 'Y', estim_var]].fillna(0)
             y = merged_df[[station_var]].fillna(0)
 
             # 1) Linear regression
@@ -465,7 +465,7 @@ class WAS_Merging:
 
             # Predict from the regression model on the entire grid
             # We assume the "estim_var" is the variable needed for regression
-            reg_input = estim.sel(T=t_val).to_dataframe().reset_index()[[estim_var]].fillna(0)
+            reg_input = estim.sel(T=t_val).to_dataframe().reset_index()[['X', 'Y',estim_var]].fillna(0)
             regression_pred_grid = reg_model.predict(reg_input)
             regression_pred_grid = regression_pred_grid.reshape(gridx.shape)
 
@@ -552,7 +552,7 @@ class WAS_Merging:
             if merged_df.empty:
                 continue
 
-            X_vals = merged_df[[estim_var]].fillna(0).to_numpy()
+            X_vals = merged_df[['X', 'Y', estim_var]].fillna(0).to_numpy()
             y_vals = merged_df[[station_var]].fillna(0).to_numpy().ravel()
 
             # Perform hyperparameter tuning for the MLPRegressor
@@ -607,7 +607,7 @@ class WAS_Merging:
             z_pred, ss = ok_model.execute('grid', estim.X.values, estim.Y.values)
 
             # Predict from the NN model on the entire grid
-            nn_input = estim_.sel(T=t_val).to_dataframe().reset_index()[[estim_var]].fillna(0)
+            nn_input = estim_.sel(T=t_val).to_dataframe().reset_index()[['X', 'Y', estim_var]].fillna(0)
             nn_pred_grid = nn_model.predict(nn_input)
             nn_pred_grid = nn_pred_grid.reshape(gridx.shape)
 
@@ -730,7 +730,7 @@ class WAS_Merging:
                 continue
     
             # Prepare inputs and labels for the Neural Network
-            X_vals = merged_df[[estim_var]].fillna(0).to_numpy()
+            X_vals = merged_df[['X', 'Y', estim_var]].fillna(0).to_numpy()
             y_vals = merged_df[[station_var]].fillna(0).to_numpy().ravel()
     
             # 2a) Hyperparameter tuning for the MLPRegressor
@@ -781,7 +781,7 @@ class WAS_Merging:
             z_pred, ss = ok_model.execute('grid', estim.X.values, estim.Y.values)
     
             # Get the NN model's predictions on the full domain
-            nn_input = estim_.sel(T=t_val).to_dataframe().reset_index()[[estim_var]].fillna(0)
+            nn_input = estim_.sel(T=t_val).to_dataframe().reset_index()[['X', 'Y', estim_var]].fillna(0)
             nn_pred_grid = nn_model.predict(nn_input)
             nn_pred_grid = nn_pred_grid.reshape(gridx.shape)
     
