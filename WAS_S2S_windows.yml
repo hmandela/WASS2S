@@ -38,6 +38,7 @@ dependencies:
   - gdal=3.9.*
   - pyproj
   - pykrige
+  - cartopy=0.23.*
 
  
 
