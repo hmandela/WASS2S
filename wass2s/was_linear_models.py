@@ -28,34 +28,78 @@ from wass2s.utils import *
 
 class WAS_LinearRegression_Model:
     """
-    A class to perform linear regression modeling on spatiotemporal datasets for climate prediction.
+    Simple Linear Regression model for spatiotemporal climate prediction.
 
-    This class is designed to work with Dask and Xarray for parallelized, high-performance 
-    regression computations across large datasets with spatial and temporal dimensions. The primary 
-    methods are for fitting the model, making predictions, and calculating probabilistic predictions 
-    for climate terciles. 
+    This class implements ordinary least squares linear regression (via scikit-learn's
+    `LinearRegression`) to model linear relationships between predictors and a continuous
+    predictand (e.g., seasonal rainfall totals, temperature anomalies, agro-climatic indices).
+
+    Key features:
+    - Basic linear modeling (no polynomial features or regularization by default)
+    - Spatially parallel fitting and prediction across large grids using dask + xarray
+    - Deterministic point predictions with optional error computation
+    - Probabilistic tercile forecasting (Below/Normal/Above = PB/PN/PA) using either:
+      - Parametric best-fit distributions per grid cell ('bestfit')
+      - Non-parametric sampling of historical forecast errors ('nonparam')
+
+    Ideal as a baseline model or when relationships are expected to be approximately linear.
+
+    Parameters
+    -----------
+    nb_cores : int, default=1
+        Number of CPU cores for parallel processing (dask workers).
+
+    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
+        Method for computing tercile probabilities:
+        - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs)
+        - 'nonparam' → empirical sampling of historical forecast errors
 
     Attributes
-    ----------
-    nb_cores : int, optional
-        The number of CPU cores to use for parallel computation (default is 1).
-    dist_method : str, optional
-        Distribution method for tercile probability calculations. One of
-        {"t","gamma","normal","lognormal","nonparam"}. Default = "gamma".
+    -----------
+    nb_cores, dist_method
+        Stored initialization parameters.
 
     Methods
-    -------
+    --------
     fit_predict(x, y, x_test, y_test=None)
-        Fits a linear regression model, makes predictions, and calculates error if y_test is provided.
+        Fits linear regression on one grid cell and returns [error, prediction] or just prediction.
 
     compute_model(X_train, y_train, X_test, y_test)
-        Applies the linear regression model across a dataset using parallel computation with Dask.
+        Parallel linear regression across the entire spatial domain.
+        Returns xarray.DataArray with dims ('output'=['error','prediction'], Y, X).
 
-    compute_prob(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det)
-        Computes tercile probabilities for hindcast predictions over specified years.
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes tercile probabilities for deterministic hindcasts.
 
-    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year)
-        Generates a single-year forecast and computes tercile probabilities.
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, best_code_da=None, best_shape_da=None,
+             best_loc_da=None, best_scale_da=None)
+        Full end-to-end forecast pipeline for one target year:
+        - deterministic linear prediction
+        - tercile probabilities (PB, PN, PA)
+
+    Notes
+    ------
+    - **Input data requirements**:
+      - Target (y) should be continuous (rainfall, temperature, etc.).
+      - Predictors (X) should be continuous or properly encoded.
+    - Negative predictions are automatically clipped to zero (useful for rainfall or non-negative variables).
+    - Linear regression assumes linear relationships; for non-linear patterns, consider higher-degree
+      polynomial, tree-based models (XGBoost, RF), or neural approaches (MLP).
+    - Large spatial domains benefit significantly from higher `nb_cores`.
+    - For `dist_method='bestfit'`, distribution fit results from `WAS_TransformData` must be provided.
+    - No explicit feature or target scaling is applied (linear regression coefficients adjust automatically,
+      but centering/scaling predictors can improve numerical stability when features have very different scales).
+
+
+    Warnings
+    ---------
+    - Linear regression can produce unrealistic negative predictions for non-negative variables
+      (e.g., rainfall); clipping is applied automatically but may bias results.
+    - Assumes homoscedasticity and no strong multicollinearity; check residuals and VIF if needed.
+    - Small per-grid-cell training sets can lead to unstable coefficient estimates.
+    - For very non-linear relationships, performance will be poor compared to tree-based or spline models.
     """
 
     def __init__(self, nb_cores=1, dist_method="nonparam"):
@@ -63,7 +107,7 @@ class WAS_LinearRegression_Model:
         Initializes the WAS_LinearRegression_Model with a specified number of CPU cores.
         
         Parameters
-        ----------
+        -----------
         nb_cores : int, optional
             Number of CPU cores to use for parallel computation, by default 1.
         dist_method : str, optional
@@ -78,7 +122,7 @@ class WAS_LinearRegression_Model:
         on the test data, and calculates the prediction error (if y_test is provided).
         
         Parameters
-        ----------
+        -----------
         x : array-like, shape (n_samples, n_features)
             Training data (predictors).
         y : array-like, shape (n_samples,)
@@ -89,7 +133,7 @@ class WAS_LinearRegression_Model:
             Test target value. If None, no error is computed.
 
         Returns
-        -------
+        --------
         np.ndarray
             If y_test is not None, returns [error, prediction].
             If y_test is None, returns [prediction].
@@ -273,21 +317,52 @@ class WAS_LinearRegression_Model:
     @staticmethod
     def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
     ):
+        
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -779,45 +854,128 @@ class WAS_LinearRegression_Model:
 
 class WAS_Ridge_Model:
     """
-    Ridge regression model for spatial rainfall prediction with support for two modes:
-    - per-grid-cell (pixel-wise) hyperparameter optimization
-    - spatially clustered optimization (faster, more robust for noisy data)
+    Ridge regression model for spatial rainfall (or continuous climate variable) prediction.
 
-    The class optimizes the Ridge regularization parameter (alpha) either:
-    * independently for each grid cell, or
-    * once per spatial cluster (using K-means on the predictand field)
+    Supports two optimization modes:
+    - **'grid'**: Independent alpha optimization for each grid cell (pixel-wise)
+      → Most local fit, but computationally expensive
+    - **'cluster'** (default): Spatially cluster the predictand field → one alpha per cluster
+      → Much faster, more robust to noise, better generalization on small/sparse data
+
+    Hyperparameter search methods:
+    - 'bayesian' → Optuna Bayesian optimization (recommended)
+    - 'random'   → scikit-learn RandomizedSearchCV
+    - 'ridgecv'  → classic RidgeCV grid search
+
+    The model uses scikit-learn's Ridge regression with L2 regularization to prevent overfitting,
+    especially useful when predictors are correlated or when per-cell training data is limited.
 
     Parameters
     ----------
     alpha_range : array-like, optional
-        Array of alpha values to consider when using classical RidgeCV.
-        Also defines the search space bounds for Bayesian/Randomized search.
-        Default: np.logspace(-10, 10, 100)
+        Range of alpha (regularization strength) values to search.
+        Default: np.logspace(-10, 10, 100) — wide log-scale range.
+
     n_clusters : int, default=5
-        Number of spatial clusters (used only when mode='cluster')
+        Number of spatial clusters (used only when mode='cluster').
+
     nb_cores : int, default=1
-        Number of CPU cores to use for parallel computation (grid mode)
+        Number of CPU cores for parallel computation (mainly used in grid mode).
+
     dist_method : str, default='nonparam'
-        Distance method used for clustering (currently only 'nonparam' implemented)
+        Method for computing tercile probabilities (PB/PN/PA).
+        Currently only 'nonparam' fully implemented; 'bestfit' requires additional inputs.
+
     hyperparam_optimizer : {'bayesian', 'random', 'ridgecv'}, default='bayesian'
-        Method used for finding the best alpha:
-        - 'bayesian'  → Optuna Bayesian optimization
-        - 'random'    → RandomizedSearchCV
-        - 'ridgecv'   → classic RidgeCV grid search
+        Strategy for finding optimal alpha:
+        - 'bayesian' → Optuna Bayesian optimization (most efficient)
+        - 'random'   → RandomizedSearchCV
+        - 'ridgecv'  → Built-in RidgeCV grid search
+
     n_trials : int, default=50
-        Number of trials for Bayesian optimization (Optuna)
+        Number of trials for Bayesian optimization (Optuna).
+
     n_iter : int, default=50
-        Number of parameter settings sampled in RandomizedSearchCV
+        Number of parameter settings sampled in RandomizedSearchCV.
+
     mode : {'cluster', 'grid'}, default='cluster'
         Optimization strategy:
-        - 'cluster' → spatially cluster the field → one alpha per cluster
-        - 'grid'    → independent alpha optimization for each grid cell
+        - 'cluster' → one alpha per spatial cluster (recommended for most cases)
+        - 'grid'    → independent alpha per grid cell (very slow, but maximally local)
 
     Notes
     -----
-    - Grid mode ('grid') is computationally expensive but gives the most local fit
-    - Cluster mode ('cluster') is much faster and usually more stable
-    - Requires xarray, dask, scikit-learn, optuna (for bayesian mode)
+    - Cluster mode is significantly faster and usually more stable, especially for noisy or
+      short time series data common in climate modeling.
+    - All NaN values in time series are properly masked.
+    - Requires at least 10 valid time steps per location/cluster to attempt optimization.
+    - Negative predictions are clipped to zero (useful for rainfall or non-negative variables).
+    - Large domains in 'grid' mode benefit greatly from higher `nb_cores`.
+    - For `dist_method='bestfit'`, additional distribution fit parameters must be provided.
+
+    Methods
+    -------
+    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
+        Computes spatially varying optimal alpha values (and cluster map if mode='cluster').
+
+    fit_predict(x, y, x_test, y_test, alpha)
+        Fits Ridge model on one grid cell using given alpha and makes prediction.
+
+    compute_model(X_train, y_train, X_test, y_test, alpha)
+        Parallel ridge regression across entire spatial domain using provided alpha map.
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes tercile probabilities for hindcast predictions.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, alpha, best_code_da=None, best_shape_da=None,
+             best_loc_da=None, best_scale_da=None)
+        Full end-to-end forecast pipeline for one target year:
+        - deterministic ridge prediction
+        - tercile probabilities (PB, PN, PA)
+
+    Examples
+    --------
+    Typical seasonal rainfall forecasting workflow (recommended cluster mode):
+
+    >>> ridge_model = WAS_Ridge_Model(
+    ...     mode='cluster',
+    ...     n_clusters=8,
+    ...     hyperparam_optimizer='bayesian',
+    ...     n_trials=80,
+    ...     nb_cores=12
+    ... )
+
+    # 1. Compute spatially varying alpha (one per cluster)
+    >>> alpha_map, cluster_map = ridge_model.compute_hyperparameters(
+    ...     seasonal_rainfall, predictors, 1991, 2020)
+
+    # 2. Train & predict on hindcast period
+    >>> hindcast_pred = ridge_model.compute_model(
+    ...     X_train=predictors,
+    ...     y_train=seasonal_rainfall,
+    ...     X_test=predictors_hindcast,
+    ...     y_test=None,
+    ...     alpha=alpha_map
+    ... )
+
+    # 3. Compute probabilistic hindcast (terciles)
+    >>> hindcast_prob = ridge_model.compute_prob(
+    ...     seasonal_rainfall, 1991, 2020, hindcast_pred,
+    ...     best_code_da=dist_code_da, best_shape_da=shape_da,
+    ...     best_loc_da=loc_da, best_scale_da=scale_da
+    ... )
+
+    # 4. Forecast next year (e.g. 2025)
+    >>> forecast_det, forecast_prob = ridge_model.forecast(
+    ...     seasonal_rainfall, 1991, 2020,
+    ...     predictors, hindcast_pred,
+    ...     predictor_2025,
+    ...     alpha=alpha_map,
+    ...     best_code_da=dist_code_da, best_shape_da=shape_da,
+    ...     best_loc_da=loc_da, best_scale_da=scale_da
+    ... )
     """
 
     def __init__(self, alpha_range=None, n_clusters=5, nb_cores=1, dist_method="nonparam",
@@ -1165,7 +1323,52 @@ class WAS_Ridge_Model:
 
     @staticmethod
     def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
-        """Calculate tercile probabilities using best-fit distribution family."""
+        """
+        Generic tercile probabilities using best-fit family per grid cell.
+    
+        Inputs (per grid cell):
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
+        Strategy:
+        - For each time step, build a predictive distribution of the same family:
+            * Use ``best_guess[t]`` to adjust mean / location;
+            * Keep shape parameters from climatology.
+        - Then compute probabilities:
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
+        """
         
         best_guess = np.asarray(best_guess, float)
         error_variance = np.asarray(error_variance, dtype=float)
@@ -1526,50 +1729,142 @@ class WAS_Ridge_Model:
 
 class WAS_Lasso_Model:
     """
-    Lasso regression model for spatial rainfall prediction with support for two modes:
-    - per-grid-cell (pixel-wise) hyperparameter optimization
-    - spatially clustered optimization (recommended for most rainfall applications)
+    Lasso regression model for spatial rainfall (or continuous climate variable) prediction.
 
-    Lasso performs feature selection by driving less important coefficients to exactly zero,
-    which can be useful when working with many atmospheric/oceanic predictors.
+    Lasso (L1 regularization) performs automatic feature selection by driving less important
+    predictor coefficients exactly to zero — particularly useful when working with many
+    atmospheric, oceanic, or teleconnection indices where some may be redundant or noisy.
 
-    Compared to Ridge, Lasso tends to need:
-    - smaller alpha values (less regularization)
-    - more iterations (coefficients can become unstable near zero)
+    Supports two optimization modes:
+    - **'cluster'** (default): One optimal alpha per spatial cluster (fast, robust, recommended)
+    - **'grid'**: Independent alpha optimization for each grid cell (very local fit, slow)
+
+    Hyperparameter search methods:
+    - 'bayesian' → Optuna Bayesian optimization (recommended, efficient)
+    - 'random'   → scikit-learn RandomizedSearchCV
+    - 'lassocv'  → scikit-learn LassoCV (fastest, grid-based)
+
+    Compared to Ridge, Lasso typically requires:
+    - smaller alpha values (less aggressive regularization)
+    - higher max_iter (convergence can be slower near zero coefficients)
 
     Parameters
     ----------
     alpha_range : array-like, optional
-        Range of alpha values to search over.
-        Default: np.logspace(-6, 2, 100) → reasonable for rainfall / standardized data
+        Range of alpha (regularization strength) values to search.
+        Default: np.logspace(-6, 2, 100) — suitable for standardized rainfall data.
+
     n_clusters : int, default=5
-        Number of spatial clusters (only used when mode='cluster')
+        Number of spatial clusters (only used when mode='cluster').
+
     nb_cores : int, default=1
-        Number of parallel workers for grid-wise optimization
+        Number of CPU cores for parallel computation (mainly used in grid mode).
+
     dist_method : str, default='nonparam'
-        Clustering distance method (currently only 'nonparam' implemented)
+        Method for computing tercile probabilities (PB/PN/PA).
+        Currently only 'nonparam' fully implemented; 'bestfit' requires additional inputs.
+
     hyperparam_optimizer : {'bayesian', 'random', 'lassocv'}, default='bayesian'
         Strategy for finding optimal alpha:
-        - 'bayesian'  → Optuna Bayesian optimization (usually best quality)
-        - 'random'    → Randomized search (faster, decent quality)
-        - 'lassocv'   → scikit-learn LassoCV (fastest, grid-based)
+        - 'bayesian' → Optuna Bayesian optimization (best quality/speed trade-off)
+        - 'random'   → Randomized search
+        - 'lassocv'  → Built-in LassoCV grid search (fastest)
+
     n_trials : int, default=50
-        Number of trials for Bayesian optimization (Optuna)
+        Number of trials for Bayesian optimization (Optuna).
+
     n_iter : int, default=50
-        Number of parameter settings sampled in randomized search
+        Number of parameter settings sampled in randomized search.
+
     mode : {'cluster', 'grid'}, default='cluster'
         Optimization strategy:
-        - 'cluster' → one alpha per spatial cluster (fast, stable)
-        - 'grid'    → independent alpha for every grid cell (slow, very local)
+        - 'cluster' → one alpha per spatial cluster (fast, stable, recommended)
+        - 'grid'    → independent alpha per grid cell (slow, maximally local)
 
     Notes
     -----
-    - Grid mode is computationally very expensive — use it only when you really need
-      maximum spatial detail and have sufficient computing resources.
-    - Cluster mode is usually a very good compromise between performance and stability.
-    - Lasso is more sensitive to data scaling than Ridge → make sure predictors
-      and predictand are properly standardized.
-    - Requires: xarray, dask, scikit-learn, optuna (for bayesian mode)
+    - **Cluster mode** is strongly recommended for most rainfall/climate applications:
+      - Much faster
+      - More robust to noise and short time series
+      - Better generalization
+    - **Grid mode** should only be used when maximum spatial detail is critical and
+      sufficient computing resources are available.
+    - Lasso is more sensitive to feature scaling than Ridge → predictors and predictand
+      should be properly standardized/normalized.
+    - Requires at least 10 valid time steps per location/cluster to attempt optimization.
+    - Negative predictions are clipped to zero (useful for rainfall).
+    - Large domains in 'grid' mode benefit greatly from higher `nb_cores`.
+
+    Methods
+    -------
+    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
+        Computes spatially varying optimal alpha values (and cluster map if mode='cluster').
+
+    fit_predict(x, y, x_test, y_test, alpha)
+        Fits Lasso model on one grid cell using given alpha and makes prediction.
+
+    compute_model(X_train, y_train, X_test, y_test, alpha=None, clim_year_start=None, clim_year_end=None)
+        Parallel Lasso regression across entire spatial domain using provided alpha map.
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes tercile probabilities for hindcast predictions.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, alpha, best_code_da=None, best_shape_da=None,
+             best_loc_da=None, best_scale_da=None)
+        Full end-to-end forecast pipeline for one target year:
+        - deterministic Lasso prediction
+        - tercile probabilities (PB, PN, PA)
+
+    Examples
+    --------
+    Recommended workflow (cluster mode with Bayesian optimization):
+
+    >>> lasso_model = WAS_Lasso_Model(
+    ...     mode='cluster',
+    ...     n_clusters=8,
+    ...     hyperparam_optimizer='bayesian',
+    ...     n_trials=80,
+    ...     nb_cores=12
+    ... )
+
+    # 1. Compute spatially varying alpha (one per cluster)
+    >>> alpha_map, cluster_map = lasso_model.compute_hyperparameters(
+    ...     seasonal_rainfall, predictors, 1991, 2020)
+
+    # 2. Train & predict on hindcast period
+    >>> hindcast_pred = lasso_model.compute_model(
+    ...     X_train=predictors,
+    ...     y_train=seasonal_rainfall,
+    ...     X_test=predictors_hindcast,
+    ...     y_test=None,
+    ...     alpha=alpha_map
+    ... )
+
+    # 3. Compute probabilistic hindcast (terciles)
+    >>> hindcast_prob = lasso_model.compute_prob(
+    ...     seasonal_rainfall, 1991, 2020, hindcast_pred,
+    ...     best_code_da=dist_code_da, best_shape_da=shape_da,
+    ...     best_loc_da=loc_da, best_scale_da=scale_da
+    ... )
+
+    # 4. Forecast next year (e.g. 2025)
+    >>> forecast_det, forecast_prob = lasso_model.forecast(
+    ...     seasonal_rainfall, 1991, 2020,
+    ...     predictors, hindcast_pred,
+    ...     predictor_2025,
+    ...     alpha=alpha_map,
+    ...     best_code_da=dist_code_da, best_shape_da=shape_da,
+    ...     best_loc_da=loc_da, best_scale_da=scale_da
+    ... )
+
+    Warnings
+    --------
+    - Lasso can eliminate all predictors if alpha is too large → monitor selected features.
+    - Very small training sets per cell/cluster may lead to unstable results.
+    - For heavy-tailed rainfall distributions, consider log-transformation before modeling.
+    - Use 'bayesian' optimizer for best quality; 'lassocv' is fastest but least flexible.
     """
 
     def __init__(self, alpha_range=None, n_clusters=5, nb_cores=1, dist_method="nonparam",
@@ -1908,19 +2203,49 @@ class WAS_Lasso_Model:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -2421,52 +2746,148 @@ class WAS_Lasso_Model:
 
 class WAS_ElasticNet_Model:
     """
-    ElasticNet regression model for spatial rainfall prediction.
+    ElasticNet regression model for spatial rainfall (or continuous climate variable) prediction.
 
-    ElasticNet combines L1 (Lasso) and L2 (Ridge) penalties, allowing both
-    feature selection and coefficient shrinkage. It is often a good compromise
-    between Lasso (aggressive sparsity) and Ridge (stability) — particularly
-    useful when predictors are correlated (common in climate/teleconnection data).
+    ElasticNet combines L1 (Lasso) and L2 (Ridge) penalties in a single model:
+    - L1 penalty → feature selection (sparsity)
+    - L2 penalty → coefficient shrinkage and stability with correlated predictors
+    This makes ElasticNet particularly suitable for climate modeling where:
+    - Many predictors (teleconnections, atmospheric fields) are often correlated
+    - Some predictors may be irrelevant or redundant
 
-    Supports two spatial optimization strategies:
-    - grid-wise: independent (α, l1_ratio) per grid cell (very expensive)
-    - cluster-wise: one (α, l1_ratio) per spatial cluster (recommended)
+    Two spatial optimization strategies:
+    - **'cluster'** (default): One optimal (alpha, l1_ratio) pair per spatial cluster
+      → Fast, robust, excellent generalization — **recommended for most applications**
+    - **'grid'**: Independent optimization per grid cell
+      → Maximum spatial detail, but **very computationally expensive**
+
+    Supported hyperparameter search methods:
+    - 'bayesian' → Optuna Bayesian optimization (best quality/speed trade-off)
+    - 'random'   → scikit-learn RandomizedSearchCV
+    - 'elasticnetcv' → scikit-learn ElasticNetCV (fastest, discrete grid)
 
     Parameters
     ----------
     alpha_range : array-like, optional
-        Range of total regularization strength values.
-        Default: np.logspace(-6, 2, 100) — suitable for standardized rainfall data
+        Range of total regularization strength (alpha).
+        Default: np.logspace(-6, 2, 100) — well-suited for standardized rainfall data.
+
     l1_ratio_range : array-like, optional
         Range of L1 penalty ratio (0 = pure Ridge, 1 = pure Lasso).
         Default: [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
+
     n_clusters : int, default=5
-        Number of spatial clusters (used only in mode='cluster')
+        Number of spatial clusters (only used when mode='cluster').
+
     nb_cores : int, default=1
-        Number of parallel workers for grid-wise optimization
+        Number of CPU cores for parallel computation (mainly used in grid mode).
+
     dist_method : str, default='nonparam'
-        Clustering distance method (currently only 'nonparam' supported)
+        Method for computing tercile probabilities (PB/PN/PA).
+        Currently only 'nonparam' fully implemented; 'bestfit' requires additional inputs.
+
     hyperparam_optimizer : {'bayesian', 'random', 'elasticnetcv'}, default='bayesian'
-        Hyperparameter search strategy:
-        - 'bayesian'     → Optuna (usually best quality)
-        - 'random'       → RandomizedSearchCV (faster, good compromise)
-        - 'elasticnetcv' → scikit-learn ElasticNetCV (fastest, discrete grid)
+        Strategy for finding optimal (alpha, l1_ratio):
+        - 'bayesian' → Optuna Bayesian optimization (recommended)
+        - 'random'   → Randomized search
+        - 'elasticnetcv' → Built-in ElasticNetCV (fastest)
+
     n_trials : int, default=50
-        Number of trials for Bayesian optimization
+        Number of trials for Bayesian optimization (Optuna).
+
     n_iter : int, default=50
-        Number of parameter settings sampled in randomized search
+        Number of parameter settings sampled in randomized search.
+
     mode : {'cluster', 'grid'}, default='cluster'
         Optimization approach:
         - 'cluster' → one (alpha, l1_ratio) per spatial cluster (fast & stable)
-        - 'grid'    → independent optimization for each grid cell (slow, local)
+        - 'grid'    → independent optimization per grid cell (slow, maximally local)
 
     Notes
     -----
-    - Grid mode is computationally intensive — use only when spatial detail is critical
-      and sufficient computing resources are available.
-    - Cluster mode is the recommended default for most rainfall modeling applications.
-    - Requires: xarray, dask, scikit-learn, optuna (if using 'bayesian')
-    - All models use max_iter=10000 to improve convergence
+    - **Cluster mode** is the recommended default for most rainfall/climate applications:
+      - Much faster
+      - More robust to noise, short time series, and data sparsity
+      - Excellent generalization
+    - **Grid mode** should only be used when maximum spatial detail is critical and
+      sufficient computing resources are available.
+    - ElasticNet benefits from feature/predictand standardization — ensure proper scaling.
+    - Requires at least 10 valid time steps per location/cluster to attempt optimization.
+    - Negative predictions are automatically clipped to zero (useful for rainfall).
+    - Large domains in 'grid' mode benefit greatly from higher `nb_cores`.
+
+    Methods
+    -------
+    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
+        Computes spatially varying optimal (alpha, l1_ratio) pairs (and cluster map if mode='cluster').
+
+    fit_predict(x, y, x_test, y_test, alpha, l1_ratio)
+        Fits ElasticNet model on one grid cell using given parameters and makes prediction.
+
+    compute_model(X_train, y_train, X_test, y_test, alpha=None, l1_ratio=None, clim_year_start=None, clim_year_end=None)
+        Parallel ElasticNet regression across entire spatial domain using provided parameter maps.
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes tercile probabilities for hindcast predictions.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, alpha, l1_ratio, best_code_da=None, best_shape_da=None,
+             best_loc_da=None, best_scale_da=None)
+        Full end-to-end forecast pipeline for one target year:
+        - deterministic ElasticNet prediction
+        - tercile probabilities (PB, PN, PA)
+
+    Examples
+    --------
+    Recommended workflow (cluster mode with Bayesian optimization):
+
+    >>> enet_model = WAS_ElasticNet_Model(
+    ...     mode='cluster',
+    ...     n_clusters=8,
+    ...     hyperparam_optimizer='bayesian',
+    ...     n_trials=80,
+    ...     nb_cores=12
+    ... )
+
+    # 1. Compute spatially varying (alpha, l1_ratio) — one pair per cluster
+    >>> alpha_map, l1_map, cluster_map = enet_model.compute_hyperparameters(
+    ...     seasonal_rainfall, predictors, 1991, 2020)
+
+    # 2. Train & predict on hindcast period
+    >>> hindcast_pred = enet_model.compute_model(
+    ...     X_train=predictors,
+    ...     y_train=seasonal_rainfall,
+    ...     X_test=predictors_hindcast,
+    ...     y_test=None,
+    ...     alpha=alpha_map,
+    ...     l1_ratio=l1_map
+    ... )
+
+    # 3. Compute probabilistic hindcast (terciles)
+    >>> hindcast_prob = enet_model.compute_prob(
+    ...     seasonal_rainfall, 1991, 2020, hindcast_pred,
+    ...     best_code_da=dist_code_da, best_shape_da=shape_da,
+    ...     best_loc_da=loc_da, best_scale_da=scale_da
+    ... )
+
+    # 4. Forecast next year (e.g. 2025)
+    >>> forecast_det, forecast_prob = enet_model.forecast(
+    ...     seasonal_rainfall, 1991, 2020,
+    ...     predictors, hindcast_pred,
+    ...     predictor_2025,
+    ...     alpha=alpha_map,
+    ...     l1_ratio=l1_map,
+    ...     best_code_da=dist_code_da, best_shape_da=shape_da,
+    ...     best_loc_da=loc_da, best_scale_da=scale_da
+    ... )
+
+    Warnings
+    --------
+    - Very high alpha or l1_ratio=1.0 can eliminate all predictors → monitor selected features.
+    - Small training sets per cell/cluster may lead to unstable results.
+    - For heavy-tailed rainfall, consider log-transformation before modeling.
+    - Use 'bayesian' optimizer for best quality; 'elasticnetcv' is fastest but least flexible.
     """
 
 
@@ -2804,21 +3225,52 @@ class WAS_ElasticNet_Model:
     @staticmethod
     def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
     ):
+        
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -3328,56 +3780,147 @@ class WAS_ElasticNet_Model:
 
 class WAS_LassoLars_Model:
     """
-    LassoLars regression model for spatial rainfall prediction with least-angle
-    regression (LARS) path computation.
+    LassoLars regression model for spatial rainfall (or continuous climate variable) prediction.
 
-    LassoLars is particularly suitable when:
-    - The number of samples is relatively small
-    - You want very precise control over the L1 regularization path
-    - Numerical stability is more important than speed
+    LassoLars implements **Lasso** (L1 regularization) using the **Least-Angle Regression (LARS)** algorithm,
+    which computes the full regularization path efficiently. It is particularly well-suited when:
 
-    Compared to standard Lasso, LassoLars tends to be:
-    - More stable for small datasets
-    - Slightly slower
-    - Better when predictors are highly correlated
+    - Number of samples (time steps) is small per grid cell/cluster
+    - High numerical stability is required (LARS is less prone to convergence issues than coordinate descent)
+    - Predictors are highly correlated (common in climate/teleconnection data)
+    - You want precise control over the regularization path
 
-    Supports two spatial strategies:
-    - grid-wise: independent alpha optimization per grid cell (very expensive)
-    - cluster-wise: one alpha per spatial cluster (recommended default)
+    Compared to standard Lasso (coordinate descent), LassoLars is:
+    - **More stable** for small/noisy datasets
+    - **Slightly slower** (especially for many features)
+    - **Better behaved** near the sparse solution
+
+    Two spatial optimization strategies are supported:
+    - **'cluster'** (recommended): One optimal alpha per spatial cluster → fast, robust, excellent generalization
+    - **'grid'**: Independent alpha optimization per grid cell → maximum spatial detail, very computationally expensive
+
+    Hyperparameter search methods:
+    - 'bayesian' → Optuna Bayesian optimization (recommended — best quality/speed trade-off)
+    - 'random'   → scikit-learn RandomizedSearchCV
+    - 'lassolars_cv' → scikit-learn LassoLarsCV (fastest, uses full LARS path)
 
     Parameters
     ----------
     alpha_range : array-like, optional
-        Range of regularization strength values to search.
-        Default: np.logspace(-6, 2, 100) — appropriate for standardized rainfall data
+        Range of regularization strength (alpha) values to search.
+        Default: np.logspace(-6, 2, 100) — well-suited for standardized rainfall data.
+
     n_clusters : int, default=5
-        Number of spatial clusters (used only when mode='cluster')
+        Number of spatial clusters (only used when mode='cluster').
+
     nb_cores : int, default=1
-        Number of parallel workers for grid-wise optimization
+        Number of CPU cores for parallel computation (mainly used in grid mode).
+
     dist_method : str, default='nonparam'
-        Clustering distance method (currently only 'nonparam' implemented)
+        Method for computing tercile probabilities (PB/PN/PA).
+        Currently only 'nonparam' fully implemented; 'bestfit' requires additional inputs.
+
     hyperparam_optimizer : {'bayesian', 'random', 'lassolars_cv'}, default='bayesian'
-        Strategy for selecting optimal alpha:
-        - 'bayesian'      → Optuna Bayesian optimization (best quality)
-        - 'random'        → Randomized search (faster, reasonable quality)
-        - 'lassolars_cv'  → scikit-learn LassoLarsCV (fastest, grid-based)
+        Strategy for finding optimal alpha:
+        - 'bayesian' → Optuna Bayesian optimization (recommended)
+        - 'random'   → Randomized search
+        - 'lassolars_cv' → Built-in LassoLarsCV (fastest, uses full LARS path)
+
     n_trials : int, default=50
-        Number of trials for Bayesian optimization (Optuna)
+        Number of trials for Bayesian optimization (Optuna).
+
     n_iter : int, default=50
-        Number of parameter settings sampled in randomized search
-    mode : {'cluster', 'grid'}, default='grid'
-        Optimization strategy:
-        - 'cluster' → one alpha per spatial cluster (fast & robust)
-        - 'grid'    → independent alpha for every grid cell (slow, very local)
+        Number of parameter settings sampled in randomized search.
+
+    mode : {'cluster', 'grid'}, default='cluster'
+        Optimization approach:
+        - 'cluster' → one alpha per spatial cluster (fast & robust — recommended)
+        - 'grid'    → independent alpha per grid cell (slow, maximally local)
 
     Notes
     -----
-    - LassoLars uses the full regularization path → can be more stable than coordinate
-      descent Lasso when data is noisy or n_samples is small.
-    - Grid mode is **very computationally expensive** — use cluster mode unless
-      you really need maximum spatial detail and have substantial computing power.
-    - Requires: xarray, dask, scikit-learn, optuna (if using 'bayesian')
-    - All models use max_iter=10000 to improve convergence on difficult cases
+    - **Cluster mode** is the recommended default for most rainfall/climate applications:
+      - Much faster
+      - More robust to noise, short time series, and data sparsity
+      - Excellent generalization
+    - **Grid mode** should only be used when maximum spatial detail is critical and
+      sufficient computing resources are available.
+    - LassoLars is more stable than coordinate-descent Lasso for small datasets,
+      but may be slower for many features.
+    - Requires at least 10 valid time steps per location/cluster to attempt optimization.
+    - Negative predictions are automatically clipped to zero (useful for rainfall).
+    - Large domains in 'grid' mode benefit greatly from higher `nb_cores`.
+
+    Methods
+    -------
+    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
+        Computes spatially varying optimal alpha values (and cluster map if mode='cluster').
+
+    fit_predict(x, y, x_test, y_test, alpha)
+        Fits LassoLars model on one grid cell using given alpha and makes prediction.
+
+    compute_model(X_train, y_train, X_test, y_test, alpha=None, clim_year_start=None, clim_year_end=None)
+        Parallel LassoLars regression across entire spatial domain using provided alpha map.
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes tercile probabilities for hindcast predictions.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, alpha, best_code_da=None, best_shape_da=None,
+             best_loc_da=None, best_scale_da=None)
+        Full end-to-end forecast pipeline for one target year:
+        - deterministic LassoLars prediction
+        - tercile probabilities (PB, PN, PA)
+
+    Examples
+    --------
+    Recommended workflow (cluster mode with Bayesian optimization):
+
+    >>> lars_model = WAS_LassoLars_Model(
+    ...     mode='cluster',
+    ...     n_clusters=8,
+    ...     hyperparam_optimizer='bayesian',
+    ...     n_trials=80,
+    ...     nb_cores=12
+    ... )
+
+    # 1. Compute spatially varying alpha (one per cluster)
+    >>> alpha_map, cluster_map = lars_model.compute_hyperparameters(
+    ...     seasonal_rainfall, predictors, 1991, 2020)
+
+    # 2. Train & predict on hindcast period
+    >>> hindcast_pred = lars_model.compute_model(
+    ...     X_train=predictors,
+    ...     y_train=seasonal_rainfall,
+    ...     X_test=predictors_hindcast,
+    ...     y_test=None,
+    ...     alpha=alpha_map
+    ... )
+
+    # 3. Compute probabilistic hindcast (terciles)
+    >>> hindcast_prob = lars_model.compute_prob(
+    ...     seasonal_rainfall, 1991, 2020, hindcast_pred,
+    ...     best_code_da=dist_code_da, best_shape_da=shape_da,
+    ...     best_loc_da=loc_da, best_scale_da=scale_da
+    ... )
+
+    # 4. Forecast next year (e.g. 2025)
+    >>> forecast_det, forecast_prob = lars_model.forecast(
+    ...     seasonal_rainfall, 1991, 2020,
+    ...     predictors, hindcast_pred,
+    ...     predictor_2025,
+    ...     alpha=alpha_map,
+    ...     best_code_da=dist_code_da, best_shape_da=shape_da,
+    ...     best_loc_da=loc_da, best_scale_da=scale_da
+    ... )
+
+    Warnings
+    --------
+    - Very high alpha can eliminate all predictors → monitor selected features.
+    - Small training sets per cell/cluster may still lead to unstable results.
+    - For heavy-tailed rainfall, consider log-transformation before modeling.
+    - Use 'bayesian' optimizer for best quality; 'lassolars_cv' is fastest but least flexible.
     """
 
 
@@ -3726,19 +4269,49 @@ class WAS_LassoLars_Model:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)

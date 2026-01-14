@@ -446,6 +446,93 @@ class BaseOptimizer:
 
 
 class WAS_SVR:
+    """
+    Support Vector Regression (SVR) based model with spatial clustering, hyperparameter optimization,
+    and probabilistic tercile forecasting for geospatial time-series data (typically seasonal rainfall).
+
+    This class implements a spatially-aware SVR workflow:
+    1. Clusters the predictand field using KMeans (spatial homogeneity zones).
+    2. Optimizes SVR hyperparameters independently per cluster using grid/random/Bayesian search.
+    3. Fits SVR models per grid cell with the best-found parameters.
+    4. Generates deterministic predictions and computes tercile probabilities (Below/Normal/Above)
+       using either best-fit parametric distributions or non-parametric error sampling.
+
+    Main use case: Seasonal climate forecasting (e.g. rainfall) with deterministic hindcasts
+    and probabilistic outputs in tercile format (PB = Below, PN = Normal, PA = Above).
+
+    Parameters
+    ----------
+    nb_cores : int, default=1
+        Number of CPU cores for parallel processing (dask + joblib).
+
+    n_clusters : int, default=5
+        Number of spatial clusters (KMeans) to group similar predictand regimes.
+
+    kernel : {'linear', 'poly', 'rbf', 'all'}, default='linear'
+        SVR kernel type. 'all' = search over linear + poly + rbf.
+
+    gamma : list of str or None, default=["auto", "scale"]
+        Gamma values for 'rbf' kernel (only used when kernel='rbf' or 'all').
+
+    C_range : list of float, default=[0.1, 1, 10, 100]
+        Regularization parameter values to search.
+
+    epsilon_range : list of float, default=[0.01, 0.1, 0.5, 1]
+        Epsilon-tube values to search.
+
+    degree_range : list of int, default=[2, 3, 4]
+        Polynomial degrees to search (only for 'poly' kernel).
+
+    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
+        Method to compute tercile probabilities:
+        - 'bestfit': use best-fit distribution per cluster/grid cell
+        - 'nonparam': empirical sampling of historical errors
+
+    optimization_method : {'grid', 'random', 'bayesian'}, default='grid'
+        Hyperparameter search strategy.
+
+    n_trials : int, default=20
+        Number of trials for 'random' or 'bayesian' optimization.
+
+    cv : int, default=5
+        Number of cross-validation folds for hyperparameter tuning.
+
+    random_state : int, default=42
+        Random seed for reproducibility (KMeans, CV splits, etc.).
+
+    Attributes
+    ----------
+    optimizer : BaseOptimizer
+        Internal hyperparameter optimization object.
+
+    Methods
+    -------
+    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
+        Cluster predictand → optimize SVR hyperparameters per cluster → return parameter maps.
+
+    fit_predict(x, y, x_test, y_test, epsilon, C, degree=None)
+        Fit SVR on one grid cell and predict (used internally in parallel apply_ufunc).
+
+    compute_model(X_train, y_train, X_test, y_test, epsilon, C, degree_array=None)
+        Spatially parallel SVR prediction across entire grid.
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Compute tercile probabilities from deterministic hindcast.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, epsilon, C, kernel_array, degree_array, gamma_array,
+             best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Full forecast pipeline for one target year → deterministic prediction + probabilities.
+
+    Notes
+    -----
+    - All input DataArrays must share compatible coordinates (T=time, Y=lat, X=lon).
+    - Hyperparameter optimization is performed per cluster, then broadcast to all grid cells.
+    - For 'bestfit' probability method, requires distribution fit results from WAS_TransformData.
+    - Negative predictions are clipped to zero (useful for rainfall).
+    - Large domains benefit greatly from higher `nb_cores` (uses dask parallel apply_ufunc).
+    """
     def __init__(
         self, 
         nb_cores=1, 
@@ -874,19 +961,49 @@ class WAS_SVR:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -1405,27 +1522,101 @@ class WAS_SVR:
 
 
 class WAS_MLP:
+    
     """
-    A class to perform MLP (Multi-Layer Perceptron) regression on spatiotemporal
-    datasets for climate prediction, with hyperparameter tuning via clustering + grid search.
+    Multi-Layer Perceptron (MLP) regression model for spatiotemporal climate prediction
+    with spatial clustering, per-cluster hyperparameter optimization, and probabilistic
+    tercile forecasting.
+
+    This class implements a complete workflow for seasonal climate forecasting (typically
+    rainfall or temperature anomalies):
+
+    1. **Spatial clustering** (KMeans) to identify homogeneous predictand regimes.
+    2. **Per-cluster hyperparameter tuning** of MLPRegressor using grid, random, or
+       Bayesian optimization.
+    3. **Spatially-varying model training & prediction** using the best local hyperparameters.
+    4. **Deterministic forecast generation** with parallel computation across the grid.
+    5. **Tercile probability computation** (Below/Normal/Above) using either:
+       - Parametric distributions fitted per grid cell/cluster (bestfit mode),
+       - or non-parametric historical error sampling (nonparam mode).
+
+    Main intended use case: Statistical downscaling or seasonal forecasting with neural
+    networks, combining deterministic predictions with calibrated probabilistic outputs.
 
     Parameters
     ----------
-    nb_cores : int
-        Number of CPU cores to use for parallel computation.
-    dist_method : str
-        Distribution method for tercile probability calculations. 
-        One of {'gamma', 't', 'normal', 'lognormal', 'nonparam'}.
-    n_clusters : int
-        Number of clusters to use for KMeans.
-    param_grid : dict or None
-        The hyperparameter search grid for MLPRegressor. 
-        If None, a default grid is used.
+    nb_cores : int, default=1
+        Number of CPU cores for parallel processing (dask + joblib).
+
+    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
+        Method for calculating tercile probabilities:
+        - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs)
+        - 'nonparam' → empirical sampling of historical forecast errors
+
+    n_clusters : int, default=5
+        Number of spatial clusters for KMeans grouping of the predictand field.
+
+    param_grid : dict or None, default=None
+        Hyperparameter search space for MLPRegressor.
+        If None, a reasonable default grid is used:
+            - hidden_layer_sizes: [(10,5), (10,), (20,10), (50,)]
+            - activation: ['relu', 'tanh', 'logistic']
+            - solver: ['adam', 'lbfgs']
+            - alpha: [0.0001, 0.001, 0.01]
+            - learning_rate_init: [0.001, 0.01, 0.1]
+            - max_iter: [200, 500, 1000]
+
+    optimization_method : {'grid', 'random', 'bayesian'}, default='grid'
+        Strategy for hyperparameter search.
+
+    n_trials : int, default=20
+        Number of trials for random or Bayesian optimization.
+
+    cv : int, default=5
+        Number of cross-validation folds during hyperparameter tuning.
+
+    random_state : int, default=42
+        Random seed for reproducibility (KMeans, CV splits, optimizer).
 
     Attributes
     ----------
-    nb_cores, dist_method, n_clusters, param_grid
-    """
+    nb_cores, dist_method, n_clusters, param_grid, optimization_method, n_trials, cv, random_state
+        Stored initialization parameters.
+
+    optimizer : BaseOptimizer
+        Internal hyperparameter optimization object.
+
+    Methods
+    -------
+    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
+        Performs spatial clustering and optimizes MLP hyperparameters per cluster.
+        Returns spatial maps of the best hyperparameters.
+
+    fit_predict(X_train, y_train, X_test, y_test, hl_sizes, activation, lr_init, maxiter)
+        Fits MLP on a single grid cell using local hyperparameters and predicts.
+        Returns [error, prediction].
+
+    compute_model(X_train, y_train, X_test, y_test, hl_array, act_array, lr_array, maxiter_array)
+        Parallelized prediction across the entire spatial domain using dask.
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes deterministic hindcast tercile probabilities.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, hl_array, act_array, lr_array,
+             best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Full forecast pipeline for one target year: deterministic prediction + probabilities.
+
+    Notes
+    -----
+    - All input DataArrays must share compatible coordinates: T (time), Y (latitude), X (longitude).
+    - Negative predictions are automatically clipped to zero (useful for precipitation).
+    - Large domains benefit significantly from higher `nb_cores`.
+    - For `dist_method='bestfit'`, you must provide distribution fit results from `WAS_TransformData`.
+    - The model internally uses `TransformedTargetRegressor` with `StandardScaler` on the target
+      (y) to improve training stability, especially for skewed variables like rainfall.
+        """      
 
     def __init__(
         self,
@@ -1438,28 +1629,7 @@ class WAS_MLP:
         cv=5,  # New parameter
         random_state=42  # New parameter
     ):
-        """
-        Initializes the WAS_MLP with specified hyperparameter ranges.
 
-        Parameters
-        ----------
-        nb_cores : int, optional
-            Number of CPU cores to use for parallel computation.
-        n_clusters : int, optional
-            Number of clusters for KMeans.
-        kernel : str, optional
-            Kernel type to be used in SVR ('linear', 'poly', 'rbf', or 'all').
-        gamma : str, optional
-            Kernel coefficient for 'rbf' kernel. Ignored otherwise.
-        C_range : list, optional
-            List of C values for hyperparameter tuning.
-        epsilon_range : list, optional
-            List of epsilon values for hyperparameter tuning.
-        degree_range : list, optional
-            List of polynomial degrees for 'poly' kernel.
-        dist_method : str, optional
-            Distribution method for tercile probability calculations.
-        """
         self.nb_cores = nb_cores
         self.dist_method = dist_method
         self.n_clusters = n_clusters
@@ -1844,19 +2014,49 @@ class WAS_MLP:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -2371,6 +2571,8 @@ class WAS_MLP:
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return forecast_expanded, forecast_prob.transpose('probability', 'T', 'Y', 'X')
 
+
+                  
 class WAS_RandomForest_XGBoost_ML_Stacking:
     def __init__(
         self,
@@ -2741,19 +2943,49 @@ class WAS_RandomForest_XGBoost_ML_Stacking:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -3266,6 +3498,103 @@ class WAS_RandomForest_XGBoost_ML_Stacking:
 
 
 class WAS_RandomForest_XGBoost_Stacking_MLP:
+    """
+    Ensemble stacking regression model that combines **Random Forest (RF)** and **XGBoost (XGB)**
+    as base learners with a **Linear Regression** meta-learner, optimized for spatiotemporal
+    climate prediction (typically seasonal rainfall totals, anomalies, or other continuous
+    predictands).
+
+    Workflow summary:
+    1. **Spatial clustering** (KMeans) on a summary statistic of the predictand (default: mean over time)
+       to identify homogeneous climate regimes.
+    2. **Per-cluster hyperparameter optimization** of the full stacking pipeline using grid, random,
+       or Bayesian search.
+    3. **Broadcast best hyperparameters** to every grid cell (Y, X).
+    4. **Spatially parallel training & prediction** using local best hyperparameters.
+    5. **Deterministic forecast generation** (point prediction + optional error).
+    6. **Tercile probability computation** (Below/Normal/Above = PB/PN/PA) using either:
+       - Parametric best-fit distributions per grid cell/cluster ('bestfit')
+       - Non-parametric sampling of historical forecast errors ('nonparam')
+
+    This model leverages the complementary strengths of tree-based methods (RF + XGB) for robust
+    non-linear modeling and a simple linear meta-learner for final calibration.
+
+    Parameters
+    ----------
+    nb_cores : int, default=1
+        Number of CPU cores for parallel processing (dask + joblib).
+
+    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
+        Method for computing tercile probabilities:
+        - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs)
+        - 'nonparam' → empirical sampling of historical forecast errors
+
+    n_clusters : int, default=5
+        Number of spatial clusters for KMeans grouping of the predictand field.
+
+    param_grid : dict or None, default=None
+        Hyperparameter search space for the stacking regressor.
+        If None, a minimal default grid is used:
+            - rf__n_estimators: [50, 100, 200]
+            - rf__max_depth: [None, 10, 20]
+            - xgb__n_estimators: [50, 100]
+            - xgb__max_depth: [3, 6, 9]
+            - xgb__learning_rate: [0.01, 0.1, 0.3]
+            - xgb__subsample: [0.8, 1.0]
+            - final_estimator__fit_intercept: [True, False]
+
+    optimization_method : {'grid', 'random', 'bayesian'}, default='grid'
+        Strategy for hyperparameter search.
+
+    n_trials : int, default=20
+        Number of trials for 'random' or 'bayesian' optimization.
+
+    cv : int, default=5
+        Number of cross-validation folds during tuning.
+
+    random_state : int, default=42
+        Random seed for reproducibility (KMeans, CV, models, optimizer).
+
+    Attributes
+    ----------
+    nb_cores, dist_method, n_clusters, param_grid, optimization_method, n_trials, cv, random_state
+        Stored initialization parameters.
+
+    optimizer : BaseOptimizer
+        Internal hyperparameter optimization object.
+
+    Methods
+    -------
+    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
+        Clusters predictand → optimizes stacking hyperparameters per cluster →
+        returns spatial map of best parameter sets (as stringified dictionaries).
+
+    fit_predict(X_train, y_train, X_test, y_test, best_params_str)
+        Fits stacking model on one grid cell using local hyperparameters and predicts.
+        Returns [error, prediction].
+
+    compute_model(X_train, y_train, X_test, y_test, best_param_da)
+        Parallelized prediction across entire spatial domain using local best params.
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes deterministic hindcast tercile probabilities.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, best_param_da, best_code_da=None, best_shape_da=None,
+             best_loc_da=None, best_scale_da=None)
+        Full forecast pipeline for one target year: deterministic prediction + probabilities.
+
+    Notes
+    -----
+    - All input DataArrays must share compatible coordinates: T (time), Y (latitude), X (longitude).
+    - Negative predictions are automatically clipped to zero (useful for precipitation).
+    - The stacking model uses `TransformedTargetRegressor` with `StandardScaler` on the target (y)
+      for improved training stability, especially for skewed variables.
+    - Hyperparameters are stored as stringified dictionaries in xarray due to nested/complex structure.
+    - Large spatial domains benefit greatly from higher `nb_cores`.
+    - For `dist_method='bestfit'`, distribution fit results from `WAS_TransformData` must be provided.
+    """
     def __init__(
         self,
         nb_cores=1,
@@ -4132,6 +4461,106 @@ class WAS_RandomForest_XGBoost_Stacking_MLP:
 
 
 class WAS_Stacking_Ridge:
+    """
+    Advanced ensemble stacking regression model combining **Random Forest (RF)**,
+    **XGBoost (XGB)**, and **MLP** base learners with a **Ridge regression** meta-learner,
+    specifically designed for high-accuracy spatiotemporal climate prediction
+    (e.g., seasonal rainfall, temperature anomalies, agro-climatic indices).
+
+    Workflow overview:
+    1. **Spatial clustering** (KMeans) on a summary statistic of the predictand
+       (default: climatological mean over time) to identify homogeneous zones.
+    2. **Per-cluster hyperparameter optimization** of the full stacking pipeline
+       using grid, random, or Bayesian search.
+    3. **Broadcast best hyperparameters** to every grid cell (Y, X) as stringified dicts.
+    4. **Spatially parallel training & prediction** using local best hyperparameters.
+    5. **Deterministic forecast generation** (point prediction + optional error term).
+    6. **Tercile probability computation** (Below/Normal/Above = PB/PN/PA) using either:
+       - Parametric best-fit distributions per grid cell/cluster ('bestfit')
+       - Non-parametric sampling of historical forecast errors ('nonparam')
+
+    This model exploits the complementary strengths of:
+    - Tree-based methods (RF + XGB): robust non-linear modeling, handling interactions
+    - MLP base learner: captures complex patterns (with feature scaling)
+    - Ridge meta-learner: stable linear combination with L2 regularization
+
+    Parameters
+    ----------
+    nb_cores : int, default=1
+        Number of CPU cores for parallel processing (dask + joblib).
+
+    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
+        Method for computing tercile probabilities:
+        - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs)
+        - 'nonparam' → empirical sampling of historical forecast errors
+
+    n_clusters : int, default=5
+        Number of spatial clusters for KMeans grouping of the predictand field.
+
+    param_grid : dict or None, default=None
+        Hyperparameter search space for the stacking regressor.
+        If None, a minimal default grid is used:
+            - rf__n_estimators: [50, 100]
+            - xgb__max_depth: [3, 6]
+            - mlp_base__hidden_layer_sizes: [(20,), (50, 10)]
+            - mlp_base__activation: ["relu", "tanh"]
+            - mlp_base__alpha: [0.0001, 0.001]
+            - final_estimator__alpha: [0.1, 0.9, 5.0]   # Ridge regularization
+
+    optimization_method : {'grid', 'random', 'bayesian'}, default='grid'
+        Strategy for hyperparameter search.
+
+    n_trials : int, default=20
+        Number of trials for 'random' or 'bayesian' optimization.
+
+    cv : int, default=5
+        Number of cross-validation folds during tuning.
+
+    random_state : int, default=42
+        Random seed for reproducibility (KMeans, CV, models, optimizer).
+
+    Attributes
+    ----------
+    nb_cores, dist_method, n_clusters, param_grid, optimization_method, n_trials, cv, random_state
+        Stored initialization parameters.
+
+    optimizer : BaseOptimizer
+        Internal hyperparameter optimization object.
+
+    Methods
+    -------
+    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
+        Clusters predictand → optimizes stacking hyperparameters per cluster →
+        returns spatial map of best parameter sets (as stringified dictionaries).
+
+    fit_predict(X_train, y_train, X_test, y_test, best_params_str)
+        Fits stacking model on one grid cell using local hyperparameters and predicts.
+        Returns [error, prediction].
+
+    compute_model(X_train, y_train, X_test, y_test, best_param_da)
+        Parallelized prediction across entire spatial domain using local best params.
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes deterministic hindcast tercile probabilities.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, best_param_da, best_code_da=None, best_shape_da=None,
+             best_loc_da=None, best_scale_da=None)
+        Full forecast pipeline for one target year: deterministic prediction + probabilities.
+
+    Notes
+    -----
+    - All input DataArrays must share compatible coordinates: T (time), Y (latitude), X (longitude).
+    - Negative predictions are automatically clipped to zero (useful for precipitation).
+    - The stacking model uses `TransformedTargetRegressor` with `StandardScaler` on the target (y)
+      for improved training stability, especially for skewed variables like rainfall.
+    - MLP base learner includes internal feature scaling via Pipeline.
+    - Hyperparameters are stored as stringified dictionaries in xarray due to nested/complex structure.
+    - Large spatial domains benefit greatly from higher `nb_cores`.
+    - For `dist_method='bestfit'`, distribution fit results from `WAS_TransformData` must be provided.
+    
+    """
     def __init__(
         self,
         nb_cores=1,
@@ -4491,19 +4920,49 @@ class WAS_Stacking_Ridge:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -5005,16 +5464,111 @@ class WAS_Stacking_Ridge:
 
 class WAS_LogisticRegression_Model:
     """
-    Logistic regression for tercile classification (0/1/2) with:
-      1) compute_class(): build tercile classes
-      2) clustering on a spatial statistic of predictand (default: climatological mean)
-      3) hyperparameter optimization per cluster (via BaseOptimizer)
-      4) broadcast best params to (Y,X)
-      5) fit/predict per grid cell using the locally broadcast params
+    Logistic Regression model for **tercile classification** (Below/Normal/Above = 0/1/2)
+    on spatiotemporal seasonal climate data (typically rainfall or temperature anomalies).
 
-    Notes:
-    - "Scale y only" does not apply here because y is categorical (0/1/2).
-    - X scaling is OFF by default, but you can enable it (x_scaler='standard' or 'robust').
+    Workflow overview:
+    1. **Tercile classification**: Compute spatial map of classes (0=Below, 1=Normal, 2=Above)
+       based on climatological terciles (33rd and 67th percentiles).
+    2. **Spatial clustering** (KMeans) on a summary statistic of the predictand (default: mean over time).
+    3. **Per-cluster hyperparameter optimization** of LogisticRegression using grid/random/Bayesian search.
+    4. **Broadcast best hyperparameters** to every grid cell (Y, X).
+    5. **Parallel per-grid-cell classification** using local hyperparameters.
+    6. **Direct probabilistic output**: model.predict_proba() gives [P(Below), P(Normal), P(Above)]
+       per grid cell and time step.
+
+    This class is designed for **probabilistic seasonal forecasting** in tercile format,
+    where the target is a categorical variable derived from climatological thresholds.
+
+    Key features:
+    - Multiclass logistic regression (multinomial + L2 penalty via 'lbfgs' solver)
+    - Optional feature scaling (x_scaler: None | 'standard' | 'robust')
+    - No target scaling (y is categorical 0/1/2)
+    - Safe handling of class imbalance via 'class_weight' tuning
+    - Full parallelization across spatial grid using dask
+
+    Parameters
+    ----------
+    nb_cores : int, default=1
+        Number of CPU cores for parallel processing (dask + joblib).
+
+    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
+        Method for computing tercile probabilities (currently unused in this class,
+        kept for API consistency with other models).
+
+    n_clusters : int, default=5
+        Number of spatial clusters for KMeans grouping of the predictand field.
+
+    param_grid : dict or None, default=None
+        Hyperparameter search space for LogisticRegression.
+        If None, a safe default grid is used (compatible with multinomial + lbfgs):
+            - C: [0.1, 0.5, 1.0, 2.0, 5.0]                # inverse regularization strength
+            - class_weight: [None, 'balanced']
+            - max_iter: [300, 600, 1000]
+
+    optimization_method : {'grid', 'random', 'bayesian'}, default='grid'
+        Strategy for hyperparameter search.
+
+    n_trials : int, default=20
+        Number of trials for 'random' or 'bayesian' optimization.
+
+    cv : int, default=5
+        Number of cross-validation folds during tuning.
+
+    random_state : int, default=42
+        Random seed for reproducibility (KMeans, CV splits, optimizer).
+
+    x_scaler : {None, 'standard', 'robust'}, default=None
+        Whether and how to scale input features (X):
+        - None: no scaling (default, logistic regression is scale-invariant)
+        - 'standard': StandardScaler (zero mean, unit variance)
+        - 'robust': RobustScaler (median-centered, IQR-scaled, robust to outliers)
+
+    Attributes
+    ----------
+    nb_cores, dist_method, n_clusters, param_grid, optimization_method, n_trials, cv, random_state, x_scaler
+        Stored initialization parameters.
+
+    optimizer : BaseOptimizer
+        Internal hyperparameter optimization object.
+
+    _cw_map / _cw_inv : dict
+        Internal mapping for broadcasting 'class_weight' (None ↔ 0, 'balanced' ↔ 1).
+
+    Methods
+    -------
+    classify(y, index_start, index_end)
+        Static method: convert continuous values to tercile classes (0/1/2).
+
+    compute_class(Predictant, clim_year_start, clim_year_end)
+        Compute tercile class map (T, Y, X) + climatological terciles.
+
+    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end, scoring='neg_log_loss')
+        Cluster predictand → optimize logistic hyperparameters per cluster →
+        return broadcast arrays of best C, class_weight (coded), max_iter, solver.
+
+    fit_predict(x, y, x_test, C, cw_code, max_iter, solver)
+        Fit logistic model on one grid cell using local hyperparameters and return
+        probability vector [P(Below), P(Normal), P(Above)].
+
+    compute_model(X_train, y_train, X_test, C_da, cw_code_da, maxiter_da, solver_da)
+        Parallel classification across entire spatial domain using local best params.
+        Returns xarray.DataArray with dims (probability=['PB','PN','PA'], T, Y, X).
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, Predictor_for_year,
+             C_da, cw_code_da, maxiter_da, solver_da)
+        Full end-to-end forecast pipeline for one target year:
+        - classify historical data
+        - optimize hyperparameters
+        - predict probabilities for the forecast year
+
+    Notes
+    -----
+    - Input predictand should be continuous seasonal values (e.g., total rainfall, anomaly).
+    - Target y is internally converted to integer classes {0, 1, 2} = {Below, Normal, Above}.
+    - Negative predictions are **not** clipped (logistic outputs probabilities 0–1).
+    - Large domains benefit greatly from higher `nb_cores`.
+    - For very small clusters or poor separability, model may fall back to uniform probabilities.
     """
 
     def __init__(
@@ -5380,37 +5934,79 @@ class WAS_LogisticRegression_Model:
 
 class WAS_PolynomialRegression:
     """
-    A class to perform Polynomial Regression on spatiotemporal datasets for climate prediction.
+    Polynomial Regression model for spatiotemporal climate prediction.
 
-    This class is designed to work with Dask and Xarray for parallelized, high-performance 
-    regression computations across large datasets with spatial and temporal dimensions. The primary 
-    methods are for fitting the polynomial regression model, making predictions, and calculating 
-    probabilistic predictions for climate terciles.
+    This class implements polynomial regression (via scikit-learn's PolynomialFeatures + LinearRegression)
+    to capture non-linear relationships between predictors and a continuous predictand (e.g., seasonal rainfall,
+    temperature anomalies, agro-climatic indices).
+
+    Key features:
+    - Polynomial feature expansion up to a specified degree
+    - Spatially parallel fitting and prediction across large grids using dask + xarray
+    - Deterministic point predictions with optional error computation
+    - Probabilistic tercile forecasting (Below/Normal/Above = PB/PN/PA) using either:
+      - Parametric best-fit distributions per grid cell ('bestfit')
+      - Non-parametric sampling of historical forecast errors ('nonparam')
+
+    Suitable for modeling moderate non-linearities where interpretability of polynomial terms is useful.
+
+    Parameters
+    -----------
+    nb_cores : int, default=1
+        Number of CPU cores for parallel processing (dask workers).
+
+    degree : int, default=2
+        Degree of the polynomial features (e.g., 2 = quadratic, 3 = cubic).
+
+    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
+        Method for computing tercile probabilities:
+        - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs)
+        - 'nonparam' → empirical sampling of historical forecast errors
 
     Attributes
-    ----------
-    nb_cores : int, optional
-        The number of CPU cores to use for parallel computation (default is 1).
-    degree : int, optional
-        The degree of the polynomial (default is 2).
-    dist_method : str, optional
-        The distribution method to compute tercile probabilities. One of 
-        {"t", "gamma", "normal", "lognormal", "nonparam"} (default is "gamma").
+    -----------
+    nb_cores, degree, dist_method
+        Stored initialization parameters.
 
     Methods
-    -------
+    --------
     fit_predict(x, y, x_test, y_test)
-        Fits a Polynomial Regression model to the training data, predicts on test data, 
-        and computes error.
+        Fits polynomial regression on one grid cell and returns [error, prediction].
+
     compute_model(X_train, y_train, X_test, y_test)
-        Applies the Polynomial Regression model across a dataset using parallel computation 
-        with Dask, returning predictions and error metrics.
-    compute_prob(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det)
-        Computes tercile probabilities for hindcast rainfall predictions 
-        over specified climatological years.
-    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year)
-        Generates a forecast for a single year (or time step) and calculates tercile probabilities 
-        using the chosen distribution method.
+        Parallel polynomial regression across the entire spatial domain.
+        Returns xarray.DataArray with dims ('output'=['error','prediction'], Y, X).
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes tercile probabilities for deterministic hindcasts.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, best_code_da=None, best_shape_da=None,
+             best_loc_da=None, best_scale_da=None)
+        Full end-to-end forecast pipeline for one target year:
+        - deterministic polynomial prediction
+        - tercile probabilities (PB, PN, PA)
+
+    Notes
+    ------
+    - **Input data requirements**:
+      - Target (y) should be continuous (rainfall, temperature, etc.).
+      - Predictors (X) should be continuous or properly encoded.
+    - Negative predictions are automatically clipped to zero (useful for rainfall or non-negative variables).
+    - Higher polynomial degrees can lead to overfitting, especially with small training sets per grid cell.
+    - Large spatial domains benefit significantly from higher `nb_cores`.
+    - For `dist_method='bestfit'`, distribution fit results from `WAS_TransformData` must be provided.
+    - No explicit feature or target scaling is applied (linear regression after polynomial expansion is scale-sensitive;
+      consider normalizing predictors externally if needed).
+
+    Warnings
+    ---------
+    - High polynomial degrees (degree ≥ 4) with many features can cause numerical instability
+      or extreme overfitting → use cautiously and validate.
+    - Very skewed targets (e.g., heavy-tailed rainfall) may benefit from transformation
+      (log, square-root) before modeling (not done automatically).
+    - Small per-grid-cell training sets can lead to poor fits or unstable coefficients.
     """
 
     def __init__(self, nb_cores=1, degree=2, dist_method="nonparam"):
@@ -5424,8 +6020,8 @@ class WAS_PolynomialRegression:
         degree : int, optional
             The degree of the polynomial, by default 2.
         dist_method : str, optional
-            The method to compute tercile probabilities ("t", "gamma", "normal", "lognormal", "nonparam"), 
-            by default "gamma".
+            The method to compute tercile probabilities ("bestfit", "nonparam"), 
+            by default "nonparam".
         """
         self.nb_cores = nb_cores
         self.degree = degree
@@ -5433,25 +6029,49 @@ class WAS_PolynomialRegression:
 
     def fit_predict(self, x, y, x_test, y_test):
         """
-        Fits a Polynomial Regression model to the provided training data, makes predictions 
-        on the test data, and calculates the prediction error.
-.
+        Fit polynomial regression model and generate predictions.
+        
         Parameters
         ----------
-        x : array-like, shape (n_samples, n_features)
-            Training data (predictors).
+        x : array-like, shape (n_samples,) or (n_samples, n_features)
+            Training feature data. For polynomial regression, this is typically 
+            a 1D array of independent variable values.
         y : array-like, shape (n_samples,)
-            Training targets.
-        x_test : array-like, shape (n_features,) or (1, n_features)
-            Test data (predictors) for which we want predictions.
-        y_test : float
-            Test target value (for computing error).
-
+            Training target values (dependent variable).
+        x_test : array-like, shape (n_test_samples,) or (n_test_samples, n_features)
+            Test feature data for which to generate predictions.
+        y_test : array-like, shape (n_test_samples,), optional
+            Test target values used to calculate prediction error. Required for 
+            error computation.
+        degree : int
+            Degree of the polynomial to fit. Must be a non-negative integer.
+        
         Returns
         -------
-        np.ndarray of shape (2,)
-            Array containing [prediction_error, predicted_value].
+        np.ndarray
+            Array containing two elements:
+            - error : float
+                Prediction error metric (e.g., MSE, RMSE) computed between 
+                predicted and actual y_test values.
+            - prediction : np.ndarray, shape (n_test_samples,)
+                Predicted values for x_test.
+        
+        Raises
+        ------
+        ValueError
+            If x, y, x_test, or y_test have incompatible shapes.
+            If degree is negative.
+            If insufficient samples for the specified polynomial degree.
+        
+        Notes
+        -----
+        1. Polynomial features are created using np.polyfit for 1D data or 
+           sklearn.preprocessing.PolynomialFeatures for multi-dimensional data.
+        2. The error metric computed depends on implementation (typically 
+           mean squared error or root mean squared error).
+        3. For high-degree polynomials, consider regularization to prevent overfitting.
         """
+        
         # Create a PolynomialFeatures transformer for the specified degree
         poly = PolynomialFeatures(degree=self.degree)
         model = LinearRegression()
@@ -5660,19 +6280,49 @@ class WAS_PolynomialRegression:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -6167,31 +6817,71 @@ class WAS_PolynomialRegression:
 
 class WAS_PoissonRegression:
     """
-    A class to perform Poisson Regression on spatiotemporal datasets for count data prediction.
+    Poisson Regression model for spatiotemporal **count data** prediction (e.g., number of rainy days,
+    number of dry spells, extreme event counts, or discretized rainfall amounts) in climate applications.
 
-    This class is designed to work with Dask and Xarray for parallelized, high-performance 
-    regression computations across large datasets with spatial and temporal dimensions. The primary 
-    methods are for fitting the Poisson regression model, making predictions, and calculating 
-    probabilistic predictions for climate terciles.
+    This class implements:
+    - Standard Poisson regression via scikit-learn's `PoissonRegressor`
+    - Spatially parallel fitting and prediction across large grids using dask + xarray
+    - Deterministic point predictions (expected counts)
+    - Optional probabilistic tercile forecasting (Below/Normal/Above) using either:
+      - Parametric distributions fitted per grid cell ('bestfit')
+      - Non-parametric historical error sampling ('nonparam')
+
+    Designed for seasonal forecasting tasks where the predictand is non-negative integer counts.
+
+    Parameters
+    ----------
+    nb_cores : int, default=1
+        Number of CPU cores to use for parallel computation (dask workers).
+
+    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
+        Method for computing tercile probabilities:
+        - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs)
+        - 'nonparam' → empirical sampling of historical forecast errors
 
     Attributes
     ----------
-    nb_cores : int
-        The number of CPU cores to use for parallel computation (default is 1).
-    dist_method : str
-        The method to use for tercile probability calculations, e.g. {"t", "gamma", "normal", 
-        "lognormal", "nonparam"} (default is "gamma").
+    nb_cores, dist_method
+        Stored initialization parameters.
 
     Methods
     -------
     fit_predict(x, y, x_test, y_test)
-        Fits a Poisson regression model to the training data, predicts on test data, and computes error.
+        Fits Poisson regression on one grid cell and returns [error, prediction].
+
     compute_model(X_train, y_train, X_test, y_test)
-        Applies the Poisson regression model across a dataset using parallel computation 
-        with Dask, returning predictions and error metrics.
-    compute_prob(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det)
-        Computes tercile probabilities for hindcast rainfall (or count data) predictions 
-        over specified climatological years, using the chosen `dist_method`.
+        Parallel Poisson regression across the entire spatial domain.
+        Returns xarray.DataArray with dims ('output'=['error','prediction'], Y, X).
+
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes tercile probabilities for deterministic hindcasts.
+
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, best_code_da=None, best_shape_da=None,
+             best_loc_da=None, best_scale_da=None)
+        Full end-to-end forecast pipeline for one target year:
+        - deterministic prediction (Poisson expected count)
+        - tercile probabilities (PB, PN, PA)
+
+    Notes
+    -----
+    - **Input data requirements**:
+      - y (target) must be non-negative integers (counts). Non-integer or negative values may cause
+        fitting errors or poor performance.
+      - Predictors (X) should be continuous or properly encoded.
+    - Predictions are clipped to ≥ 0 (Poisson rates cannot be negative).
+    - Large spatial domains benefit significantly from higher `nb_cores`.
+    - For `dist_method='bestfit'`, distribution fit results from `WAS_TransformData` must be provided.
+    - No target scaling is applied (Poisson regression is scale-invariant in the response).
+    - Error is computed as `y_test - prediction` (can be negative).
+
+    Warnings
+    --------
+    - Ensure y (target) contains only non-negative integers.
+    - Very low counts or zero-inflated data may require zero-inflated Poisson (not implemented here).
+    - Small clusters or sparse data can lead to unstable fits.
     """
 
     def __init__(self, nb_cores=1, dist_method="nonparam"):
@@ -6413,19 +7103,49 @@ class WAS_PoissonRegression:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -7231,41 +7951,86 @@ class MARS:
 
 class WAS_MARS_Model:
     """
-    A class to perform MARS-based modeling on spatiotemporal datasets for climate prediction.
-    MARS stands for Multivariate Adaptive Regression Splines with Generalized Cross-Validation.
+    Multivariate Adaptive Regression Splines (MARS) model for spatiotemporal climate prediction.
 
-    This class is designed to work with Dask and Xarray for parallelized, high-performance 
-    regression computations across large datasets with spatial and temporal dimensions. The primary 
-    methods are for fitting the model, making predictions, and calculating probabilistic predictions 
-    for climate terciles. 
+    MARS is a non-parametric regression technique that builds flexible models by fitting piecewise
+    linear or cubic basis functions with knots automatically determined via a forward-backward
+    selection process, regularized by Generalized Cross-Validation (GCV).
+
+    This class implements:
+    - MARS regression using the pyearth library (or compatible MARS implementation)
+    - Spatially parallel fitting and prediction across large grids using dask + xarray
+    - Deterministic point predictions with optional error computation
+    - Probabilistic tercile forecasting (Below/Normal/Above = PB/PN/PA) using either:
+      - Parametric best-fit distributions per grid cell ('bestfit')
+      - Non-parametric sampling of historical forecast errors ('nonparam')
+
+    Ideal for modeling non-linear relationships in seasonal climate variables (rainfall, temperature,
+    agro-climatic indices) with good interpretability through selected basis functions.
+
+    Parameters
+    ----------
+    nb_cores : int, default=1
+        Number of CPU cores for parallel processing (dask workers).
+
+    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
+        Method for computing tercile probabilities:
+        - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs)
+        - 'nonparam' → empirical sampling of historical forecast errors
+
+    max_terms : int, default=21
+        Maximum number of basis functions (terms) allowed in the MARS model.
+
+    max_degree : int, default=2
+        Maximum degree of interaction (number of variables in a single hinge function).
+
+    c : float, default=3.0
+        Penalty cost parameter for effective number of parameters in GCV score
+        (higher values → stronger regularization, fewer terms).
 
     Attributes
     ----------
-    nb_cores : int, optional
-        The number of CPU cores to use for parallel computation (default is 1).
-    dist_method : str, optional
-        Distribution method for tercile probability calculations. One of
-        {"t","gamma","normal","lognormal","nonparam"}. Default = "gamma".
-    max_terms : int, optional
-        Maximum number of basis functions for MARS (default: 21).
-    max_degree : int, optional
-        Maximum degree of interaction for MARS (default: 1).
-    c : float, optional
-        Cost parameter for effective parameters in GCV for MARS (default: 3).
+    nb_cores, dist_method, max_terms, max_degree, c
+        Stored initialization parameters.
 
     Methods
     -------
     fit_predict(x, y, x_test, y_test=None)
-        Fits a MARS model, makes predictions, and calculates error if y_test is provided.
+        Fits MARS on one grid cell and returns [error, prediction] or just prediction.
 
     compute_model(X_train, y_train, X_test, y_test)
-        Applies the MARS model across a dataset using parallel computation with Dask.
+        Parallel MARS regression across the entire spatial domain.
+        Returns xarray.DataArray with dims ('output'=['error','prediction'], Y, X).
 
-    compute_prob(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det)
-        Computes tercile probabilities for hindcast predictions over specified years.
+    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+        Computes tercile probabilities for deterministic hindcasts.
 
-    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year)
-        Generates a single-year forecast and computes tercile probabilities.
+    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
+             Predictor_for_year, best_code_da=None, best_shape_da=None,
+             best_loc_da=None, best_scale_da=None)
+        Full end-to-end forecast pipeline for one target year:
+        - deterministic MARS prediction
+        - tercile probabilities (PB, PN, PA)
+
+    Notes
+    -----
+    - **Input data requirements**:
+      - Target (y) should be continuous (rainfall, temperature, etc.).
+      - Predictors (X) can be continuous or categorical (MARS handles both).
+    - Negative predictions are clipped to zero (useful for rainfall or non-negative variables).
+    - MARS models are interpretable: final model consists of selected hinge functions.
+    - Large spatial domains benefit significantly from higher `nb_cores`.
+    - For `dist_method='bestfit'`, distribution fit results from `WAS_TransformData` must be provided.
+    - No explicit feature or target scaling is applied (MARS is invariant to monotonic transformations).
+
+    Warnings
+    --------
+    - Very small training sets per grid cell may lead to overfitting or degenerate models.
+    - Extremely skewed targets (e.g., heavy-tailed rainfall) may benefit from transformation
+      before modeling (not done automatically).
+    - MARS can produce piecewise-linear behavior; for very smooth functions, consider higher
+      max_degree or compare with other models (e.g., XGBoost, MLP).
     """
 
     def __init__(self, nb_cores=1, dist_method="nonparam", max_terms=21, max_degree=2, c=3):
@@ -7494,19 +8259,49 @@ class WAS_MARS_Model:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -7843,31 +8638,59 @@ class WAS_MARS_Model:
     # --------------------------------------------------------------------------
     def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         """
-        Generates a single-year forecast using MARS, then computes 
-        tercile probabilities using self.dist_method.
+        Generate a single-year deterministic forecast using the MARS model,
+        then compute tercile probabilities (PB, PN, PA) based on the selected
+        distribution method (``self.dist_method``).
+
+        The forecast is computed by:
+        - Standardizing the predictand over the climatology period
+        - Fitting the MARS model on historical data and predicting for the target year
+        - Reversing standardization to get raw-scale forecast values
+        - Computing probabilities using either best-fit distributions or nonparametric methods
 
         Parameters
         ----------
-        Predictant : xarray.DataArray
-            Observed data with dims (T, Y, X).
+        Predictant : xr.DataArray
+            Observed target variable (e.g., rainfall) with dimensions (T, Y, X).
         clim_year_start : int
-            Start year for climatology
+            Start year of climatology period for standardization and terciles.
         clim_year_end : int
-            End year for climatology
-        Predictor : xarray.DataArray
-            Historical predictor data with dims (T, features).
-        hindcast_det : xarray.DataArray
-            Historical deterministic forecast with dims (output=[error,prediction], T, Y, X).
-        Predictor_for_year : xarray.DataArray
-            Single-year predictor with shape (features,) or (1, features).
+            End year of climatology period.
+        Predictor : xr.DataArray
+            Historical predictors with dimensions (T, features).
+        hindcast_det : xr.DataArray
+            Historical deterministic hindcasts with dimensions (output=[error, prediction], T, Y, X).
+            Used for error variance estimation in nonparametric method.
+        Predictor_for_year : xr.DataArray
+            Predictors for the target forecast year, shape (features,) or (1, features).
+        best_code_da : xr.DataArray, optional
+            Distribution codes per grid cell (required for "bestfit" method).
+        best_shape_da : xr.DataArray, optional
+            Shape parameters per grid cell (required for "bestfit").
+        best_loc_da : xr.DataArray, optional
+            Location parameters per grid cell (required for "bestfit").
+        best_scale_da : xr.DataArray, optional
+            Scale parameters per grid cell (required for "bestfit").
 
         Returns
         -------
-        result_ : xarray.DataArray
-            dims (output=2, Y, X) => [error, prediction]. 
-            For a true forecast, error is typically NaN.
-        hindcast_prob : xarray.DataArray
-            dims (probability=3, Y, X) => [PB, PN, PA].
+        forecast_expanded : xr.DataArray
+            Deterministic forecast values with dimensions (T=1, Y, X).
+        forecast_prob : xr.DataArray
+            Probabilities with dimensions (probability=3, T=1, Y, X):
+            - probability: ['PB', 'PN', 'PA'] (Below, Normal, Above).
+
+        Raises
+        ------
+        ValueError
+            If "bestfit" method is selected but required distribution parameters are missing.
+            If invalid ``dist_method`` is set.
+
+        Notes
+        -----
+        - For real forecasts, the "error" in the deterministic output is NaN (no verification available).
+        - The forecast date is set to the first day of the month matching the predictand's time structure.
+        - Uses Dask for parallel computation across spatial chunks.
         """
         # Provide a dummy y_test with the same shape as the spatial domain => [NaNs]
         y_test_dummy = xr.full_like(Predictant.isel(T=0), np.nan)

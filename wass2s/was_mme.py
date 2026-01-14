@@ -663,19 +663,49 @@ class WAS_mme_Weighted:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -4713,19 +4743,49 @@ class WAS_mme_hpELM:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -5841,19 +5901,49 @@ class WAS_mme_hpELM_:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -6840,19 +6930,49 @@ class WAS_mme_MLP_:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -7893,19 +8013,49 @@ class WAS_mme_MLP:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -8959,19 +9109,49 @@ class WAS_mme_XGBoosting_:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -10084,19 +10264,49 @@ class WAS_mme_XGBoosting:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -11008,19 +11218,49 @@ class WAS_mme_RF_:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -12113,19 +12353,49 @@ class WAS_mme_RF:
     ):
         """
         Generic tercile probabilities using best-fit family per grid cell.
-
+    
         Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
         Strategy:
         - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
+            * Use ``best_guess[t]`` to adjust mean / location;
             * Keep shape parameters from climatology.
         - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         
         best_guess = np.asarray(best_guess, float)
@@ -13126,6 +13396,54 @@ class WAS_mme_Stacking:
     @staticmethod
     def calculate_tercile_probabilities_bestfit(best_guess, error_variance,
                                                 T1, T2, dist_code, dof):
+
+        """
+        Generic tercile probabilities using best-fit family per grid cell.
+    
+        Inputs (per grid cell):
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
+        Strategy:
+        - For each time step, build a predictive distribution of the same family:
+            * Use ``best_guess[t]`` to adjust mean / location;
+            * Keep shape parameters from climatology.
+        - Then compute probabilities:
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
+        """
+        
         best_guess = np.asarray(best_guess, float)
         error_variance = np.asarray(error_variance, float)
         n_time = best_guess.size
@@ -13884,6 +14202,49 @@ class WAS_mme_Stacking_:
     def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
         """
         Generic tercile probabilities using best-fit family per grid cell.
+    
+        Inputs (per grid cell):
+        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
+        Strategy:
+        - For each time step, build a predictive distribution of the same family:
+            * Use ``best_guess[t]`` to adjust mean / location;
+            * Keep shape parameters from climatology.
+        - Then compute probabilities:
+            * P(B) = F(T1)
+            * P(N) = F(T2) - F(T1)
+            * P(A) = 1 - F(T2)
+    
+        Parameters
+        ----------
+        best_guess : array-like
+            Forecast/hindcast best estimates.
+        error_variance : float
+            Variance of prediction errors.
+        T1 : float
+            Lower tercile threshold.
+        T2 : float
+            Upper tercile threshold.
+        dist_code : int
+            Distribution code (1-8).
+        shape : float
+            Shape parameter.
+        loc : float
+            Location parameter.
+        scale : float
+            Scale parameter.
+    
+        Returns
+        -------
+        array-like
+            Probabilities [P(B), P(N), P(A)].
+    
+        Notes
+        -----
+        - Uses :math:`F` as the CDF of the predictive distribution.
         """
         best_guess = np.asarray(best_guess, float)
         error_variance = np.asarray(error_variance, float)
@@ -15341,16 +15702,53 @@ def _weibull_shape_solver(k, M, V):
 
 def _calc_tercile_probs_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
     """
-    Predictive tercile probabilities using the best-fit family per grid cell.
+    Generic tercile probabilities using best-fit family per grid cell.
 
-    Inputs per cell:
-      best_guess : 1D array over T
-      error_variance : scalar
-      T1, T2 : scalars
-      dist_code : int in {1..8}
-      dof : degrees of freedom for t
-    Output: (3, T) array: [PB, PN, PA]
+    Inputs (per grid cell):
+    - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+    - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+    - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+    - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+
+    Strategy:
+    - For each time step, build a predictive distribution of the same family:
+        * Use ``best_guess[t]`` to adjust mean / location;
+        * Keep shape parameters from climatology.
+    - Then compute probabilities:
+        * P(B) = F(T1)
+        * P(N) = F(T2) - F(T1)
+        * P(A) = 1 - F(T2)
+
+    Parameters
+    ----------
+    best_guess : array-like
+        Forecast/hindcast best estimates.
+    error_variance : float
+        Variance of prediction errors.
+    T1 : float
+        Lower tercile threshold.
+    T2 : float
+        Upper tercile threshold.
+    dist_code : int
+        Distribution code (1-8).
+    shape : float
+        Shape parameter.
+    loc : float
+        Location parameter.
+    scale : float
+        Scale parameter.
+
+    Returns
+    -------
+    array-like
+        Probabilities [P(B), P(N), P(A)].
+
+    Notes
+    -----
+    - Uses :math:`F` as the CDF of the predictive distribution.
     """
+
+    
     if not _HAS_SCIPY:
         n_time = np.asarray(best_guess).size
         return np.full((3, n_time), np.nan, float)

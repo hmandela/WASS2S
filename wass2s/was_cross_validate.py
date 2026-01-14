@@ -250,40 +250,40 @@ class WAS_Cross_Validator:
 
             return xr.where(hindcast_det<0, 0, hindcast_det)*mask, xr.where(hindcast_prob<0, 0, hindcast_prob)*mask
 
-        elif isinstance(model, WAS_KCCA):
+        # elif isinstance(model, WAS_KCCA):
 
-            all_params = {**model_params}
-            params_prob = {
-                key: value for key, value in all_params.items() 
-                if key not in model.compute_model.__code__.co_varnames
-            }
+        #     all_params = {**model_params}
+        #     params_prob = {
+        #         key: value for key, value in all_params.items() 
+        #         if key not in model.compute_model.__code__.co_varnames
+        #     }
 
-            params_models = {
-                key: value for key, value in all_params.items() 
-                if key not in params_prob
-            } 
+        #     params_models = {
+        #         key: value for key, value in all_params.items() 
+        #         if key not in params_prob
+        #     } 
 
             
-            mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+        #     mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
             
-            Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
+        #     Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
 
-            print("Cross-validation ongoing")
-            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor_['T'], self.nb_omit), total=n_splits), start=1):
+        #     print("Cross-validation ongoing")
+        #     for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor_['T'], self.nb_omit), total=n_splits), start=1):
 
-                X_train_, X_test_ = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
+        #         X_train_, X_test_ = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
                 
-                y_train, y_test = Predictant_.isel(T=train_index), Predictant_.isel(T=test_index)
+        #         y_train, y_test = Predictant_.isel(T=train_index), Predictant_.isel(T=test_index)
                 
-                pred_det = model.compute_model(X_train, y_train, X_test_, y_test, **params_models)
-                hindcast_det.append(pred_det)
+        #         pred_det = model.compute_model(X_train, y_train, X_test_, y_test, **params_models)
+        #         hindcast_det.append(pred_det)
 
-            hindcast_det = xr.concat(hindcast_det, dim="T")
-            hindcast_det['T'] = Predictant_['T']
-            hindcast_det = reverse_standardize(hindcast_det, Predictant, clim_year_start, clim_year_end)
-            hindcast_prob = model.compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det, **params_prob)
+        #     hindcast_det = xr.concat(hindcast_det, dim="T")
+        #     hindcast_det['T'] = Predictant_['T']
+        #     hindcast_det = reverse_standardize(hindcast_det, Predictant, clim_year_start, clim_year_end)
+        #     hindcast_prob = model.compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det, **params_prob)
 
-            return xr.where(hindcast_det<0, 0, hindcast_det)*mask, xr.where(hindcast_prob<0, 0, hindcast_prob)*mask
+        #     return xr.where(hindcast_det<0, 0, hindcast_det)*mask, xr.where(hindcast_prob<0, 0, hindcast_prob)*mask
 
 
         elif isinstance(model, WAS_Analog):

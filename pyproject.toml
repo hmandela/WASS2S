@@ -42,6 +42,10 @@ dependencies = [
     "rioxarray",
     "SkillMetrics",
     "optuna"    
+    # "torch",
+    # "lightning",
+    # "cca-zoo"
+
 ]
 
 [project.urls]

@@ -17,9 +17,39 @@ from enum import Enum
 
 class WAS_compute_onset:
     """
-    A class that encapsulates methods for transforming precipitation data
-    from different formats (CPT, CDT) and computing onset dates based on
-    rainfall criteria.
+    Class for computing agricultural seasonal onset dates based on cumulative rainfall criteria.
+
+    This class implements a widely used onset detection method in West African agrometeorology,
+    particularly for Sahel and Sudanian zones. It supports multiple agro-climatic zones with
+    zone-specific onset criteria (start/end search dates, cumulative rainfall threshold,
+    maximum dry days allowed, rainy day threshold).
+
+    Key Features:
+    - Handles both station-based (CDT format) and gridded (xarray) daily rainfall data
+    - Automatically assigns zones based on mean annual rainfall and latitude (Sahel–Guinea)
+    - Parallel computation using Dask for large gridded datasets
+    - Produces onset dates in day-of-year format (1–365/366)
+
+    Standard Zones & Criteria (default):
+    0. Sahel100_0mm:   start 01-Jun, ≥10 mm, ≤25 dry days, end 30-Aug
+    1. Sahel200_100mm: start 15-May, ≥15 mm, ≤25 dry days, end 15-Aug
+    2. Sahel400_200mm: start 01-May, ≥15 mm, ≤20 dry days, end 31-Jul
+    3. Sahel600_400mm: start 15-Mar, ≥20 mm, ≤20 dry days, end 31-Jul
+    4. Soudan:         start 15-Mar, ≥20 mm, ≤10 dry days, end 31-Jul
+    5. Golfe Of Guinea: start 01-Feb, ≥20 mm, ≤10 dry days, end 15-Jun
+
+    References:
+    - AGRHYMET Regional Centre (various operational guidelines)
+    - Sivakumar (1988, 1991): Methodology for onset prediction in West Africa
+    - Common practice in West African national meteorological services
+
+    Parameters
+    ----------
+    user_criteria : dict, optional
+        Custom zone-specific onset criteria. If None, uses default dictionary.
+        Expected format: {zone_id: {"zone_name": str, "start_search": "MM-DD",
+        "cumulative": float, "number_dry_days": int,
+        "thrd_rain_day": float, "end_search": "MM-DD"}}
     """
 
     # Default class-level criteria dictionary
@@ -470,8 +500,42 @@ class WAS_compute_onset:
 
 class WAS_compute_onset_dry_spell:
     """
-    A class for computing the longest dry spell length 
-    after the onset of a rainy season, based on user-defined criteria.
+    Class for computing the **longest dry spell length after the onset** of the rainy season.
+
+    This class extends standard onset detection by calculating the maximum consecutive dry days
+    within a user-defined window (``nbjour``) following the detected onset date.
+
+    The onset detection follows the same cumulative rainfall + dry-day tolerance method used
+    in West African agrometeorology (AGRHYMET, national services), with zone-specific criteria.
+
+    Key Features:
+    - Computes onset date (same logic as ``WAS_compute_onset``)
+    - Then finds the longest dry spell (consecutive days ≤ ``thrd_rain_day`` mm) within the next ``nbjour`` days
+    - Supports station (CDT) and gridded (xarray) daily rainfall data
+    - Automatically assigns agro-climatic zones based on mean annual rainfall and latitude
+    - Parallel computation with Dask for large grids
+
+    Default Zones & Criteria:
+    0. Sahel100_0mm     → start 01-Jun, ≥10 mm, ≤25 dry days, check 40 days after onset
+    1. Sahel200_100mm   → start 15-May, ≥15 mm, ≤25 dry days, check 40 days
+    2. Sahel400_200mm   → start 01-May, ≥15 mm, ≤20 dry days, check 40 days
+    3. Sahel600_400mm   → start 15-Mar, ≥20 mm, ≤20 dry days, check 45 days
+    4. Soudan           → start 15-Mar, ≥20 mm, ≤10 dry days, check 50 days
+    5. Golfe of Guinea  → start 01-Feb, ≥20 mm, ≤10 dry days, check 50 days
+
+    References:
+    - AGRHYMET Regional Centre operational methodologies
+    - Sivakumar (1988, 1991): Onset and dry spell analysis in West Africa
+    - Common practice in Sahelian and Sudanian national meteorological services
+
+    Parameters
+    ----------
+    user_criteria : dict, optional
+        Custom zone-specific criteria. If None, uses default dictionary.
+        Expected keys: zone_id → {"zone_name": str, "start_search": "MM-DD",
+        "cumulative": float, "number_dry_days": int,
+        "thrd_rain_day": float, "end_search": "MM-DD",
+        "nbjour": int}
     """
 
     # Default class-level criteria dictionary
@@ -810,7 +874,7 @@ class WAS_compute_onset_dry_spell:
                 if trouv == 1:
                     break
 
-            # Compute the longest dry spell within `nbjour` days after the onset
+            # Compute the longest dry spell within ``nbjour`` days after the onset
             if not np.isnan(deb_saison):
                 pluie_nbjour = x[int(deb_saison) : min(int(deb_saison) + nbjour + 1, len(x))]
                 rainy_days = np.where(pluie_nbjour > jour_pluvieux)[0]
@@ -1017,8 +1081,40 @@ class WAS_compute_onset_dry_spell:
 
 class WAS_compute_cessation:
     """
-    A class to compute cessation dates based on soil moisture balance for different
-    regions and criteria, leveraging parallel computation for efficiency.
+    Class for computing the **cessation date** (end of rainy season) based on **soil moisture balance**.
+
+    This class uses a simple water balance model to determine when soil moisture is depleted,
+    marking the end of the rainy season. It is widely used in West African agrometeorology
+    (AGRHYMET, national services) for Sahel, Sudanian, and Guinean zones.
+
+    Key Features:
+    - Soil water balance: rainfall - ETP (evapotranspiration), capped at soil retention capacity
+    - Cessation date: first day when soil moisture reaches zero after the search start
+    - Zone-specific criteria (start search, ETP, retention capacity, end search)
+    - Supports station (CDT format) and gridded (xarray) daily rainfall data
+    - Automatic agro-climatic zone assignment based on mean annual rainfall and latitude
+    - Parallel computation with Dask for large grids
+
+    Default Zones & Criteria:
+    0. Sahel100_0mm     → start search 01-Sep, ETP 5.0 mm/day, capacity 70 mm, end 30-Sep
+    1. Sahel200_100mm   → start search 01-Sep, ETP 5.0 mm/day, capacity 70 mm, end 05-Oct
+    2. Sahel400_200mm   → start search 01-Sep, ETP 5.0 mm/day, capacity 70 mm, end 10-Nov
+    3. Sahel600_400mm   → start search 15-Sep, ETP 5.0 mm/day, capacity 70 mm, end 15-Nov
+    4. Soudan           → start search 01-Oct, ETP 4.5 mm/day, capacity 70 mm, end 30-Nov
+    5. Golfe of Guinea  → start search 15-Oct, ETP 4.0 mm/day, capacity 70 mm, end 01-Dec
+
+    References:
+    - AGRHYMET Regional Centre operational methodologies
+    - Sivakumar (1991): Soil water balance and cessation prediction in West Africa
+    - Common practice in Sahelian and Sudanian national meteorological services
+
+    Parameters
+    ----------
+    user_criteria : dict, optional
+        Custom zone-specific cessation criteria. If None, uses default dictionary.
+        Expected keys: zone_id → {"zone_name": str, "date_dry_soil": "MM-DD",
+        "start_search": "MM-DD", "ETP": float,
+        "Cap_ret_maxi": float, "end_search": "MM-DD"}
     """
 
     # Default class-level criteria dictionary
@@ -1374,8 +1470,47 @@ class WAS_compute_cessation:
 
 class WAS_compute_cessation_dry_spell:
     """
-    A class for computing the longest dry spell length 
-    after the onset of a rainy season, based on user-defined criteria.
+    Class for computing the **longest dry spell length** between the onset and cessation
+    of the rainy season, using a two-stage approach:
+
+    1. Detect **onset** (start of rainy season) using cumulative rainfall criteria
+    2. Detect **cessation** (end of rainy season) using soil water balance
+    3. Calculate the maximum consecutive dry days (≤ thrd_rain_day mm) within that window
+
+    This is a critical agro-meteorological indicator in West Africa, especially for assessing
+    drought risk during the growing season after planting.
+
+    Key Features:
+    - Uses zone-specific criteria for both onset and cessation
+    - Automatic agro-climatic zone assignment based on mean annual rainfall and latitude
+    - Supports station (CDT format) and gridded (xarray) daily rainfall data
+    - Parallel computation with Dask for large domains
+    - Returns the longest dry spell length (in days) between onset and cessation
+
+    Default Zones & Criteria:
+    0. Sahel100_0mm     → onset: 01-May → 15-Aug | cessation: 01-Sep → 30-Sep
+    1. Sahel200_100mm   → onset: 15-May → 15-Aug | cessation: 01-Sep → 05-Oct
+    2. Sahel400_200mm   → onset: 01-May → 31-Jul | cessation: 01-Sep → 10-Nov
+    3. Sahel600_400mm   → onset: 15-Mar → 31-Jul | cessation: 15-Sep → 15-Nov
+    4. Soudan           → onset: 15-Mar → 31-Jul | cessation: 01-Oct → 30-Nov
+    5. Golfe of Guinea  → onset: 01-Feb → 15-Jun | cessation: 15-Oct → 01-Dec
+
+    References:
+    - AGRHYMET Regional Centre operational methodologies
+    - Sivakumar (1991): Methodology for onset, cessation, and dry spell analysis
+    - Common practice in West African national meteorological and agricultural services
+
+    Parameters
+    ----------
+    user_criteria : dict, optional
+        Custom zone-specific criteria. If None, uses default dictionary.
+        Expected keys: zone_id → {"zone_name": str,
+        "start_search1": "MM-DD", "cumulative": float,
+        "number_dry_days": int, "thrd_rain_day": float,
+        "end_search1": "MM-DD", "nbjour": int,
+        "date_dry_soil": "MM-DD", "start_search2": "MM-DD",
+        "ETP": float, "Cap_ret_maxi": float,
+        "end_search2": "MM-DD"}
     """
 
     # Default class-level criteria dictionary
@@ -2045,8 +2180,65 @@ class WAS_compute_cessation_dry_spell:
 
 class WAS_count_dry_spells:
     """
-    A class to compute the number of dry spells within a specified period
-    (onset to cessation) for each pixel or station in a daily rainfall dataset.
+    Class for computing the **number of dry spells** of a specified length
+    occurring between the onset and cessation dates of the rainy season.
+
+    This class is designed to quantify intra-seasonal dry spell risk — a critical
+    indicator for agriculture in West Africa, where consecutive dry days after
+    planting can severely impact crop establishment and yield.
+
+    Key Features:
+    - Counts dry spells (consecutive days ≤ ``dry_threshold`` mm) between onset and cessation
+    - Accepts onset and cessation dates as pre-computed xarray DataArrays or CPT DataFrames
+    - Supports both station-based (CDT format) and gridded (xarray) daily rainfall data
+    - Efficient parallel computation using Dask for large domains
+    - Outputs in CPT-compatible wide format for station data
+
+    Typical Use Case:
+    After computing onset (e.g., via ``WAS_compute_onset``) and cessation
+    (e.g., via ``WAS_compute_cessation``), use this class to count risky dry spells
+    (e.g., 10-day, 15-day) during the growing window.
+
+    References:
+    - AGRHYMET Regional Centre operational dry spell monitoring
+    - Sivakumar (1991): Methodology for dry spell analysis in Sahelian agriculture
+    - Common practice in West African national meteorological and agricultural services
+
+    Parameters
+    ----------
+    None (no initialization parameters required — all criteria passed at compute time)
+
+    Methods
+    -------
+    compute_insitu(daily_df, onset_df_cpt, cessation_df_cpt, dry_spell_length, dry_threshold=1.0)
+        Compute number of dry spells for station data (CDT input, CPT output).
+
+    compute(daily_data, onset_date, cessation_date, dry_spell_length, dry_threshold, nb_cores)
+        Compute number of dry spells for gridded xarray data (parallelized).
+
+    Examples
+    --------
+    Count number of 10-day dry spells between onset and cessation (gridded):
+
+    >>> count_calc = WAS_count_dry_spells()
+    >>> dry_spell_count = count_calc.compute(
+    ...     daily_pr,           # xarray.DataArray daily rainfall
+    ...     onset_da,           # xarray.DataArray of onset dates
+    ...     cessation_da,       # xarray.DataArray of cessation dates
+    ...     dry_spell_length=10,
+    ...     dry_threshold=1.0,
+    ...     nb_cores=8
+    ... )
+
+    For station data (CDT rainfall, CPT onset/cessation):
+
+    >>> count_cpt = count_calc.compute_insitu(
+    ...     daily_cdt_df,
+    ...     onset_cpt_df,
+    ...     cessation_cpt_df,
+    ...     dry_spell_length=15,
+    ...     dry_threshold=0.5
+    ... )
     """
 
     @staticmethod
@@ -2476,9 +2668,67 @@ class WAS_count_dry_spells:
 
 
 class WAS_count_wet_spells:
+
     """
-    A class to compute the number of wet spells within a specified period
-    (onset to cessation) for each pixel or station in a daily rainfall dataset.
+    Class for computing the **number of wet spells** of a specified length
+    occurring between the onset and cessation dates of the rainy season.
+
+    This class is designed to quantify periods of consecutive rainy days during the
+    growing season — a key indicator for assessing moisture availability, crop growth,
+    and potential waterlogging risk in West African agriculture.
+
+    Key Features:
+    - Counts wet spells (consecutive days ≥ ``wet_threshold`` mm) between onset and cessation
+    - Accepts pre-computed onset and cessation dates (xarray DataArrays or CPT DataFrames)
+    - Supports both station-based (CDT format) and gridded (xarray) daily rainfall data
+    - Efficient parallel computation using Dask for large-scale gridded analysis
+    - Outputs in CPT-compatible wide format for station data
+
+    Typical Use Case:
+    After calculating onset (e.g., ``WAS_compute_onset``) and cessation
+    (e.g., ``WAS_compute_cessation``), use this class to count sequences of wet days
+    (e.g., 5-day, 7-day wet spells) that support crop development or indicate flood risk.
+
+    References:
+    - AGRHYMET Regional Centre operational wet spell monitoring
+    - Sivakumar (1991): Rainfall variability and wet spell analysis in Sahelian agriculture
+    - Common practice in West African national meteorological and agricultural services
+
+    Parameters
+    ----------
+    None (no initialization parameters required — all criteria passed at compute time)
+
+    Methods
+    -------
+    compute_insitu(daily_df, onset_df_cpt, cessation_df_cpt, wet_spell_length, wet_threshold=1.0)
+        Compute number of wet spells for station data (CDT input, CPT output).
+
+    compute(daily_data, onset_date, cessation_date, wet_spell_length, wet_threshold, nb_cores)
+        Compute number of wet spells for gridded xarray data (parallelized).
+
+    Examples
+    --------
+    Count number of 7-day wet spells between onset and cessation (gridded):
+
+    >>> wet_calc = WAS_count_wet_spells()
+    >>> wet_spell_count = wet_calc.compute(
+    ...     daily_pr,           # xarray.DataArray daily rainfall (mm)
+    ...     onset_da,           # xarray.DataArray of onset dates (day-of-year)
+    ...     cessation_da,       # xarray.DataArray of cessation dates
+    ...     wet_spell_length=7,
+    ...     wet_threshold=1.0,  # mm/day
+    ...     nb_cores=8
+    ... )
+
+    For station data (CDT rainfall, CPT onset/cessation):
+
+    >>> wet_cpt = wet_calc.compute_insitu(
+    ...     daily_cdt_df,
+    ...     onset_cpt_df,
+    ...     cessation_cpt_df,
+    ...     wet_spell_length=5,
+    ...     wet_threshold=2.0
+    ... )
     """
 
     @staticmethod
@@ -2857,8 +3107,63 @@ class WAS_count_wet_spells:
 
 class WAS_count_rainy_days:
     """
-    A class to compute the number of rainy days between onset and cessation dates
-    for each pixel or station in a daily rainfall dataset.
+    Class for computing the **number of rainy days** (days with precipitation ≥ a threshold)
+    between the onset and cessation dates of the rainy season.
+
+    This is a key agro-meteorological indicator used in West Africa to assess seasonal
+    moisture availability during the growing period — directly relevant for crop water
+    requirements, yield estimation, and drought/vulnerability assessments.
+
+    Key Features:
+    - Counts days where daily rainfall ≥ ``rain_threshold`` (default 0.85 mm)
+    - Uses pre-computed onset and cessation dates (xarray DataArrays or CPT DataFrames)
+    - Supports both station-based (CDT format) and gridded (xarray) daily rainfall data
+    - Efficient parallel computation with Dask for large-scale gridded analysis
+    - Outputs in CPT-compatible wide format for station data
+
+    Typical Use Case:
+    After calculating onset (e.g., via ``WAS_compute_onset``) and cessation
+    (e.g., via ``WAS_compute_cessation``), use this class to quantify the total number
+    of rainy days available to crops during the growing window.
+
+    References:
+    - AGRHYMET Regional Centre seasonal rainfall monitoring
+    - Sivakumar (1991): Rainfall characteristics and agricultural planning in West Africa
+    - Common practice in Sahelian and Sudanian national meteorological services
+
+    Parameters
+    ----------
+    None (no initialization parameters required — all criteria passed at compute time)
+
+    Methods
+    -------
+    compute_insitu(daily_df, onset_df_cpt, cessation_df_cpt, rain_threshold=0.85)
+        Compute number of rainy days for station data (CDT input, CPT output).
+
+    compute(daily_data, onset_date, cessation_date, rain_threshold, nb_cores)
+        Compute number of rainy days for gridded xarray data (parallelized).
+
+    Examples
+    --------
+    Count rainy days (≥ 0.85 mm) between onset and cessation (gridded):
+
+    >>> rainy_calc = WAS_count_rainy_days()
+    >>> rainy_days_count = rainy_calc.compute(
+    ...     daily_pr,           # xarray.DataArray daily rainfall (mm)
+    ...     onset_da,           # xarray.DataArray of onset dates (day-of-year)
+    ...     cessation_da,       # xarray.DataArray of cessation dates
+    ...     rain_threshold=0.85,
+    ...     nb_cores=8
+    ... )
+
+    For station data (CDT rainfall, CPT onset/cessation):
+
+    >>> rainy_cpt = rainy_calc.compute_insitu(
+    ...     daily_cdt_df,
+    ...     onset_cpt_df,
+    ...     cessation_cpt_df,
+    ...     rain_threshold=1.0
+    ... )
     """
 
     @staticmethod
@@ -3132,7 +3437,7 @@ class WAS_count_rainy_days:
             CDT precipitation data (ID column = date; columns = stations).
             Follows the standard CDT format.
         onset_df_cpt : pd.DataFrame
-            Result of `WAS_compute_onset.compute_insitu(...)` for onset (CPT format).
+            Result of ``WAS_compute_onset.compute_insitu(...)`` for onset (CPT format).
         cessation_df_cpt : pd.DataFrame
             Same format for cessation (CPT format).
         rain_threshold : float, optional
@@ -3321,7 +3626,7 @@ class WAS_count_rainy_days:
 #             window_data = np.vstack(arrays)
             
 #             # Calculate percentile along axis 0 (time/samples), ignoring NaNs
-#             # Result: vector of thresholds for each station for day `d`
+#             # Result: vector of thresholds for each station for day ``d``
 #             # Suppress "All-NaN slice" warnings
 #             with np.errstate(invalid='ignore'):
 #                 th = np.nanpercentile(window_data, percentile, axis=0)
@@ -3479,15 +3784,69 @@ class ExtremeType(Enum):
 
 class WAS_TempPercentileIndices:
     """
-    Correct implementation of ETCCDI temperature percentile indices.
-    
-    Standard ETCCDI Indices:
-    - Hot Days: TX90p (daily max temperature > 90th percentile)
-    - Hot Nights: TN90p (daily min temperature > 90th percentile)
-    - Cold Days: TX10p (daily max temperature < 10th percentile)
-    - Cold Nights: TN10p (daily min temperature < 10th percentile)
-    
-    Reference: ETCCDI Climate Change Indices (2009)
+    Implementation of ETCCDI temperature percentile-based extreme indices.
+
+    Computes the annual percentage of days/nights exceeding (hot) or falling below (cold)
+    a specified percentile threshold, using a 5-day centered window for percentile calculation
+    (standard ETCCDI methodology).
+
+    Supported ETCCDI Indices:
+    - **TX90p** / **TN90p**: Percentage of hot days (TX > 90th) / hot nights (TN > 90th)
+    - **TX10p** / **TN10p**: Percentage of cold days (TX < 10th) / cold nights (TN < 10th)
+    - Custom percentiles are also supported (e.g., TX95p, TN99p, TX05p)
+
+    Key Features:
+    - 5-day centered window for calendar-day percentiles (avoids day-of-year bias)
+    - Proper leap-year handling (Feb 29 mapped to Feb 28)
+    - Seasonal filtering option
+    - Bootstrap confidence intervals (optional)
+    - Works with both station (CDT format) and gridded (xarray) data
+
+    References:
+    - ETCCDI Climate Change Indices (2009)
+    - Zhang et al. (2011): Indices for monitoring changes in extremes
+    - Sillmann et al. (2013): Climate extremes indices in the CMIP5 ensemble
+
+    Parameters
+    ----------
+    base_period : slice
+        Climatological base period for percentile calculation, e.g. slice("1961", "1990")
+    percentile : float, default=90
+        Percentile threshold:
+        - For hot extremes: 90, 95, 99 (days above percentile)
+        - For cold extremes: 10, 5, 1 (days below percentile)
+    season : list of int, optional
+        Months to include in analysis (e.g., [6,7,8] for JJA)
+    var_type : {'TMAX', 'TMIN'}, default='TMAX'
+        Temperature variable: 'TMAX' (TX - daily max) or 'TMIN' (TN - daily min)
+    extreme_type : {'hot', 'cold'}, default='hot'
+        Type of extreme: 'hot' (above percentile) or 'cold' (below percentile)
+    bootstrap_samples : int, default=10
+        Number of bootstrap samples for confidence interval calculation
+    min_base_years : int, default=15
+        Minimum number of years required in base period (warning if fewer)
+
+    Examples
+    --------
+    Standard TX90p (Warm days percentage):
+
+    >>> calc = WAS_TempPercentileIndices(
+    ...     base_period=slice("1961", "1990"),
+    ...     percentile=90,
+    ...     var_type='TMAX',
+    ...     extreme_type='hot'
+    ... )
+    >>> tx90p = calc.compute_xarray(tmax_da)
+
+    Cold nights (TN10p) for JJA season:
+
+    >>> cold_nights = WAS_TempPercentileIndices(
+    ...     base_period=slice("1961", "1990"),
+    ...     percentile=10,
+    ...     var_type='TMIN',
+    ...     extreme_type='cold',
+    ...     season=[6, 7, 8]
+    ... ).compute_xarray(tmin_da)
     """
     
     def __init__(
@@ -4246,20 +4605,57 @@ class ETCCDITempIndices:
 
 class WAS_PrecipIndices:
     """
-    Correct implementation of ETCCDI precipitation indices (R95p, R99p, etc.)
-    
+    Implementation of ETCCDI extreme precipitation indices, specifically R95p and R99p.
+
+    These indices measure the **annual total precipitation from very/extremely wet days**:
+
+    - **R95p**: Total precipitation from days when precipitation ≥ 95th percentile of wet-day precipitation in the base period
+    - **R99p**: Total precipitation from days when precipitation ≥ 99th percentile of wet-day precipitation in the base period
+
+    A **wet day** is defined as precipitation ≥ ``wet_day_threshold`` (default 1.0 mm).
+
+    Key Features:
+    - Uses only **wet days** in the base period for percentile calculation (ETCCDI standard)
+    - Supports seasonal filtering (e.g., JJAS season)
+    - Handles both station-based (CDT format) and gridded (xarray) data
+    - Proper leap-year handling and missing value treatment
+    - Outputs in CDT-compatible format for station data
+
+    References:
+    - ETCCDI Climate Change Indices (2009)
+    - Zhang et al. (2011): Indices for monitoring changes in extremes
+    - Sillmann et al. (2013): Climate extremes indices in the CMIP5 multi-model ensemble
+
     Parameters
     ----------
     base_period : slice
-        Slice for base period years, e.g., slice("1991", "2020")
-    percentile : float
-        Percentile value (95 for R95p, 99 for R99p)
-    season : list, optional
-        Months to consider (e.g., [6, 7, 8, 9] for JJAS)
-    wet_day_threshold : float
-        Minimum precipitation for a wet day (default 1.0 mm)
-    min_base_years : int
-        Minimum years required in base period (default 15)
+        Base period for percentile calculation, e.g. slice("1991", "2020")
+    percentile : float, default=95
+        Percentile threshold (95 → R95p, 99 → R99p)
+    season : list of int, optional
+        Months to include in analysis (e.g., [6,7,8,9] for JJAS)
+    wet_day_threshold : float, default=1.0
+        Minimum precipitation amount (mm) to consider a wet day
+    min_base_years : int, default=15
+        Minimum number of years required in base period (warning issued if fewer)
+
+    Examples
+    --------
+    Compute R95p for full year:
+
+    >>> r95p_calc = WAS_PrecipIndices(
+    ...     base_period=slice("1991", "2020"),
+    ...     percentile=95
+    ... )
+    >>> r95p = r95p_calc.compute_xarray(pr_da)  # pr_da is precipitation DataArray
+
+    Compute R99p for JJAS season only:
+
+    >>> r99p_jjas = WAS_PrecipIndices(
+    ...     base_period=slice("1991", "2020"),
+    ...     percentile=99,
+    ...     season=[6,7,8,9]
+    ... ).compute_xarray(pr_da)
     """
     
     def __init__(
@@ -4862,7 +5258,6 @@ class WAS_PrecipIndices:
 
 
 
-
 class HeatWaveMetric(Enum):
     """ETCCDI Heat Wave Indices."""
     HWDI = "HWDI"  # Heat Wave Duration Index (days in longest heat wave)
@@ -4881,17 +5276,72 @@ class HeatWaveDefinition:
 
 class WAS_HeatWaveIndices:
     """
-    Correct implementation of ETCCDI heat wave indices.
-    
-    Standard ETCCDI Indices:
-    1. WSDI (Warm Spell Duration Index): Annual count of days with at least 
-       6 consecutive days when TX > 90th percentile
-    2. HWF (Heat Wave Frequency): Annual count of heat wave events
-    3. HWDI (Heat Wave Duration Index): Annual maximum length of heat waves
-    
-    Reference: 
+    Implementation of ETCCDI heat wave indices for daily temperature data.
+
+    This class computes standard ETCCDI heat wave indices based on daily maximum
+    temperature (TX) and optionally daily minimum temperature (TN) for compound events.
+
+    Supported Indices (ETCCDI definitions):
+
+    - **WSDI** (Warm Spell Duration Index): Annual count of days in spells of at least
+      6 consecutive days where TX > 90th percentile (default).
+    - **HWF** (Heat Wave Frequency): Annual count of heat wave events (≥ min_consecutive_days).
+    - **HWDI** (Heat Wave Duration Index): Annual maximum duration of any heat wave.
+
+    Key Features:
+    - Uses 5-day centered window for percentile calculation (standard ETCCDI practice)
+    - Handles leap years (maps Feb 29 → Feb 28 for thresholds)
+    - Supports seasonal filtering
+    - Supports compound heat waves (both TX and TN exceed thresholds)
+    - Optional minimum intensity filter
+    - Works with both in-situ (CDT format) and gridded (xarray) data
+
+    References:
     - ETCCDI Climate Change Indices (2009)
     - Perkins & Alexander (2013): On the measurement of heat waves
+    - Zhang et al. (2011): Indices for monitoring changes in extremes
+
+    Parameters
+    ----------
+    base_period : slice
+        Climatological base period for percentile calculation, e.g. slice("1961", "1990")
+    tx_percentile : float, default=90
+        Percentile threshold for daily maximum temperature (TX)
+    tn_percentile : float, optional
+        Percentile threshold for daily minimum temperature (TN) — for compound events
+    min_consecutive_days : int, default=3
+        Minimum number of consecutive days to define a heat wave
+        (ETCCDI uses 6 for WSDI)
+    max_break_days : int, default=1
+        Maximum number of non-hot days allowed within a heat wave (currently not used)
+    season : list of int, optional
+        Months to consider (e.g., [5,6,7,8,9] for May–Sep)
+    require_both_tx_tn : bool, default=False
+        If True, requires both TX and TN to exceed their percentiles (compound heat wave)
+    min_intensity : float, optional
+        Minimum mean temperature anomaly required for a heat wave to be counted
+
+    Examples
+    --------
+    Standard WSDI (ETCCDI definition):
+
+    >>> calc = WAS_HeatWaveIndices(
+    ...     base_period=slice("1961", "1990"),
+    ...     tx_percentile=90,
+    ...     min_consecutive_days=6
+    ... )
+    >>> wsdi = calc.compute_xarray(ds_tx, metric="WSDI")
+
+    Compound heat waves (TX + TN):
+
+    >>> compound = WAS_HeatWaveIndices(
+    ...     base_period=slice("1961", "1990"),
+    ...     tx_percentile=90,
+    ...     tn_percentile=90,
+    ...     min_consecutive_days=3,
+    ...     require_both_tx_tn=True
+    ... )
+    >>> hwf_compound = compound.compute_xarray(ds_tx, ds_tn, metric="HWF")
     """
     
     def __init__(
@@ -5556,7 +6006,6 @@ class WAS_HeatWaveIndices:
         
         return result
 
-
 # Convenience class for standard ETCCDI WSDI
 class ETCCDIHeatWaveIndices:
     """Factory for creating standard ETCCDI heat wave indices."""
@@ -5608,7 +6057,6 @@ class ETCCDIHeatWaveIndices:
             season=season,
             require_both_tx_tn=True
         )
-
         
 # #### look this part again -----
 # class WAS_compute_HWSDI:
@@ -5651,7 +6099,7 @@ class ETCCDIHeatWaveIndices:
 #     @staticmethod
 #     def _count_consecutive_days(data, min_days=6):
 #         """
-#         Count sequences of at least `min_days` consecutive True values in a boolean array.
+#         Count sequences of at least ``min_days`` consecutive True values in a boolean array.
 
 #         Parameters
 #         ----------
@@ -5663,7 +6111,7 @@ class ETCCDIHeatWaveIndices:
 #         Returns
 #         -------
 #         int
-#             Count of sequences with at least `min_days` consecutive True values.
+#             Count of sequences with at least ``min_days`` consecutive True values.
 #         """
 #         count = 0
 #         current_streak = 0
@@ -5809,7 +6257,7 @@ class ETCCDIHeatWaveIndices:
 #     @staticmethod
 #     def _count_consecutive_days(data, min_days=6):
 #         """
-#         Count sequences of at least `min_days` consecutive True values in a boolean array.
+#         Count sequences of at least ``min_days`` consecutive True values in a boolean array.
 
 #         Parameters
 #         ----------
@@ -5821,7 +6269,7 @@ class ETCCDIHeatWaveIndices:
 #         Returns
 #         -------
 #         int
-#             Count of sequences with at least `min_days` consecutive True values.
+#             Count of sequences with at least ``min_days`` consecutive True values.
 #         """
 #         count = 0
 #         current_streak = 0
@@ -5967,7 +6415,7 @@ class ETCCDIHeatWaveIndices:
 #     @staticmethod
 #     def _count_consecutive_days(data, min_days=5):
 #         """
-#         Count sequences of at least `min_days` consecutive True values in a boolean array.
+#         Count sequences of at least ``min_days`` consecutive True values in a boolean array.
 
 #         Parameters
 #         ----------
@@ -5979,7 +6427,7 @@ class ETCCDIHeatWaveIndices:
 #         Returns
 #         -------
 #         int
-#             Count of sequences with at least `min_days` consecutive True values.
+#             Count of sequences with at least ``min_days`` consecutive True values.
 #         """
 #         count = 0
 #         current_streak = 0

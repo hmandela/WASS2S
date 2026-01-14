@@ -31,9 +31,7 @@ import datetime as dt
 import time as _time
 import urllib.request
 from typing import List, Tuple, Sequence, Optional
-
-
-# Suppress warnings
+# Suppress warnings for urllib3 to avoid SSL certificate verification errors
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.getLogger("cdsapi").setLevel(logging.ERROR)
 
@@ -887,15 +885,15 @@ class WAS_Download:
         -----
         - The function downloads data from the CDS dataset "sis-agrometeorological-indicators".
         - Data is downloaded year-by-year as ZIP files containing NetCDF files, which are
-        extracted, concatenated, and saved as a single NetCDF file per variable.
+          extracted, concatenated, and saved as a single NetCDF file per variable.
         - Temperature variables ("AGRO.TMIN", "AGRO.TEMP", "AGRO.TMAX") are converted
-        from Kelvin to Celsius.
+          from Kelvin to Celsius.
         - Solar radiation ("AGRO.DSWR") is converted from J/m^2/day to W/m^2.
         - Coordinates are renamed to "X" (longitude), "Y" (latitude), and "T" (time),
-        with latitude flipped to ascending order.
+          with latitude flipped to ascending order.
         - The function requires a valid CDS API key configured in `~/.cdsapirc`.
         - Downloads are skipped for a variable if any year's data fails to download
-        after `max_retries` attempts to ensure data completeness.
+          after `max_retries` attempts to ensure data completeness.
         """
         dir_to_save = Path(dir_to_save)
         dir_to_save.mkdir(parents=True, exist_ok=True)
@@ -2427,6 +2425,7 @@ class WAS_Download:
         """
         Download daily ERA5Land reanalysis data from the Copernicus Data Store (CDS)
         for specified variables and years, with retries for failed downloads.
+
         Parameters
         ----------
         dir_to_save : str or pathlib.Path
@@ -2446,14 +2445,16 @@ class WAS_Download:
             Maximum number of retry attempts for failed downloads. Default is 3.
         retry_delay : int, optional
             Seconds to wait between retry attempts. Default is 5.
+
         Returns
         -------
         None
             The function saves NetCDF files to `dir_to_save` but does not return a value.
             Output files are named as `Daily_<variable>_<year_start>_<year_end>.nc`.
+
         Notes
         -----
-        - The function downloads hourly data from the CDS dataset "reanalysis-era5-land" 
+        - The function downloads hourly data from the CDS dataset "reanalysis-era5-land"
           and aggregates it to daily resolution.
         - Aggregation: sum for accumulative variables (e.g., PRCP, radiation), mean for others (e.g., TEMP).
         - Unit conversions: PRCP to mm/day, TEMP to °C, radiation to W/m² (daily average).
@@ -2595,6 +2596,7 @@ class WAS_Download:
         """
         Download daily CHIRPS v3.0 precipitation (blended with ERA5 or IMERGlate-v07) from the Copernicus Data Store (CDS)
         for specified years, with retries for failed downloads.
+
         Parameters
         ----------
         dir_to_save : str or pathlib.Path
@@ -2615,11 +2617,13 @@ class WAS_Download:
             Maximum number of retry attempts for failed downloads. Default is 3.
         retry_delay : int, optional
             Seconds to wait between retry attempts. Default is 5.
+
         Returns
         -------
         None
             The function saves NetCDF files to `dir_to_save` but does not return a value.
             Output files are named as `Daily_PRCP_{blend_type}_{year_start}_{year_end}.nc`.
+
         Notes
         -----
         - Downloads individual daily TIFF files, processes them with rioxarray, clips if area specified,
@@ -2947,8 +2951,10 @@ class WAS_Download:
             force_download: bool = False,
             agg: Optional[Literal["sum", "mean"]] = None,
         ) -> Path:
+        
             """
             Download and aggregate TAMSAT monthly data (RFE v3.1 or Soil Moisture v2.3.1) for a specified season.
+
             Parameters
             ----------
             dir_to_save : str | Path
@@ -2962,7 +2968,8 @@ class WAS_Download:
             year_start : int, default 1983
                 First seasonal year (pivot year) to include.
             year_end : int, default 2025
-                Last year for which data is included (inclusive). For seasons spanning calendar years, the last pivot year processed will be year_end - 1 to ensure no data from year_end + 1 is fetched.
+                Last year for which data is included (inclusive). For seasons spanning calendar years,
+                the last pivot year processed will be year_end - 1 to ensure no data from year_end + 1 is fetched.
             area : list[float], optional
                 Bounding box [north, west, south, east] in degrees.
             season_months : sequence[str], default ["03","04","05"]
@@ -2977,6 +2984,7 @@ class WAS_Download:
                 Seasonal aggregation. Defaults to:
                 - rfe: "sum"
                 - soil_moisture: "mean"
+
             Returns
             -------
             Path
@@ -3173,6 +3181,7 @@ class WAS_Download:
         ) -> Path:
             """
             Download TAMSAT daily data (RFE v3.1 or Soil Moisture v2.3.1) and combine into a single NetCDF file.
+
             Parameters
             ----------
             dir_to_save : str | Path
@@ -3195,6 +3204,7 @@ class WAS_Download:
                 - soil_moisture: "v2.3.1"
             force_download : bool, default False
                 Re-download daily files even if present locally.
+
             Returns
             -------
             Path
