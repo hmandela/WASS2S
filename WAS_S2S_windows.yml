@@ -80,7 +80,7 @@ dependencies:
       - fitter==1.7.1
       - minisom==2.3.5
       - properscoring
-      - xgboost=2.1.*
+      - xgboost=2.1.0
       - lightgbm==4.6.0
       - pymc==5.22.0
       - arviz==0.21.0
