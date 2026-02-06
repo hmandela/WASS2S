@@ -147,9 +147,9 @@ class WAS_Analog:
     """
 
     def __init__(self, dir_to_save, year_start, year_forecast,
-                 predictor_vars=[{'reanalysis_name': 'NOAA', 'model_name': 'NCEP_2', 'variable': 'SST', 'area': [60, -180, -60, 180]},
-                                {'reanalysis_name': 'ERA5', 'model_name': 'NCEP_2', 'variable': 'SP', 'area': [60, -180, -60, 180]},
-                                {'reanalysis_name': 'ERA5', 'model_name': 'NCEP_2', 'variable': 'VGRD_850', 'area': [60, -180, -60, 180]}],
+                 predictor_vars=[{'reanalysis_name': 'ERA5', 'model_name': 'ECMWF_51', 'variable': 'SST', 'area': [60, -180, -60, 180]},
+                                {'reanalysis_name': 'ERA5', 'model_name': 'ECMWF_51', 'variable': 'SP', 'area': [60, -180, -60, 180]},
+                                {'reanalysis_name': 'ERA5', 'model_name': 'ECMWF_51', 'variable': 'VGRD_850', 'area': [60, -180, -60, 180]}],
                  method_analog="som", month_of_initialization=None,
                  lead_time=None, ensemble_mean="mean", rolling=3, standardize=True, detrend=False, multivariateEOF=False,
                  eof_explained_var=0.95, clim_year_start=None, clim_year_end=None,
@@ -640,14 +640,32 @@ class WAS_Analog:
         print(f"Selected {n_modes} modes explaining {cumulative_var[n_modes-1].values*100:.2f}% variance")
         return model.scores().isel(mode=slice(0, n_modes))
 
-    def _detrended_da(self, da):
-        """Detrend a DataArray by removing the linear trend."""
-        if 'T' not in da.dims:
-            raise ValueError("DataArray must have a time dimension 'T' for detrending.")
-        trend = da.polyfit(dim='T', deg=1)
-        da_detrended = da - (trend.polyval(da['T']) if 'polyval' in dir(trend) else trend)
-        return da_detrended.isel(degree=0, drop=True).to_array().drop_vars('variable').squeeze(),\
-             trend.isel(degree=0, drop=True).to_array().drop_vars('variable').squeeze()
+    # def _detrended_da(self, da):
+    #     """Detrend a DataArray by removing the linear trend."""
+    #     if 'T' not in da.dims:
+    #         raise ValueError("DataArray must have a time dimension 'T' for detrending.")
+    #     trend = da.polyfit(dim='T', deg=1)
+    #     da_detrended = da - (trend.polyval(da['T']) if 'polyval' in dir(trend) else trend)
+    #     return da_detrended.isel(degree=0, drop=True).to_array().drop_vars('variable').squeeze(),\
+    #          trend.isel(degree=0, drop=True).to_array().drop_vars('variable').squeeze()
+
+    def _detrended_da(self, da, dim='T'):
+            """
+            Detrend a DataArray by removing the linear trend.
+            """
+            if dim not in da.dims:
+                raise ValueError(f"DataArray must have a time dimension '{dim}' for detrending.")
+    
+            # 1. Calculate coefficients (Slope + Intercept)
+            # Returns a Dataset containing 'polyfit_coefficients'
+            coeffs = da.polyfit(dim=dim, deg=1)
+    
+            # 2. Reconstruct the trend line using standard xarray syntax
+            trend = xr.polyval(da[dim], coeffs.polyfit_coefficients)
+    
+            # 3. Return anomalies and the FULL coefficients 
+            # (We need the full coefficients to detrend future data for prediction)
+            return da - trend, coeffs
 
     def _prepare_data_for_clustering(self, unique_years, target_year=None):
         """Helper to prepare data (indices or EOFs) for clustering methods."""

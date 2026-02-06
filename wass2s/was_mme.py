@@ -37,8 +37,8 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.svm import SVR
 from sklearn.gaussian_process import GaussianProcessRegressor, GaussianProcessClassifier
 from sklearn.gaussian_process.kernels import RBF, Matern, ConstantKernel as C, WhiteKernel
-from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, KFold
-from sklearn.metrics import mean_squared_error, log_loss
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, KFold, TimeSeriesSplit, cross_val_score
+from sklearn.metrics import mean_squared_error, log_loss, make_scorer
 from sklearn.exceptions import ConvergenceWarning
 
 from xgboost import XGBRegressor
@@ -4156,8 +4156,16 @@ class HPELMWrapper(BaseEstimator, RegressorMixin):
         self.model = None
 
     def fit(self, X, y):
+        # Set numpy random seed for this operation
+        rng = np.random.RandomState(self.random_state)
+        
         self.model = HPELM(inputs=X.shape[1], outputs=1, classification='r', norm=self.norm)
-        self.model.add_neurons(self.neurons, self.activation)
+        
+        # Generate reproducible weights
+        W = rng.randn(X.shape[1], self.neurons)
+        B = rng.randn(self.neurons)
+        
+        self.model.add_neurons(self.neurons, self.activation, W=W, B=B)
         self.model.train(X, y, 'r')
         return self
 
@@ -4408,6 +4416,10 @@ class WAS_mme_hpELM:
         cluster_da : xarray.DataArray
             Cluster labels with dimensions (Y, X).
         """
+        # Set global seeds for reproducibility
+        np.random.seed(self.random_state)
+        random.seed(self.random_state)
+        
         if "M" in Predictand.coords:
             Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
             
@@ -4606,15 +4618,12 @@ class WAS_mme_hpELM:
                 norm=bp['norm']
             )
 
-            # Initialize weights and biases for the neurons
-            # Use a random number generator for reproducibility
-            # rng = np.random.default_rng(1234)    # isolated RNG
-            # n = bp['neurons']
-            # W = rng.standard_normal((X_train_clean_c.shape[1], n))
-            # B = rng.standard_normal(n)
-            # hpelm_c.add_neurons(bp['neurons'], bp['activation'],W=W, B=B)
-            
-            hpelm_c.add_neurons(bp['neurons'], bp['activation'])
+            # Create reproducible random weights
+            rng = np.random.RandomState(self.random_state)
+            W = rng.randn(X_train_clean_c.shape[1], bp['neurons'])
+            B = rng.randn(bp['neurons'])
+            hpelm_c.add_neurons(bp['neurons'], bp['activation'], W=W, B=B)
+            # hpelm_c.add_neurons(bp['neurons'], bp['activation'])
             hpelm_c.train(X_train_clean_c, y_train_clean_c, 'r')
             self.hpelm[c] = hpelm_c
 
@@ -5215,15 +5224,13 @@ class WAS_mme_hpELM:
                 norm=bp['norm']
             )
 
-            # Initialize weights and biases for the neurons
-            # Use a random number generator for reproducibility
-            # rng = np.random.default_rng(1234)    # isolated RNG
-            # n = bp['neurons']
-            # W = rng.standard_normal((X_train_clean_c.shape[1], n))
-            # B = rng.standard_normal(n)
-            # hpelm_c.add_neurons(bp['neurons'], bp['activation'],W=W, B=B)
-    
-            hpelm_c.add_neurons(bp['neurons'], bp['activation'])
+            # Create reproducible random weights
+            rng = np.random.RandomState(self.random_state)  # Add cluster for variety
+            W = rng.randn(X_train_clean_c.shape[1], bp['neurons'])
+            B = rng.randn(bp['neurons'])
+            hpelm_c.add_neurons(bp['neurons'], bp['activation'], W=W, B=B)
+            
+            # hpelm_c.add_neurons(bp['neurons'], bp['activation'])
             hpelm_c.train(X_train_clean_c, y_train_clean_c, 'r')
             self.hpelm[c] = hpelm_c
             # Predict
@@ -5646,6 +5653,11 @@ class WAS_mme_hpELM_:
         dict
             Best hyperparameters found.
         """
+
+        # Set global seeds for reproducibility
+        np.random.seed(self.random_state)
+        random.seed(self.random_state)
+        
         if "M" in Predictand.coords:
             Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
 
@@ -5756,15 +5768,16 @@ class WAS_mme_hpELM_:
 
         # Stack training data
         X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1)
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        # y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
 
         # Stack testing data
         X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1)
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()  # Flatten to 1D
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
 
         # Use provided best_params or compute if None
         if best_params is None:
@@ -5777,7 +5790,14 @@ class WAS_mme_hpELM_:
             classification='r',
             norm=best_params['norm']
         )
-        self.hpelm.add_neurons(best_params['neurons'], best_params['activation'])
+       
+        # Create reproducible random weights
+        rng = np.random.RandomState(self.random_state)  # Add cluster for variety
+        W = rng.randn(X_train_clean.shape[1], best_params['neurons'])
+        B = rng.randn(best_params['neurons'])
+        self.hpelm.add_neurons(best_params['neurons'], best_params['activation'], W=W, B=B)        
+
+        # self.hpelm.add_neurons(best_params['neurons'], best_params['activation'])
         self.hpelm.train(X_train_clean, y_train_clean, 'r')
         y_pred = self.hpelm.predict(X_test_stacked[~test_nan_mask]).ravel()
 
@@ -6369,7 +6389,14 @@ class WAS_mme_hpELM_:
             classification='r',
             norm=best_params['norm']
         )
-        self.hpelm.add_neurons(best_params['neurons'], best_params['activation'])
+
+        # Create reproducible random weights
+        rng = np.random.RandomState(self.random_state)  # Add cluster for variety
+        W = rng.randn(X_train_clean.shape[1], best_params['neurons'])
+        B = rng.randn(best_params['neurons'])
+        self.hpelm.add_neurons(best_params['neurons'], best_params['activation'], W=W, B=B) 
+        
+        # self.hpelm.add_neurons(best_params['neurons'], best_params['activation'])
         self.hpelm.train(X_train_clean, y_train_clean, 'r')
         y_pred = self.hpelm.predict(X_test_stacked[~test_nan_mask]).ravel()
 
@@ -7500,6 +7527,7 @@ class WAS_mme_MLP_:
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_da * mask, mask * forecast_prob.transpose('probability', 'T', 'Y', 'X')
 
+## Je peux add mean over M et std over M in hindcast. ça aidera mon MLP et ELM
 
 class WAS_mme_MLP:
     """
@@ -8587,34 +8615,33 @@ class WAS_mme_MLP:
 
 
 class WAS_mme_XGBoosting_:
+    ### add early stopping here: early_stopping_rounds=50
     """
-    XGBoost-based Multi-Model Ensemble (MME) forecasting.
-    This class implements a single-model forecasting approach using XGBoost's XGBRegressor
-    for deterministic predictions, with optional tercile probability calculations using
-    various statistical distributions. Implements multiple hyperparameter optimization methods.
+    XGBoost-based Multi-Model Ensemble (MME) forecasting for seasonal rainfall.
+    Enhanced with additional regularization hyperparameters for climate forecasting.
     
     Parameters
     ----------
     search_method : str, optional
         Hyperparameter optimization method: 'grid', 'random', or 'bayesian' (default: 'random').
     n_estimators_range : list of int or scipy.stats distribution, optional
-        List of n_estimators values to tune (default is [50, 100, 200, 300]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of n_estimators values to tune (optimized for climate data).
     learning_rate_range : list of float or scipy.stats distribution, optional
-        List of learning rates to tune (default is [0.01, 0.05, 0.1, 0.2]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of learning rates to tune (optimized for climate data).
     max_depth_range : list of int or scipy.stats distribution, optional
-        List of max depths to tune (default is [3, 5, 7, 9]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of max depths to tune (optimized for climate data).
     min_child_weight_range : list of float or scipy.stats distribution, optional
-        List of minimum child weights to tune (default is [1, 3, 5]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of minimum child weights to tune (optimized for climate data).
     subsample_range : list of float or scipy.stats distribution, optional
-        List of subsample ratios to tune (default is [0.6, 0.8, 1.0]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of subsample ratios to tune.
     colsample_bytree_range : list of float or scipy.stats distribution, optional
-        List of column sampling ratios to tune (default is [0.6, 0.8, 1.0]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of column sampling ratios to tune.
+    gamma_range : list of float or scipy.stats distribution, optional
+        List of gamma (min_split_loss) values for regularization.
+    reg_alpha_range : list of float or scipy.stats distribution, optional
+        List of L1 regularization (alpha) values.
+    reg_lambda_range : list of float or scipy.stats distribution, optional
+        List of L2 regularization (lambda) values.
     random_state : int, optional
         Seed for reproducibility (default is 42).
     dist_method : str, optional
@@ -8623,6 +8650,9 @@ class WAS_mme_XGBoosting_:
         Number of iterations for randomized/bayesian search or points to sample for grid search (default is 10).
     cv_folds : int, optional
         Number of cross-validation folds (default is 3).
+    cv_method : str, optional
+        Cross-validation method: 'timeseries' or 'kfold' (default: 'timeseries').
+        Use 'timeseries' for temporal data to prevent data leakage.
     optuna_n_jobs : int, optional
         Number of parallel jobs for Optuna (default is 1).
     optuna_timeout : int, optional
@@ -8630,16 +8660,20 @@ class WAS_mme_XGBoosting_:
     """
     def __init__(self,
                  search_method='random',
-                 n_estimators_range=[50, 100, 200, 300],
-                 learning_rate_range=[0.01, 0.05, 0.1, 0.2],
-                 max_depth_range=[3, 5, 7, 9],
+                 n_estimators_range=[50, 100, 150, 200, 250],  # Reduced upper bound
+                 learning_rate_range=[0.005, 0.01, 0.03, 0.05, 0.1],  # Finer low-end
+                 max_depth_range=[3, 5, 7],  # More conservative for climate data
                  min_child_weight_range=[1, 3, 5],
                  subsample_range=[0.6, 0.8, 1.0],
                  colsample_bytree_range=[0.6, 0.8, 1.0],
+                 gamma_range=[0, 0.1, 0.2, 0.5, 1],  #  Gamma regularization
+                 reg_alpha_range=[0, 0.01, 0.1],  # L1 regularization
+                 reg_lambda_range=[1, 1.5, 2],  # ADDED: L2 regularization
                  random_state=42,
                  dist_method="nonparam",
                  n_iter_search=10,
                  cv_folds=3,
+                 cv_method='timeseries',  #  CV method for temporal data or None
                  optuna_n_jobs=1,
                  optuna_timeout=None):
         
@@ -8650,105 +8684,75 @@ class WAS_mme_XGBoosting_:
         self.min_child_weight_range = min_child_weight_range
         self.subsample_range = subsample_range
         self.colsample_bytree_range = colsample_bytree_range
+        self.gamma_range = gamma_range  # ADDED
+        self.reg_alpha_range = reg_alpha_range  # ADDED
+        self.reg_lambda_range = reg_lambda_range  # ADDED
         self.random_state = random_state
         self.dist_method = dist_method
         self.n_iter_search = n_iter_search
         self.cv_folds = cv_folds
+        self.cv_method = cv_method  # ADDED
         self.optuna_n_jobs = optuna_n_jobs
         self.optuna_timeout = optuna_timeout
         self.xgb = None
+        self.best_params_ = None
+
+    def _get_cv_splitter(self):
+        """Get appropriate cross-validator for time series data."""
+        if self.cv_method == 'timeseries':
+            return TimeSeriesSplit(n_splits=self.cv_folds)
+        else:
+            return self.cv_folds  # Regular k-fold
 
     def _objective(self, trial, X_train, y_train):
         """
-        Objective function for Optuna optimization.
+        Objective function for Optuna optimization with all hyperparameters.
         """
         # Define hyperparameter search space
-        # Handle n_estimators
-        if isinstance(self.n_estimators_range, list):
-            n_estimators = trial.suggest_categorical('n_estimators', self.n_estimators_range)
-        else:
-            # Assume it's a distribution
-            n_estimators = trial.suggest_int(
-                'n_estimators', 
-                int(self.n_estimators_range.a),
-                int(self.n_estimators_range.b)
-            )
+        params = {}
         
-        # Handle learning_rate
-        if isinstance(self.learning_rate_range, list):
-            learning_rate = trial.suggest_categorical('learning_rate', self.learning_rate_range)
-        else:
-            # Assume it's a distribution
-            learning_rate = trial.suggest_float(
-                'learning_rate', 
-                self.learning_rate_range.a,
-                self.learning_rate_range.b,
-                log=True
-            )
+        # Helper function to handle list vs distribution
+        def suggest_param(name, range_obj, param_type='float'):
+            if isinstance(range_obj, list):
+                return trial.suggest_categorical(name, range_obj)
+            else:
+                if param_type == 'int':
+                    return trial.suggest_int(name, int(range_obj.a), int(range_obj.b))
+                elif param_type == 'float_log':
+                    return trial.suggest_float(name, range_obj.a, range_obj.b, log=True)
+                else:  # float linear
+                    return trial.suggest_float(name, range_obj.a, range_obj.b)
         
-        # Handle max_depth
-        if isinstance(self.max_depth_range, list):
-            max_depth = trial.suggest_categorical('max_depth', self.max_depth_range)
-        else:
-            # Assume it's a distribution
-            max_depth = trial.suggest_int(
-                'max_depth', 
-                int(self.max_depth_range.a),
-                int(self.max_depth_range.b)
-            )
+        # Core parameters
+        params['n_estimators'] = suggest_param('n_estimators', self.n_estimators_range, 'int')
+        params['learning_rate'] = suggest_param('learning_rate', self.learning_rate_range, 'float_log')
+        params['max_depth'] = suggest_param('max_depth', self.max_depth_range, 'int')
+        params['min_child_weight'] = suggest_param('min_child_weight', self.min_child_weight_range, 'float')
+        params['subsample'] = suggest_param('subsample', self.subsample_range, 'float')
+        params['colsample_bytree'] = suggest_param('colsample_bytree', self.colsample_bytree_range, 'float')
         
-        # Handle min_child_weight
-        if isinstance(self.min_child_weight_range, list):
-            min_child_weight = trial.suggest_categorical('min_child_weight', self.min_child_weight_range)
-        else:
-            # Assume it's a distribution
-            min_child_weight = trial.suggest_float(
-                'min_child_weight', 
-                self.min_child_weight_range.a,
-                self.min_child_weight_range.b
-            )
-        
-        # Handle subsample
-        if isinstance(self.subsample_range, list):
-            subsample = trial.suggest_categorical('subsample', self.subsample_range)
-        else:
-            # Assume it's a distribution
-            subsample = trial.suggest_float(
-                'subsample', 
-                self.subsample_range.a,
-                self.subsample_range.b
-            )
-        
-        # Handle colsample_bytree
-        if isinstance(self.colsample_bytree_range, list):
-            colsample_bytree = trial.suggest_categorical('colsample_bytree', self.colsample_bytree_range)
-        else:
-            # Assume it's a distribution
-            colsample_bytree = trial.suggest_float(
-                'colsample_bytree', 
-                self.colsample_bytree_range.a,
-                self.colsample_bytree_range.b
-            )
+        # New regularization parameters
+        params['gamma'] = suggest_param('gamma', self.gamma_range, 'float')
+        params['reg_alpha'] = suggest_param('reg_alpha', self.reg_alpha_range, 'float')
+        params['reg_lambda'] = suggest_param('reg_lambda', self.reg_lambda_range, 'float')
         
         # Create and train model
         model = XGBRegressor(
-            n_estimators=n_estimators,
-            learning_rate=learning_rate,
-            max_depth=max_depth,
-            min_child_weight=min_child_weight,
-            subsample=subsample,
-            colsample_bytree=colsample_bytree,
+            **params,
             random_state=self.random_state,
             verbosity=0,
             n_jobs=-1
         )
         
-        # Use cross-validation
+        # Use appropriate cross-validation
         from sklearn.model_selection import cross_val_score
+        cv_splitter = self._get_cv_splitter()
+        
+        # Use MAE for rainfall prediction (less sensitive to outliers than MSE)
         scores = cross_val_score(
             model, X_train, y_train, 
-            cv=self.cv_folds, 
-            scoring='neg_mean_squared_error',
+            cv=cv_splitter, 
+            scoring='neg_mean_absolute_error',
             n_jobs=-1
         )
         
@@ -8775,8 +8779,8 @@ class WAS_mme_XGBoosting_:
         dict
             Best hyperparameters found.
         """
-        X_train = Predictors
-        y_train = Predictand
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
 
         # Stack training data
         X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
@@ -8785,71 +8789,43 @@ class WAS_mme_XGBoosting_:
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
 
+        # For climate forecasting, use MAE as it's more robust for rainfall
+        scoring = make_scorer(lambda y_true, y_pred: -np.mean(np.abs(y_true - y_pred)))
+
         if self.search_method == 'grid':
             # Prepare parameter grid for GridSearchCV
             param_grid = {}
             
-            # Handle n_estimators
-            if isinstance(self.n_estimators_range, list):
-                param_grid['n_estimators'] = self.n_estimators_range
-            else:
-                # Sample from distribution for grid search
-                n_samples = min(5, self.n_iter_search)
-                samples = self.n_estimators_range.rvs(size=n_samples, random_state=self.random_state)
-                param_grid['n_estimators'] = np.unique(samples.astype(int))
+            # Helper function to handle list vs distribution
+            def prepare_grid(name, range_obj, n_samples=4):
+                if isinstance(range_obj, list):
+                    param_grid[name] = range_obj
+                else:
+                    # Sample from distribution for grid search
+                    samples = range_obj.rvs(size=min(n_samples, self.n_iter_search), 
+                                          random_state=self.random_state)
+                    param_grid[name] = np.unique(samples.astype(float) if 'int' in name else samples)
             
-            # Handle learning_rate
-            if isinstance(self.learning_rate_range, list):
-                param_grid['learning_rate'] = self.learning_rate_range
-            else:
-                # Sample from distribution for grid search
-                n_samples = min(5, self.n_iter_search)
-                samples = self.learning_rate_range.rvs(size=n_samples, random_state=self.random_state)
-                param_grid['learning_rate'] = np.unique(samples)
-            
-            # Handle max_depth
-            if isinstance(self.max_depth_range, list):
-                param_grid['max_depth'] = self.max_depth_range
-            else:
-                # Sample from distribution for grid search
-                n_samples = min(5, self.n_iter_search)
-                samples = self.max_depth_range.rvs(size=n_samples, random_state=self.random_state)
-                param_grid['max_depth'] = np.unique(samples.astype(int))
-            
-            # Handle min_child_weight
-            if isinstance(self.min_child_weight_range, list):
-                param_grid['min_child_weight'] = self.min_child_weight_range
-            else:
-                # Sample from distribution for grid search
-                n_samples = min(5, self.n_iter_search)
-                samples = self.min_child_weight_range.rvs(size=n_samples, random_state=self.random_state)
-                param_grid['min_child_weight'] = np.unique(samples)
-            
-            # Handle subsample
-            if isinstance(self.subsample_range, list):
-                param_grid['subsample'] = self.subsample_range
-            else:
-                # Sample from distribution for grid search
-                n_samples = min(5, self.n_iter_search)
-                samples = self.subsample_range.rvs(size=n_samples, random_state=self.random_state)
-                param_grid['subsample'] = np.unique(samples)
-            
-            # Handle colsample_bytree
-            if isinstance(self.colsample_bytree_range, list):
-                param_grid['colsample_bytree'] = self.colsample_bytree_range
-            else:
-                # Sample from distribution for grid search
-                n_samples = min(5, self.n_iter_search)
-                samples = self.colsample_bytree_range.rvs(size=n_samples, random_state=self.random_state)
-                param_grid['colsample_bytree'] = np.unique(samples)
+            prepare_grid('n_estimators', self.n_estimators_range)
+            prepare_grid('learning_rate', self.learning_rate_range)
+            prepare_grid('max_depth', self.max_depth_range)
+            prepare_grid('min_child_weight', self.min_child_weight_range)
+            prepare_grid('subsample', self.subsample_range)
+            prepare_grid('colsample_bytree', self.colsample_bytree_range)
+            prepare_grid('gamma', self.gamma_range)
+            prepare_grid('reg_alpha', self.reg_alpha_range)
+            prepare_grid('reg_lambda', self.reg_lambda_range)
             
             # Initialize XGBRegressor base model
             model = XGBRegressor(random_state=self.random_state, verbosity=0, n_jobs=-1)
             
+            # Get appropriate CV splitter
+            cv_splitter = self._get_cv_splitter()
+            
             # Grid search
             grid_search = GridSearchCV(
                 model, param_grid=param_grid,
-                cv=self.cv_folds, scoring='neg_mean_squared_error',
+                cv=cv_splitter, scoring=scoring,
                 error_score=np.nan, n_jobs=-1
             )
             grid_search.fit(X_train_clean, y_train_clean)
@@ -8859,31 +8835,27 @@ class WAS_mme_XGBoosting_:
             # Prepare parameter distributions for RandomizedSearchCV
             param_dist = {}
             
-            # Handle n_estimators
+            # All parameters can be lists or distributions
             param_dist['n_estimators'] = self.n_estimators_range
-            
-            # Handle learning_rate
             param_dist['learning_rate'] = self.learning_rate_range
-            
-            # Handle max_depth
             param_dist['max_depth'] = self.max_depth_range
-            
-            # Handle min_child_weight
             param_dist['min_child_weight'] = self.min_child_weight_range
-            
-            # Handle subsample
             param_dist['subsample'] = self.subsample_range
-            
-            # Handle colsample_bytree
             param_dist['colsample_bytree'] = self.colsample_bytree_range
+            param_dist['gamma'] = self.gamma_range
+            param_dist['reg_alpha'] = self.reg_alpha_range
+            param_dist['reg_lambda'] = self.reg_lambda_range
             
             # Initialize XGBRegressor base model
             model = XGBRegressor(random_state=self.random_state, verbosity=0, n_jobs=-1)
             
+            # Get appropriate CV splitter
+            cv_splitter = self._get_cv_splitter()
+            
             # Randomized search
             random_search = RandomizedSearchCV(
                 model, param_distributions=param_dist, n_iter=self.n_iter_search,
-                cv=self.cv_folds, scoring='neg_mean_squared_error',
+                cv=cv_splitter, scoring=scoring,
                 random_state=self.random_state, error_score=np.nan, n_jobs=-1
             )
             random_search.fit(X_train_clean, y_train_clean)
@@ -8892,7 +8864,7 @@ class WAS_mme_XGBoosting_:
         elif self.search_method == 'bayesian':
             # Bayesian optimization with Optuna
             study = optuna.create_study(
-                direction='maximize',  # We're maximizing negative MSE
+                direction='maximize',  # We're maximizing negative MAE
                 sampler=optuna.samplers.TPESampler(seed=self.random_state),
                 pruner=optuna.pruners.MedianPruner(n_startup_trials=5)
             )
@@ -8911,22 +8883,12 @@ class WAS_mme_XGBoosting_:
             # Extract best parameters
             best_params = study.best_params
             
-            # Convert Optuna's best_params to scikit-learn format
-            sklearn_params = {
-                'n_estimators': best_params['n_estimators'],
-                'learning_rate': best_params['learning_rate'],
-                'max_depth': best_params['max_depth'],
-                'min_child_weight': best_params['min_child_weight'],
-                'subsample': best_params['subsample'],
-                'colsample_bytree': best_params['colsample_bytree']
-            }
-            best_params = sklearn_params
-            
         else:
             raise ValueError(f"Unknown search_method: {self.search_method}. Choose from 'grid', 'random', or 'bayesian'.")
 
+        # Store best parameters
+        self.best_params_ = best_params
         return best_params
-
 
     def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
         """
@@ -8960,32 +8922,42 @@ class WAS_mme_XGBoosting_:
 
         # Stack training data
         X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
 
         # Stack testing data
         X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
 
         # Use provided best_params or compute if None
         if best_params is None:
             best_params = self.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end)
 
-        # Initialize the model with best parameters
-        self.xgb = XGBRegressor(
-            n_estimators=best_params['n_estimators'],
-            learning_rate=best_params['learning_rate'],
-            max_depth=best_params['max_depth'],
-            min_child_weight=best_params['min_child_weight'],
-            subsample=best_params['subsample'],
-            colsample_bytree=best_params['colsample_bytree'],
-            random_state=self.random_state,
-            verbosity=0,
-            n_jobs=-1
-        )
+        # Initialize the model with best parameters including new ones
+        base_params = {
+            'n_estimators': best_params.get('n_estimators', 100),
+            'learning_rate': best_params.get('learning_rate', 0.1),
+            'max_depth': best_params.get('max_depth', 5),
+            'min_child_weight': best_params.get('min_child_weight', 1),
+            'subsample': best_params.get('subsample', 1.0),
+            'colsample_bytree': best_params.get('colsample_bytree', 1.0),
+            'random_state': self.random_state,
+            'verbosity': 0,
+            'n_jobs': -1
+        }
+        
+        # Add new regularization parameters if present
+        if 'gamma' in best_params:
+            base_params['gamma'] = best_params['gamma']
+        if 'reg_alpha' in best_params:
+            base_params['reg_alpha'] = best_params['reg_alpha']
+        if 'reg_lambda' in best_params:
+            base_params['reg_lambda'] = best_params['reg_lambda']
+        
+        self.xgb = XGBRegressor(**base_params)
 
         # Fit the model and predict on non-NaN testing data
         self.xgb.fit(X_train_clean, y_train_clean)
@@ -9537,16 +9509,16 @@ class WAS_mme_XGBoosting_:
         # Standardize Predictor_for_year using hindcast climatology
         mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
         std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        # Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
+        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
         
-        Predictor_for_year_st = Predictor_for_year
+        # Predictor_for_year_st = Predictor_for_year
 
-        # hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
         
-        hindcast_det_st = hindcast_det
+        # hindcast_det_st = hindcast_det
         
-        # Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
-        Predictant_st = Predictant_no_m
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
+        # Predictant_st = Predictant_no_m
         
         y_test = Predictant_st.isel(T=[-1])
 
@@ -9573,19 +9545,29 @@ class WAS_mme_XGBoosting_:
         # Use provided best_params or compute if None
         if best_params is None:
             best_params = self.compute_hyperparameters(hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
-
-        # Initialize and fit the model with best parameters
-        self.xgb = XGBRegressor(
-            n_estimators=best_params['n_estimators'],
-            learning_rate=best_params['learning_rate'],
-            max_depth=best_params['max_depth'],
-            min_child_weight=best_params['min_child_weight'],
-            subsample=best_params['subsample'],
-            colsample_bytree=best_params['colsample_bytree'],
-            random_state=self.random_state,
-            verbosity=0
-        )
-        self.xgb.fit(X_train_clean, y_train_clean)
+        
+        # Initialize model with all parameters including new ones
+        base_params = {
+            'n_estimators': best_params.get('n_estimators', 100),
+            'learning_rate': best_params.get('learning_rate', 0.1),
+            'max_depth': best_params.get('max_depth', 5),
+            'min_child_weight': best_params.get('min_child_weight', 1),
+            'subsample': best_params.get('subsample', 1.0),
+            'colsample_bytree': best_params.get('colsample_bytree', 1.0),
+            'random_state': self.random_state,
+            'verbosity': 0,
+            'n_jobs': -1
+        }
+        
+        # Add new regularization parameters if present
+        if 'gamma' in best_params:
+            base_params['gamma'] = best_params['gamma']
+        if 'reg_alpha' in best_params:
+            base_params['reg_alpha'] = best_params['reg_alpha']
+        if 'reg_lambda' in best_params:
+            base_params['reg_lambda'] = best_params['reg_lambda']
+        
+        self.xgb = XGBRegressor(**base_params)
         y_pred = self.xgb.predict(X_test_stacked[~test_nan_mask])
 
         # Reconstruct the prediction array
@@ -9598,7 +9580,7 @@ class WAS_mme_XGBoosting_:
                                  coords={'T': time, 'Y': lat, 'X': lon},
                                  dims=['T', 'Y', 'X']) * mask
 
-        # result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
 
         year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
         T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
@@ -9685,34 +9667,33 @@ class WAS_mme_XGBoosting_:
 
 
 class WAS_mme_XGBoosting:
+    ### add early stopping here: early_stopping_rounds=50
     """
-    XGBoost-based Multi-Model Ensemble (MME) forecasting.
-    This class implements a single-model forecasting approach using XGBoost's XGBRegressor
-    for deterministic predictions, with optional tercile probability calculations using
-    various statistical distributions. Implements multiple hyperparameter optimization methods.
+    XGBoost-based Multi-Model Ensemble (MME) forecasting for seasonal rainfall.
+    Enhanced with additional regularization hyperparameters and time-series CV.
     
     Parameters
     ----------
     search_method : str, optional
         Hyperparameter optimization method: 'grid', 'random', or 'bayesian' (default: 'random').
     n_estimators_range : list of int or scipy.stats distribution, optional
-        List of n_estimators values to tune (default is [50, 100, 200, 300]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of n_estimators values to tune (optimized for climate data).
     learning_rate_range : list of float or scipy.stats distribution, optional
-        List of learning rates to tune (default is [0.01, 0.05, 0.1, 0.2]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of learning rates to tune (optimized for climate data).
     max_depth_range : list of int or scipy.stats distribution, optional
-        List of max depths to tune (default is [3, 5, 7, 9]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of max depths to tune (optimized for climate data).
     min_child_weight_range : list of float or scipy.stats distribution, optional
-        List of minimum child weights to tune (default is [1, 3, 5]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of minimum child weights to tune (optimized for climate data).
     subsample_range : list of float or scipy.stats distribution, optional
-        List of subsample ratios to tune (default is [0.6, 0.8, 1.0]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of subsample ratios to tune.
     colsample_bytree_range : list of float or scipy.stats distribution, optional
-        List of column sampling ratios to tune (default is [0.6, 0.8, 1.0]).
-        Can be a list for grid search or a distribution for random/bayesian search.
+        List of column sampling ratios to tune.
+    gamma_range : list of float or scipy.stats distribution, optional
+        List of gamma (min_split_loss) values for regularization.
+    reg_alpha_range : list of float or scipy.stats distribution, optional
+        List of L1 regularization (alpha) values.
+    reg_lambda_range : list of float or scipy.stats distribution, optional
+        List of L2 regularization (lambda) values.
     random_state : int, optional
         Seed for reproducibility (default is 42).
     dist_method : str, optional
@@ -9721,6 +9702,9 @@ class WAS_mme_XGBoosting:
         Number of iterations for randomized/bayesian search or points to sample for grid search (default is 10).
     cv_folds : int, optional
         Number of cross-validation folds (default is 3).
+    cv_method : str, optional
+        Cross-validation method: 'timeseries' or 'kfold' (default: 'timeseries').
+        Use 'timeseries' for temporal data to prevent data leakage.
     n_clusters : int, optional
         Number of clusters for homogenized zones (default is 4).
     optuna_n_jobs : int, optional
@@ -9730,16 +9714,20 @@ class WAS_mme_XGBoosting:
     """
     def __init__(self,
                  search_method='random',
-                 n_estimators_range=[50, 100, 200, 300],
-                 learning_rate_range=[0.01, 0.05, 0.1, 0.2],
-                 max_depth_range=[3, 5, 7, 9],
+                 n_estimators_range=[50, 100, 150, 200],  # Reduced for climate data
+                 learning_rate_range=[0.005, 0.01, 0.03, 0.05, 0.1],  # Finer low-end
+                 max_depth_range=[3, 5, 7],  # More conservative
                  min_child_weight_range=[1, 3, 5],
                  subsample_range=[0.6, 0.8, 1.0],
                  colsample_bytree_range=[0.6, 0.8, 1.0],
+                 gamma_range=[0, 0.1, 0.2, 0.5, 1],  # ADDED: Gamma regularization
+                 reg_alpha_range=[0, 0.01, 0.1],  # ADDED: L1 regularization
+                 reg_lambda_range=[1, 1.5, 2],  # ADDED: L2 regularization
                  random_state=42,
                  dist_method="nonparam",
                  n_iter_search=10,
                  cv_folds=3,
+                 cv_method=None,  # ADDED: CV method for temporal data
                  n_clusters=4,
                  optuna_n_jobs=1,
                  optuna_timeout=None):
@@ -9751,106 +9739,77 @@ class WAS_mme_XGBoosting:
         self.min_child_weight_range = min_child_weight_range
         self.subsample_range = subsample_range
         self.colsample_bytree_range = colsample_bytree_range
+        self.gamma_range = gamma_range  # ADDED
+        self.reg_alpha_range = reg_alpha_range  # ADDED
+        self.reg_lambda_range = reg_lambda_range  # ADDED
         self.random_state = random_state
         self.dist_method = dist_method
         self.n_iter_search = n_iter_search
         self.cv_folds = cv_folds
+        self.cv_method = cv_method  # ADDED
         self.n_clusters = n_clusters
         self.optuna_n_jobs = optuna_n_jobs
         self.optuna_timeout = optuna_timeout
-        self.xgb = None
+        self.xgb = {}  # Dictionary to store models per cluster
+        self.best_params_ = None
+        self.cluster_da_ = None
+
+    def _get_cv_splitter(self):
+        """Get appropriate cross-validator for time series data."""
+        if self.cv_method == 'timeseries':
+            return TimeSeriesSplit(n_splits=self.cv_folds)
+        else:
+            return self.cv_folds  # Regular k-fold
 
     def _objective(self, trial, X_train, y_train):
         """
-        Objective function for Optuna optimization.
+        Objective function for Optuna optimization with all hyperparameters.
         """
         # Define hyperparameter search space
-        # Handle n_estimators
-        if isinstance(self.n_estimators_range, list):
-            n_estimators = trial.suggest_categorical('n_estimators', self.n_estimators_range)
-        else:
-            # Assume it's a distribution
-            n_estimators = trial.suggest_int(
-                'n_estimators', 
-                int(self.n_estimators_range.a),
-                int(self.n_estimators_range.b)
-            )
+        params = {}
         
-        # Handle learning_rate
-        if isinstance(self.learning_rate_range, list):
-            learning_rate = trial.suggest_categorical('learning_rate', self.learning_rate_range)
-        else:
-            # Assume it's a distribution
-            learning_rate = trial.suggest_float(
-                'learning_rate', 
-                self.learning_rate_range.a,
-                self.learning_rate_range.b,
-                log=True
-            )
+        # Helper function to handle list vs distribution
+        def suggest_param(name, range_obj, param_type='float'):
+            if isinstance(range_obj, list):
+                return trial.suggest_categorical(name, range_obj)
+            else:
+                if param_type == 'int':
+                    return trial.suggest_int(name, int(range_obj.a), int(range_obj.b))
+                elif param_type == 'float_log':
+                    return trial.suggest_float(name, range_obj.a, range_obj.b, log=True)
+                else:  # float linear
+                    return trial.suggest_float(name, range_obj.a, range_obj.b)
         
-        # Handle max_depth
-        if isinstance(self.max_depth_range, list):
-            max_depth = trial.suggest_categorical('max_depth', self.max_depth_range)
-        else:
-            # Assume it's a distribution
-            max_depth = trial.suggest_int(
-                'max_depth', 
-                int(self.max_depth_range.a),
-                int(self.max_depth_range.b)
-            )
+        # Core parameters
+        params['n_estimators'] = suggest_param('n_estimators', self.n_estimators_range, 'int')
+        params['learning_rate'] = suggest_param('learning_rate', self.learning_rate_range, 'float_log')
+        params['max_depth'] = suggest_param('max_depth', self.max_depth_range, 'int')
+        params['min_child_weight'] = suggest_param('min_child_weight', self.min_child_weight_range, 'float')
+        params['subsample'] = suggest_param('subsample', self.subsample_range, 'float')
+        params['colsample_bytree'] = suggest_param('colsample_bytree', self.colsample_bytree_range, 'float')
         
-        # Handle min_child_weight
-        if isinstance(self.min_child_weight_range, list):
-            min_child_weight = trial.suggest_categorical('min_child_weight', self.min_child_weight_range)
-        else:
-            # Assume it's a distribution
-            min_child_weight = trial.suggest_float(
-                'min_child_weight', 
-                self.min_child_weight_range.a,
-                self.min_child_weight_range.b
-            )
-        
-        # Handle subsample
-        if isinstance(self.subsample_range, list):
-            subsample = trial.suggest_categorical('subsample', self.subsample_range)
-        else:
-            # Assume it's a distribution
-            subsample = trial.suggest_float(
-                'subsample', 
-                self.subsample_range.a,
-                self.subsample_range.b
-            )
-        
-        # Handle colsample_bytree
-        if isinstance(self.colsample_bytree_range, list):
-            colsample_bytree = trial.suggest_categorical('colsample_bytree', self.colsample_bytree_range)
-        else:
-            # Assume it's a distribution
-            colsample_bytree = trial.suggest_float(
-                'colsample_bytree', 
-                self.colsample_bytree_range.a,
-                self.colsample_bytree_range.b
-            )
+        # New regularization parameters
+        params['gamma'] = suggest_param('gamma', self.gamma_range, 'float')
+        params['reg_alpha'] = suggest_param('reg_alpha', self.reg_alpha_range, 'float')
+        params['reg_lambda'] = suggest_param('reg_lambda', self.reg_lambda_range, 'float')
         
         # Create and train model
         model = XGBRegressor(
-            n_estimators=n_estimators,
-            learning_rate=learning_rate,
-            max_depth=max_depth,
-            min_child_weight=min_child_weight,
-            subsample=subsample,
-            colsample_bytree=colsample_bytree,
+            **params,
             random_state=self.random_state,
             verbosity=0,
             n_jobs=-1
         )
         
-        # Use cross-validation
+        # Use appropriate cross-validation
         from sklearn.model_selection import cross_val_score
+        cv_splitter = self._get_cv_splitter()
+        
+        # Use MAE for rainfall prediction (less sensitive to outliers than MSE)
         scores = cross_val_score(
             model, X_train, y_train, 
-            cv=self.cv_folds, 
-            scoring='neg_mean_squared_error',
+            cv=cv_splitter, 
+            scoring='neg_mean_absolute_error',
             n_jobs=-1
         )
         
@@ -9881,10 +9840,9 @@ class WAS_mme_XGBoosting:
         """
         if "M" in Predictand.coords:
             Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
-        
-        X_train_std = Predictors
-        
+        X_train_std = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
         Predictand.name = "varname"
+        
         # Step 1: Perform KMeans clustering based on predictand's spatial distribution
         kmeans = KMeans(n_clusters=self.n_clusters, random_state=self.random_state)
         Predictand_dropna = Predictand.to_dataframe().reset_index().dropna().drop(columns=['T'])
@@ -9906,11 +9864,15 @@ class WAS_mme_XGBoosting:
         clusters = np.unique(xarray2)
         clusters = clusters[~np.isnan(clusters)]
         cluster_da = xarray2
-        y_train_std = Predictand
-        
+        # y_train_std = xarray1
+        y_train_std = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
         X_train_std['T'] = y_train_std['T']
         
+        
         best_params_dict = {}
+        
+        # For climate forecasting, use MAE as it's more robust for rainfall
+        scoring = make_scorer(lambda y_true, y_pred: -np.mean(np.abs(y_true - y_pred)))
         
         for c in clusters:
             mask_3d = (cluster_da == c).expand_dims({'T': y_train_std['T']})
@@ -9927,67 +9889,36 @@ class WAS_mme_XGBoosting:
                 # Prepare parameter grid for GridSearchCV
                 param_grid = {}
                 
-                # Handle n_estimators
-                if isinstance(self.n_estimators_range, list):
-                    param_grid['n_estimators'] = self.n_estimators_range
-                else:
-                    # Sample from distribution for grid search
-                    n_samples = min(5, self.n_iter_search)
-                    samples = self.n_estimators_range.rvs(size=n_samples, random_state=self.random_state)
-                    param_grid['n_estimators'] = np.unique(samples.astype(int))
+                # Helper function to handle list vs distribution
+                def prepare_grid(name, range_obj, n_samples=4):
+                    if isinstance(range_obj, list):
+                        param_grid[name] = range_obj
+                    else:
+                        # Sample from distribution for grid search
+                        samples = range_obj.rvs(size=min(n_samples, self.n_iter_search), 
+                                              random_state=self.random_state)
+                        param_grid[name] = np.unique(samples.astype(float) if 'int' in name else samples)
                 
-                # Handle learning_rate
-                if isinstance(self.learning_rate_range, list):
-                    param_grid['learning_rate'] = self.learning_rate_range
-                else:
-                    # Sample from distribution for grid search
-                    n_samples = min(5, self.n_iter_search)
-                    samples = self.learning_rate_range.rvs(size=n_samples, random_state=self.random_state)
-                    param_grid['learning_rate'] = np.unique(samples)
-                
-                # Handle max_depth
-                if isinstance(self.max_depth_range, list):
-                    param_grid['max_depth'] = self.max_depth_range
-                else:
-                    # Sample from distribution for grid search
-                    n_samples = min(5, self.n_iter_search)
-                    samples = self.max_depth_range.rvs(size=n_samples, random_state=self.random_state)
-                    param_grid['max_depth'] = np.unique(samples.astype(int))
-                
-                # Handle min_child_weight
-                if isinstance(self.min_child_weight_range, list):
-                    param_grid['min_child_weight'] = self.min_child_weight_range
-                else:
-                    # Sample from distribution for grid search
-                    n_samples = min(5, self.n_iter_search)
-                    samples = self.min_child_weight_range.rvs(size=n_samples, random_state=self.random_state)
-                    param_grid['min_child_weight'] = np.unique(samples)
-                
-                # Handle subsample
-                if isinstance(self.subsample_range, list):
-                    param_grid['subsample'] = self.subsample_range
-                else:
-                    # Sample from distribution for grid search
-                    n_samples = min(5, self.n_iter_search)
-                    samples = self.subsample_range.rvs(size=n_samples, random_state=self.random_state)
-                    param_grid['subsample'] = np.unique(samples)
-                
-                # Handle colsample_bytree
-                if isinstance(self.colsample_bytree_range, list):
-                    param_grid['colsample_bytree'] = self.colsample_bytree_range
-                else:
-                    # Sample from distribution for grid search
-                    n_samples = min(5, self.n_iter_search)
-                    samples = self.colsample_bytree_range.rvs(size=n_samples, random_state=self.random_state)
-                    param_grid['colsample_bytree'] = np.unique(samples)
+                prepare_grid('n_estimators', self.n_estimators_range)
+                prepare_grid('learning_rate', self.learning_rate_range)
+                prepare_grid('max_depth', self.max_depth_range)
+                prepare_grid('min_child_weight', self.min_child_weight_range)
+                prepare_grid('subsample', self.subsample_range)
+                prepare_grid('colsample_bytree', self.colsample_bytree_range)
+                prepare_grid('gamma', self.gamma_range)
+                prepare_grid('reg_alpha', self.reg_alpha_range)
+                prepare_grid('reg_lambda', self.reg_lambda_range)
                 
                 # Initialize XGBRegressor base model
                 model = XGBRegressor(random_state=self.random_state, verbosity=0, n_jobs=-1)
                 
+                # Get appropriate CV splitter
+                cv_splitter = self._get_cv_splitter()
+                
                 # Grid search
                 grid_search = GridSearchCV(
                     model, param_grid=param_grid,
-                    cv=self.cv_folds, scoring='neg_mean_squared_error',
+                    cv=cv_splitter, scoring=scoring,
                     error_score=np.nan, n_jobs=-1
                 )
                 grid_search.fit(X_clean_c, y_clean_c)
@@ -9997,31 +9928,27 @@ class WAS_mme_XGBoosting:
                 # Prepare parameter distributions for RandomizedSearchCV
                 param_dist = {}
                 
-                # Handle n_estimators
+                # All parameters can be lists or distributions
                 param_dist['n_estimators'] = self.n_estimators_range
-                
-                # Handle learning_rate
                 param_dist['learning_rate'] = self.learning_rate_range
-                
-                # Handle max_depth
                 param_dist['max_depth'] = self.max_depth_range
-                
-                # Handle min_child_weight
                 param_dist['min_child_weight'] = self.min_child_weight_range
-                
-                # Handle subsample
                 param_dist['subsample'] = self.subsample_range
-                
-                # Handle colsample_bytree
                 param_dist['colsample_bytree'] = self.colsample_bytree_range
+                param_dist['gamma'] = self.gamma_range
+                param_dist['reg_alpha'] = self.reg_alpha_range
+                param_dist['reg_lambda'] = self.reg_lambda_range
                 
                 # Initialize XGBRegressor base model
                 model = XGBRegressor(random_state=self.random_state, verbosity=0, n_jobs=-1)
                 
+                # Get appropriate CV splitter
+                cv_splitter = self._get_cv_splitter()
+                
                 # Randomized search
                 random_search = RandomizedSearchCV(
                     model, param_distributions=param_dist, n_iter=self.n_iter_search,
-                    cv=self.cv_folds, scoring='neg_mean_squared_error',
+                    cv=cv_splitter, scoring=scoring,
                     random_state=self.random_state, error_score=np.nan, n_jobs=-1
                 )
                 random_search.fit(X_clean_c, y_clean_c)
@@ -10030,7 +9957,7 @@ class WAS_mme_XGBoosting:
             elif self.search_method == 'bayesian':
                 # Bayesian optimization with Optuna
                 study = optuna.create_study(
-                    direction='maximize',  # We're maximizing negative MSE
+                    direction='maximize',  # We're maximizing negative MAE
                     sampler=optuna.samplers.TPESampler(seed=self.random_state),
                     pruner=optuna.pruners.MedianPruner(n_startup_trials=5)
                 )
@@ -10048,27 +9975,20 @@ class WAS_mme_XGBoosting:
                 
                 # Extract best parameters
                 best_params = study.best_params
-                
-                # Convert Optuna's best_params to scikit-learn format
-                sklearn_params = {
-                    'n_estimators': best_params['n_estimators'],
-                    'learning_rate': best_params['learning_rate'],
-                    'max_depth': best_params['max_depth'],
-                    'min_child_weight': best_params['min_child_weight'],
-                    'subsample': best_params['subsample'],
-                    'colsample_bytree': best_params['colsample_bytree']
-                }
-                best_params_dict[c] = sklearn_params
+                best_params_dict[c] = best_params
                 
             else:
                 raise ValueError(f"Unknown search_method: {self.search_method}. Choose from 'grid', 'random', or 'bayesian'.")
         
+        # Store best parameters and cluster data
+        self.best_params_ = best_params_dict
+        self.cluster_da_ = cluster_da
         return best_params_dict, cluster_da
-
 
     def compute_model(self, X_train, y_train, X_test, y_test, best_params=None, cluster_da=None):
         """
         Compute deterministic hindcast using the XGBRegressor model with injected hyperparameters for each zone.
+        
         Parameters
         ----------
         X_train : xarray.DataArray
@@ -10079,14 +9999,11 @@ class WAS_mme_XGBoosting:
             Testing predictor data with dimensions (T, M, Y, X).
         y_test : xarray.DataArray
             Testing predictand data with dimensions (T, Y, X).
-        clim_year_start : int
-            Start year of the climatology period.
-        clim_year_end : int
-            End year of the climatology period.
         best_params : dict, optional
             Pre-computed best hyperparameters per cluster. If None, computes internally.
         cluster_da : xarray.DataArray, optional
             Pre-computed cluster labels. If None, computes internally.
+        
         Returns
         -------
         predicted_da : xarray.DataArray
@@ -10097,6 +10014,7 @@ class WAS_mme_XGBoosting:
         y_train_std = y_train
         X_test_std = X_test
         y_test_std = y_test
+        
         # Extract coordinate variables from X_test
         time = X_test_std['T']
         lat = X_test_std['Y']
@@ -10104,51 +10022,74 @@ class WAS_mme_XGBoosting:
         n_time = len(time)
         n_lat = len(lat)
         n_lon = len(lon)
+        
         # Use provided best_params and cluster_da or compute if None
-        if best_params is None:
+        if best_params is None or cluster_da is None:
             best_params, cluster_da = self.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end)
+        
         # Initialize predictions array
         predictions = np.full((n_time, n_lat, n_lon), np.nan)
         self.xgb = {}  # Dictionary to store models per cluster
+        
         for c in range(self.n_clusters):
             if c not in best_params:
                 continue
             bp = best_params[c]
+            
             # Mask for this cluster
             mask_3d_train = (cluster_da == c).expand_dims({'T': X_train_std['T']})
             mask_3d_test = (cluster_da == c).expand_dims({'T': X_test_std['T']})
+            
             # Stack training data for cluster
             X_train_stacked_c = X_train_std.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
             y_train_stacked_c = y_train_std.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).values.ravel()
             train_nan_mask = np.any(~np.isfinite(X_train_stacked_c), axis=1) | ~np.isfinite(y_train_stacked_c)
             X_train_clean_c = X_train_stacked_c[~train_nan_mask]
             y_train_clean_c = y_train_stacked_c[~train_nan_mask]
+            
             # Stack testing data for cluster
             X_test_stacked_c = X_test_std.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
             y_test_stacked_c = y_test_std.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).values.ravel()
             test_nan_mask = np.any(~np.isfinite(X_test_stacked_c), axis=1) | ~np.isfinite(y_test_stacked_c)
             X_test_clean_c = X_test_stacked_c[~test_nan_mask]
-            # Initialize the model with best parameters for this cluster
-            xgb_c = XGBRegressor(
-                n_estimators=bp['n_estimators'],
-                learning_rate=bp['learning_rate'],
-                max_depth=bp['max_depth'],
-                min_child_weight=bp['min_child_weight'],
-                subsample=bp['subsample'],
-                colsample_bytree=bp['colsample_bytree'],
-                random_state=self.random_state,
-                verbosity=0
-            )
+            
+            # Initialize the model with best parameters including new ones
+            base_params = {
+                'n_estimators': bp.get('n_estimators', 500),
+                'learning_rate': bp.get('learning_rate', 0.01),
+                'max_depth': bp.get('max_depth', 7),
+                'min_child_weight': bp.get('min_child_weight', 1),
+                'subsample': bp.get('subsample', 1.0),
+                'colsample_bytree': bp.get('colsample_bytree', 1.0),
+                'random_state': self.random_state,
+                'verbosity': 0,
+                'n_jobs': -1
+            }
+            
+            # Add new regularization parameters if present
+            if 'gamma' in bp:
+                base_params['gamma'] = bp['gamma']
+            if 'reg_alpha' in bp:
+                base_params['reg_alpha'] = bp['reg_alpha']
+            if 'reg_lambda' in bp:
+                base_params['reg_lambda'] = bp['reg_lambda']
+
+            # print(base_params)
+            
             # Fit and predict
+            xgb_c = XGBRegressor(**base_params)
             xgb_c.fit(X_train_clean_c, y_train_clean_c)
             self.xgb[c] = xgb_c
             y_pred_c = xgb_c.predict(X_test_clean_c)
+            
             # Reconstruct predictions for this cluster
             result_c = np.full(len(y_test_stacked_c), np.nan)
             result_c[~test_nan_mask] = y_pred_c
             pred_c_reshaped = result_c.reshape(n_time, n_lat, n_lon)
-            # Fill in the predictions array
+            
+            # Fill in the predictions array (using np.where to handle overlapping regions)
             predictions = np.where(np.isnan(predictions), pred_c_reshaped, predictions)
+        
         predicted_da = xr.DataArray(
             data=predictions,
             coords={'T': time, 'Y': lat, 'X': lon},
@@ -10156,7 +10097,7 @@ class WAS_mme_XGBoosting:
         )
 
         return predicted_da
-
+        
     # ------------------ Probability Calculation Methods ------------------
 
     @staticmethod
@@ -10653,9 +10594,12 @@ class WAS_mme_XGBoosting:
         nan_mask = np.any(np.isnan(da_values), axis=1)
         return da_values[~nan_mask], nan_mask, da_values
 
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, hindcast_det_cross, Predictor_for_year, best_params=None, cluster_da=None, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, 
+                 hindcast_det_cross, Predictor_for_year, best_params=None, cluster_da=None,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         """
-        Forecast method using a single XGBoost model with optimized hyperparameters.
+        Forecast method using XGBoost models with optimized hyperparameters per cluster.
+        
         Parameters
         ----------
         Predictant : xarray.DataArray
@@ -10671,9 +10615,12 @@ class WAS_mme_XGBoosting:
         Predictor_for_year : xarray.DataArray
             Predictor data for the target year with dimensions (T, M, Y, X).
         best_params : dict, optional
-            Pre-computed best hyperparameters. If None, computes internally.
+            Pre-computed best hyperparameters per cluster. If None, computes internally.
         cluster_da : xarray.DataArray, optional
             Pre-computed cluster labels. If None, computes internally.
+        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
+            Distribution parameters for 'bestfit' method.
+        
         Returns
         -------
         forecast_det : xarray.DataArray
@@ -10686,83 +10633,105 @@ class WAS_mme_XGBoosting:
         else:
             Predictant_no_m = Predictant
         mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+        
         # Standardize Predictor_for_year using hindcast climatology
         mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
         std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        # Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        Predictor_for_year_st = Predictor_for_year
-        # hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        hindcast_det_st = hindcast_det
-        # Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
-        Predictant_st = Predictant_no_m
+        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
         hindcast_det_st['T'] = Predictant_st['T']
+        hindcast_det_cross['T'] = Predictant_st['T']      
         
         # Extract coordinates from X_test
         time = Predictor_for_year_st['T']
         lat = Predictor_for_year_st['Y']
         lon = Predictor_for_year_st['X']
+        
         n_time = len(time)
         n_lat = len(lat)
         n_lon = len(lon)
+        
         # Use provided best_params and cluster_da or compute if None
-        if best_params is None:
+        if best_params is None or cluster_da is None:
             best_params, cluster_da = self.compute_hyperparameters(hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
+        
         # Initialize predictions array
         predictions = np.full((n_time, n_lat, n_lon), np.nan)
         self.xgb = {}  # Dictionary to store models per cluster
+        
         for c in range(self.n_clusters):
             if c not in best_params:
                 continue
             bp = best_params[c]
+            
             # Mask for this cluster
             mask_3d_train = (cluster_da == c).expand_dims({'T': hindcast_det_st['T']})
             mask_3d_test = (cluster_da == c).expand_dims({'T': Predictor_for_year_st['T']})
+            
             # Stack training data for cluster
             X_train_stacked_c = hindcast_det_st.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
             y_train_stacked_c = Predictant_st.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).values.ravel()
             train_nan_mask = np.any(~np.isfinite(X_train_stacked_c), axis=1) | ~np.isfinite(y_train_stacked_c)
             X_train_clean_c = X_train_stacked_c[~train_nan_mask]
             y_train_clean_c = y_train_stacked_c[~train_nan_mask]
+            
             # Stack testing data for cluster
             X_test_stacked_c = Predictor_for_year_st.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
             test_nan_mask = np.any(~np.isfinite(X_test_stacked_c), axis=1)
             X_test_clean_c = X_test_stacked_c[~test_nan_mask]
-            # Initialize the model with best parameters for this cluster
-            xgb_c = XGBRegressor(
-                n_estimators=bp['n_estimators'],
-                learning_rate=bp['learning_rate'],
-                max_depth=bp['max_depth'],
-                min_child_weight=bp['min_child_weight'],
-                subsample=bp['subsample'],
-                colsample_bytree=bp['colsample_bytree'],
-                random_state=self.random_state,
-                verbosity=0,
-                n_jobs=-1
-            )
+            
+            # Initialize the model with best parameters including new ones
+            base_params = {
+                'n_estimators': bp.get('n_estimators', 100),
+                'learning_rate': bp.get('learning_rate', 0.1),
+                'max_depth': bp.get('max_depth', 5),
+                'min_child_weight': bp.get('min_child_weight', 1),
+                'subsample': bp.get('subsample', 1.0),
+                'colsample_bytree': bp.get('colsample_bytree', 1.0),
+                'random_state': self.random_state,
+                'verbosity': 0,
+                'n_jobs': -1
+            }
+            
+            # Add new regularization parameters if present
+            if 'gamma' in bp:
+                base_params['gamma'] = bp['gamma']
+            if 'reg_alpha' in bp:
+                base_params['reg_alpha'] = bp['reg_alpha']
+            if 'reg_lambda' in bp:
+                base_params['reg_lambda'] = bp['reg_lambda']
+            
             # Fit and predict
+            xgb_c = XGBRegressor(**base_params)
             xgb_c.fit(X_train_clean_c, y_train_clean_c)
             self.xgb[c] = xgb_c
             y_pred_c = xgb_c.predict(X_test_clean_c)
+            
             # Reconstruct predictions for this cluster
             result_c = np.full(len(X_test_stacked_c), np.nan)
             result_c[~test_nan_mask] = y_pred_c
             pred_c_reshaped = result_c.reshape(n_time, n_lat, n_lon)
+            
             # Fill in the predictions array
             predictions = np.where(np.isnan(predictions), pred_c_reshaped, predictions)
+        
         result_da = xr.DataArray(
             data=predictions,
             coords={'T': time, 'Y': lat, 'X': lon},
             dims=['T', 'Y', 'X']
         ) * mask
+
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
         
-        # result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
-        
+        # Adjust time coordinate
         year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
         T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
         month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
         new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
         result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
         result_da['T'] = result_da['T'].astype('datetime64[ns]')
+        
         # Compute tercile probabilities
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
@@ -10836,13 +10805,13 @@ class WAS_mme_XGBoosting:
 
         else:
             raise ValueError(f"Invalid dist_method: {self.dist_method}")
+        
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_da * mask, mask * forecast_prob.transpose('probability', 'T', 'Y', 'X')
 
-
 class WAS_mme_RF_:
     """
-    Random Forest-based Multi-Model Ensemble (MME) forecasting.
+    Enhanced Random Forest-based Multi-Model Ensemble (MME) forecasting.
     This class implements a single-model forecasting approach using scikit-learn's RandomForestRegressor
     for deterministic predictions, with optional tercile probability calculations using
     various statistical distributions. Implements multiple hyperparameter optimization methods.
@@ -10850,15 +10819,23 @@ class WAS_mme_RF_:
     Parameters
     ----------
     n_estimators_range : list of int, optional
-        List of n_estimators values to tune (default is [50, 100, 200, 300]).
-    max_depth_range : list of int, optional
-        List of max depths to tune (default is [None, 10, 20, 30]).
+        List of n_estimators values to tune (default is [100, 200, 300, 500]).
+    max_depth_range : list of int or None, optional
+        List of max depths to tune (default is [None, 5, 10, 15, 20]).
     min_samples_split_range : list of int, optional
-        List of minimum samples required to split to tune (default is [2, 5, 10]).
+        List of minimum samples required to split to tune (default is [2, 5, 10, 20]).
     min_samples_leaf_range : list of int, optional
-        List of minimum samples required at leaf node to tune (default is [1, 2, 4]).
-    max_features_range : list of str or float, optional
-        List of max features to tune (default is [None, 'sqrt', 0.33, 0.5]).
+        List of minimum samples required at leaf node to tune (default is [1, 2, 4, 8]).
+    max_features_range : list of str, float, or None, optional
+        List of max features to tune (default is [None, 'sqrt', 'log2', 0.33, 0.5, 0.7]).
+    max_samples_range : list of float, optional
+        List of bootstrap sample fractions (default is [None, 0.7, 0.8, 0.9, 1.0]).
+    max_leaf_nodes_range : list of int or None, optional
+        List of maximum leaf nodes to tune (default is [None, 100, 500, 1000]).
+    min_impurity_decrease_range : list of float, optional
+        List of minimum impurity decrease values (default is [0.0, 0.01, 0.1]).
+    warm_start : bool, optional
+        Whether to reuse solution of previous call to fit (default is False).
     random_state : int, optional
         Seed for reproducibility (default is 42).
     dist_method : str, optional
@@ -10867,88 +10844,130 @@ class WAS_mme_RF_:
         Hyperparameter optimization method: 'random' (RandomizedSearchCV), 
         'grid' (GridSearchCV), or 'bayesian' (Optuna) (default is 'random').
     n_iter_search : int, optional
-        Number of iterations for randomized search (default is 10).
+        Number of iterations for randomized search (default is 20).
     n_trials : int, optional
-        Number of trials for Bayesian optimization with Optuna (default is 100).
+        Number of trials for Bayesian optimization with Optuna (default is 50).
     cv_folds : int, optional
-        Number of cross-validation folds (default is 3).
+        Number of cross-validation folds (default is 5).
+    scoring : str, optional
+        Scoring metric for hyperparameter optimization (default is 'neg_mean_squared_error').
+    n_jobs : int, optional
+        Number of parallel jobs for RandomForest (default is -1, all cores).
+    verbose : int, optional
+        Verbosity level (default is 0, silent).
     """
     def __init__(self,
-                 n_estimators_range=[50, 100, 200, 300],
-                 max_depth_range=[None, 10, 20, 30],
-                 min_samples_split_range=[2, 5, 10],
-                 min_samples_leaf_range=[1, 2, 4],
-                 max_features_range=[None, 'sqrt', 'log2' ,0.33, 0.5],
-                 random_state=42,
-                 dist_method="nonparam",
-                 search_method="random",
-                 n_iter_search=10,
-                 n_trials=100,
-                 cv_folds=3):
+                 n_estimators_range: List[int] = [100, 200, 300, 500],
+                 max_depth_range: List[Union[int, None]] = [None, 5, 10, 15, 20],
+                 min_samples_split_range: List[int] = [2, 5, 10, 20],
+                 min_samples_leaf_range: List[int] = [1, 2, 4, 8],
+                 max_features_range: List[Union[str, float, None]] = [None, 'sqrt', 'log2', 0.33, 0.5, 0.7],
+                 max_samples_range: List[Union[float, None]] = [None, 0.7, 0.8, 0.9, 1.0],
+                 # max_leaf_nodes_range: List[Union[int, None]] = [100, 500, 1000],
+                 min_impurity_decrease_range: List[float] = [0.0, 0.01, 0.1],
+                 warm_start: bool = False,
+                 random_state: int = 42,
+                 dist_method: str = "nonparam",
+                 search_method: str = "random",
+                 n_iter_search: int = 20,
+                 n_trials: int = 50,
+                 cv_folds: int = 5,
+                 scoring: str = 'neg_mean_squared_error',
+                 n_jobs: int = -1,
+                 verbose: int = 0):
+        
+        # Core Random Forest hyperparameters
         self.n_estimators_range = n_estimators_range
         self.max_depth_range = max_depth_range
         self.min_samples_split_range = min_samples_split_range
         self.min_samples_leaf_range = min_samples_leaf_range
         self.max_features_range = max_features_range
+        
+        # Additional Random Forest hyperparameters
+        self.max_samples_range = max_samples_range
+        # self.max_leaf_nodes_range = max_leaf_nodes_range
+        self.min_impurity_decrease_range = min_impurity_decrease_range
+        self.warm_start = warm_start
+        
+        # Training and optimization parameters
         self.random_state = random_state
         self.dist_method = dist_method
         self.search_method = search_method
         self.n_iter_search = n_iter_search
         self.n_trials = n_trials
         self.cv_folds = cv_folds
+        self.scoring = scoring
+        self.n_jobs = n_jobs
+        self.verbose = verbose
+        
+        # Model storage
         self.rf = None
-        self.best_params_ = None  # Store best parameters found
-        self.study_ = None  # Store Optuna study
+        self.best_params_ = None
+        self.study_ = None
+        self.feature_importances_ = None
+        self.cv_results_ = None
 
-    def _prepare_param_distributions(self):
+    def _prepare_param_distributions(self) -> Dict:
         """Prepare parameter distributions for different search methods."""
+        param_dict = {
+            'n_estimators': self.n_estimators_range,
+            'max_depth': self.max_depth_range,
+            'min_samples_split': self.min_samples_split_range,
+            'min_samples_leaf': self.min_samples_leaf_range,
+            'max_features': self.max_features_range,
+            'max_samples': self.max_samples_range,
+            # 'max_leaf_nodes': self.max_leaf_nodes_range,
+            'min_impurity_decrease': self.min_impurity_decrease_range
+        }
+        
+        # Remove None values for grid search (handled differently)
         if self.search_method == 'grid':
-            # For GridSearch, we need all combinations
-            param_grid = {
-                'n_estimators': self.n_estimators_range,
-                'max_depth': self.max_depth_range,
-                'min_samples_split': self.min_samples_split_range,
-                'min_samples_leaf': self.min_samples_leaf_range,
-                'max_features': self.max_features_range
-            }
-            return param_grid
+            # For grid search, we need to handle None values carefully
+            # They will be passed as is
+            return param_dict
         else:
-            # For random search and bayesian, we can use distributions
-            param_dist = {
-                'n_estimators': self.n_estimators_range,
-                'max_depth': self.max_depth_range,
-                'min_samples_split': self.min_samples_split_range,
-                'min_samples_leaf': self.min_samples_leaf_range,
-                'max_features': self.max_features_range
-            }
-            return param_dist
+            # For random and bayesian search
+            return param_dict
 
-    def _objective(self, trial, X_train, y_train):
+    def _objective(self, trial, X_train: np.ndarray, y_train: np.ndarray) -> float:
         """Objective function for Bayesian optimization with Optuna."""
-        n_estimators = trial.suggest_categorical('n_estimators', self.n_estimators_range)
-        max_depth = trial.suggest_categorical('max_depth', self.max_depth_range)
-        min_samples_split = trial.suggest_categorical('min_samples_split', self.min_samples_split_range)
-        min_samples_leaf = trial.suggest_categorical('min_samples_leaf', self.min_samples_leaf_range)
-        max_features = trial.suggest_categorical('max_features', self.max_features_range)
+        params = {
+            'n_estimators': trial.suggest_categorical('n_estimators', self.n_estimators_range),
+            'max_depth': trial.suggest_categorical('max_depth', self.max_depth_range),
+            'min_samples_split': trial.suggest_categorical('min_samples_split', 
+                                                          self.min_samples_split_range),
+            'min_samples_leaf': trial.suggest_categorical('min_samples_leaf', 
+                                                         self.min_samples_leaf_range),
+            'max_features': trial.suggest_categorical('max_features', self.max_features_range),
+            'max_samples': trial.suggest_categorical('max_samples', self.max_samples_range),
+            # 'max_leaf_nodes': trial.suggest_categorical('max_leaf_nodes', 
+            #                                            self.max_leaf_nodes_range),
+            'min_impurity_decrease': trial.suggest_categorical('min_impurity_decrease',
+                                                              self.min_impurity_decrease_range)
+        }
         
-        # Handle 'None' and 'sqrt' for max_features
+        # Handle string and None values for max_features
+        max_features = params['max_features']
         if isinstance(max_features, str):
-            if max_features == None:
-                max_features = X_train.shape[1]
-            elif max_features == 'sqrt':
-                max_features = 'sqrt'
+            if max_features == 'None':
+                max_features = None
         
+        # Initialize model
         model = RandomForestRegressor(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            min_samples_split=min_samples_split,
-            min_samples_leaf=min_samples_leaf,
+            n_estimators=params['n_estimators'],
+            max_depth=params['max_depth'],
+            min_samples_split=params['min_samples_split'],
+            min_samples_leaf=params['min_samples_leaf'],
             max_features=max_features,
+            max_samples=params['max_samples'],
+            max_leaf_nodes=params['max_leaf_nodes'],
+            min_impurity_decrease=params['min_impurity_decrease'],
+            warm_start=self.warm_start,
             random_state=self.random_state,
-            n_jobs=-1
+            n_jobs=self.n_jobs
         )
         
-        # Simple cross-validation (could be improved with sklearn's cross_val_score)
+        # Cross-validation
         from sklearn.model_selection import KFold
         kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
         
@@ -10957,14 +10976,17 @@ class WAS_mme_RF_:
             X_train_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
             y_train_fold, y_val_fold = y_train[train_idx], y_train[val_idx]
             
-            model.fit(X_train_fold, y_train_fold)
+            model.fit(X_train_fold, y_train_fold.ravel())
             y_pred = model.predict(X_val_fold)
+            
+            # Use negative MSE for maximization
             mse = np.mean((y_val_fold - y_pred) ** 2)
-            scores.append(-mse)  # Negative MSE for maximization
+            scores.append(-mse)
         
         return np.mean(scores)
 
-    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
+    def compute_hyperparameters(self, Predictors: xr.DataArray, Predictand: xr.DataArray,
+                                clim_year_start: int, clim_year_end: int) -> Dict:
         """
         Independently computes the best hyperparameters using selected optimization method.
 
@@ -10984,62 +11006,93 @@ class WAS_mme_RF_:
         dict
             Best hyperparameters found.
         """
-        X_train = Predictors
-        y_train = Predictand
 
-        # Stack training data
-        X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
-        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
-        X_train_clean = X_train_stacked[~train_nan_mask]
-        y_train_clean = y_train_stacked[~train_nan_mask]
+        X_train = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        y_train = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
 
+        # Stack and clean data
+        X_train = Predictors.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+        y_train = Predictand.stack(sample=('T', 'Y', 'X')).values.ravel()
+        # Remove NaN values
+        train_nan_mask = np.any(~np.isfinite(X_train), axis=1) | ~np.isfinite(y_train)
+        X_train_clean = X_train[~train_nan_mask]
+        y_train_clean = y_train[~train_nan_mask]
+        
+        if len(y_train_clean) == 0:
+            raise ValueError("No valid training data after removing NaN values")
+        
         # Initialize base model
-        model = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
+        model = RandomForestRegressor(
+            random_state=self.random_state,
+            n_jobs=self.n_jobs,
+            warm_start=self.warm_start
+        )
 
         if self.search_method == 'grid':
             # Grid Search
             param_grid = self._prepare_param_distributions()
             grid_search = GridSearchCV(
-                model, param_grid=param_grid,
-                cv=self.cv_folds, scoring='neg_mean_squared_error',
-                error_score=np.nan, verbose=0
+                model,
+                param_grid=param_grid,
+                cv=self.cv_folds,
+                scoring=self.scoring,
+                n_jobs=self.n_jobs,
+                verbose=self.verbose,
+                error_score='raise'
             )
             grid_search.fit(X_train_clean, y_train_clean)
-            best_params = grid_search.best_params_
-            self.best_params_ = best_params
+            self.best_params_ = grid_search.best_params_
+            self.cv_results_ = grid_search.cv_results_
 
         elif self.search_method == 'bayesian':
             # Bayesian Optimization with Optuna
             sampler = TPESampler(seed=self.random_state)
             self.study_ = optuna.create_study(
                 direction='maximize',
-                sampler=sampler
+                sampler=sampler,
+                study_name=f"RF_Optuna_{clim_year_start}_{clim_year_end}"
             )
             
             # Create objective function with data
             objective_with_data = lambda trial: self._objective(trial, X_train_clean, y_train_clean)
-            self.study_.optimize(objective_with_data, n_trials=self.n_trials)
+            self.study_.optimize(objective_with_data, n_trials=self.n_trials, show_progress_bar=self.verbose>0)
             
             # Get best parameters
-            best_params = self.study_.best_params
-            self.best_params_ = best_params
+            self.best_params_ = self.study_.best_params
+            
+            # Convert best params to proper types
+            for key, value in self.best_params_.items():
+                if value == 'None':
+                    self.best_params_[key] = None
 
         else:  # Default to random search
-            # Random Search (default)
+            # Random Search
             param_dist = self._prepare_param_distributions()
             random_search = RandomizedSearchCV(
-                model, param_distributions=param_dist, n_iter=self.n_iter_search,
-                cv=self.cv_folds, scoring='neg_mean_squared_error',
-                random_state=self.random_state, error_score=np.nan
+                model,
+                param_distributions=param_dist,
+                n_iter=self.n_iter_search,
+                cv=self.cv_folds,
+                scoring=self.scoring,
+                random_state=self.random_state,
+                n_jobs=self.n_jobs,
+                verbose=self.verbose,
+                error_score='raise'
             )
             random_search.fit(X_train_clean, y_train_clean)
-            best_params = random_search.best_params_
-            self.best_params_ = best_params
+            self.best_params_ = random_search.best_params_
+            self.cv_results_ = random_search.cv_results_
 
-        return best_params
+        # Store feature importances if model is fitted
+        if self.search_method == 'grid' or self.search_method == 'random':
+            self.rf = random_search.best_estimator_ if self.search_method == 'random' else grid_search.best_estimator_
+            self.feature_importances_ = self.rf.feature_importances_
 
-    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None):
+        return self.best_params_
+
+    def compute_model(self, X_train: xr.DataArray, y_train: xr.DataArray,
+                      X_test: xr.DataArray, y_test: xr.DataArray,
+                      best_params: Optional[Dict] = None) -> xr.DataArray:
         """
         Compute deterministic hindcast using the RandomForestRegressor model with injected hyperparameters.
 
@@ -11065,51 +11118,120 @@ class WAS_mme_RF_:
         time = X_test['T']
         lat = X_test['Y']
         lon = X_test['X']
-        n_time = len(X_test.coords['T'])
-        n_lat = len(X_test.coords['Y'])
-        n_lon = len(X_test.coords['X'])
-
+        
         # Stack training data
         X_train_stacked = X_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        train_nan_mask = (np.any(~np.isfinite(X_train_stacked), axis=1) | np.any(~np.isfinite(y_train_stacked), axis=1))
+        y_train_stacked = y_train.stack(sample=('T', 'Y', 'X')).values.ravel()
+        train_nan_mask = np.any(~np.isfinite(X_train_stacked), axis=1) | ~np.isfinite(y_train_stacked)
         X_train_clean = X_train_stacked[~train_nan_mask]
         y_train_clean = y_train_stacked[~train_nan_mask]
-
+        
+        if len(y_train_clean) == 0:
+            raise ValueError("No valid training data after removing NaN values")
+        
         # Stack testing data
         X_test_stacked = X_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-        test_nan_mask = (np.any(~np.isfinite(X_test_stacked), axis=1) | np.any(~np.isfinite(y_test_stacked), axis=1))
-
+        y_test_stacked = y_test.stack(sample=('T', 'Y', 'X')).values.ravel()
+        test_nan_mask = np.any(~np.isfinite(X_test_stacked), axis=1) | ~np.isfinite(y_test_stacked)
+        
         # Use provided best_params or compute if None
         if best_params is None:
-            best_params = self.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end)
-
-        # Initialize the model with best parameters
+            # For consistency, we need clim_year_start and end, but they're not available here so 1991, 2020
+            # We'll compute hyperparameters using the training data only
+            best_params = self.compute_hyperparameters(X_train, y_train, 1991, 2020)
+        
+        # Handle string and None values in best_params
+        processed_params = {}
+        for key, value in best_params.items():
+            if key == 'max_features' and isinstance(value, str):
+                if value == 'None':
+                    processed_params[key] = None
+                else:
+                    processed_params[key] = value
+            elif value == 'None':
+                processed_params[key] = None
+            else:
+                processed_params[key] = value
+        
+        # Initialize and train the model
         self.rf = RandomForestRegressor(
-            n_estimators=best_params['n_estimators'],
-            max_depth=best_params['max_depth'],
-            min_samples_split=best_params['min_samples_split'],
-            min_samples_leaf=best_params['min_samples_leaf'],
-            max_features=best_params['max_features'],
+            **processed_params,
             random_state=self.random_state,
-            n_jobs=-1
+            n_jobs=self.n_jobs,
+            warm_start=self.warm_start
+        )
+        
+        self.rf.fit(X_train_clean, y_train_clean)
+        
+        # Store feature importances
+        self.feature_importances_ = self.rf.feature_importances_
+        
+        # Predict on non-NaN testing data
+        if np.any(~test_nan_mask):
+            y_pred = self.rf.predict(X_test_stacked[~test_nan_mask])
+        else:
+            y_pred = np.array([])
+        
+        # Reconstruct predictions
+        result = np.full_like(y_test_stacked, np.nan, dtype=float)
+        if len(y_pred) > 0:
+            result[~test_nan_mask] = y_pred
+        
+        # Reshape to original dimensions
+        n_time = len(time)
+        n_lat = len(lat)
+        n_lon = len(lon)
+        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
+        
+        # Create DataArray
+        predicted_da = xr.DataArray(
+            data=predictions_reshaped,
+            coords={'T': time, 'Y': lat, 'X': lon},
+            dims=['T', 'Y', 'X'],
+            attrs={'model': 'RandomForest', 'hyperparameters': str(best_params)}
+        )
+        
+        return predicted_da
+
+    def get_feature_importance(self, feature_names: Optional[List[str]] = None) -> xr.DataArray:
+        """
+        Get feature importance scores.
+        
+        Parameters
+        ----------
+        feature_names : list of str, optional
+            Names of features. If None, uses generic names.
+            
+        Returns
+        -------
+        xarray.DataArray
+            Feature importance scores.
+        """
+        if self.feature_importances_ is None:
+            raise ValueError("Model not fitted yet. Call compute_model or compute_hyperparameters first.")
+        
+        if feature_names is None:
+            feature_names = [f'Feature_{i}' for i in range(len(self.feature_importances_))]
+        
+        return xr.DataArray(
+            data=self.feature_importances_,
+            coords={'feature': feature_names},
+            dims=['feature'],
+            name='feature_importance'
         )
 
-        # Fit the model and predict on non-NaN testing data
-        self.rf.fit(X_train_clean, y_train_clean)
-        y_pred = self.rf.predict(X_test_stacked[~test_nan_mask])
-
-        # Reconstruct predictions
-        result = np.empty_like(np.squeeze(y_test_stacked))
-        result[np.squeeze(test_nan_mask)] = np.squeeze(y_test_stacked[test_nan_mask])
-        result[~np.squeeze(test_nan_mask)] = y_pred
-
-        predictions_reshaped = result.reshape(n_time, n_lat, n_lon)
-        predicted_da = xr.DataArray(data=predictions_reshaped,
-                                    coords={'T': time, 'Y': lat, 'X': lon},
-                                    dims=['T', 'Y', 'X'])
-        return predicted_da
+    def get_oob_score(self) -> Optional[float]:
+        """
+        Get out-of-bag score if available.
+        
+        Returns
+        -------
+        float or None
+            Out-of-bag score if model was trained with oob_score=True.
+        """
+        if self.rf is not None and hasattr(self.rf, 'oob_score_'):
+            return self.rf.oob_score_
+        return None
 
     # ------------------ Probability Calculation Methods ------------------
 
@@ -11645,15 +11767,15 @@ class WAS_mme_RF_:
         # Standardize Predictor_for_year using hindcast climatology
         mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
         std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        # Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
+        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
 
-        Predictor_for_year_st = Predictor_for_year
+        # Predictor_for_year_st = Predictor_for_year
 
-        # hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
-        hindcast_det_st = hindcast_det
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        # hindcast_det_st = hindcast_det
         
-        # Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
-        Predictant_st = Predictant_no_m
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
+        # Predictant_st = Predictant_no_m
         
         y_test = Predictant_st.isel(T=[-1])
 
@@ -11681,17 +11803,46 @@ class WAS_mme_RF_:
         if best_params is None:
             best_params = self.compute_hyperparameters(hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
 
-        # Initialize and fit the model with best parameters
+        # Handle string and None values in best_params
+        processed_params = {}
+        for key, value in best_params.items():
+            if key == 'max_features' and isinstance(value, str):
+                if value == 'None':
+                    processed_params[key] = None
+                else:
+                    processed_params[key] = value
+            elif value == 'None':
+                processed_params[key] = None
+            else:
+                processed_params[key] = value
+        
+        # Initialize and train the model
         self.rf = RandomForestRegressor(
-            n_estimators=best_params['n_estimators'],
-            max_depth=best_params['max_depth'],
-            min_samples_split=best_params['min_samples_split'],
-            min_samples_leaf=best_params['min_samples_leaf'],
-            max_features=best_params['max_features'],
+            **processed_params,
             random_state=self.random_state,
-            n_jobs=-1
+            n_jobs=self.n_jobs,
+            warm_start=self.warm_start
         )
+        
         self.rf.fit(X_train_clean, y_train_clean)
+        
+        # Store feature importances
+        self.feature_importances_ = self.rf.feature_importances_
+
+
+        
+        # # Initialize and fit the model with best parameters
+        # self.rf = RandomForestRegressor(
+        #     n_estimators=best_params['n_estimators'],
+        #     max_depth=best_params['max_depth'],
+        #     min_samples_split=best_params['min_samples_split'],
+        #     min_samples_leaf=best_params['min_samples_leaf'],
+        #     max_features=best_params['max_features'],
+        #     random_state=self.random_state,
+        #     n_jobs=-1
+        # )
+        # self.rf.fit(X_train_clean, y_train_clean)
+        
         y_pred = self.rf.predict(X_test_stacked[~test_nan_mask])
 
         # Reconstruct the prediction array
@@ -11704,7 +11855,7 @@ class WAS_mme_RF_:
                                  coords={'T': time, 'Y': lat, 'X': lon},
                                  dims=['T', 'Y', 'X']) * mask
 
-        # result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
         
         year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
         T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
@@ -11791,22 +11942,1001 @@ class WAS_mme_RF_:
 
 
 
+
+
 class WAS_mme_RF:
     """
-    Random Forest-based Multi-Model Ensemble (MME) forecasting.
+    Enhanced Random Forest-based Multi-Model Ensemble (MME) forecasting for West Africa.
+    
+    Parameters
+    ----------
+    search_method : str, optional
+        Hyperparameter optimization method: 'grid', 'random', or 'bayesian' (default: 'random').
+    n_estimators_range : list of int, optional
+        List of n_estimators values to tune (default is [100, 200, 300, 500]).
+    max_depth_range : list of int or None, optional
+        List of max depths to tune (default is [None, 8, 12, 16]).
+    min_samples_split_range : list of int, optional
+        List of minimum samples required to split (default is [2, 5, 10]).
+    min_samples_leaf_range : list of int, optional
+        List of minimum samples required at leaf node (default is [1, 2, 4]).
+    max_features_range : list of str or float, optional
+        List of max features to tune (default is ['sqrt', 0.3, 0.5, 0.7]).
+    bootstrap_range : list of bool, optional
+        List of bootstrap options to tune (default is [True, False]).
+    max_samples_range : list of float or None, optional
+        List of max samples as fraction of dataset (default is [None, 0.7, 0.8]).
+    min_impurity_decrease_range : list of float, optional
+        List of min impurity decrease values (default is [0.0, 0.001, 0.01]).
+    max_leaf_nodes_range : list of int or None, optional
+        List of max leaf nodes (default is [None, 50, 100]).
+    ccp_alpha_range : list of float, optional
+        List of complexity parameters for pruning (default is [0.0, 0.001, 0.01]).
+    min_weight_fraction_leaf_range : list of float, optional
+        List of minimum weighted fraction of leaves (default is [0.0, 0.1, 0.2]).
+    warm_start : bool, optional
+        Whether to reuse solution of previous call to fit (default is False).
+    random_state : int, optional
+        Seed for reproducibility (default is 42).
+    dist_method : str, optional
+        Distribution method for tercile probabilities ('bestfit', 'nonparam', etc.) (default is 'nonparam').
+    n_iter_search : int, optional
+        Number of iterations for randomized/bayesian search (default is 20).
+    cv_folds : int, optional
+        Number of cross-validation folds (default is 5).
+    n_clusters : int, optional
+        Number of clusters for homogenized zones (default is 6 for West Africa).
+    scoring : str, optional
+        Scoring metric for hyperparameter optimization (default is 'neg_mean_squared_error').
+    verbose : int, optional
+        Verbosity level (default is 0).
+    """
+    
+    def __init__(self,
+                 search_method: str = 'random',
+                 n_estimators_range: Union[List[int], object] = [100, 200, 300, 500],
+                 max_depth_range: Union[List[Optional[int]], object] = [None, 8, 12, 16],
+                 min_samples_split_range: Union[List[int], object] = [2, 5, 10],
+                 min_samples_leaf_range: Union[List[int], object] = [1, 2, 4],
+                 max_features_range: List[Union[str, float]] = ['sqrt', 0.3, 0.5, 0.7],
+                 bootstrap_range: List[bool] = [True, False],
+                 max_samples_range: List[Optional[float]] = [None, 0.7, 0.8],
+                 min_impurity_decrease_range: List[float] = [0.0, 0.001, 0.01],
+                 ccp_alpha_range: List[float] = [0.0, 0.001, 0.01],
+                 warm_start: bool = False,
+                 random_state: int = 42,
+                 dist_method: str = "nonparam",
+                 n_iter_search: int = 20,
+                 cv_folds: int = 5,
+                 n_clusters: int = 6,
+                 scoring: str = 'neg_mean_squared_error',
+                 verbose: int = 0):
+        
+        self.search_method = search_method
+        self.n_estimators_range = n_estimators_range
+        self.max_depth_range = max_depth_range
+        self.min_samples_split_range = min_samples_split_range
+        self.min_samples_leaf_range = min_samples_leaf_range
+        self.max_features_range = max_features_range
+        self.bootstrap_range = bootstrap_range
+        self.max_samples_range = max_samples_range
+        self.min_impurity_decrease_range = min_impurity_decrease_range
+        self.ccp_alpha_range = ccp_alpha_range
+        # self.min_weight_fraction_leaf_range = min_weight_fraction_leaf_range
+        self.warm_start = warm_start
+        self.random_state = random_state
+        self.dist_method = dist_method
+        self.n_iter_search = n_iter_search
+        self.cv_folds = cv_folds
+        self.n_clusters = n_clusters
+        self.scoring = scoring
+        self.verbose = verbose
+        self.rf = None
+        self.best_params_dict = {}
+        self.cluster_da = None
+        
+    def _objective(self, trial, X_train, y_train) -> float:
+        """
+        Objective function for Optuna optimization.
+        """
+        # Core hyperparameters
+        if isinstance(self.n_estimators_range, list):
+            params = {'n_estimators': trial.suggest_categorical('n_estimators', self.n_estimators_range)}
+        else:
+            params = {'n_estimators': trial.suggest_int('n_estimators', 50, 1000)}
+        
+        # Max depth with None handling
+        if isinstance(self.max_depth_range, list):
+            max_depth_options = [str(opt) if opt is None else opt for opt in self.max_depth_range]
+            max_depth_str = trial.suggest_categorical('max_depth', max_depth_options)
+            params['max_depth'] = None if max_depth_str == 'None' else int(max_depth_str)
+        else:
+            params['max_depth'] = trial.suggest_int('max_depth', 5, 50)
+        
+        # Other core parameters
+        for param_name, param_range in [
+            ('min_samples_split', self.min_samples_split_range),
+            ('min_samples_leaf', self.min_samples_leaf_range),
+        ]:
+            if isinstance(param_range, list):
+                params[param_name] = trial.suggest_categorical(param_name, param_range)
+            else:
+                params[param_name] = trial.suggest_int(param_name, 2, 20)
+        
+        # Max features
+        max_features_options = [str(opt) if isinstance(opt, (int, float)) else opt for opt in self.max_features_range]
+        max_features_str = trial.suggest_categorical('max_features', max_features_options)
+        if max_features_str in ['sqrt', 'log2', 'auto', None]:
+            params['max_features'] = max_features_str if max_features_str != 'auto' else 'sqrt'
+        else:
+            params['max_features'] = float(max_features_str)
+        
+        # Bootstrap and max_samples
+        params['bootstrap'] = trial.suggest_categorical('bootstrap', self.bootstrap_range)
+        
+        if params['bootstrap']:
+            if isinstance(self.max_samples_range[0], (int, float)):
+                params['max_samples'] = trial.suggest_float('max_samples', 
+                                                          min(self.max_samples_range),
+                                                          max(self.max_samples_range))
+            else:
+                max_samples_options = [str(opt) if opt is not None else opt for opt in self.max_samples_range]
+                max_samples_str = trial.suggest_categorical('max_samples', max_samples_options)
+                params['max_samples'] = None if max_samples_str == 'None' else float(max_samples_str)
+        else:
+            params['max_samples'] = None
+        
+        # Additional regularization parameters
+        params['min_impurity_decrease'] = trial.suggest_float('min_impurity_decrease',
+                                                             min(self.min_impurity_decrease_range),
+                                                             max(self.min_impurity_decrease_range))
+        
+        # # Max leaf nodes
+        # if isinstance(self.max_leaf_nodes_range[0], (int, type(None))):
+        #     max_leaf_options = [str(opt) if opt is not None else opt for opt in self.max_leaf_nodes_range]
+        #     max_leaf_str = trial.suggest_categorical('max_leaf_nodes', max_leaf_options)
+        #     params['max_leaf_nodes'] = None if max_leaf_str == 'None' else int(max_leaf_str)
+        
+        # Complexity parameter for pruning
+        params['ccp_alpha'] = trial.suggest_float('ccp_alpha',
+                                                  min(self.ccp_alpha_range),
+                                                  max(self.ccp_alpha_range))
+        
+        # # Min weight fraction leaf
+        # params['min_weight_fraction_leaf'] = trial.suggest_float('min_weight_fraction_leaf',
+        #                                                         min(self.min_weight_fraction_leaf_range),
+        #                                                         max(self.min_weight_fraction_leaf_range))
+        
+        # Create and train model
+        model = RandomForestRegressor(
+            **params,
+            random_state=self.random_state,
+            n_jobs=-1,
+            warm_start=self.warm_start
+        )
+        
+        from sklearn.model_selection import cross_val_score
+        # Cross-validation
+        try:
+            scores = cross_val_score(
+                model, X_train, y_train, 
+                cv=self.cv_folds, 
+                scoring=self.scoring,
+                n_jobs=-1
+            )
+            return np.mean(scores)
+        # except:
+        #     return -1e10
+        except Exception as e:
+            print(f"TRIAL FAILED: {e}")  
+            import traceback
+            traceback.print_exc()        # <--- see the full error
+            return -1e10
+
+    def _grid_search(self, X: np.ndarray, y: np.ndarray) -> Dict:
+        """Perform grid search hyperparameter optimization."""
+        param_grid = {}
+        
+        # Core parameters
+        param_grid['n_estimators'] = self.n_estimators_range
+        param_grid['max_depth'] = self.max_depth_range
+        param_grid['min_samples_split'] = self.min_samples_split_range
+        param_grid['min_samples_leaf'] = self.min_samples_leaf_range
+        param_grid['max_features'] = self.max_features_range
+        param_grid['bootstrap'] = self.bootstrap_range
+        param_grid['max_samples'] = self.max_samples_range
+        param_grid['min_impurity_decrease'] = self.min_impurity_decrease_range
+        # param_grid['max_leaf_nodes'] = self.max_leaf_nodes_range
+        param_grid['ccp_alpha'] = self.ccp_alpha_range
+        # param_grid['min_weight_fraction_leaf'] = self.min_weight_fraction_leaf_range
+        
+        # Initialize model
+        model = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
+        
+        # Grid search
+        grid_search = GridSearchCV(
+            model, param_grid=param_grid,
+            cv=self.cv_folds, scoring=self.scoring,
+            n_jobs=-1, verbose=self.verbose
+        )
+        
+        grid_search.fit(X, y)
+        
+        if self.verbose > 0:
+            print(f"Best score: {grid_search.best_score_:.4f}")
+            print(f"Best params: {grid_search.best_params_}")
+        
+        return grid_search.best_params_
+    
+    def _random_search(self, X: np.ndarray, y: np.ndarray) -> Dict:
+        """Perform random search hyperparameter optimization."""
+        param_dist = {}
+        
+        # Core parameters
+        param_dist['n_estimators'] = self.n_estimators_range
+        param_dist['max_depth'] = self.max_depth_range
+        param_dist['min_samples_split'] = self.min_samples_split_range
+        param_dist['min_samples_leaf'] = self.min_samples_leaf_range
+        param_dist['max_features'] = self.max_features_range
+        param_dist['bootstrap'] = self.bootstrap_range
+        param_dist['max_samples'] = self.max_samples_range
+        param_dist['min_impurity_decrease'] = self.min_impurity_decrease_range
+        # param_dist['max_leaf_nodes'] = self.max_leaf_nodes_range
+        param_dist['ccp_alpha'] = self.ccp_alpha_range
+        # param_dist['min_weight_fraction_leaf'] = self.min_weight_fraction_leaf_range
+        
+        # Initialize model
+        model = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
+        
+        # Randomized search
+        random_search = RandomizedSearchCV(
+            model, param_distributions=param_dist,
+            n_iter=self.n_iter_search, cv=self.cv_folds,
+            scoring=self.scoring, random_state=self.random_state,
+            n_jobs=-1, verbose=self.verbose
+        )
+        
+        random_search.fit(X, y)
+        
+        if self.verbose > 0:
+            print(f"Best score: {random_search.best_score_:.4f}")
+            print(f"Best params: {random_search.best_params_}")
+        
+        return random_search.best_params_
+    
+    def _bayesian_search(self, X: np.ndarray, y: np.ndarray) -> Dict:
+        """Perform Bayesian optimization with Optuna."""
+        study = optuna.create_study(
+            direction='maximize' if 'neg_' in self.scoring else 'minimize',
+            sampler=optuna.samplers.TPESampler(seed=self.random_state)
+        )
+        
+        # Create objective function with data
+        objective_with_data = lambda trial: self._objective(trial, X, y)
+        
+        # Optimize
+        study.optimize(
+            objective_with_data,
+            n_trials=self.n_iter_search,
+            show_progress_bar=self.verbose > 0
+        )
+        
+        # Convert Optuna's best_params to scikit-learn format
+        best_params = study.best_params
+        
+        # Post-process parameters
+        sklearn_params = {}
+        for key, value in best_params.items():
+            if key == 'max_features' and isinstance(value, str):
+                if value == 'None':
+                    sklearn_params[key] = None
+                else:
+                    try:
+                        sklearn_params[key] = float(value)
+                    except ValueError:
+                        sklearn_params[key] = value
+            elif key == 'max_depth' and value == 'None':
+                sklearn_params[key] = None
+            elif key == 'max_leaf_nodes' and value == 'None':
+                sklearn_params[key] = None
+            elif key == 'max_samples' and value == 'None':
+                sklearn_params[key] = None
+            else:
+                sklearn_params[key] = value
+        
+        if self.verbose > 0:
+            print(f"Best score: {study.best_value:.4f}")
+            print(f"Best params: {sklearn_params}")
+        
+        return sklearn_params
+    
+    def compute_hyperparameters(self, Predictors: xr.DataArray, Predictand: xr.DataArray,
+                                clim_year_start: int, clim_year_end: int) -> Tuple[Dict, xr.DataArray]:
+        """
+        Independently computes the best hyperparameters using selected optimization method
+        on stacked training data for each homogenized zone.
+        """
+        if "M" in Predictand.coords:
+            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        X_train_std = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        Predictand.name = "varname"
+        
+        # Step 1: Perform KMeans clustering based on predictand's spatial distribution
+        kmeans = KMeans(n_clusters=self.n_clusters, random_state=self.random_state)
+        Predictand_dropna = Predictand.to_dataframe().reset_index().dropna().drop(columns=['T'])
+        variable_column = Predictand_dropna.columns[2]
+        Predictand_dropna['cluster'] = kmeans.fit_predict(
+            Predictand_dropna[[variable_column]]
+        )
+        
+        # Convert cluster assignments back into an xarray structure
+        df_unique = Predictand_dropna.drop_duplicates(subset=['Y', 'X'])
+        dataset = df_unique.set_index(['Y', 'X']).to_xarray()
+        mask = xr.where(~np.isnan(Predictand.isel(T=0)), 1, np.nan)
+        Cluster = (dataset['cluster'] * mask)
+        
+        # Align cluster array with the predictand array
+        Predictand, cluster_aligned = xr.align(Predictand, Cluster, join="outer")
+        
+        # Identify unique cluster labels
+        clusters = np.unique(cluster_aligned)
+        clusters = clusters[~np.isnan(clusters)]
+        self.cluster_da = cluster_aligned
+
+        y_train_std = standardize_timeseries(Predictand, clim_year_start, clim_year_end)
+        X_train_std['T'] = y_train_std['T']
+
+        # Predictors['T'] = Predictand['T']
+        
+        best_params_dict = {}
+        
+        for c in clusters:
+            if self.verbose > 0:
+                print(f"\nOptimizing hyperparameters for cluster {int(c)}...")
+            
+            # Create mask for current cluster
+            mask_3d = (self.cluster_da == c).expand_dims({'T': Predictand['T']})
+            # Stack data for current cluster
+            X_stacked_c = X_train_std.where(mask_3d).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+            y_stacked_c = y_train_std.where(mask_3d).stack(sample=('T', 'Y', 'X')).values.ravel()
+            
+            # Remove NaN values
+            nan_mask_c = np.any(~np.isfinite(X_stacked_c), axis=1) | ~np.isfinite(y_stacked_c)
+            X_clean_c = X_stacked_c[~nan_mask_c]
+            y_clean_c = y_stacked_c[~nan_mask_c]
+            
+            if len(X_clean_c) < self.cv_folds * 2:
+                if self.verbose > 0:
+                    print(f"Cluster {int(c)} has insufficient data ({len(X_clean_c)} samples). Skipping.")
+                continue
+            
+            if self.search_method == 'grid':
+                best_params_dict[c] = self._grid_search(X_clean_c, y_clean_c)
+                
+            elif self.search_method == 'random':
+                best_params_dict[c] = self._random_search(X_clean_c, y_clean_c)
+                
+            elif self.search_method == 'bayesian':
+                best_params_dict[c] = self._bayesian_search(X_clean_c, y_clean_c)
+                
+            else:
+                raise ValueError(f"Unknown search_method: {self.search_method}")
+        
+        self.best_params_dict = best_params_dict
+        return best_params_dict, self.cluster_da
+    
+    def compute_model(self, X_train: xr.DataArray, y_train: xr.DataArray,
+                      X_test: xr.DataArray, y_test: xr.DataArray,
+                      best_params: Optional[Dict] = None,
+                      cluster_da: Optional[xr.DataArray] = None) -> xr.DataArray:
+        """
+        Compute deterministic hindcast using RandomForestRegressor with optimized hyperparameters.
+        """
+        # Use provided best_params and cluster_da or compute if None
+        if best_params is None or cluster_da is None:
+            best_params, cluster_da = self.compute_hyperparameters(X_train, y_train, 1970, 2000)
+        
+        # Extract coordinate variables from X_test
+        time = X_test['T']
+        lat = X_test['Y']
+        lon = X_test['X']
+        n_time = len(time)
+        n_lat = len(lat)
+        n_lon = len(lon)
+        
+        # Initialize predictions array
+        predictions = np.full((n_time, n_lat, n_lon), np.nan)
+        self.rf = {}  # Dictionary to store models per cluster
+        
+        for c in range(self.n_clusters):
+            if c not in best_params:
+                continue
+            
+            bp = best_params[c]
+            
+            # Mask for this cluster
+            mask_3d_train = (cluster_da == c).expand_dims({'T': X_train['T']})
+            mask_3d_test = (cluster_da == c).expand_dims({'T': X_test['T']})
+            
+            # Stack training data for cluster
+            X_train_stacked_c = X_train.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+            y_train_stacked_c = y_train.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).values.ravel()
+            
+            train_nan_mask = np.any(~np.isfinite(X_train_stacked_c), axis=1) | ~np.isfinite(y_train_stacked_c)
+            X_train_clean_c = X_train_stacked_c[~train_nan_mask]
+            y_train_clean_c = y_train_stacked_c[~train_nan_mask]
+            
+            # Stack testing data for cluster
+            X_test_stacked_c = X_test.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+            test_nan_mask = np.any(~np.isfinite(X_test_stacked_c), axis=1)
+            X_test_clean_c = X_test_stacked_c[~test_nan_mask]
+            
+            # Skip if no training data
+            if len(X_train_clean_c) == 0:
+                continue
+            
+            # Initialize the model with best parameters
+            rf_c = RandomForestRegressor(
+                **{k: v for k, v in bp.items() if k in RandomForestRegressor().get_params()},
+                random_state=self.random_state,
+                n_jobs=-1,
+                warm_start=self.warm_start
+            )
+            
+            # Fit and predict
+            rf_c.fit(X_train_clean_c, y_train_clean_c)
+            self.rf[c] = rf_c
+            
+            if len(X_test_clean_c) > 0:
+                y_pred_c = rf_c.predict(X_test_clean_c)
+                
+                # Reconstruct predictions for this cluster
+                result_c = np.full(len(X_test_stacked_c), np.nan)
+                result_c[~test_nan_mask] = y_pred_c
+                pred_c_reshaped = result_c.reshape(n_time, n_lat, n_lon)
+                
+                # Fill in the predictions array
+                predictions = np.where(np.isnan(predictions), pred_c_reshaped, predictions)
+        
+        # Create output DataArray
+        predicted_da = xr.DataArray(
+            data=predictions,
+            coords={'T': time, 'Y': lat, 'X': lon},
+            dims=['T', 'Y', 'X']
+        )
+        
+        return predicted_da
+    
+    # ------------------ Probability Calculation Methods ------------------
+    # (Keeping all your original probability calculation methods exactly as they were)
+
+    @staticmethod
+    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
+        """
+        Return tercile thresholds (T1, T2) from best-fit distribution parameters.
+    
+        dist_code:
+            1: norm
+            2: lognorm
+            3: expon
+            4: gamma
+            5: weibull_min
+            6: t
+            7: poisson
+            8: nbinom
+        """
+        if np.isnan(dist_code):
+            return np.nan, np.nan
+    
+        code = int(dist_code)
+        try:
+            if code == 1:
+                return (
+                    norm.ppf(0.33, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
+                )
+            elif code == 2:
+                return (
+                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                )
+            elif code == 3:
+                return (
+                    expon.ppf(0.33, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
+                )
+            elif code == 4:
+                return (
+                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                )
+            elif code == 5:
+                return (
+                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                )
+            elif code == 6:
+                return (
+                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                )
+            elif code == 7:
+                return (
+                    poisson.ppf(0.33, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
+                )
+            elif code == 8:
+                return (
+                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                )
+        except Exception:
+            return np.nan, np.nan
+    
+        return np.nan, np.nan
+        
+    @staticmethod
+    def weibull_shape_solver(k, M, V):
+        """
+        Function to find the root of the Weibull shape parameter 'k'.
+        """
+        if k <= 0:
+            return -np.inf
+        try:
+            g1 = gamma_function(1 + 1/k)
+            g2 = gamma_function(1 + 2/k)
+            implied_v_over_m_sq = (g2 / (g1**2)) - 1
+            observed_v_over_m_sq = V / (M**2)
+            return observed_v_over_m_sq - implied_v_over_m_sq
+        except ValueError:
+            return -np.inf
+
+    @staticmethod
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
+        """
+        Generic tercile probabilities using best-fit family per grid cell.
+        """
+        best_guess = np.asarray(best_guess, float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        n_time = best_guess.size
+        out = np.full((3, n_time), np.nan, float)
+
+        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
+            return out
+
+        code = int(dist_code)
+
+        # Normal: loc = forecast; scale from clim
+        if code == 1:
+            error_std = np.sqrt(error_variance)
+            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
+
+        # Lognormal: shape = sigma from clim; enforce mean = best_guess
+        elif code == 2:
+            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
+            mu = np.log(best_guess) - sigma**2 / 2
+            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
+
+        # Exponential: keep scale from clim; shift loc so mean = best_guess
+        elif code == 3:
+            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
+            c2 = expon.cdf(T2, loc=best_guess, scale=np.sqrt(error_variance))
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        # Gamma: use shape from clim; set scale so mean = best_guess
+        elif code == 4:
+            alpha = (best_guess ** 2) / error_variance
+            theta = error_variance / best_guess
+            c1 = gamma.cdf(T1, a=alpha, scale=theta)
+            c2 = gamma.cdf(T2, a=alpha, scale=theta)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 5: # Weibull
+            for i in range(n_time):
+                M = best_guess[i]
+                V = error_variance
+                
+                if V <= 0 or M <= 0:
+                    out[0, i] = np.nan
+                    out[1, i] = np.nan
+                    out[2, i] = np.nan
+                    continue
+        
+                initial_guess = 2.0
+                k = fsolve(WAS_mme_RF.weibull_shape_solver, initial_guess, args=(M, V))[0]
+        
+                if k <= 0:
+                    out[0, i] = np.nan
+                    out[1, i] = np.nan
+                    out[2, i] = np.nan
+                    continue
+                
+                lambda_scale = M / gamma_function(1 + 1/k)
+                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
+                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
+        
+                out[0, i] = c1
+                out[1, i] = c2 - c1
+                out[2, i] = 1.0 - c2
+
+        # Student-t
+        elif code == 6:       
+            if dof <= 2:
+                out[0, :] = np.nan
+                out[1, :] = np.nan
+                out[2, :] = np.nan
+            else:
+                loc = best_guess
+                scale = np.sqrt(error_variance * (dof - 2) / dof)
+                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
+                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
+
+                out[0, :] = c1
+                out[1, :] = c2 - c1
+                out[2, :] = 1.0 - c2
+
+        elif code == 7: # Poisson
+            mu = best_guess
+            c1 = poisson.cdf(T1, mu=mu)
+            c2 = poisson.cdf(T2, mu=mu)
+            
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 8: # Negative Binomial
+            p = np.where(error_variance > best_guess, 
+                         best_guess / error_variance, 
+                         np.nan)
+            n = np.where(error_variance > best_guess, 
+                         (best_guess**2) / (error_variance - best_guess), 
+                         np.nan)
+            
+            c1 = nbinom.cdf(T1, n=n, p=p)
+            c2 = nbinom.cdf(T2, n=n, p=p)
+            
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+            
+        else:
+            raise ValueError(f"Invalid distribution code: {dist_code}")
+
+        return out
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        """Non-parametric method using historical error samples."""
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+        for t in range(n_time):
+            if np.isnan(best_guess[t]):
+                continue
+            dist = best_guess[t] + error_samples
+            dist = dist[np.isfinite(dist)]
+            if len(dist) == 0:
+                continue
+            p_below = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above = 1.0 - (p_below + p_between)
+            pred_prob[0, t] = p_below
+            pred_prob[1, t] = p_between
+            pred_prob[2, t] = p_above
+        return pred_prob
+
+    def compute_prob(self, Predictant: xr.DataArray, clim_year_start, clim_year_end,
+                     hindcast_det: xr.DataArray, best_code_da: xr.DataArray = None,
+                     best_shape_da: xr.DataArray = None, best_loc_da: xr.DataArray = None,
+                     best_scale_da: xr.DataArray = None) -> xr.DataArray:
+        """
+        Compute tercile probabilities for deterministic hindcasts.
+        """
+        # Handle member dimension if present
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+
+        # Ensure dimension order
+        Predictant = Predictant.transpose("T", "Y", "X")
+
+        # Spatial mask
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+
+        # Climatology subset
+        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+        if clim.sizes.get("T", 0) < 3:
+            raise ValueError("Not enough years in climatology period for terciles.")
+
+        # Error variance for predictive distributions
+        error_variance = (Predictant - hindcast_det).var(dim="T")
+        dof = max(int(clim.sizes["T"]) - 1, 2)
+
+        # Empirical terciles (used by non-bestfit methods)
+        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
+        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
+
+        dm = self.dist_method
+
+        # ---------- BESTFIT: zone-wise optimal distributions ----------
+        if dm == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+                raise ValueError(
+                    "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
+                )
+
+            # T1, T2 from best-fit distributions (per grid)
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code,
+                best_code_da,
+                best_shape_da,
+                best_loc_da,
+                best_scale_da,
+                input_core_dims=[(), (), (), ()],
+                output_core_dims=[(), ()],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float, float],
+            )
+
+            # Predictive probabilities using same family
+            hindcast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_bestfit,
+                hindcast_det,
+                error_variance,
+                T1,
+                T2,
+                best_code_da,
+                input_core_dims=[("T",), (), (), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                kwargs={'dof': dof},
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
+            )
+
+        # ---------- Nonparametric ----------
+        elif dm == "nonparam":
+            error_samples = Predictant - hindcast_det
+            hindcast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_nonparametric,
+                hindcast_det,
+                error_samples,
+                T1_emp,
+                T2_emp,
+                input_core_dims=[("T",), ("T",), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
+            )
+
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
+
+        hindcast_prob = hindcast_prob.assign_coords(
+            probability=("probability", ["PB", "PN", "PA"])
+        )
+        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
+
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, 
+                 hindcast_det_cross, Predictor_for_year, best_params=None, cluster_da=None,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
+        """
+        Forecast method using Random Forest model with optimized hyperparameters.
+        """
+        if "M" in Predictant.coords:
+            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        else:
+            Predictant_no_m = Predictant
+            
+        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+        # Standardize Predictor_for_year using hindcast climatology
+        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
+        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
+        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
+        # Predictor_for_year_st = Predictor_for_year
+        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        # hindcast_det_st = hindcast_det
+        Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
+        # Predictant_st = Predictant_no_m
+        hindcast_det_st['T'] = Predictant_st['T']
+        
+        # Extract coordinates from X_test
+        time = Predictor_for_year_st['T']
+        lat = Predictor_for_year_st['Y']
+        lon = Predictor_for_year_st['X']
+        n_time = len(time)
+        n_lat = len(lat)
+        n_lon = len(lon)
+        
+        # Use provided best_params and cluster_da or compute if None
+        if best_params is None:
+            best_params, cluster_da = self.compute_hyperparameters(hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
+        
+        # Initialize predictions array
+        predictions = np.full((n_time, n_lat, n_lon), np.nan)
+        self.rf = {}  # Dictionary to store models per cluster
+        
+        for c in range(self.n_clusters):
+            if c not in best_params:
+                continue
+                
+            bp = best_params[c]
+            
+            # Mask for this cluster
+            mask_3d_train = (cluster_da == c).expand_dims({'T': hindcast_det_st['T']})
+            mask_3d_test = (cluster_da == c).expand_dims({'T': Predictor_for_year_st['T']})
+            
+            # Stack training data for cluster
+            X_train_stacked_c = hindcast_det_st.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+            y_train_stacked_c = Predictant_st.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).values.ravel()
+            
+            train_nan_mask = np.any(~np.isfinite(X_train_stacked_c), axis=1) | ~np.isfinite(y_train_stacked_c)
+            X_train_clean_c = X_train_stacked_c[~train_nan_mask]
+            y_train_clean_c = y_train_stacked_c[~train_nan_mask]
+            
+            # Stack testing data for cluster
+            X_test_stacked_c = Predictor_for_year_st.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+            test_nan_mask = np.any(~np.isfinite(X_test_stacked_c), axis=1)
+            X_test_clean_c = X_test_stacked_c[~test_nan_mask]
+            
+            # Initialize the model with best parameters
+            rf_c = RandomForestRegressor(
+                **{k: v for k, v in bp.items() if k in RandomForestRegressor().get_params()},
+                random_state=self.random_state,
+                n_jobs=-1,
+                warm_start=self.warm_start
+            )            
+            
+            # Fit and predict
+            rf_c.fit(X_train_clean_c, y_train_clean_c)
+            self.rf[c] = rf_c
+            
+            if len(X_test_clean_c) > 0:
+                y_pred_c = rf_c.predict(X_test_clean_c)
+                
+                # Reconstruct predictions for this cluster
+                result_c = np.full(len(X_test_stacked_c), np.nan)
+                result_c[~test_nan_mask] = y_pred_c
+                pred_c_reshaped = result_c.reshape(n_time, n_lat, n_lon)
+                
+                # Fill in the predictions array
+                predictions = np.where(np.isnan(predictions), pred_c_reshaped, predictions)
+        
+        result_da = xr.DataArray(
+            data=predictions,
+            coords={'T': time, 'Y': lat, 'X': lon},
+            dims=['T', 'Y', 'X']
+        ) * mask
+
+        result_da = reverse_standardize(result_da, Predictant_no_m, clim_year_start, clim_year_end)
+        
+        # Adjust time coordinate
+        year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+        T_value_1 = Predictant_no_m.isel(T=0).coords['T'].values
+        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
+        result_da = result_da.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+        result_da['T'] = result_da['T'].astype('datetime64[ns]')
+
+        
+        # Compute tercile probabilities
+        index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
+        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
+        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
+        
+        dm = self.dist_method
+
+        # ---------- BESTFIT ----------
+        if dm == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+                raise ValueError(
+                    "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
+                )
+
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code,
+                best_code_da,
+                best_shape_da,
+                best_loc_da,
+                best_scale_da,
+                input_core_dims=[(), (), (), ()],
+                output_core_dims=[(), ()],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float, float],
+            )
+
+            forecast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_bestfit,
+                result_da,
+                error_variance,
+                T1,
+                T2,
+                best_code_da,
+                input_core_dims=[("T",), (), (), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                dask="parallelized",
+                kwargs={"dof": dof},
+                output_dtypes=[float],
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
+            )
+            
+            
+        # ---------- Nonparametric ----------
+        elif dm == "nonparam":
+            error_samples = Predictant - hindcast_det
+            forecast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_nonparametric,
+                result_da,
+                error_samples,
+                T1_emp,
+                T2_emp,
+                input_core_dims=[("T",), ("T",), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
+            )
+
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
+            
+        forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+        return result_da * mask, mask * forecast_prob.transpose('probability', 'T', 'Y', 'X')
+
+
+class WAS_mme_RF_old:
+    """
+    Enhanced Random Forest-based Multi-Model Ensemble (MME) forecasting for West Africa.
     This class implements a single-model forecasting approach using scikit-learn's RandomForestRegressor
     for deterministic predictions, with optional tercile probability calculations using
     various statistical distributions. Implements multiple hyperparameter optimization methods.
+    
+    Key Features:
+    - Spatial clustering for region-specific tuning
+    - Multiple hyperparameter optimization methods
+    - Advanced tercile probability calculations
+    - Comprehensive Random Forest hyperparameter support
     
     Parameters
     ----------
     search_method : str, optional
         Hyperparameter optimization method: 'grid', 'random', or 'bayesian' (default: 'random').
     n_estimators_range : list of int or scipy.stats distribution, optional
-        List of n_estimators values to tune (default is [50, 100, 200, 300]).
+        List of n_estimators values to tune (default is [100, 200, 300, 500]).
         Can be a list for grid search or a distribution for random/bayesian search.
     max_depth_range : list of int or scipy.stats distribution, optional
-        List of max depths to tune (default is [None, 10, 20, 30]).
+        List of max depths to tune (default is [None, 8, 12, 16]).
         Can be a list for grid search or a distribution for random/bayesian search.
     min_samples_split_range : list of int or scipy.stats distribution, optional
         List of minimum samples required to split to tune (default is [2, 5, 10]).
@@ -11815,36 +12945,61 @@ class WAS_mme_RF:
         List of minimum samples required at leaf node to tune (default is [1, 2, 4]).
         Can be a list for grid search or a distribution for random/bayesian search.
     max_features_range : list of str or float, optional
-        List of max features to tune (default is [None, 'sqrt', 0.33, 0.5]).
+        List of max features to tune (default is ['sqrt', 0.3, 0.5, 0.7]).
+    bootstrap_range : list of bool, optional
+        List of bootstrap options to tune (default is [True, False]).
+    max_samples_range : list of float or None, optional
+        List of max samples as fraction of dataset (default is [None, 0.7, 0.8]).
+    min_impurity_decrease_range : list of float, optional
+        List of min impurity decrease values (default is [0.0, 0.001, 0.01]).
+    max_leaf_nodes_range : list of int or None, optional
+        List of max leaf nodes (default is [None, 50, 100]).
+    ccp_alpha_range : list of float, optional
+        List of complexity parameters for pruning (default is [0.0, 0.001, 0.01]).
     random_state : int, optional
         Seed for reproducibility (default is 42).
     dist_method : str, optional
         Distribution method for tercile probabilities ('bestfit', 'nonparam', etc.) (default is 'nonparam').
     n_iter_search : int, optional
-        Number of iterations for randomized/bayesian search or points to sample for grid search (default is 10).
+        Number of iterations for randomized/bayesian search or points to sample for grid search (default is 20).
     cv_folds : int, optional
-        Number of cross-validation folds (default is 3).
+        Number of cross-validation folds (default is 5).
     n_clusters : int, optional
-        Number of clusters for homogenized zones (default is 4).
+        Number of clusters for homogenized zones (default is 6 for West Africa).
     optuna_n_jobs : int, optional
         Number of parallel jobs for Optuna (default is 1).
     optuna_timeout : int, optional
         Timeout in seconds for Optuna optimization (default is None).
+    scoring : str, optional
+        Scoring metric for hyperparameter optimization (default is 'neg_mean_squared_error').
+    verbose : int, optional
+        Verbosity level (default is 0).
     """
+    
     def __init__(self,
-                 search_method='random',
-                 n_estimators_range=[50, 100, 200, 300],
-                 max_depth_range=[None, 10, 20, 30],
-                 min_samples_split_range=[2, 5, 10],
-                 min_samples_leaf_range=[1, 2, 4],
-                 max_features_range=[None, 'sqrt', 'log2',  0.33, 0.5],
-                 random_state=42,
-                 dist_method="nonparam",
-                 n_iter_search=10,
-                 cv_folds=3,
-                 n_clusters=4,
-                 optuna_n_jobs=1,
-                 optuna_timeout=None):
+                 search_method: str = 'random',
+                 n_estimators_range: Union[List[int], object] = [100, 200, 300, 500],
+                 max_depth_range: Union[List[Optional[int]], object] = [None, 8, 12, 16],
+                 min_samples_split_range: Union[List[int], object] = [2, 5, 10],
+                 min_samples_leaf_range: Union[List[int], object] = [1, 2, 4],
+                 max_features_range: List[Union[str, float]] = ['sqrt', 0.3, 0.5, 0.7],
+                 bootstrap_range: List[bool] = [True, False],
+                 max_samples_range: List[Optional[float]] = [None, 0.7, 0.8],
+                 min_impurity_decrease_range: List[float] = [0.0, 0.001, 0.01],
+                 # max_leaf_nodes_range: List[Optional[int]] = [None, 50, 100],
+                 ccp_alpha_range: List[float] = [0.0, 0.001, 0.01],
+                 # min_weight_fraction_leaf_range: List[float] = [0.0, 0.1, 0.2],
+                 max_samples_discrete_range: List[Optional[int]] = [None, 1000, 2000],
+                 warm_start: bool = False,
+                 random_state: int = 42,
+                 dist_method: str = "nonparam",
+                 n_iter_search: int = 20,
+                 cv_folds: int = 5,
+                 n_clusters: int = 6,
+                 optuna_n_jobs: int = 1,
+                 optuna_timeout: Optional[int] = None,
+                 scoring: str = 'neg_mean_squared_error',
+                 verbose: int = 0):
         
         self.search_method = search_method
         self.n_estimators_range = n_estimators_range
@@ -11852,6 +13007,14 @@ class WAS_mme_RF:
         self.min_samples_split_range = min_samples_split_range
         self.min_samples_leaf_range = min_samples_leaf_range
         self.max_features_range = max_features_range
+        self.bootstrap_range = bootstrap_range
+        self.max_samples_range = max_samples_range
+        self.min_impurity_decrease_range = min_impurity_decrease_range
+        # self.max_leaf_nodes_range = max_leaf_nodes_range
+        self.ccp_alpha_range = ccp_alpha_range
+        # self.min_weight_fraction_leaf_range = min_weight_fraction_leaf_range
+        self.max_samples_discrete_range = max_samples_discrete_range
+        self.warm_start = warm_start
         self.random_state = random_state
         self.dist_method = dist_method
         self.n_iter_search = n_iter_search
@@ -11859,98 +13022,280 @@ class WAS_mme_RF:
         self.n_clusters = n_clusters
         self.optuna_n_jobs = optuna_n_jobs
         self.optuna_timeout = optuna_timeout
+        self.scoring = scoring
+        self.verbose = verbose
         self.rf = None
-
-    def _objective(self, trial, X_train, y_train):
+        self.best_params_dict = {}
+        self.cluster_da = None
+        
+    def _objective(self, trial, X_train, y_train) -> float:
         """
-        Objective function for Optuna optimization.
+        Objective function for Optuna optimization with enhanced hyperparameter space.
+        
+        Parameters
+        ----------
+        trial : optuna.Trial
+            Optuna trial object.
+        X_train : np.ndarray
+            Training features.
+        y_train : np.ndarray
+            Training target.
+            
+        Returns
+        -------
+        float
+            Cross-validation score.
         """
         # Define hyperparameter search space
-        # Handle n_estimators
+        params = {}
+        
+        # Core hyperparameters
         if isinstance(self.n_estimators_range, list):
-            n_estimators = trial.suggest_categorical('n_estimators', self.n_estimators_range)
+            params['n_estimators'] = trial.suggest_categorical('n_estimators', self.n_estimators_range)
         else:
-            # Assume it's a distribution
-            n_estimators = trial.suggest_int(
+            params['n_estimators'] = trial.suggest_int(
                 'n_estimators', 
                 int(self.n_estimators_range.a),
                 int(self.n_estimators_range.b)
             )
         
-        # Handle max_depth
+        # Max depth with proper handling of None
         if isinstance(self.max_depth_range, list):
-            max_depth_options = self.max_depth_range
-            # Convert None to string for Optuna categorical suggestion
-            max_depth_str_options = [str(opt) if opt is None else opt for opt in max_depth_options]
-            max_depth_str = trial.suggest_categorical('max_depth', max_depth_str_options)
-            # Convert back to None if needed
-            max_depth = None if max_depth_str == 'None' else int(max_depth_str)
+            max_depth_options = [str(opt) if opt is None else opt for opt in self.max_depth_range]
+            max_depth_str = trial.suggest_categorical('max_depth', max_depth_options)
+            params['max_depth'] = None if max_depth_str == 'None' else int(max_depth_str)
         else:
-            # Assume it's a distribution for depth values (excluding None)
-            max_depth = trial.suggest_int('max_depth', 5, 50)
+            params['max_depth'] = trial.suggest_int('max_depth', 5, 50)
         
-        # Handle min_samples_split
-        if isinstance(self.min_samples_split_range, list):
-            min_samples_split = trial.suggest_categorical('min_samples_split', self.min_samples_split_range)
-        else:
-            # Assume it's a distribution
-            min_samples_split = trial.suggest_int(
-                'min_samples_split', 
-                int(self.min_samples_split_range.a),
-                int(self.min_samples_split_range.b)
-            )
-        
-        # Handle min_samples_leaf
-        if isinstance(self.min_samples_leaf_range, list):
-            min_samples_leaf = trial.suggest_categorical('min_samples_leaf', self.min_samples_leaf_range)
-        else:
-            # Assume it's a distribution
-            min_samples_leaf = trial.suggest_int(
-                'min_samples_leaf', 
-                int(self.min_samples_leaf_range.a),
-                int(self.min_samples_leaf_range.b)
-            )
-        
-        # Handle max_features
-        # For Optuna, we need to handle both string and float options
-        max_features_options = []
-        for opt in self.max_features_range:
-            if isinstance(opt, str):
-                max_features_options.append(opt)
+        # Other core parameters
+        for param_name, param_range in [
+            ('min_samples_split', self.min_samples_split_range),
+            ('min_samples_leaf', self.min_samples_leaf_range),
+        ]:
+            if isinstance(param_range, list):
+                params[param_name] = trial.suggest_categorical(param_name, param_range)
             else:
-                max_features_options.append(str(opt))
+                params[param_name] = trial.suggest_int(
+                    param_name,
+                    int(param_range.a),
+                    int(param_range.b)
+                )
         
+        # Max features
+        max_features_options = [str(opt) if isinstance(opt, (int, float)) else opt for opt in self.max_features_range]
         max_features_str = trial.suggest_categorical('max_features', max_features_options)
-        
-        # Convert back to appropriate type
-        if max_features_str in [None, 'sqrt', 'log2']:
-            max_features = max_features_str
+        if max_features_str in ['sqrt', 'log2', 'auto', None]:
+            params['max_features'] = max_features_str if max_features_str != 'auto' else 'sqrt'
         else:
-            max_features = float(max_features_str)
+            params['max_features'] = float(max_features_str)
+        
+        # Enhanced hyperparameters
+        params['bootstrap'] = trial.suggest_categorical('bootstrap', self.bootstrap_range)
+        
+        # Conditional max_samples
+        if params['bootstrap']:
+            if isinstance(self.max_samples_range[0], (int, float)):
+                params['max_samples'] = trial.suggest_float('max_samples', 
+                                                          min(self.max_samples_range),
+                                                          max(self.max_samples_range))
+            else:
+                # Handle None values in list
+                max_samples_options = [str(opt) if opt is not None else opt for opt in self.max_samples_range]
+                max_samples_str = trial.suggest_categorical('max_samples', max_samples_options)
+                params['max_samples'] = None if max_samples_str == 'None' else float(max_samples_str)
+        else:
+            params['max_samples'] = None
+        
+        # Additional regularization parameters
+        params['min_impurity_decrease'] = trial.suggest_float('min_impurity_decrease',
+                                                             min(self.min_impurity_decrease_range),
+                                                             max(self.min_impurity_decrease_range))
+        
+        # # Max leaf nodes with None handling
+        # if isinstance(self.max_leaf_nodes_range[0], (int, type(None))):
+        #     max_leaf_options = [str(opt) if opt is not None else opt for opt in self.max_leaf_nodes_range]
+        #     max_leaf_str = trial.suggest_categorical('max_leaf_nodes', max_leaf_options)
+        #     params['max_leaf_nodes'] = None if max_leaf_str == 'None' else int(max_leaf_str)
+        
+        # Complexity parameter for pruning
+        params['ccp_alpha'] = trial.suggest_float('ccp_alpha',
+                                                  min(self.ccp_alpha_range),
+                                                  max(self.ccp_alpha_range))
+        
+        # # Min weight fraction leaf
+        # params['min_weight_fraction_leaf'] = trial.suggest_float('min_weight_fraction_leaf',
+        #                                                         min(self.min_weight_fraction_leaf_range),
+        #                                                         max(self.min_weight_fraction_leaf_range))
         
         # Create and train model
         model = RandomForestRegressor(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            min_samples_split=min_samples_split,
-            min_samples_leaf=min_samples_leaf,
-            max_features=max_features,
+            **params,
             random_state=self.random_state,
-            n_jobs=-1
+            n_jobs=-1,
+            warm_start=self.warm_start
         )
         
         # Use cross-validation
-        from sklearn.model_selection import cross_val_score
-        scores = cross_val_score(
-            model, X_train, y_train, 
-            cv=self.cv_folds, 
-            scoring='neg_mean_squared_error',
-            n_jobs=-1
+        try:
+            scores = cross_val_score(
+                model, X_train, y_train, 
+                cv=self.cv_folds, 
+                scoring=self.scoring,
+                n_jobs=-1
+            )
+            return np.mean(scores)
+        except Exception as e:
+            # Return a very poor score if model fails
+            if self.verbose > 0:
+                print(f"Model failed during CV: {e}")
+            return -1e10
+
+    def _grid_search(self, X: np.ndarray, y: np.ndarray) -> Dict:
+        """Perform grid search hyperparameter optimization."""
+        param_grid = {}
+        
+        # Core parameters
+        param_grid['n_estimators'] = self._process_param_range(self.n_estimators_range, 'int')
+        param_grid['max_depth'] = self._process_param_range(self.max_depth_range, 'depth')
+        param_grid['min_samples_split'] = self._process_param_range(self.min_samples_split_range, 'int')
+        param_grid['min_samples_leaf'] = self._process_param_range(self.min_samples_leaf_range, 'int')
+        param_grid['max_features'] = self.max_features_range
+        param_grid['bootstrap'] = self.bootstrap_range
+        param_grid['max_samples'] = self.max_samples_range
+        param_grid['min_impurity_decrease'] = self.min_impurity_decrease_range
+        # param_grid['max_leaf_nodes'] = self.max_leaf_nodes_range
+        param_grid['ccp_alpha'] = self.ccp_alpha_range
+        # param_grid['min_weight_fraction_leaf'] = self.min_weight_fraction_leaf_range
+        
+        # Initialize model
+        model = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
+        
+        # Grid search
+        grid_search = GridSearchCV(
+            model, param_grid=param_grid,
+            cv=self.cv_folds, scoring=self.scoring,
+            n_jobs=-1, verbose=self.verbose,
+            error_score='raise'
         )
         
-        return np.mean(scores)
+        grid_search.fit(X, y)
+        
+        if self.verbose > 0:
+            print(f"Best score: {grid_search.best_score_:.4f}")
+            print(f"Best params: {grid_search.best_params_}")
+        
+        return grid_search.best_params_
+    
+    def _random_search(self, X: np.ndarray, y: np.ndarray) -> Dict:
+        """Perform random search hyperparameter optimization."""
+        param_dist = {}
+        
+        # Core parameters
+        param_dist['n_estimators'] = self.n_estimators_range
+        param_dist['max_depth'] = self.max_depth_range
+        param_dist['min_samples_split'] = self.min_samples_split_range
+        param_dist['min_samples_leaf'] = self.min_samples_leaf_range
+        param_dist['max_features'] = self.max_features_range
+        param_dist['bootstrap'] = self.bootstrap_range
+        param_dist['max_samples'] = self.max_samples_range
+        param_dist['min_impurity_decrease'] = self.min_impurity_decrease_range
+        # param_dist['max_leaf_nodes'] = self.max_leaf_nodes_range
+        param_dist['ccp_alpha'] = self.ccp_alpha_range
+        # param_dist['min_weight_fraction_leaf'] = self.min_weight_fraction_leaf_range
+        
+        # Initialize model
+        model = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
+        
+        # Randomized search
+        random_search = RandomizedSearchCV(
+            model, param_distributions=param_dist,
+            n_iter=self.n_iter_search, cv=self.cv_folds,
+            scoring=self.scoring, random_state=self.random_state,
+            n_jobs=-1, verbose=self.verbose
+        )
+        
+        random_search.fit(X, y)
+        
+        if self.verbose > 0:
+            print(f"Best score: {random_search.best_score_:.4f}")
+            print(f"Best params: {random_search.best_params_}")
+        
+        return random_search.best_params_
+    
+    def _bayesian_search(self, X: np.ndarray, y: np.ndarray) -> Dict:
+        """Perform Bayesian optimization with Optuna."""
+        study = optuna.create_study(
+            direction='maximize' if 'neg_' in self.scoring else 'minimize',
+            sampler=optuna.samplers.TPESampler(seed=self.random_state),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5)
+        )
+        
+        # Create objective function with data
+        objective_with_data = lambda trial: self._objective(trial, X, y)
+        
+        # Optimize
+        study.optimize(
+            objective_with_data,
+            n_trials=self.n_iter_search,
+            timeout=self.optuna_timeout,
+            n_jobs=self.optuna_n_jobs,
+            show_progress_bar=self.verbose > 0
+        )
+        
+        # Convert Optuna's best_params to scikit-learn format
+        best_params = study.best_params
+        
+        # Post-process parameters
+        sklearn_params = {}
+        for key, value in best_params.items():
+            if key == 'max_features' and isinstance(value, str):
+                if value == 'None':
+                    sklearn_params[key] = None
+                else:
+                    try:
+                        sklearn_params[key] = float(value)
+                    except ValueError:
+                        sklearn_params[key] = value
+            elif key == 'max_depth' and value == 'None':
+                sklearn_params[key] = None
+            elif key == 'max_leaf_nodes' and value == 'None':
+                sklearn_params[key] = None
+            elif key == 'max_samples' and value == 'None':
+                sklearn_params[key] = None
+            else:
+                sklearn_params[key] = value
+        
+        if self.verbose > 0:
+            print(f"Best score: {study.best_value:.4f}")
+            print(f"Best params: {sklearn_params}")
+        
+        return sklearn_params
+    
+    def _process_param_range(self, param_range, param_type: str = 'int') -> List:
+        """Process parameter range for grid search."""
+        if isinstance(param_range, list):
+            return param_range
+        else:
+            # Sample from distribution
+            n_samples = min(5, self.n_iter_search)
+            samples = param_range.rvs(size=n_samples, random_state=self.random_state)
+            
+            if param_type == 'depth':
+                # Handle None in max_depth
+                samples = samples[~np.isnan(samples)].astype(int)
+                unique_samples = np.unique(samples).tolist()
+                if None in self.max_depth_range:
+                    unique_samples.append(None)
+                return unique_samples
+            elif param_type == 'int':
+                return np.unique(samples.astype(int)).tolist()
+            else:
+                return np.unique(samples).tolist()
 
-    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
+
+    
+    def compute_hyperparameters(self, Predictors: xr.DataArray, Predictand: xr.DataArray,
+                                clim_year_start: int, clim_year_end: int) -> Tuple[Dict, xr.DataArray]:
         """
         Independently computes the best hyperparameters using selected optimization method
         on stacked training data for each homogenized zone.
@@ -11976,9 +13321,6 @@ class WAS_mme_RF:
         if "M" in Predictand.coords:
             Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
         
-        X_train_std = Predictors
-        Predictand.name = "varname"
-        
         # Step 1: Perform KMeans clustering based on predictand's spatial distribution
         kmeans = KMeans(n_clusters=self.n_clusters, random_state=self.random_state)
         Predictand_dropna = Predictand.to_dataframe().reset_index().dropna().drop(columns=['T'])
@@ -11994,172 +13336,60 @@ class WAS_mme_RF:
         Cluster = (dataset['cluster'] * mask)
         
         # Align cluster array with the predictand array
-        xarray1, xarray2 = xr.align(Predictand, Cluster, join="outer")
+        _, cluster_aligned = xr.align(Predictand, Cluster, join="outer")
         
         # Identify unique cluster labels
-        clusters = np.unique(xarray2)
+        clusters = np.unique(cluster_aligned)
         clusters = clusters[~np.isnan(clusters)]
-        cluster_da = xarray2
-        y_train_std = Predictand
-        X_train_std['T'] = y_train_std['T']
+        self.cluster_da = cluster_aligned
         
         best_params_dict = {}
         
         for c in clusters:
-            mask_3d = (cluster_da == c).expand_dims({'T': y_train_std['T']})
-            X_stacked_c = X_train_std.where(mask_3d).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            y_stacked_c = y_train_std.where(mask_3d).stack(sample=('T', 'Y', 'X')).values.ravel()
+            if self.verbose > 0:
+                print(f"\nOptimizing hyperparameters for cluster {int(c)}...")
+            
+            # Create mask for current cluster
+            mask_3d = (self.cluster_da == c).expand_dims({'T': Predictand['T']})
+            
+            # Stack data for current cluster
+            X_stacked_c = Predictors.where(mask_3d).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+            y_stacked_c = Predictand.where(mask_3d).stack(sample=('T', 'Y', 'X')).values.ravel()
+            
+            # Remove NaN values
             nan_mask_c = np.any(~np.isfinite(X_stacked_c), axis=1) | ~np.isfinite(y_stacked_c)
             X_clean_c = X_stacked_c[~nan_mask_c]
             y_clean_c = y_stacked_c[~nan_mask_c]
             
-            if len(X_clean_c) == 0:
+            if len(X_clean_c) < self.cv_folds * 2:
+                if self.verbose > 0:
+                    print(f"Cluster {int(c)} has insufficient data ({len(X_clean_c)} samples). Skipping.")
                 continue
             
             if self.search_method == 'grid':
-                # Prepare parameter grid for GridSearchCV
-                param_grid = {}
-                
-                # Handle n_estimators
-                if isinstance(self.n_estimators_range, list):
-                    param_grid['n_estimators'] = self.n_estimators_range
-                else:
-                    # Sample from distribution for grid search
-                    n_samples = min(5, self.n_iter_search)
-                    samples = self.n_estimators_range.rvs(size=n_samples, random_state=self.random_state)
-                    param_grid['n_estimators'] = np.unique(samples.astype(int))
-                
-                # Handle max_depth
-                if isinstance(self.max_depth_range, list):
-                    param_grid['max_depth'] = self.max_depth_range
-                else:
-                    # Sample from distribution for grid search
-                    n_samples = min(5, self.n_iter_search)
-                    samples = self.max_depth_range.rvs(size=n_samples, random_state=self.random_state)
-                    # Filter out None values and convert to int
-                    samples = samples[~np.isnan(samples)].astype(int)
-                    unique_samples = np.unique(samples)
-                    # Add None option back if it was in the original range
-                    if None in self.max_depth_range:
-                        unique_samples = list(unique_samples)
-                        unique_samples.append(None)
-                    param_grid['max_depth'] = unique_samples
-                
-                # Handle min_samples_split
-                if isinstance(self.min_samples_split_range, list):
-                    param_grid['min_samples_split'] = self.min_samples_split_range
-                else:
-                    # Sample from distribution for grid search
-                    n_samples = min(5, self.n_iter_search)
-                    samples = self.min_samples_split_range.rvs(size=n_samples, random_state=self.random_state)
-                    param_grid['min_samples_split'] = np.unique(samples.astype(int))
-                
-                # Handle min_samples_leaf
-                if isinstance(self.min_samples_leaf_range, list):
-                    param_grid['min_samples_leaf'] = self.min_samples_leaf_range
-                else:
-                    # Sample from distribution for grid search
-                    n_samples = min(5, self.n_iter_search)
-                    samples = self.min_samples_leaf_range.rvs(size=n_samples, random_state=self.random_state)
-                    param_grid['min_samples_leaf'] = np.unique(samples.astype(int))
-                
-                # Handle max_features
-                param_grid['max_features'] = self.max_features_range
-                
-                # Initialize RandomForestRegressor base model
-                model = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
-                
-                # Grid search
-                grid_search = GridSearchCV(
-                    model, param_grid=param_grid,
-                    cv=self.cv_folds, scoring='neg_mean_squared_error',
-                    error_score=np.nan, n_jobs=-1
-                )
-                grid_search.fit(X_clean_c, y_clean_c)
-                best_params_dict[c] = grid_search.best_params_
+                best_params_dict[c] = self._grid_search(X_clean_c, y_clean_c)
                 
             elif self.search_method == 'random':
-                # Prepare parameter distributions for RandomizedSearchCV
-                param_dist = {}
-                
-                # Handle n_estimators
-                param_dist['n_estimators'] = self.n_estimators_range
-                
-                # Handle max_depth
-                param_dist['max_depth'] = self.max_depth_range
-                
-                # Handle min_samples_split
-                param_dist['min_samples_split'] = self.min_samples_split_range
-                
-                # Handle min_samples_leaf
-                param_dist['min_samples_leaf'] = self.min_samples_leaf_range
-                
-                # Handle max_features
-                param_dist['max_features'] = self.max_features_range
-                
-                # Initialize RandomForestRegressor base model
-                model = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
-                
-                # Randomized search
-                random_search = RandomizedSearchCV(
-                    model, param_distributions=param_dist, n_iter=self.n_iter_search,
-                    cv=self.cv_folds, scoring='neg_mean_squared_error',
-                    random_state=self.random_state, error_score=np.nan, n_jobs=-1
-                )
-                random_search.fit(X_clean_c, y_clean_c)
-                best_params_dict[c] = random_search.best_params_
+                best_params_dict[c] = self._random_search(X_clean_c, y_clean_c)
                 
             elif self.search_method == 'bayesian':
-                # Bayesian optimization with Optuna
-                study = optuna.create_study(
-                    direction='maximize',  # We're maximizing negative MSE
-                    sampler=optuna.samplers.TPESampler(seed=self.random_state),
-                    pruner=optuna.pruners.MedianPruner(n_startup_trials=5)
-                )
-                
-                # Create objective function with data
-                objective_with_data = lambda trial: self._objective(trial, X_clean_c, y_clean_c)
-                
-                # Optimize
-                study.optimize(
-                    objective_with_data,
-                    n_trials=self.n_iter_search,
-                    timeout=self.optuna_timeout,
-                    n_jobs=self.optuna_n_jobs
-                )
-                
-                # Extract best parameters
-                best_params = study.best_params
-                
-                # Convert Optuna's best_params to scikit-learn format
-                # Handle max_depth conversion
-                max_depth = best_params['max_depth']
-                
-                # Convert max_features back to appropriate type
-                max_features_str = best_params['max_features']
-                if max_features_str in [None, 'sqrt', 'log2']:
-                    max_features = max_features_str
-                else:
-                    max_features = float(max_features_str)
-                
-                sklearn_params = {
-                    'n_estimators': best_params['n_estimators'],
-                    'max_depth': max_depth,
-                    'min_samples_split': best_params['min_samples_split'],
-                    'min_samples_leaf': best_params['min_samples_leaf'],
-                    'max_features': max_features
-                }
-                best_params_dict[c] = sklearn_params
+                best_params_dict[c] = self._bayesian_search(X_clean_c, y_clean_c)
                 
             else:
-                raise ValueError(f"Unknown search_method: {self.search_method}. Choose from 'grid', 'random', or 'bayesian'.")
+                raise ValueError(f"Unknown search_method: {self.search_method}. "
+                               f"Choose from 'grid', 'random', or 'bayesian'.")
         
-        return best_params_dict, cluster_da
-
-
-    def compute_model(self, X_train, y_train, X_test, y_test, best_params=None, cluster_da=None):
+        self.best_params_dict = best_params_dict
+        return best_params_dict, self.cluster_da
+    
+    
+    def compute_model(self, X_train: xr.DataArray, y_train: xr.DataArray,
+                      X_test: xr.DataArray, y_test: xr.DataArray,
+                      best_params: Optional[Dict] = None,
+                      cluster_da: Optional[xr.DataArray] = None) -> xr.DataArray:
         """
-        Compute deterministic hindcast using the RandomForestRegressor model with injected hyperparameters for each zone.
+        Compute deterministic hindcast using RandomForestRegressor with optimized hyperparameters.
+        
         Parameters
         ----------
         X_train : xarray.DataArray
@@ -12169,83 +13399,91 @@ class WAS_mme_RF:
         X_test : xarray.DataArray
             Testing predictor data with dimensions (T, M, Y, X).
         y_test : xarray.DataArray
-            Testing predictand data with dimensions (T, Y, X).
-        clim_year_start : int
-            Start year of the climatology period.
-        clim_year_end : int
-            End year of the climatology period.
+            T.esting predictand data with dimensions (T, Y, X).
         best_params : dict, optional
-            Pre-computed best hyperparameters per cluster. If None, computes internally.
+            Pre-computed best hyperparameters per cluster.
         cluster_da : xarray.DataArray, optional
-            Pre-computed cluster labels. If None, computes internally.
+            Pre-computed cluster labels.
+        
         Returns
         -------
         predicted_da : xarray.DataArray
             Deterministic hindcast with dimensions (T, Y, X).
         """
-        # Standardize inputs
-        X_train_std = X_train
-        y_train_std = y_train
-        X_test_std = X_test
-        y_test_std = y_test
+        # Use provided best_params and cluster_da or compute if None
+        if best_params is None or cluster_da is None:
+            best_params, cluster_da = self.compute_hyperparameters(X_train, y_train, 1970, 2000)
+        
         # Extract coordinate variables from X_test
-        time = X_test_std['T']
-        lat = X_test_std['Y']
-        lon = X_test_std['X']
+        time = X_test['T']
+        lat = X_test['Y']
+        lon = X_test['X']
         n_time = len(time)
         n_lat = len(lat)
         n_lon = len(lon)
-        # Use provided best_params and cluster_da or compute if None
-        if best_params is None:
-            best_params, cluster_da = self.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end)
+        
         # Initialize predictions array
         predictions = np.full((n_time, n_lat, n_lon), np.nan)
         self.rf = {}  # Dictionary to store models per cluster
+        
         for c in range(self.n_clusters):
             if c not in best_params:
                 continue
+            
             bp = best_params[c]
+            
             # Mask for this cluster
-            mask_3d_train = (cluster_da == c).expand_dims({'T': X_train_std['T']})
-            mask_3d_test = (cluster_da == c).expand_dims({'T': X_test_std['T']})
+            mask_3d_train = (cluster_da == c).expand_dims({'T': X_train['T']})
+            mask_3d_test = (cluster_da == c).expand_dims({'T': X_test['T']})
+            
             # Stack training data for cluster
-            X_train_stacked_c = X_train_std.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            y_train_stacked_c = y_train_std.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).values.ravel()
+            X_train_stacked_c = X_train.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+            y_train_stacked_c = y_train.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).values.ravel()
+            
             train_nan_mask = np.any(~np.isfinite(X_train_stacked_c), axis=1) | ~np.isfinite(y_train_stacked_c)
             X_train_clean_c = X_train_stacked_c[~train_nan_mask]
             y_train_clean_c = y_train_stacked_c[~train_nan_mask]
+            
             # Stack testing data for cluster
-            X_test_stacked_c = X_test_std.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            y_test_stacked_c = y_test_std.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).values.ravel()
-            test_nan_mask = np.any(~np.isfinite(X_test_stacked_c), axis=1) | ~np.isfinite(y_test_stacked_c)
+            X_test_stacked_c = X_test.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+            test_nan_mask = np.any(~np.isfinite(X_test_stacked_c), axis=1)
             X_test_clean_c = X_test_stacked_c[~test_nan_mask]
-            # Initialize the model with best parameters for this cluster
+            
+            # Skip if no training data
+            if len(X_train_clean_c) == 0:
+                continue
+            
+            # Initialize the model with best parameters
             rf_c = RandomForestRegressor(
-                n_estimators=bp['n_estimators'],
-                max_depth=bp['max_depth'],
-                min_samples_split=bp['min_samples_split'],
-                min_samples_leaf=bp['min_samples_leaf'],
-                max_features=bp['max_features'],
+                **{k: v for k, v in bp.items() if k in RandomForestRegressor().get_params()},
                 random_state=self.random_state,
-                n_jobs=-1
+                n_jobs=-1,
+                warm_start=self.warm_start
             )
+            
             # Fit and predict
             rf_c.fit(X_train_clean_c, y_train_clean_c)
             self.rf[c] = rf_c
-            y_pred_c = rf_c.predict(X_test_clean_c)
-            # Reconstruct predictions for this cluster
-            result_c = np.full(len(y_test_stacked_c), np.nan)
-            result_c[~test_nan_mask] = y_pred_c
-            pred_c_reshaped = result_c.reshape(n_time, n_lat, n_lon)
-            # Fill in the predictions array
-            predictions = np.where(np.isnan(predictions), pred_c_reshaped, predictions)
+            
+            if len(X_test_clean_c) > 0:
+                y_pred_c = rf_c.predict(X_test_clean_c)
+                
+                # Reconstruct predictions for this cluster
+                result_c = np.full(len(X_test_stacked_c), np.nan)
+                result_c[~test_nan_mask] = y_pred_c
+                pred_c_reshaped = result_c.reshape(n_time, n_lat, n_lon)
+                
+                # Fill in the predictions array
+                predictions = np.where(np.isnan(predictions), pred_c_reshaped, predictions)
+        
+        # Create output DataArray
         predicted_da = xr.DataArray(
             data=predictions,
             coords={'T': time, 'Y': lat, 'X': lon},
             dims=['T', 'Y', 'X']
         )
+        
         return predicted_da
-
     # ------------------ Probability Calculation Methods ------------------
 
     @staticmethod
@@ -12815,16 +14053,24 @@ class WAS_mme_RF:
             X_test_stacked_c = Predictor_for_year_st.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
             test_nan_mask = np.any(~np.isfinite(X_test_stacked_c), axis=1)
             X_test_clean_c = X_test_stacked_c[~test_nan_mask]
-            # Initialize the model with best parameters for this cluster
+            # # Initialize the model with best parameters for this cluster
+            # rf_c = RandomForestRegressor(
+            #     n_estimators=bp['n_estimators'],
+            #     max_depth=bp['max_depth'],
+            #     min_samples_split=bp['min_samples_split'],
+            #     min_samples_leaf=bp['min_samples_leaf'],
+            #     max_features=bp['max_features'],
+            #     random_state=self.random_state,
+            #     n_jobs=-1
+            # )
+
+            # Initialize the model with best parameters
             rf_c = RandomForestRegressor(
-                n_estimators=bp['n_estimators'],
-                max_depth=bp['max_depth'],
-                min_samples_split=bp['min_samples_split'],
-                min_samples_leaf=bp['min_samples_leaf'],
-                max_features=bp['max_features'],
+                **{k: v for k, v in bp.items() if k in RandomForestRegressor().get_params()},
                 random_state=self.random_state,
-                n_jobs=-1
-            )
+                n_jobs=-1,
+                warm_start=self.warm_start
+            )            
             # Fit and predict
             rf_c.fit(X_train_clean_c, y_train_clean_c)
             self.rf[c] = rf_c

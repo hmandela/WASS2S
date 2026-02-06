@@ -733,7 +733,9 @@ class WAS_LinearRegression_Model:
 
         # Align time dimension
         Predictor['T'] = Predictant['T']
+
         Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
+            
         Predictant_st = Predictant_st.transpose('T','Y','X')
         Predictor_for_year_ = Predictor_for_year.squeeze()
 
@@ -761,6 +763,7 @@ class WAS_LinearRegression_Model:
         client.close()
         result_ = result_.isel(output=1)
         result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end)
+            
         # 2) Compute thresholds T1, T2 from climatology
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop

@@ -8818,3 +8818,733 @@ class WAS_MARS_Model:
             raise ValueError(f"Invalid dist_method: {self.dist_method}")
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return forecast_expanded, forecast_prob.transpose('probability', 'T', 'Y', 'X')
+
+
+
+# import numpy as np
+# import pandas as pd
+# import xarray as xr
+
+# try:
+#     from dask.distributed import Client
+# except Exception:
+#     Client = None
+
+# from scipy import stats
+# from scipy.stats import (
+#     norm, lognorm, expon, gamma, weibull_min, t, poisson, nbinom
+# )
+# from scipy.special import gamma as gamma_function
+# from scipy.optimize import fsolve
+
+
+# # =============================================================================
+# # Low-level, Dask-safe (NumPy-only) solvers
+# # =============================================================================
+
+def _add_intercept(X: np.ndarray) -> np.ndarray:
+    return np.column_stack([np.ones(X.shape[0], dtype=float), X])
+
+
+def _wls_solve(X: np.ndarray, z: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """Weighted least squares via sqrt(w) trick."""
+    sw = np.sqrt(np.clip(w, 1e-12, None))
+    Xw = X * sw[:, None]
+    zw = z * sw
+    beta, *_ = np.linalg.lstsq(Xw, zw, rcond=None)
+    return beta
+
+
+def _poisson_irls_beta(y: np.ndarray, X: np.ndarray, max_iter: int = 60, tol: float = 1e-8) -> np.ndarray:
+    """Poisson GLM (log link) IRLS."""
+    n, p = X.shape
+    beta = np.zeros(p, dtype=float)
+    for _ in range(max_iter):
+        eta = np.clip(X @ beta, -700.0, 700.0)
+        mu = np.exp(eta)
+        mu = np.clip(mu, 1e-12, None)
+
+        z = eta + (y - mu) / mu
+        w = mu  # Poisson: Var=mu, dmu/deta=mu => w = mu^2/Var = mu
+
+        beta_new = _wls_solve(X, z, w)
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            break
+        beta = beta_new
+    return beta
+
+
+def _nb2_irls_beta_alpha(
+    y: np.ndarray,
+    X: np.ndarray,
+    max_iter: int = 80,
+    tol: float = 1e-8,
+    alpha_init: float = 0.2,
+) -> tuple[np.ndarray, float]:
+    """
+    Negative Binomial (NB2) GLM with log link: Var = mu + alpha*mu^2.
+
+    Practical alternating scheme:
+      - update beta with IRLS given alpha
+      - update alpha with a method-of-moments estimator from residuals
+
+    This is Dask-safe and robust, but not a full MLE for alpha.
+    """
+    n, p = X.shape
+    df_resid = max(n - p, 1)
+
+    beta = _poisson_irls_beta(y, X, max_iter=40, tol=tol)  # good starting point
+    alpha = max(float(alpha_init), 1e-10)
+
+    for _ in range(max_iter):
+        eta = np.clip(X @ beta, -700.0, 700.0)
+        mu = np.exp(eta)
+        mu = np.clip(mu, 1e-12, None)
+
+        # IRLS for NB2 GLM: w = (dmu/deta)^2 / Var = mu^2 / (mu + alpha mu^2) = mu/(1+alpha mu)
+        w = mu / (1.0 + alpha * mu)
+        z = eta + (y - mu) / mu
+
+        beta_new = _wls_solve(X, z, w)
+
+        # Update alpha (MoM) using: Var - mu ≈ alpha mu^2
+        # Use mean of ((y-mu)^2 - y)/mu^2, stabilized and truncated at 0
+        resid2 = (y - mu) ** 2
+        alpha_raw = np.nanmean((resid2 - y) / (mu ** 2))
+        alpha_new = float(np.clip(alpha_raw, 0.0, 1e6))
+
+        # Convergence check
+        if (np.max(np.abs(beta_new - beta)) < tol) and (abs(alpha_new - alpha) < 1e-6):
+            beta, alpha = beta_new, max(alpha_new, 1e-10)
+            break
+
+        beta, alpha = beta_new, max(alpha_new, 1e-10)
+
+    return beta, float(alpha)
+
+
+def _logit_irls_coef(
+    y01: np.ndarray,
+    X: np.ndarray,
+    max_iter: int = 60,
+    tol: float = 1e-8,
+) -> np.ndarray:
+    """Binomial logistic regression via IRLS (NumPy-only)."""
+    n, p = X.shape
+    beta = np.zeros(p, dtype=float)
+
+    for _ in range(max_iter):
+        eta = np.clip(X @ beta, -35.0, 35.0)
+        p_hat = 1.0 / (1.0 + np.exp(-eta))
+
+        # IRLS for logit
+        w = p_hat * (1.0 - p_hat)
+        w = np.clip(w, 1e-12, None)
+
+        z = eta + (y01 - p_hat) / w  # since dmu/deta = w for logit; this is standard IRLS form
+
+        beta_new = _wls_solve(X, z, w)
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            break
+        beta = beta_new
+
+    return beta
+
+
+def _safe_mask_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    m = np.all(np.isfinite(x), axis=1) & np.isfinite(y)
+    return x[m], y[m]
+
+
+
+class _WAS_CountProbMixin:
+    @staticmethod
+    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
+        if np.isnan(dist_code):
+            return np.nan, np.nan
+        code = int(dist_code)
+        try:
+            if code == 1:
+                return (norm.ppf(0.32, loc=loc, scale=scale),
+                        norm.ppf(0.67, loc=loc, scale=scale))
+            elif code == 2:
+                return (lognorm.ppf(0.32, s=shape, loc=loc, scale=scale),
+                        lognorm.ppf(0.67, s=shape, loc=loc, scale=scale))
+            elif code == 3:
+                return (expon.ppf(0.32, loc=loc, scale=scale),
+                        expon.ppf(0.67, loc=loc, scale=scale))
+            elif code == 4:
+                return (gamma.ppf(0.32, a=shape, loc=loc, scale=scale),
+                        gamma.ppf(0.67, a=shape, loc=loc, scale=scale))
+            elif code == 5:
+                return (weibull_min.ppf(0.32, c=shape, loc=loc, scale=scale),
+                        weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale))
+            elif code == 6:
+                return (t.ppf(0.32, df=shape, loc=loc, scale=scale),
+                        t.ppf(0.67, df=shape, loc=loc, scale=scale))
+            elif code == 7:
+                return (poisson.ppf(0.32, mu=shape, loc=loc),
+                        poisson.ppf(0.67, mu=shape, loc=loc))
+            elif code == 8:
+                return (nbinom.ppf(0.32, n=shape, p=scale, loc=loc),
+                        nbinom.ppf(0.67, n=shape, p=scale, loc=loc))
+        except Exception:
+            return np.nan, np.nan
+        return np.nan, np.nan
+
+    @staticmethod
+    def weibull_shape_solver(k, M, V):
+        if k <= 0:
+            return -np.inf
+        try:
+            g1 = gamma_function(1 + 1 / k)
+            g2 = gamma_function(1 + 2 / k)
+            implied = (g2 / (g1 ** 2)) - 1
+            observed = V / (M ** 2)
+            return observed - implied
+        except ValueError:
+            return -np.inf
+
+    @staticmethod
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
+        best_guess = np.asarray(best_guess, float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        n_time = best_guess.size
+        out = np.full((3, n_time), np.nan, float)
+
+        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
+            return out
+
+        code = int(dist_code)
+
+        if code == 1:
+            error_std = np.sqrt(error_variance)
+            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
+
+        elif code == 2:
+            sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
+            mu = np.log(best_guess) - sigma ** 2 / 2
+            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))
+
+        elif code == 3:
+####### Revoir cette partie dans les autres classes
+            scale_ = np.sqrt(error_variance)
+            c1 = expon.cdf(T1, loc=best_guess, scale=scale_)
+            c2 = expon.cdf(T2, loc=best_guess, scale=scale_)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 4:
+            alpha = (best_guess ** 2) / error_variance
+            theta = error_variance / best_guess
+            c1 = gamma.cdf(T1, a=alpha, scale=theta)
+            c2 = gamma.cdf(T2, a=alpha, scale=theta)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 5:
+            for i in range(n_time):
+                M = best_guess[i]
+                V = float(error_variance)
+                if (V <= 0) or (M <= 0):
+                    continue
+                k = fsolve(_WAS_CountProbMixin.weibull_shape_solver, 2.0, args=(M, V))[0]
+                if k <= 0:
+                    continue
+                lambda_scale = M / gamma_function(1 + 1 / k)
+                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
+                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
+                out[0, i] = c1
+                out[1, i] = c2 - c1
+                out[2, i] = 1.0 - c2
+
+        elif code == 6:
+            if dof <= 2:
+                return out
+            loc_ = best_guess
+            scale_ = np.sqrt(error_variance * (dof - 2) / dof)
+            c1 = t.cdf(T1, df=dof, loc=loc_, scale=scale_)
+            c2 = t.cdf(T2, df=dof, loc=loc_, scale=scale_)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 7:
+            mu_ = best_guess
+            c1 = poisson.cdf(T1, mu=mu_)
+            c2 = poisson.cdf(T2, mu=mu_)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 8:
+            p = np.where(error_variance > best_guess, best_guess / error_variance, np.nan)
+            n = np.where(error_variance > best_guess, (best_guess ** 2) / (error_variance - best_guess), np.nan)
+            c1 = nbinom.cdf(T1, n=n, p=p)
+            c2 = nbinom.cdf(T2, n=n, p=p)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        else:
+            raise ValueError("Invalid distribution code")
+
+        return out
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+        for t_ in range(n_time):
+            if np.isnan(best_guess[t_]):
+                continue
+            dist = best_guess[t_] + error_samples
+            dist = dist[np.isfinite(dist)]
+            if len(dist) == 0:
+                continue
+            p_below = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above = 1.0 - (p_below + p_between)
+            pred_prob[0, t_] = p_below
+            pred_prob[1, t_] = p_between
+            pred_prob[2, t_] = p_above
+        return pred_prob
+
+
+
+class WAS_NegativeBinomial_Model(_WAS_CountProbMixin):
+    """
+    Negative Binomial (NB2) regression for spatiotemporal count prediction (Dask/xarray safe).
+
+    Deterministic prediction: mu_hat = E[Y|X] from NB2 GLM with log link:
+        Var(Y|X) = mu + alpha * mu^2
+    """
+
+    def __init__(self, nb_cores=1, dist_method="nonparam", alpha_init=0.2, add_intercept=True):
+        self.nb_cores = nb_cores
+        self.dist_method = dist_method
+        self.alpha_init = alpha_init
+        self.add_intercept = add_intercept
+
+    def fit_predict(self, x, y, x_test, y_test):
+        x = np.asarray(x, float)
+        y = np.asarray(y, float)
+        x_test = np.asarray(x_test, float)
+
+        if x.ndim == 1:
+            x = x[:, None]
+        x, y = _safe_mask_xy(x, y)
+
+        if y.size < 5 or np.any(y < 0):
+            return np.array([np.nan, np.nan], dtype=float)
+
+        if self.add_intercept:
+            X = _add_intercept(x)
+        else:
+            X = x
+
+        beta, alpha = _nb2_irls_beta_alpha(y, X, alpha_init=self.alpha_init)
+
+        if x_test.ndim == 1:
+            x_test = x_test.reshape(1, -1)
+
+        if self.add_intercept:
+            Xtest = _add_intercept(x_test)
+        else:
+            Xtest = x_test
+
+        eta_test = np.clip(Xtest @ beta, -700.0, 700.0)
+        mu_test = np.exp(eta_test).squeeze()
+        mu_test = np.maximum(mu_test, 0.0)
+
+        # error (may be NaN for future forecasts)
+        err = (np.asarray(y_test, float) - mu_test).squeeze()
+        return np.array([err, mu_test], dtype=float).squeeze()
+
+    def compute_model(self, X_train, y_train, X_test, y_test):
+        chunksize_x = int(np.round(len(y_train.get_index("X")) / self.nb_cores))
+        chunksize_y = int(np.round(len(y_train.get_index("Y")) / self.nb_cores))
+
+        X_train["T"] = y_train["T"]
+        y_train = y_train.transpose("T", "Y", "X")
+
+        X_test = X_test.squeeze()
+        if "T" in y_test.dims:
+            y_test = y_test.drop_vars("T")
+        y_test = y_test.squeeze().transpose("Y", "X")
+
+        client = None
+        if Client is not None and self.nb_cores and self.nb_cores > 1:
+            client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+
+        result = xr.apply_ufunc(
+            self.fit_predict,
+            X_train,
+            y_train.chunk({"Y": chunksize_y, "X": chunksize_x}),
+            X_test,
+            y_test.chunk({"Y": chunksize_y, "X": chunksize_x}),
+            input_core_dims=[("T", "features"), ("T",), ("features",), ()],
+            vectorize=True,
+            output_core_dims=[("output",)],
+            dask="parallelized",
+            output_dtypes=["float"],
+            dask_gufunc_kwargs={"output_sizes": {"output": 2}},
+        )
+
+        result_ = result.compute()
+        if client is not None:
+            client.close()
+
+        return result_.isel(output=1)
+
+    # ---- probability and forecast: same pattern as your Poisson class ----
+
+    def compute_prob(
+        self,
+        Predictant: xr.DataArray,
+        clim_year_start,
+        clim_year_end,
+        hindcast_det: xr.DataArray,
+        best_code_da: xr.DataArray = None,
+        best_shape_da: xr.DataArray = None,
+        best_loc_da: xr.DataArray = None,
+        best_scale_da: xr.DataArray = None,
+    ) -> xr.DataArray:
+
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+
+        Predictant = Predictant.transpose("T", "Y", "X")
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+
+        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+        if clim.sizes.get("T", 0) < 3:
+            raise ValueError("Not enough years in climatology period for terciles.")
+
+        error_variance = (Predictant - hindcast_det).var(dim="T")
+        dof = max(int(clim.sizes["T"]) - 1, 2)
+
+        terciles_emp = clim.quantile([0.32, 0.67], dim="T")
+        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
+        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
+
+        dm = self.dist_method
+
+        if dm == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+                raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
+
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code,
+                best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                input_core_dims=[(), (), (), ()],
+                output_core_dims=[(), ()],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float, float],
+            )
+
+            hindcast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_bestfit,
+                hindcast_det,
+                error_variance,
+                T1, T2,
+                best_code_da,
+                input_core_dims=[("T",), (), (), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                kwargs={"dof": dof},
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
+            )
+
+        elif dm == "nonparam":
+            error_samples = Predictant - hindcast_det
+            hindcast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_nonparametric,
+                hindcast_det,
+                error_samples,
+                T1_emp, T2_emp,
+                input_core_dims=[("T",), ("T",), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
+
+        hindcast_prob = hindcast_prob.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
+        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
+
+    def forecast(
+        self,
+        Predictant,
+        clim_year_start,
+        clim_year_end,
+        Predictor,
+        hindcast_det,
+        Predictor_for_year,
+        best_code_da=None,
+        best_shape_da=None,
+        best_loc_da=None,
+        best_scale_da=None,
+    ):
+        chunksize_x = int(np.round(len(Predictant.get_index("X")) / self.nb_cores))
+        chunksize_y = int(np.round(len(Predictant.get_index("Y")) / self.nb_cores))
+
+        Predictor["T"] = Predictant["T"]
+        Predictant = Predictant.transpose("T", "Y", "X")
+
+        Predictor_for_year_ = Predictor_for_year.squeeze()
+        y_test = xr.full_like(Predictant.isel(T=0), np.nan)
+
+        client = None
+        if Client is not None and self.nb_cores and self.nb_cores > 1:
+            client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+
+        result = xr.apply_ufunc(
+            self.fit_predict,
+            Predictor,
+            Predictant.chunk({"Y": chunksize_y, "X": chunksize_x}),
+            Predictor_for_year_,
+            y_test.chunk({"Y": chunksize_y, "X": chunksize_x}),
+            input_core_dims=[("T", "features"), ("T",), ("features",), ()],
+            vectorize=True,
+            dask="parallelized",
+            output_core_dims=[("output",)],
+            output_dtypes=["float"],
+            dask_gufunc_kwargs={"output_sizes": {"output": 2}},
+        )
+
+        result_ = result.compute()
+        if client is not None:
+            client.close()
+
+        forecast_det = result_.isel(output=1)
+
+        # Build a 1-step time coordinate for probability routines
+        year = Predictor_for_year.coords["T"].values[0].astype("datetime64[Y]").astype(int) + 1970
+        T_value_1 = Predictant.isel(T=0).coords["T"].values
+        month_1 = T_value_1.astype("datetime64[M]").astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
+
+        forecast_expanded = forecast_det.expand_dims(T=[new_T_value]).astype("float")
+        forecast_expanded["T"] = forecast_expanded["T"].astype("datetime64[ns]")
+
+        # climatological terciles (empirical)
+        rainfall_for_tercile = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+        terciles = rainfall_for_tercile.quantile([0.32, 0.67], dim="T")
+        T1_emp = terciles.isel(quantile=0).drop_vars("quantile")
+        T2_emp = terciles.isel(quantile=1).drop_vars("quantile")
+
+        error_variance = (Predictant - hindcast_det).var(dim="T")
+        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
+
+        dm = self.dist_method
+
+        if dm == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+                raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
+
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code,
+                best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                input_core_dims=[(), (), (), ()],
+                output_core_dims=[(), ()],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float, float],
+            )
+
+            forecast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_bestfit,
+                forecast_expanded,
+                error_variance,
+                T1, T2,
+                best_code_da,
+                input_core_dims=[("T",), (), (), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                dask="parallelized",
+                kwargs={"dof": dof},
+                output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
+            )
+
+        elif dm == "nonparam":
+            error_samples = Predictant - hindcast_det
+            forecast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_nonparametric,
+                forecast_expanded,
+                error_samples,
+                T1_emp, T2_emp,
+                input_core_dims=[("T",), ("T",), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
+
+        forecast_prob = forecast_prob.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
+        return forecast_expanded, forecast_prob.transpose("probability", "T", "Y", "X")
+
+
+class WAS_ZINB_Model(WAS_NegativeBinomial_Model):
+    """
+    Zero-Inflated Negative Binomial (pragmatic two-part fit, Dask-safe).
+
+    Model:
+      P(Y=0|X) = pi(X) + (1-pi(X)) * NB(y=0 | mu(X), alpha)
+      E[Y|X]   = (1 - pi(X)) * mu(X)
+
+    Fitting strategy (per grid cell):
+      1) logistic regression on I(y==0) to estimate pi(X)
+      2) NB2 regression on y to estimate mu(X), alpha
+
+    """
+
+    def fit_predict(self, x, y, x_test, y_test):
+        x = np.asarray(x, float)
+        y = np.asarray(y, float)
+        x_test = np.asarray(x_test, float)
+
+        if x.ndim == 1:
+            x = x[:, None]
+        x, y = _safe_mask_xy(x, y)
+
+        if y.size < 8 or np.any(y < 0):
+            return np.array([np.nan, np.nan], dtype=float)
+
+        if self.add_intercept:
+            X = _add_intercept(x)
+        else:
+            X = x
+
+        # 1) zero-inflation part
+        y0 = (y == 0.0).astype(float)
+        gamma_ = _logit_irls_coef(y0, X)
+
+        # 2) NB count part (includes zeros)
+        beta, alpha = _nb2_irls_beta_alpha(y, X, alpha_init=self.alpha_init)
+
+        if x_test.ndim == 1:
+            x_test = x_test.reshape(1, -1)
+        Xtest = _add_intercept(x_test) if self.add_intercept else x_test
+
+        eta_nb = np.clip(Xtest @ beta, -700.0, 700.0)
+        mu = np.exp(eta_nb).squeeze()
+        mu = np.clip(mu, 0.0, None)
+
+        eta_zi = np.clip(Xtest @ gamma_, -35.0, 35.0)
+        pi = (1.0 / (1.0 + np.exp(-eta_zi))).squeeze()
+        pi = np.clip(pi, 0.0, 1.0)
+
+        yhat = (1.0 - pi) * mu
+
+        err = (np.asarray(y_test, float) - yhat).squeeze()
+        return np.array([err, yhat], dtype=float).squeeze()
+
+
+class WAS_HurdleNB_Model(WAS_NegativeBinomial_Model):
+    """
+    Hurdle Negative Binomial (two-part, Dask-safe).
+
+    Model:
+      P(Y>0|X) = p+(X)  via logistic regression
+      Y|Y>0,X  ~ zero-truncated NB(mu(X), alpha) fit using NB on positives as approximation
+
+    Deterministic mean:
+      E[Y|X] = p+(X) * E[Y|Y>0,X]
+    where for NB2 (with r=1/alpha, p=r/(r+mu)):
+      P0_NB = (r/(r+mu))^r
+      E[Y|Y>0] = mu / (1 - P0_NB)
+
+    Notes:
+      - We fit NB on positive counts (not fully truncated likelihood) for operational stability.
+    """
+
+    def fit_predict(self, x, y, x_test, y_test):
+        x = np.asarray(x, float)
+        y = np.asarray(y, float)
+        x_test = np.asarray(x_test, float)
+
+        if x.ndim == 1:
+            x = x[:, None]
+        x, y = _safe_mask_xy(x, y)
+
+        if y.size < 8 or np.any(y < 0):
+            return np.array([np.nan, np.nan], dtype=float)
+
+        if self.add_intercept:
+            X = _add_intercept(x)
+        else:
+            X = x
+
+        # 1) hurdle part: probability of positive
+        y_pos = (y > 0.0).astype(float)
+        gamma_ = _logit_irls_coef(y_pos, X)
+
+        # 2) count part: fit NB on positive counts (approximation to truncated NB)
+        mpos = y > 0.0
+        if np.sum(mpos) < 5:
+            return np.array([np.nan, np.nan], dtype=float)
+
+        Xp = X[mpos, :]
+        yp = y[mpos]
+        beta, alpha = _nb2_irls_beta_alpha(yp, Xp, alpha_init=self.alpha_init)
+
+        if x_test.ndim == 1:
+            x_test = x_test.reshape(1, -1)
+        Xtest = _add_intercept(x_test) if self.add_intercept else x_test
+
+        # p+(X)
+        eta_h = np.clip(Xtest @ gamma_, -35.0, 35.0)
+        pplus = (1.0 / (1.0 + np.exp(-eta_h))).squeeze()
+        pplus = np.clip(pplus, 0.0, 1.0)
+
+        # NB mean mu(X)
+        eta_nb = np.clip(Xtest @ beta, -700.0, 700.0)
+        mu = np.exp(eta_nb).squeeze()
+        mu = np.clip(mu, 0.0, None)
+
+        # zero-truncation adjustment using NB pmf at 0 from (mu, alpha)
+        alpha = max(float(alpha), 1e-10)
+        r = 1.0 / alpha
+        p = r / (r + mu + 1e-12)
+        P0 = np.power(p, r)  # NB P(Y=0)
+        trunc_mean = mu / np.clip(1.0 - P0, 1e-12, None)
+
+        yhat = pplus * trunc_mean
+
+        err = (np.asarray(y_test, float) - yhat).squeeze()
+        return np.array([err, yhat], dtype=float).squeeze()
+
+# # Choose the model
+# model_nb   = WAS_NegativeBinomial_Model(nb_cores=8, dist_method="nonparam")
+# model_zinb = WAS_ZINB_Model(nb_cores=8, dist_method="nonparam")
+# model_hurd = WAS_HurdleNB_Model(nb_cores=8, dist_method="nonparam")
+
+# # Deterministic hindcast on grid:
+# hind_det = model_nb.compute_model(Predictor, Predictant, X_test, y_test)
+
+# # Probabilities for hindcast:
+# hind_prob = model_nb.compute_prob(Predictant, clim_year_start, clim_year_end, hind_det, ...)
+
+# # One-year forecast:
+# fcst_det, fcst_prob = model_nb.forecast(Predictant, clim_year_start, clim_year_end,
+#                                        Predictor, hind_det, Predictor_for_year, ...)
+

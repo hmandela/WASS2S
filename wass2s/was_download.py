@@ -538,7 +538,7 @@ class WAS_Download:
                                 
                                 temp_file = dir_to_save / f"tmp_{fname}"
                                 
-                                print(f"Downloading from NMME FTP: {url}")
+                                # print(f"Downloading from NMME FTP: {url}")
                                 urllib.request.urlretrieve(url, temp_file)
                                 
                                 # Use decode_times=False to avoid "months since" decoding errors
@@ -618,23 +618,52 @@ class WAS_Download:
                                         year_range = f"{year_forecast}-{year_forecast}"
                                         
                                     # year_range = f"{year_forecast}-{year_forecast + 1}" if crosses_year else f"{year_forecast}-{year_forecast}"
+                                    file_name = f"{cent}_{k}_{tag}_{init_str}_{lead_str}_{year_range}.txt"
+                                    full_url = base_url + file_name
+                                    file_txt_path = dir_to_save / file_name
+                                    try:
+                                        if os.path.exists(file_txt_path):
+                                            da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path)
+                                        else:
+                                            self.download_nmme_txt_with_progress(full_url, file_txt_path)
+                                            da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path)
+                                    except:
+                                        print(f"failed to download {file_name}")
                                 else:
                                     base_url = "https://ftp.cpc.ncep.noaa.gov/International/nmme/seasonal_nmme_hindcast_in_cpt_format/"
     
                                     # CPC archive: seasons that cross year (NDJ/DJF) start in 1991; others in 1992
                                     hind_start = 1991 if crosses_year else 1992
                                     hind_end   = 2021
-                                    year_range = f"{hind_start}-{hind_end}"
+                                    year_range1 = f"{hind_start}-{hind_end}"
+                                    year_range2 = f"{1991}-{2020}"
             
-                                file_name = f"{cent}_{k}_{tag}_{init_str}_{lead_str}_{year_range}.txt"
-                                full_url = base_url + file_name
-                                print(full_url)
-                                file_txt_path = dir_to_save / file_name
-                                if os.path.exists(file_txt_path):
-                                    da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path)
-                                else:
-                                    self.download_nmme_txt_with_progress(full_url, file_txt_path)
-                                    da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path)
+                                    file_name_1 = f"{cent}_{k}_{tag}_{init_str}_{lead_str}_{year_range1}.txt"
+                                    file_name_2 = f"{cent}_{k}_{tag}_{init_str}_{lead_str}_{year_range2}.txt"
+                                    full_url1 = base_url + file_name_1
+                                    full_url2 = base_url + file_name_2
+                                    # print(full_url2)
+                                    file_txt_path_1 = dir_to_save / file_name_1
+                                    file_txt_path_2 = dir_to_save / file_name_2
+                                    try:
+                                        if os.path.exists(file_txt_path_1):
+                                            da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path_1)
+                                        else:
+                                            self.download_nmme_txt_with_progress(full_url1, file_txt_path_1)
+                                            da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path_1)
+                                    except:
+                                        print(f"failed to download {file_name_1}")
+    
+                                    try:
+                                        
+                                        if os.path.exists(file_txt_path_2):
+                                            da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path_2)
+                                        else:
+                                            self.download_nmme_txt_with_progress(full_url2, file_txt_path_2)
+                                            da, number_day, times_start = self.parse_cpt_data_optimized(file_txt_path_2)
+                                    except:
+                                        print(f"failed to download {file_name_2}")
+
         
                                 if k == "precip":
                                     da = da * number_day
@@ -1530,12 +1559,12 @@ class WAS_Download:
             # Post-process & combine all partial years
             if all_years_datasets and all_years_downloaded:
                 try:
-                    combined_ds = xr.concat(all_years_datasets, dim="time").drop_vars('crs')
-
+                    combined_ds = xr.concat(all_years_datasets, dim="time").drop_vars('crs', errors="ignore")
+                    
                     # Unit conversions
                     if var in ["AGRO.TMIN", "AGRO.TEMP", "AGRO.TMAX"]:
                         combined_ds = combined_ds - 273.15  # Kelvin to Celsius
-
+  
                     # Aggregate for cross-year seasons
                     combined_ds = self._aggregate_crossyear(
                         ds=combined_ds,
@@ -1543,8 +1572,9 @@ class WAS_Download:
                         var_name=var
                     )
 
+                    ########## Revoir ceci surtout l'emplacement et calcul
                     if var == "AGRO.DSWR":
-                        combined_ds = combined_ds / 86400  # J/m^2/day to W/m^2
+                        combined_ds = combined_ds / 86400  # J/m^2/day to W/m^2 
 
                     # Rename dimensions
                     if "lon" in combined_ds.dims:
@@ -1554,7 +1584,14 @@ class WAS_Download:
                     combined_ds = combined_ds.isel(Y=slice(None, None, -1))
 
                     # Adjust time coordinate
-                    combined_ds["time"] = [f"{year}-{seas[1]}-01" for year in combined_ds["time"].astype(str).values]
+                    if len(seas)==1:
+                        combined_ds["time"] = [f"{year}-{seas[0]}-01" for year in combined_ds["time"].astype(str).values]
+                    elif len(seas) in [2,3]:
+                        combined_ds["time"] = [f"{year}-{seas[1]}-01" for year in combined_ds["time"].astype(str).values]
+                    elif len(seas) in [4,5]:
+                        combined_ds["time"] = [f"{year}-{seas[3]}-01" for year in combined_ds["time"].astype(str).values]
+                    else:
+                        combined_ds["time"] = [f"{year}-{seas[4]}-01" for year in combined_ds["time"].astype(str).values]
                     combined_ds["time"] = combined_ds["time"].astype("datetime64[ns]")
                     combined_ds = combined_ds.rename({"time": "T"})
 
@@ -1638,6 +1675,7 @@ class WAS_Download:
 
         if any(x in var_name for x in ["TEMP","TMIN","TMAX","SST","SLP","RUNOFF"]):
             ds_out = ds.groupby("season_year").mean("time")
+
         elif any(x in var_name for x in ["PRCP","DSWR","DLWR","NOLR"]):
             # For precipitation and radiation, we sum over time
             ds_out = ds.groupby("season_year").sum("time")
@@ -1726,7 +1764,7 @@ class WAS_Download:
                         print(f"{out_file} exists. Skipping.")
                         continue
                     
-                    print(f"Starting download for NOAA ERSST (v5) for {year_start}-{year_end}")
+                    print(f"Starting download for NOAA ERSST (v6) for {year_start}-{year_end}")
     
                     # Create a cache dir for individual monthly files so we don't redownload them unnecessarily
                     cache_dir = dir_to_save / "ersst_cache"
@@ -1794,7 +1832,7 @@ class WAS_Download:
                         
                         ds = ds.rename(rename_dict)
 
-                        print(ds)
+                        # print(ds)
                         
                         # 3. Slice the Area
                         # Area format: [N, W, S, E]
@@ -1803,16 +1841,12 @@ class WAS_Download:
                         # Ensure X and Y are sorted for slicing
                         ds = ds.sortby(['X', 'Y'])
                         ds = ds.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
-
-                        print(ds)
-    
     
                         # 5. Aggregate Cross-Year
                         # ERSST is in Celsius. Do NOT subtract 273.15 later.
                         # We pass 'SST' as var_name so aggregator calculates MEAN.
                         ds_agg = self._aggregate_crossyear(ds, season_months, "SST")
 
-                        print(ds_agg)
     
                         # 6. Final Format
                         # Rename 'time' to 'T' as per your output spec
@@ -1821,7 +1855,15 @@ class WAS_Download:
                         # Ensure Variable name is 'sst' (lowercase) for final output if that is preferred
                         if 'SST' in ds_agg:
                             ds_agg = ds_agg.rename({'SST': 'sst'})
-                        ds_agg["T"] = [f"{year}-{seas[1]}-01" for year in ds_agg["T"].astype(str).values]
+                        if len(seas)==1:
+                            ds_agg["T"] = [f"{year}-{seas[0]}-01" for year in ds_agg["T"].astype(str).values]
+                        elif len(seas) in [2,3]:
+                            ds_agg["T"] = [f"{year}-{seas[1]}-01" for year in ds_agg["T"].astype(str).values]
+                        elif len(seas) in [4,5]:
+                            ds_agg["T"] = [f"{year}-{seas[2]}-01" for year in ds_agg["T"].astype(str).values]
+                        else:
+                            ds_agg["T"] = [f"{year}-{seas[3]}-01" for year in ds_agg["T"].astype(str).values]
+                            
                         ds_agg["T"] = ds_agg["T"].astype("datetime64[ns]")
     
                         # 7. Save
@@ -1980,8 +2022,15 @@ class WAS_Download:
     
                     if v == "SLP":
                         dsC = dsC / 100  # Convert to hPa(mb)
-    
-                    dsC["time"] = [f"{year}-{seas[1]}-01" for year in dsC["time"].astype(str).values]
+                       
+                    if len(seas)==1:
+                        dsC["time"] = [f"{year}-{seas[0]}-01" for year in dsC["time"].astype(str).values]
+                    elif len(seas) in [2,3]:
+                        dsC["time"] = [f"{year}-{seas[1]}-01" for year in dsC["time"].astype(str).values]
+                    elif len(seas) in [4,5]:
+                        dsC["time"] = [f"{year}-{seas[2]}-01" for year in dsC["time"].astype(str).values]
+                    else:
+                        dsC["time"] = [f"{year}-{seas[3]}-01" for year in dsC["time"].astype(str).values]
                     dsC["time"] = dsC["time"].astype("datetime64[ns]")
                     dsC = dsC.rename({"time": "T"})
                     
@@ -2246,9 +2295,17 @@ class WAS_Download:
                 if v == "SLP":
                     dsC = dsC / 100  # Convert to hPa(mb)
 
-                dsC["time"] = [f"{year}-{seas[1]}-01" for year in dsC["time"].astype(str).values]
+                if len(seas)==1:
+                    dsC["time"] = [f"{year}-{seas[0]}-01" for year in dsC["time"].astype(str).values]
+                elif len(seas) in [2,3]:
+                    dsC["time"] = [f"{year}-{seas[1]}-01" for year in dsC["time"].astype(str).values]
+                elif len(seas) in [4,5]:
+                    dsC["time"] = [f"{year}-{seas[2]}-01" for year in dsC["time"].astype(str).values]
+                else:
+                    dsC["time"] = [f"{year}-{seas[3]}-01" for year in dsC["time"].astype(str).values]
                 dsC["time"] = dsC["time"].astype("datetime64[ns]")
                 dsC = dsC.rename({"time": "T"})
+
                 
                 # Save final
                 dsC.to_netcdf(out_file)
@@ -2839,8 +2896,17 @@ class WAS_Download:
             if "time" in ds_season.dims:
                 ds_season = ds_season.rename({"time": "T"})
                 
-            ds_season["T"] = [f"{year}-{season_months[1]:02d}-01" for year in ds_season["T"].dt.year.astype(str).values]
+
+            if len(seas)==1:
+                ds_season["T"] = [f"{year}-{season_months[0]:02d}-01" for year in ds_season["T"].dt.year.astype(str).values]
+            elif len(seas) in [2,3]:
+                ds_season["T"] = [f"{year}-{season_months[1]:02d}-01" for year in ds_season["T"].dt.year.astype(str).values]
+            elif len(seas) in [4,5]:
+                ds_season["T"] = [f"{year}-{season_months[2]:02d}-01" for year in ds_season["T"].dt.year.astype(str).values]
+            else:
+                ds_season["T"] = [f"{year}-{season_months[3]:02d}-01" for year in ds_season["T"].dt.year.astype(str).values]
             ds_season["T"] = ds_season["T"].astype("datetime64[ns]")
+
             
             # Write to NetCDF
             ds_season.drop_vars(['band','spatial_ref']).squeeze().to_netcdf(out_nc)
@@ -3088,7 +3154,14 @@ class WAS_Download:
                 # harmonize dims if needed
                 rename_dict = {k: v for k, v in {"lon": "X", "lat": "Y", "time": "T"}.items() if k in ds_out.dims}
                 ds_out = ds_out.rename(rename_dict)
-                ds_out["T"] = [f"{year}-{season_months[1]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
+                if len(season_months)==1:
+                    ds_out["T"] = [f"{year}-{season_months[0]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
+                elif len(season_months) in [2,3]:
+                    ds_out["T"] = [f"{year}-{season_months[1]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
+                elif len(season_months) in [4,5]:
+                    ds_out["T"] = [f"{year}-{season_months[2]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
+                else:
+                    ds_out["T"] = [f"{year}-{season_months[3]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]                    
                 ds_out["T"] = ds_out["T"].astype("datetime64[ns]")
                 ds_out.to_netcdf(out_nc)
                 print(f"[INFO] Saved seasonal {product.upper()} data → {out_nc}")

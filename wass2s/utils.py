@@ -418,57 +418,110 @@ def trend_data(data):
     except Exception as e:
         raise RuntimeError(f"Failed to detrend data using ExtendedEOF: {e}")
 
+def detrended_data(da, dim="T", min_valid=10):
+    if dim not in da.dims:
+        raise ValueError(f"Dimension '{dim}' not found in DataArray.")
+
+    x = da[dim]
+
+    if np.issubdtype(x.dtype, np.datetime64):
+        x0 = x.isel({dim: 0}).values
+        x_days = (x - x.isel({dim: 0})).astype("timedelta64[D]").astype(np.float64)
+        x_type = "datetime"
+    else:
+        x0 = float(x.isel({dim: 0}).values) if x.size else 0.0
+        x_days = x.astype(np.float64)
+        x_type = "numeric"
+
+    ok = da.notnull().sum(dim=dim) >= int(min_valid)
+    da_fit = da.where(ok)
+
+    try:
+        coeffs = da_fit.assign_coords({dim: x_days}).polyfit(dim=dim, deg=1, skipna=True)
+    except TypeError:
+        coeffs = da_fit.assign_coords({dim: x_days}).polyfit(dim=dim, deg=1)
+
+    if not isinstance(x_days, xr.DataArray):
+         x_days = xr.DataArray(x_days, dims=dim, coords={dim: da[dim]})
+
+    trend = xr.polyval(x_days, coeffs.polyfit_coefficients)
+    da_detrended = da - trend
+    da_detrended.attrs = da.attrs.copy()
+
+    meta = {
+        "dim": dim,
+        "x0": x0,
+        "x_units": "days",
+        "type": x_type,
+        "min_valid": int(min_valid),
+    }
+    return da_detrended, coeffs, meta
+
+def apply_detrend_data(da, coeffs, meta):
+    dim = meta.get("dim", "T")
+    if dim not in da.dims:
+        if "T" in da.dims:
+            dim = "T"
+        elif "time" in da.dims:
+            dim = "time"
+        else:
+            raise ValueError(f"Cannot find time dim. Expected '{meta.get('dim')}'. Found: {da.dims}")
+
+    x = da[dim]
+
+    if meta.get("type") == "datetime":
+        x0 = np.datetime64(meta["x0"])
+        x_days = (x - x0).astype("timedelta64[D]").astype(np.float64)
+    else:
+        x_days = x.astype(np.float64)
+
+    if not isinstance(x_days, xr.DataArray):
+         x_days = xr.DataArray(x_days, dims=dim, coords={dim: da[dim]})
+
+    trend = xr.polyval(x_days, coeffs.polyfit_coefficients)
+    return trend
+
 def prepare_predictand(dir_to_save_Obs, variables_obs, year_start, year_end, season=None, ds=True, daily=False, param="prcp"):
     """
     Prepare the predictand dataset from observational data.
-
-    Parameters
-    ----------
-    dir_to_save_Obs : str
-        Directory path where observational data is stored.
-    variables_obs : list
-        List containing the variable string in the format 'center.variable'.
-    year_start : int
-        Start year of the data.
-    year_end : int
-        End year of the data.
-    season : list, optional
-        List of month numbers defining the season (e.g., [6, 7, 8] for JJA).
-    ds : bool, optional
-        If True, return dataset without converting to array (default is True).
-    daily : bool, optional
-        If True, load daily data; otherwise, load seasonal data (default is False).
-    param : Indicate parameter name
-
-    Returns
-    -------
-    xarray.Dataset or xarray.DataArray
-        Prepared predictand dataset or data array.
-
-    Notes
-    -----
-    Applies a mask for non-daily data based on rainfall thresholds and latitude.
     """
     _, variable = parse_variable(variables_obs[0])
+    
+    # 1. Determine Filepath
     if daily:
         filepath = f'{dir_to_save_Obs}/Daily_{variable}_{year_start}_{year_end}.nc'
-        rainfall = xr.open_dataset(filepath)
-        rainfall = xr.where(rainfall < 0.1, 0, rainfall)
-        rainfall['T'] = rainfall['T'].astype('datetime64[ns]')
     else:
         season_str = "".join([calendar.month_abbr[int(month)] for month in season])
         filepath = f'{dir_to_save_Obs}/Obs_{variable}_{year_start}_{year_end}_{season_str}.nc'
-        rainfall = xr.open_dataset(filepath)
-        mean_rainfall = rainfall.mean(dim="T").to_array().squeeze()
-        mask = xr.where(mean_rainfall <= 20, np.nan, 1)
-        mask = mask.where(abs(mask.Y) <= 20, np.nan)
-        rainfall = xr.where(mask == 1, rainfall, np.nan)
-        rainfall['T'] = rainfall['T'].astype('datetime64[ns]')
+    
+    data = xr.open_dataset(filepath)
+
+    # 2. Conditional Masking: Only apply to Precipitation
+    if param == "prcp":
+        if daily:
+            # Basic daily thresholding
+            data = xr.where(data < 0.1, 0, data)
+        else:
+            # Seasonal masking: Mean rainfall > 20 and Latitude (Y) <= 20
+            mean_val = data.mean(dim="T").to_array().squeeze()
+            mask = xr.where((mean_val > 20) & (abs(data.Y) <= 20), 1, np.nan)
+            data = data.where(mask == 1)
+    
+    # Otherwise, if param is "temp" or others, it skips the masking above.
+
+    # 3. Format Time Coordinate
+    if 'T' in data.coords:
+        data['T'] = data['T'].astype('datetime64[ns]')
+
+    # 4. Final Formatting & Return
+    data_out = data.squeeze().transpose('T', 'Y', 'X').sortby("T")
+    
     if ds:
-        return rainfall.squeeze().transpose('T', 'Y', 'X').sortby("T")
+        return data_out
     else:
-        # Check in future how to define the variable name other than 'prcp'
-        return rainfall.to_array().drop_vars("variable").squeeze().rename(param).transpose('T', 'Y', 'X').sortby("T")
+        # Renames the variable to your 'param' string (e.g., 'temp')
+        return data_out.to_array().drop_vars("variable").squeeze().rename(param)
+
 
 def load_gridded_predictor(dir_to_data, variables_list, year_start, year_end, season=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None):
     """

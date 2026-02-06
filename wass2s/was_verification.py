@@ -31,16 +31,19 @@ class WAS_Verification:
     ----------
     dist_method : str, optional
         Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
+        ('bestfit', 'nonparam'). Default is 'nonparam'.
     """
 
-    def __init__(self, dist_method="gamma"):
+    def __init__(self, dist_method="nonparam", mae_rmse_crps_thrsd=100):
+        self.dist_method = dist_method
+        self.mae_rmse_crps_thrsd = float(mae_rmse_crps_thrsd)
+
         self.scores = {
             "KGE": ("Kling Gupta Efficiency", -1, 1, "det_score", "RdBu_r", self.kling_gupta_efficiency, ""),
             "Pearson": ("Pearson Correlation", -1, 1, "det_score", "RdBu_r", self.pearson_corr, ""),
             "IOA": ("Index Of Agreement", 0, 1, "det_score", "RdBu_r", self.index_of_agreement, ""),
-            "MAE": ("Mean Absolute Error", 0, 500, "det_score", "viridis", self.mean_absolute_error, "[mm]"),
-            "RMSE": ("Root Mean Square Error", 0, 500, "det_score", "viridis", self.root_mean_square_error, "[mm]"),
+            "MAE": ("Mean Absolute Error", 0, self.mae_rmse_crps_thrsd, "det_score", "viridis", self.mean_absolute_error, "[mm]"),
+            "RMSE": ("Root Mean Square Error", 0, self.mae_rmse_crps_thrsd, "det_score", "viridis", self.root_mean_square_error, "[mm]"),
             "NSE": ("Nash Sutcliffe Efficiency", None, 1, "det_score", "RdBu_r", self.nash_sutcliffe_efficiency, ""),
             "TAYLOR_DIAGRAM": ("Taylor Diagram", None, None, "all_grid_det_score", None, self.taylor_diagram),
             "GROC": ("Generalized Discrimination Score", 0, 1, "prob_score", "RdBu_r", self.calculate_groc, ""),
@@ -52,9 +55,8 @@ class WAS_Verification:
             "BS": ("Brier Score", 0, 1, "prob_score", "viridis", self.brier_score, ""),
             "BSS": ("Brier Skill Score vs climatology", -1, 1, "prob_score", "RdBu_r", self.brier_skill_score, ""),
             "ROC_CURVE": ("ROC CURVE", None, None, "all_grid_prob_score", None, self.plot_roc_curves, ""),
-            "CRPS": ("Continuous Ranked Probability Score with the ensemble distribution", 0, 100, "ensemble_score", "RdBu", self.compute_crps, "[mm]")
+            "CRPS": ("Continuous Ranked Probability Score with the ensemble distribution", 0, self.mae_rmse_crps_thrsd, "ensemble_score", "RdBu", self.compute_crps, "[mm]")
         }
-        self.dist_method = dist_method
 
     def get_scores_metadata(self):
         """
@@ -2091,12 +2093,69 @@ class WAS_Verification:
         plt.show()
         plt.close()
 
+    # def plot_models_score(self, model_metrics, score, dir_save_score):
+    #     """
+    #     Plot multiple model scores on a grid of maps.
+
+    #     Creates a subplot grid with geographical plots for each model's score.
+
+    #     Parameters
+    #     ----------
+    #     model_metrics : dict
+    #         Dictionary of model names and their corresponding score DataArrays (Y, X).
+    #     score : str
+    #         Name of the score to plot (e.g., 'Pearson', 'MAE').
+    #     dir_save_score : str or Path
+    #         Directory to save the plot.
+    #     """
+    #     dir_save_score = Path(dir_save_score)
+    #     dir_save_score.mkdir(parents=True, exist_ok=True)
+    #     score_meta_data = self.scores[score]
+    #     n_scores = len(model_metrics)
+    #     n_cols = min(3, n_scores)
+    #     n_rows = int(np.ceil(n_scores / n_cols))
+    #     fig, axes = plt.subplots(
+    #         n_rows, n_cols,
+    #         figsize=(n_cols * 6, n_rows * 4),
+    #         subplot_kw={'projection': ccrs.PlateCarree()}
+    #     )
+    #     axes = axes.flatten()
+    #     for i, (center, data) in enumerate(model_metrics.items()):
+    #         ax = axes[i]
+    #         im = data.plot(
+    #             ax=ax,
+    #             transform=ccrs.PlateCarree(),
+    #             cmap=score_meta_data[4],
+    #             vmin=score_meta_data[1] if score_meta_data[1] is not None else None,
+    #             vmax=score_meta_data[2] if score_meta_data[2] is not None else None,
+    #             add_colorbar=False
+    #         )
+    #         ax.coastlines(resolution='10m')
+    #         ax.add_feature(cfeature.BORDERS, linestyle='--')
+    #         ax.set_title(f"{score} {center[:-1]}")
+    #         gl = ax.gridlines(draw_labels=True, linewidth=0.1, color='gray', alpha=0.5)
+    #         gl.top_labels = False
+    #         gl.right_labels = False
+    #         cbar = fig.colorbar(im, ax=ax, orientation='horizontal', pad=0.15, shrink=0.7)
+    #         cbar.ax.set_position([ax.get_position().x0, ax.get_position().y0 - 0.12,
+    #                               ax.get_position().width, 0.03])
+    #         name, _, _, _, _, _, unit = self.scores[score]
+    #         label = f"{name} {unit}".rstrip()  
+    #         cbar.set_label(label)
+    #     for j in range(i + 1, len(axes)):
+    #         fig.delaxes(axes[j])
+    #     plt.subplots_adjust(wspace=0.3, hspace=0.3)
+    #     plt.savefig(dir_save_score / f"{score}_all_models.png", dpi=300, bbox_inches='tight')
+    #     plt.show()
+    #     plt.close()
+
+
     def plot_models_score(self, model_metrics, score, dir_save_score):
         """
         Plot multiple model scores on a grid of maps.
-
+    
         Creates a subplot grid with geographical plots for each model's score.
-
+    
         Parameters
         ----------
         model_metrics : dict
@@ -2108,45 +2167,99 @@ class WAS_Verification:
         """
         dir_save_score = Path(dir_save_score)
         dir_save_score.mkdir(parents=True, exist_ok=True)
+        
+        # Check if the score exists in the scores dictionary
+        if score not in self.scores:
+            raise ValueError(f"Score '{score}' is not defined in the scores dictionary. "
+                             f"Available scores: {list(self.scores.keys())}")
+        
         score_meta_data = self.scores[score]
         n_scores = len(model_metrics)
         n_cols = min(3, n_scores)
         n_rows = int(np.ceil(n_scores / n_cols))
+        
+        # Create figure and axes
         fig, axes = plt.subplots(
             n_rows, n_cols,
             figsize=(n_cols * 6, n_rows * 4),
             subplot_kw={'projection': ccrs.PlateCarree()}
         )
+        
+        # Handle single axis case
+        if n_scores == 1:
+            axes = np.array([axes])
+        
         axes = axes.flatten()
+        
+        # Ensure vmin and vmax are numeric (not strings)
+        vmin = score_meta_data[1]
+        vmax = score_meta_data[2]
+        
+        # Convert to float if they're not None and can be converted
+        if vmin is not None:
+            try:
+                vmin = float(vmin)
+            except (ValueError, TypeError):
+                # print(f"Warning: vmin for score '{score}' is not numeric: {vmin}. Setting to None.")
+                vmin = None
+        
+        if vmax is not None:
+            try:
+                vmax = float(vmax)
+            except (ValueError, TypeError):
+                # print(f"Warning: vmax for score '{score}' is not numeric: {vmax}. Setting to None.")
+                vmax = None
+        
         for i, (center, data) in enumerate(model_metrics.items()):
             ax = axes[i]
+            
+            # Plot the data
             im = data.plot(
                 ax=ax,
                 transform=ccrs.PlateCarree(),
-                cmap=score_meta_data[4],
-                vmin=score_meta_data[1] if score_meta_data[1] is not None else None,
-                vmax=score_meta_data[2] if score_meta_data[2] is not None else None,
+                cmap=score_meta_data[4] if score_meta_data[4] else 'viridis',  # Default colormap
+                vmin=vmin,
+                vmax=vmax,
                 add_colorbar=False
             )
+            
+            # Add map features
             ax.coastlines(resolution='10m')
             ax.add_feature(cfeature.BORDERS, linestyle='--')
             ax.set_title(f"{score} {center[:-1]}")
+            
+            # Add gridlines
             gl = ax.gridlines(draw_labels=True, linewidth=0.1, color='gray', alpha=0.5)
             gl.top_labels = False
             gl.right_labels = False
+            
+            # Add colorbar
             cbar = fig.colorbar(im, ax=ax, orientation='horizontal', pad=0.15, shrink=0.7)
-            cbar.ax.set_position([ax.get_position().x0, ax.get_position().y0 - 0.12,
-                                  ax.get_position().width, 0.03])
-            name, _, _, _, _, _, unit = self.scores[score]
-            label = f"{name} {unit}".rstrip()  
+            cbar.ax.set_position([
+                ax.get_position().x0, 
+                ax.get_position().y0 - 0.12,
+                ax.get_position().width, 
+                0.03
+            ])
+            
+            # Get score metadata for labeling
+            name, _, _, _, _, _, unit = score_meta_data
+            label = f"{name}"
+            if unit and unit.strip():
+                label += f" {unit}"
             cbar.set_label(label)
+        
+        # Remove unused subplots
         for j in range(i + 1, len(axes)):
             fig.delaxes(axes[j])
+        
+        # Adjust layout and save
         plt.subplots_adjust(wspace=0.3, hspace=0.3)
         plt.savefig(dir_save_score / f"{score}_all_models.png", dpi=300, bbox_inches='tight')
         plt.show()
         plt.close()
 
+        
     # ------------------ Probability Calculation Methods ------------------
 
     @staticmethod

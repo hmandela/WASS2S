@@ -20,6 +20,7 @@ from wass2s.utils import *
 from wass2s.was_cross_validate import *
 from wass2s.was_transformdata import *
 from wass2s.was_bias_correction import *
+from wass2s.was_seasonal_analysis import *
 # from wass2s.was_hydro_processing import *
 # from wass2s.was_cca_2 import *
 
