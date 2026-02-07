@@ -1247,7 +1247,8 @@ class WAS_CCA:
             
         plt.tight_layout()
         plt.show()
-
+        
+    @staticmethod
     def _ppf_terciles_from_code(dist_code, shape, loc, scale):
         """
         Return tercile thresholds (T1, T2) from best-fit distribution parameters.

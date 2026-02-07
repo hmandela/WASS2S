@@ -199,6 +199,8 @@ class WAS_Cross_Validator:
                 k: v for k, v in all_params.items()
                 if k not in model.compute_model.__code__.co_varnames
             }
+            # print(all_params)
+            # print(params_prob)
             params_models = {
                 k: v for k, v in all_params.items()
                 if k not in params_prob
