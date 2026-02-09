@@ -1630,54 +1630,104 @@ def plot_tercile(A, save_dir=None, colors=None, year=None):
         plt.show()
 
 
-def find_best_distribution_grid(rainfall, distribution_map=None):
-    """
-    Determine the best-fitting distribution for variables data at each grid cell.
 
-    Parameters
-    ----------
-    rainfall : xarray.DataArray
-        Precipitation data with a time dimension 'T' and spatial dimensions 'Y', 'X'.
-    distribution_map : dict, optional
-        Mapping of distribution names to numeric codes. Defaults to:
-        {'norm': 1, 'lognorm': 2, 'expon': 3, 'gamma': 4, 'weibull_min': 5}
+def plot_det_forecasts(da2d: xr.DataArray, title: str, outpng: str = None):
+    """Plot a 2D field (Y, X) on a PlateCarree map."""
+    if not set(["Y", "X"]).issubset(set(da2d.dims)):
+        raise ValueError(f"Expected dims (Y, X). Got {da2d.dims}")
 
-    Returns
-    -------
-    xarray.DataArray
-        Array with numeric codes for the best-fitting distribution at each grid cell.
+    # Ensure sorted coords for clean pcolormesh
+    da2d = da2d.sortby(["Y", "X"])
 
-    Notes
-    -----
-    Uses the Fitter library to fit distributions and select the best based on sum-of-squared errors.
-    """
-    if distribution_map is None:
-        distribution_map = {
-            'norm': 1,
-            'lognorm': 2,
-            'expon': 3,
-            'gamma': 4,
-            'weibull_min': 5
-        }
-    def find_best_distribution(precip_data, distribution_map):
-        precip_data = np.asarray(precip_data)
-        if np.isnan(precip_data).all():
-            return np.nan
-        f = Fitter(precip_data, distributions=list(distribution_map.keys()))
-        f.fit()
-        best_fit = f.get_best(method='sumsquare_error')
-        best_dist_name = list(best_fit.keys())[0]
-        return distribution_map.get(best_dist_name, np.nan)
-    best_fit_da = xr.apply_ufunc(
-        find_best_distribution,
-        rainfall,
-        input_core_dims=[["T"]],
-        kwargs={'distribution_map': distribution_map},
-        vectorize=True,
-        dask="parallelized",
-        output_dtypes=[float]
+    lon = da2d["X"].values
+    lat = da2d["Y"].values
+    data = da2d.values
+
+    # Robust limits (avoids extreme outliers dominating the color range)
+    vmin = np.nanpercentile(data, 2)
+    vmax = np.nanpercentile(data, 98)
+
+    fig = plt.figure(figsize=(10, 6))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+
+    # Extent: [west, east, south, north]
+    ax.set_extent([float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max())], crs=ccrs.PlateCarree())
+
+    im = ax.pcolormesh(
+        lon, lat, data,
+        transform=ccrs.PlateCarree(),
+        shading="auto",
+        vmin=vmin, vmax=vmax,
     )
-    return best_fit_da
+
+    ax.coastlines(linewidth=1.0)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.8)
+    ax.add_feature(cfeature.LAND, edgecolor="black", linewidth=0.3, alpha=0.2)
+    ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+
+    cb = plt.colorbar(im, ax=ax, orientation="horizontal", pad=0.06, fraction=0.05)
+    # cb.set_label(f"{da2d.name or 'variable'} (units unknown)")
+
+    ax.set_title(title)
+    plt.tight_layout()
+
+    if outpng:
+        plt.savefig(outpng, dpi=200, bbox_inches="tight")
+        print(f"Saved figure: {outpng}")
+
+    plt.show()
+
+
+
+
+# def find_best_distribution_grid(rainfall, distribution_map=None):
+#     """
+#     Determine the best-fitting distribution for variables data at each grid cell.
+
+#     Parameters
+#     ----------
+#     rainfall : xarray.DataArray
+#         Precipitation data with a time dimension 'T' and spatial dimensions 'Y', 'X'.
+#     distribution_map : dict, optional
+#         Mapping of distribution names to numeric codes. Defaults to:
+#         {'norm': 1, 'lognorm': 2, 'expon': 3, 'gamma': 4, 'weibull_min': 5}
+
+#     Returns
+#     -------
+#     xarray.DataArray
+#         Array with numeric codes for the best-fitting distribution at each grid cell.
+
+#     Notes
+#     -----
+#     Uses the Fitter library to fit distributions and select the best based on sum-of-squared errors.
+#     """
+#     if distribution_map is None:
+#         distribution_map = {
+#             'norm': 1,
+#             'lognorm': 2,
+#             'expon': 3,
+#             'gamma': 4,
+#             'weibull_min': 5
+#         }
+#     def find_best_distribution(precip_data, distribution_map):
+#         precip_data = np.asarray(precip_data)
+#         if np.isnan(precip_data).all():
+#             return np.nan
+#         f = Fitter(precip_data, distributions=list(distribution_map.keys()))
+#         f.fit()
+#         best_fit = f.get_best(method='sumsquare_error')
+#         best_dist_name = list(best_fit.keys())[0]
+#         return distribution_map.get(best_dist_name, np.nan)
+#     best_fit_da = xr.apply_ufunc(
+#         find_best_distribution,
+#         rainfall,
+#         input_core_dims=[["T"]],
+#         kwargs={'distribution_map': distribution_map},
+#         vectorize=True,
+#         dask="parallelized",
+#         output_dtypes=[float]
+#     )
+#     return best_fit_da
 
 def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization, year_start, year_end, year_forecast, nb_cores=2, agrometparam="Onset"):
     """
