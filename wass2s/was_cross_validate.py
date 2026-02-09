@@ -250,50 +250,39 @@ class WAS_Cross_Validator:
             # print(np.unique(hindcast_prob))
             return hindcast_det, hindcast_prob
         
-        # if isinstance(model, WAS_CCA):
+        if isinstance(model, WAS_CCA_old):
 
-        #     all_params = {**model_params}
-        #     params_prob = {
-        #         key: value for key, value in all_params.items() 
-        #         if key not in model.compute_model.__code__.co_varnames
-        #     }
+            all_params = {**model_params}
+            params_prob = {
+                key: value for key, value in all_params.items() 
+                if key not in model.compute_model.__code__.co_varnames
+            }
 
-        #     params_models = {
-        #         key: value for key, value in all_params.items() 
-        #         if key not in params_prob
-        #     } 
+            params_models = {
+                key: value for key, value in all_params.items() 
+                if key not in params_prob
+            } 
 
             
-        #     mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-            
-        #     # Predictor_ = (Predictor - trend_data(Predictor).fillna(trend_data(Predictor)[-3])).fillna(0)
-        #     # Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        #     # Predictant_ = (Predictant_st - trend_data(Predictant_st).fillna(trend_data(Predictant_st)[-3])).fillna(0)
+            mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+            Predictor_ = (Predictor - trend_data(Predictor).fillna(trend_data(Predictor)[-3])).fillna(0)
+            Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
+            Predictant_ = (Predictant_st - trend_data(Predictant_st).fillna(trend_data(Predictant_st)[-3])).fillna(0)
 
-        #     Predictor_detrend, coeffss, metas = detrended_data(Predictor, dim="T")
-        #     Predictor_detrend = Predictor_detrend.fillna(Predictor_detrend.mean(dim="T", skipna=True))
-            
-        #     Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        #     Predictant_st_detrend, coeffs, meta = detrended_data(Predictant_st, dim="T")
-        #     Predictant_st_detrend = Predictant_st_detrend.fillna(Predictant_st_detrend.mean(dim="T", skipna=True))
-        #     print("Cross-validation ongoing")
-        #     for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
-        #         X_train, X_test = Predictor_detrend.isel(T=train_index), Predictor_detrend.isel(T=test_index)
-        #         # X_train_, X_test_ = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
-        #         # y_train, y_test = Predictant_.isel(T=train_index), Predictant_.isel(T=test_index)
-        #         y_train, y_test = Predictant_st_detrend.isel(T=train_index), Predictant_st_detrend.isel(T=test_index)
-        #         # pred_det = model.compute_model(X_train, y_train, X_test_, y_test, **params_models)
-        #         pred_det = model.compute_model(X_train, y_train, X_test, y_test, **params_models)
-        #         hindcast_det.append(pred_det)
+            print("Cross-validation ongoing")
+            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor_['T'], self.nb_omit), total=n_splits), start=1):
+                X_train, X_test = Predictor_.isel(T=train_index), Predictor_.isel(T=test_index)
+                X_train_, X_test_ = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
+                y_train, y_test = Predictant_.isel(T=train_index), Predictant_.isel(T=test_index)
+                pred_det = model.compute_model(X_train, y_train, X_test_, y_test, **params_models)
+                hindcast_det.append(pred_det)
 
-        #     hindcast_det = xr.concat(hindcast_det, dim="T")
-        #     hindcast_det['T'] = Predictant['T']
-        #     hindcast_det = hindcast_det + apply_detrend_data(hindcast_det, coeffs, meta)
-        #     hindcast_det = hindcast_det.transpose('T', 'Y', 'X')*mask
-        #     hindcast_det = reverse_standardize(hindcast_det, Predictant, clim_year_start, clim_year_end)
-        #     hindcast_prob = model.compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det, **params_prob)
+            hindcast_det = xr.concat(hindcast_det, dim="T")
+            hindcast_det['T'] = Predictant_['T']
+            hindcast_det = reverse_standardize(hindcast_det, Predictant, clim_year_start, clim_year_end)
+            hindcast_prob = model.compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det, **params_prob)
 
-        #     return xr.where(hindcast_det<0, 0, hindcast_det)*mask, xr.where(hindcast_prob<0, 0, hindcast_prob)*mask
+            return xr.where(hindcast_det<0, 0, hindcast_det)*mask, xr.where(hindcast_prob<0, 0, hindcast_prob)*mask
 
         elif isinstance(model, WAS_Analog):
 
