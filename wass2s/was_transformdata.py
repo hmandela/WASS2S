@@ -1764,57 +1764,108 @@ class WAS_TransformData:
     # ----------------------------------------------------------------------
     # 6. Plotting
     # ----------------------------------------------------------------------
+    # def plot_best_fit_map_(self, data_array, map_dict, output_file='map.png', 
+    #                       title='Map', colors=None, show_plot=True):
+    #     """Plot categorical map using Cartopy."""
+    #     if colors is None:
+    #         colors = ['#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', 
+    #                   '#fb9a99', '#e31a1c', '#fdbf6f', '#ff7f00']
+            
+    #     # Filter map_dict to only what's in the data
+    #     unique_vals = np.unique(data_array.values[~np.isnan(data_array.values)])
+    #     if len(unique_vals) == 0:
+    #         print("No data to plot.")
+    #         return
+
+    #     # Ensure we have enough colors
+    #     if len(colors) < len(unique_vals):
+    #         colors = colors * (len(unique_vals) // len(colors) + 1)
+            
+    #     cmap = ListedColormap(colors[:len(unique_vals)])
+    #     bounds = np.arange(len(unique_vals) + 1)
+    #     norm = BoundaryNorm(bounds, cmap.N)
+        
+    #     # Create lookup for legend
+    #     val_to_idx = {v: i for i, v in enumerate(unique_vals)}
+    #     # Code to Name
+    #     code_to_name = {v: k for k, v in map_dict.items()}
+        
+    #     # Transform data to indices for plotting
+    #     plot_data = xr.apply_ufunc(lambda x: val_to_idx.get(x, np.nan), data_array, vectorize=True)
+
+    #     fig = plt.figure(figsize=(10, 6))
+    #     ax = plt.axes(projection=ccrs.PlateCarree())
+        
+    #     extent = [float(data_array.X.min()), float(data_array.X.max()), 
+    #               float(data_array.Y.min()), float(data_array.Y.max())]
+    #     ax.set_extent(extent, crs=ccrs.PlateCarree())
+        
+    #     ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+    #     ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+    #     ax.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
+
+    #     mesh = plot_data.plot.pcolormesh(
+    #         ax=ax, transform=ccrs.PlateCarree(),
+    #         cmap=cmap, norm=norm, add_colorbar=False
+    #     )
+        
+    #     # Custom colorbar
+    #     cbar = plt.colorbar(mesh, ax=ax, ticks=bounds[:-1] + 0.5, pad=0.05)
+    #     cbar.set_ticklabels([code_to_name.get(v, str(v)) for v in unique_vals])
+        
+    #     ax.set_title(title)
+    #     plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    #     if show_plot:
+    #         plt.show()
+    #     plt.close()
+
     def plot_best_fit_map(self, data_array, map_dict, output_file='map.png', 
-                          title='Map', colors=None, show_plot=True):
-        """Plot categorical map using Cartopy."""
-        if colors is None:
-            colors = ['#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', 
-                      '#fb9a99', '#e31a1c', '#fdbf6f', '#ff7f00']
+                              title='Map', colors=None, show_plot=True):
+            if colors is None:
+                colors = ['#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', 
+                          '#fb9a99', '#e31a1c', '#fdbf6f', '#ff7f00']
+                
+            unique_vals = np.unique(data_array.values[~np.isnan(data_array.values)])
+            if len(unique_vals) == 0:
+                print("No data to plot.")
+                return
+    
+            if len(colors) < len(unique_vals):
+                colors = colors * (len(unique_vals) // len(colors) + 1)
+                
+            cmap = ListedColormap(colors[:len(unique_vals)])
+            bounds = np.arange(len(unique_vals) + 1)
+            norm = BoundaryNorm(bounds, cmap.N)
             
-        # Filter map_dict to only what's in the data
-        unique_vals = np.unique(data_array.values[~np.isnan(data_array.values)])
-        if len(unique_vals) == 0:
-            print("No data to plot.")
-            return
-
-        # Ensure we have enough colors
-        if len(colors) < len(unique_vals):
-            colors = colors * (len(unique_vals) // len(colors) + 1)
+            val_to_idx = {v: i for i, v in enumerate(unique_vals)}
+            code_to_name = {v: k for k, v in map_dict.items()}
             
-        cmap = ListedColormap(colors[:len(unique_vals)])
-        bounds = np.arange(len(unique_vals) + 1)
-        norm = BoundaryNorm(bounds, cmap.N)
-        
-        # Create lookup for legend
-        val_to_idx = {v: i for i, v in enumerate(unique_vals)}
-        # Code to Name
-        code_to_name = {v: k for k, v in map_dict.items()}
-        
-        # Transform data to indices for plotting
-        plot_data = xr.apply_ufunc(lambda x: val_to_idx.get(x, np.nan), data_array, vectorize=True)
-
-        fig = plt.figure(figsize=(10, 6))
-        ax = plt.axes(projection=ccrs.PlateCarree())
-        
-        extent = [float(data_array.X.min()), float(data_array.X.max()), 
-                  float(data_array.Y.min()), float(data_array.Y.max())]
-        ax.set_extent(extent, crs=ccrs.PlateCarree())
-        
-        ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
-        ax.add_feature(cfeature.BORDERS, linewidth=0.5)
-        ax.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
-
-        mesh = plot_data.plot.pcolormesh(
-            ax=ax, transform=ccrs.PlateCarree(),
-            cmap=cmap, norm=norm, add_colorbar=False
-        )
-        
-        # Custom colorbar
-        cbar = plt.colorbar(mesh, ax=ax, ticks=bounds[:-1] + 0.5, pad=0.05)
-        cbar.set_ticklabels([code_to_name.get(v, str(v)) for v in unique_vals])
-        
-        ax.set_title(title)
-        plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        if show_plot:
-            plt.show()
-        plt.close()
+            plot_data = xr.full_like(data_array, fill_value=np.nan, dtype=float)
+            
+            for val, idx in val_to_idx.items():
+                plot_data = xr.where(data_array == val, idx, plot_data)
+    
+            fig = plt.figure(figsize=(10, 6))
+            ax = plt.axes(projection=ccrs.PlateCarree())
+            
+            extent = [float(data_array.X.min()), float(data_array.X.max()), 
+                      float(data_array.Y.min()), float(data_array.Y.max())]
+            ax.set_extent(extent, crs=ccrs.PlateCarree())
+            
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+            ax.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
+    
+            mesh = plot_data.plot.pcolormesh(
+                ax=ax, transform=ccrs.PlateCarree(),
+                cmap=cmap, norm=norm, add_colorbar=False
+            )
+            
+            cbar = plt.colorbar(mesh, ax=ax, ticks=bounds[:-1] + 0.5, pad=0.05)
+            cbar.set_ticklabels([code_to_name.get(v, str(v)) for v in unique_vals])
+            
+            ax.set_title(title)
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            if show_plot:
+                plt.show()
+            plt.close()

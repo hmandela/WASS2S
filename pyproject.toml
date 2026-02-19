@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wass2s"
-version = "0.3.9"
+version = "0.4.0"
 description = "A Python package for seasonal climate forecast."
 readme = "README.md"
 authors = [
@@ -36,6 +36,7 @@ dependencies = [
     "matplotlib==3.7.3",
     "xeofs==3.0.4",
     "cdsapi==0.7.4",
+    "cartopy==0.25.*",
     "rasterio",
     "geopandas",
     "shapely",
@@ -43,7 +44,9 @@ dependencies = [
     "SkillMetrics",
     "optuna",
     "earthkit",
-    "ipywidgets"    
+    "ipywidgets",
+    "regionmask",
+    "pycountry"    
     # "torch",
     # "lightning",
     # "cca-zoo"

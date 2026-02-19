@@ -3087,7 +3087,7 @@ class WAS_Verification:
         else:
             return np.nan
 
-    def compute_one_year_rpss(self, obs, prob_pred, clim_year_start, clim_year_end, year):
+    def compute_one_year_rpss_(self, obs, prob_pred, clim_year_start, clim_year_end, year):
         """
         Compute and visualize the Ranked Probability Skill Score (RPSS) for a specific year.
 
@@ -3150,3 +3150,82 @@ class WAS_Verification:
         plt.tight_layout()
         plt.show()
            
+
+    def compute_one_year_rpss(self, obs, prob_pred, clim_year_start, clim_year_end, year, shapefile_path=None):
+        """
+        Compute RPSS and display the percentage of skillful grids (RPSS > 0) in the title.
+        """
+        # 1. Classify Observations and Align
+        obs_class = self.compute_class(obs, clim_year_start, clim_year_end)
+        obs_year = obs_class.sel(T=str(year))
+        prob_pred['T'] = obs_year['T']
+        obs_year, prob_pred = xr.align(obs_year, prob_pred)
+    
+        # 2. Compute RPSS using vectorized ufunc
+        rpss_array = xr.apply_ufunc(
+            self.calculate_rpss_,
+            obs_year,
+            prob_pred,
+            input_core_dims=[('T',), ('probability', 'T')],
+            vectorize=True,
+            dask='parallelized',
+            output_core_dims=[()],
+            output_dtypes=['float'],
+            dask_gufunc_kwargs={"allow_rechunk": True},
+        )
+        
+        # Clip values to standard RPSS range
+        rpss_clipped = xr.where(rpss_array > 1, 1, rpss_array)
+    
+        # We only count grids that are NOT NaN (inside the study area/mask)
+        valid_grids = rpss_clipped.notnull().sum().values
+        skillful_grids = (rpss_clipped > 0).sum().values
+        
+        skill_percentage = (skillful_grids / valid_grids * 100) if valid_grids > 0 else 0
+        # ---------------------------------------
+    
+        # 3. Visualization
+        fig = plt.figure(figsize=(10, 8))
+        ax = plt.axes(projection=ccrs.PlateCarree())
+        
+        # Handle Shapefile boundary for the RPSS map if provided
+        if shapefile_path:
+            import geopandas as gpd
+            import regionmask
+            gdf = gpd.read_file(shapefile_path)
+            mask = regionmask.mask_3D_geopandas(gdf, rpss_clipped.X, rpss_clipped.Y)
+            rpss_clipped = rpss_clipped.where(mask.any(dim='region'))
+            
+            bounds = gdf.total_bounds
+            ax.set_extent([bounds[0]-0.5, bounds[2]+0.5, bounds[1]-0.5, bounds[3]+0.5])
+    
+        # Plotting the RPSS Map
+        im = rpss_clipped.plot(
+            ax=ax,
+            transform=ccrs.PlateCarree(),
+            cmap='RdBu_r', # Red for negative skill, Blue for positive
+            vmin=-1, vmax=1,
+            add_colorbar=False # We will create a custom one for the "fine lines"
+        )
+    
+        # 4. Custom Colorbar with "Blank Fine Lines"
+        cbar = fig.colorbar(im, ax=ax, shrink=0.6, extend='both', orientation='vertical')
+        cbar.set_label('Ranked Probability Skill Score (RPSS)', fontsize=10)
+        ticks = [-1, -0.5, 0, 0.5, 1]
+        cbar.set_ticks(ticks)
+        
+        # Draw white separators at ticks
+        # Since orientation is vertical, we use hlines (horizontal lines)
+        tick_locs = (np.array(ticks) - (-1)) / (1 - (-1)) # Normalize to 0-1
+        cbar.ax.hlines(tick_locs, 0, 1, colors='white', linewidth=1.5)
+    
+        # 5. Title with Skill Judgement
+        ax.add_feature(cfeature.BORDERS, edgecolor='gray')
+        ax.add_feature(cfeature.COASTLINE)
+        
+        # Title includes the count/percentage of skillful grids
+        ax.set_title(f"RPSS for {year}\nSkillful Grids (RPSS > 0): {skill_percentage:.1f}%", 
+                     fontsize=13, fontweight='bold', pad=20)
+    
+        plt.tight_layout()
+        plt.show()

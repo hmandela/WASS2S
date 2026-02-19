@@ -2897,11 +2897,11 @@ class WAS_Download:
                 ds_season = ds_season.rename({"time": "T"})
                 
 
-            if len(seas)==1:
+            if len(season_months)==1:
                 ds_season["T"] = [f"{year}-{season_months[0]:02d}-01" for year in ds_season["T"].dt.year.astype(str).values]
-            elif len(seas) in [2,3]:
+            elif len(season_months) in [2,3]:
                 ds_season["T"] = [f"{year}-{season_months[1]:02d}-01" for year in ds_season["T"].dt.year.astype(str).values]
-            elif len(seas) in [4,5]:
+            elif len(season_months) in [4,5]:
                 ds_season["T"] = [f"{year}-{season_months[2]:02d}-01" for year in ds_season["T"].dt.year.astype(str).values]
             else:
                 ds_season["T"] = [f"{year}-{season_months[3]:02d}-01" for year in ds_season["T"].dt.year.astype(str).values]
@@ -2909,7 +2909,7 @@ class WAS_Download:
 
             
             # Write to NetCDF
-            ds_season.drop_vars(['band','spatial_ref']).squeeze().to_netcdf(out_nc)
+            ds_season.drop_vars(['band','spatial_ref']).squeeze().isel(Y=slice(None, None, -1)).to_netcdf(out_nc)
             print(f"[INFO] Saved seasonal CHIRPS data to {out_nc}")
             # Delete individual monthly TIF files
             for tif_file in dir_to_save.glob("chirps-v3.0.*.tif"):

@@ -43,7 +43,7 @@ dependencies:
   - magics
   - cdo
   - pykrige
-  - cartopy=0.23.*
+  - cartopy=0.25.*
 
 
   # --- Visualization ---

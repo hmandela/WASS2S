@@ -873,7 +873,7 @@ import matplotlib.pyplot as plt
 import xeofs as xe
 from wass2s.utils import * 
 
-class WAS_CCA:
+class WAS_CCA_new:
     def __init__(self, n_modes=4, n_pca_modes=8, standardize=False, use_coslat=True, use_pca=True, dist_method="bestfit"):
         """
         Initialize parameters. The CCA model instance is created in fit_cca to ensure safe CV.
@@ -1692,7 +1692,7 @@ class WAS_CCA:
         return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
 
 
-class WAS_CCA_old:
+class WAS_CCA:
     def __init__(self, n_modes=4, n_pca_modes=8, standardize=False, use_coslat=True, use_pca=True, dist_method="nonparam"):
         """
         Initialize the WAS_CCA class with specified parameters.

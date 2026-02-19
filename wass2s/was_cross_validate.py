@@ -193,7 +193,7 @@ class WAS_Cross_Validator:
         
 
 
-        if isinstance(model, WAS_CCA):
+        if isinstance(model, WAS_CCA_new):
             all_params = {**model_params}
             params_prob = {
                 k: v for k, v in all_params.items()
@@ -250,7 +250,7 @@ class WAS_Cross_Validator:
             # print(np.unique(hindcast_prob))
             return hindcast_det, hindcast_prob
         
-        if isinstance(model, WAS_CCA_old):
+        if isinstance(model, WAS_CCA):
 
             all_params = {**model_params}
             params_prob = {

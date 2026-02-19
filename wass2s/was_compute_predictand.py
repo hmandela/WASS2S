@@ -3836,7 +3836,7 @@ class WAS_TempPercentileIndices:
     ...     var_type='TMAX',
     ...     extreme_type='hot'
     ... )
-    >>> tx90p = calc.compute_xarray(tmax_da)
+    >>> tx90p = calc.compute(tmax_da)
 
     Cold nights (TN10p) for JJA season:
 
@@ -3846,7 +3846,7 @@ class WAS_TempPercentileIndices:
     ...     var_type='TMIN',
     ...     extreme_type='cold',
     ...     season=[6, 7, 8]
-    ... ).compute_xarray(tmin_da)
+    ... ).compute(tmin_da)
     """
     
     def __init__(
@@ -4136,7 +4136,7 @@ class WAS_TempPercentileIndices:
         
         return result_cdt
     
-    def compute_xarray(
+    def compute(
         self, 
         ds: Union[xr.Dataset, xr.DataArray],
         var_name: Optional[str] = None,
@@ -4647,7 +4647,7 @@ class WAS_PrecipIndices:
     ...     base_period=slice("1991", "2020"),
     ...     percentile=95
     ... )
-    >>> r95p = r95p_calc.compute_xarray(pr_da)  # pr_da is precipitation DataArray
+    >>> r95p = r95p_calc.compute(pr_da)  # pr_da is precipitation DataArray
 
     Compute R99p for JJAS season only:
 
@@ -4655,7 +4655,7 @@ class WAS_PrecipIndices:
     ...     base_period=slice("1991", "2020"),
     ...     percentile=99,
     ...     season=[6,7,8,9]
-    ... ).compute_xarray(pr_da)
+    ... ).compute(pr_da)
     """
     
     def __init__(
@@ -4798,7 +4798,7 @@ class WAS_PrecipIndices:
         # Convert back to CDT format
         return self._format_to_cdt(result)
     
-    def compute_xarray(
+    def compute(
         self, 
         da: xr.DataArray,
         # chunk_size: Optional[Dict[str, int]] = None,
@@ -4982,7 +4982,7 @@ class WAS_PrecipIndices:
 #     # Assuming pr is your precipitation DataArray
 #     # pr = xr.open_dataset('precipitation.nc').pr
 #     # index_calc = WAS_PrecipIndices(base_period=slice("1991", "2020"), percentile=95)
-#     # r95p = index_calc.compute_xarray(pr)
+#     # r95p = index_calc.compute(pr)
     
 #     # Example 3: With season
 #     # index_calc = WAS_PrecipIndices(
@@ -5256,807 +5256,1317 @@ class WAS_PrecipIndices:
 
 #         return result
 
+################################################################################################################
+################################################################################################################
 
+# =============================================================================
+# Enums / dataclasses
+# =============================================================================
 
 class HeatWaveMetric(Enum):
-    """ETCCDI Heat Wave Indices."""
-    HWDI = "HWDI"  # Heat Wave Duration Index (days in longest heat wave)
-    HWF = "HWF"    # Heat Wave Frequency (number of heat waves)
-    HWN = "HWN"    # Heat Wave Number (not standard ETCCDI, but sometimes used)
-    WSDI = "WSDI"  # Warm Spell Duration Index (ETCCDI standard)
+    """Heat wave / warm spell metrics (ETCCDI-style)."""
+    WSDI = "WSDI"  # warm spell duration index (days)
+    HWF  = "HWF"   # heat wave frequency (events)
+    HWDI = "HWDI"  # heat wave duration index (max duration in days)
+    HWN  = "HWN"   # alias of HWF (often used)
+
 
 @dataclass
 class HeatWaveDefinition:
-    """Definition of a heat wave event."""
     start_date: pd.Timestamp
     end_date: pd.Timestamp
     duration: int
     max_temp: float
     mean_temp: float
 
+
+# =============================================================================
+# Main class
+# =============================================================================
+
 class WAS_HeatWaveIndices:
     """
-    Implementation of ETCCDI heat wave indices for daily temperature data.
+    ETCCDI-like warm spell / heat wave indices for daily temperature.
 
-    This class computes standard ETCCDI heat wave indices based on daily maximum
-    temperature (TX) and optionally daily minimum temperature (TN) for compound events.
+    Metrics:
+    - WSDI: total number of days that belong to spells of >= min_consecutive_days
+            where TX > TXp (p-th percentile threshold based on base_period)
+    - HWF : number of spells/events per year (runs >= min_consecutive_days)
+    - HWDI: maximum run length per year (runs >= min_consecutive_days)
 
-    Supported Indices (ETCCDI definitions):
+    Threshold definition:
+    - Standard ETCCDI practice uses a 5-day centered window for each calendar day.
+      Implementation: rolling(time=5,center=True).construct("window")
+      then groupby(time.dayofyear).quantile(..., dim=["time","window"])
 
-    - **WSDI** (Warm Spell Duration Index): Annual count of days in spells of at least
-      6 consecutive days where TX > 90th percentile (default).
-    - **HWF** (Heat Wave Frequency): Annual count of heat wave events (≥ min_consecutive_days).
-    - **HWDI** (Heat Wave Duration Index): Annual maximum duration of any heat wave.
+    Dask/xarray robustness:
+    - quantile along time requires the 'time' dimension to be a single chunk.
+      We enforce .chunk({"time": -1}) immediately before quantile.
+    - parallelization is across space via lat/lon chunking.
 
-    Key Features:
-    - Uses 5-day centered window for percentile calculation (standard ETCCDI practice)
-    - Handles leap years (maps Feb 29 → Feb 28 for thresholds)
-    - Supports seasonal filtering
-    - Supports compound heat waves (both TX and TN exceed thresholds)
-    - Optional minimum intensity filter
-    - Works with both in-situ (CDT format) and gridded (xarray) data
-
-    References:
-    - ETCCDI Climate Change Indices (2009)
-    - Perkins & Alexander (2013): On the measurement of heat waves
-    - Zhang et al. (2011): Indices for monitoring changes in extremes
-
-    Parameters
-    ----------
-    base_period : slice
-        Climatological base period for percentile calculation, e.g. slice("1961", "1990")
-    tx_percentile : float, default=90
-        Percentile threshold for daily maximum temperature (TX)
-    tn_percentile : float, optional
-        Percentile threshold for daily minimum temperature (TN) — for compound events
-    min_consecutive_days : int, default=3
-        Minimum number of consecutive days to define a heat wave
-        (ETCCDI uses 6 for WSDI)
-    max_break_days : int, default=1
-        Maximum number of non-hot days allowed within a heat wave (currently not used)
-    season : list of int, optional
-        Months to consider (e.g., [5,6,7,8,9] for May–Sep)
-    require_both_tx_tn : bool, default=False
-        If True, requires both TX and TN to exceed their percentiles (compound heat wave)
-    min_intensity : float, optional
-        Minimum mean temperature anomaly required for a heat wave to be counted
-
-    Examples
-    --------
-    Standard WSDI (ETCCDI definition):
-
-    >>> calc = WAS_HeatWaveIndices(
-    ...     base_period=slice("1961", "1990"),
-    ...     tx_percentile=90,
-    ...     min_consecutive_days=6
-    ... )
-    >>> wsdi = calc.compute_xarray(ds_tx, metric="WSDI")
-
-    Compound heat waves (TX + TN):
-
-    >>> compound = WAS_HeatWaveIndices(
-    ...     base_period=slice("1961", "1990"),
-    ...     tx_percentile=90,
-    ...     tn_percentile=90,
-    ...     min_consecutive_days=3,
-    ...     require_both_tx_tn=True
-    ... )
-    >>> hwf_compound = compound.compute_xarray(ds_tx, ds_tn, metric="HWF")
+    Output:
+    - annual values on a 'T' dimension (one value per year, time stamp YYYY-01-01)
+    - dims renamed to (T, Y, X) i.e. time->T, lat->Y, lon->X
     """
-    
+
     def __init__(
         self,
         base_period: slice,
-        tx_percentile: float = 90,        # Percentile for TX (usually 90)
-        tn_percentile: Optional[float] = None,  # Optional: for TN in compound heat waves
-        min_consecutive_days: int = 3,    # Min days for a heat wave (ETCCDI uses 6 for WSDI)
-        max_break_days: int = 1,          # Max break days allowed within a heat wave
-        season: Optional[List[int]] = None,  # Months to consider (e.g., [5, 6, 7, 8, 9])
-        require_both_tx_tn: bool = False,  # If True, requires both TX and TN exceed percentiles
-        min_intensity: Optional[float] = None  # Optional minimum intensity threshold
+        tx_percentile: float = 90,
+        tn_percentile: Optional[float] = None,
+        min_consecutive_days: int = 6,
+        season: Optional[List[int]] = None,
+        require_both_tx_tn: bool = False,
     ):
-        """
-        Parameters
-        ----------
-        base_period : slice
-            Base period for percentile calculation, e.g., slice("1961", "1990")
-        tx_percentile : float
-            Percentile for daily maximum temperature (TX)
-        tn_percentile : float, optional
-            Percentile for daily minimum temperature (TN) for compound heat waves
-        min_consecutive_days : int
-            Minimum consecutive days for a heat wave (ETCCDI WSDI uses 6)
-        max_break_days : int
-            Maximum number of break days allowed within a heat wave
-        season : list, optional
-            Months to consider for heat wave analysis
-        require_both_tx_tn : bool
-            If True, requires both TX and TN to exceed percentiles (compound heat wave)
-        min_intensity : float, optional
-            Minimum intensity (e.g., temperature anomaly) for a heat wave
-        """
         self.base_period = base_period
-        self.tx_percentile = tx_percentile
-        self.tn_percentile = tn_percentile
-        self.min_consecutive_days = min_consecutive_days
-        self.max_break_days = max_break_days
+        self.tx_percentile = float(tx_percentile)
+        self.tn_percentile = None if tn_percentile is None else float(tn_percentile)
+        self.min_consecutive_days = int(min_consecutive_days)
         self.season = season
-        self.require_both_tx_tn = require_both_tx_tn
-        self.min_intensity = min_intensity
-        
-        # Validate inputs
+        self.require_both_tx_tn = bool(require_both_tx_tn)
+
         self._validate_inputs()
-    
-    def _validate_inputs(self):
-        """Validate all input parameters."""
+
+    # -------------------------------------------------------------------------
+    # Validation
+    # -------------------------------------------------------------------------
+    def _validate_inputs(self) -> None:
         if self.min_consecutive_days < 1:
-            raise ValueError(f"min_consecutive_days must be >= 1, got {self.min_consecutive_days}")
-        
-        if self.max_break_days < 0:
-            raise ValueError(f"max_break_days must be >= 0, got {self.max_break_days}")
-        
-        if not (0 < self.tx_percentile < 100):
-            raise ValueError(f"tx_percentile must be between 0 and 100, got {self.tx_percentile}")
-        
-        if self.tn_percentile is not None and not (0 < self.tn_percentile < 100):
-            raise ValueError(f"tn_percentile must be between 0 and 100, got {self.tn_percentile}")
-    
+            raise ValueError("min_consecutive_days must be >= 1")
+        if not (0.0 < self.tx_percentile < 100.0):
+            raise ValueError("tx_percentile must be between 0 and 100")
+        if self.require_both_tx_tn and self.tn_percentile is None:
+            raise ValueError("tn_percentile must be provided when require_both_tx_tn=True")
+        if self.tn_percentile is not None and not (0.0 < self.tn_percentile < 100.0):
+            raise ValueError("tn_percentile must be between 0 and 100")
+
+    # -------------------------------------------------------------------------
+    # Extract / standardize
+    # -------------------------------------------------------------------------
     @staticmethod
-    def transform_cdt(df: pd.DataFrame) -> pd.DataFrame:
-        """Transform CDT format to long format DataFrame."""
-        # Extract metadata
-        meta = df.iloc[:3].set_index("ID").T.reset_index()
-        meta.columns = ["STATION", "LON", "LAT", "ELEV"]
-        
-        # Extract data
-        data = df.iloc[3:].rename(columns={"ID": "DATE"})
-        data = data.melt(
-            id_vars=["DATE"],
-            var_name="STATION",
-            value_name="VALUE"
-        )
-        
-        # Merge and clean
-        final = pd.merge(data, meta, on="STATION")
-        final["DATE"] = pd.to_datetime(final["DATE"], format="%Y%m%d")
-        final["VALUE"] = pd.to_numeric(final["VALUE"], errors='coerce')
-        
-        # Convert -99.0 to NaN
-        final["VALUE"] = final["VALUE"].replace(-99.0, np.nan)
-        
-        return final
-    
-    def _calculate_temperature_thresholds(
-        self, 
-        df_temp: pd.DataFrame,
+    def _extract_da(obj: Union[xr.DataArray, xr.Dataset], candidates: List[str]) -> xr.DataArray:
+        if isinstance(obj, xr.DataArray):
+            return obj
+        if not isinstance(obj, xr.Dataset):
+            raise TypeError(f"Expected xarray Dataset or DataArray, got {type(obj)}")
+
+        for name in candidates:
+            if name in obj.data_vars:
+                return obj[name]
+        return obj[list(obj.data_vars)[0]]
+
+    @staticmethod
+    def _standardize_dims(da: xr.DataArray) -> xr.DataArray:
+        """
+        Rename dims to ('time','lat','lon') from common variants.
+        """
+        dim_map = {}
+
+        # time
+        for c in ["time", "T", "date", "Date", "valid_time"]:
+            if c in da.dims:
+                dim_map[c] = "time"
+                break
+
+        # lat
+        for c in ["lat", "latitude", "Y", "y"]:
+            if c in da.dims:
+                dim_map[c] = "lat"
+                break
+
+        # lon
+        for c in ["lon", "longitude", "X", "x"]:
+            if c in da.dims:
+                dim_map[c] = "lon"
+                break
+
+        if dim_map:
+            da = da.rename(dim_map)
+
+        if "time" not in da.dims:
+            raise ValueError(f"Missing time dimension. Found dims={list(da.dims)}")
+        if "lat" not in da.dims or "lon" not in da.dims:
+            raise ValueError(f"Missing lat/lon dimensions. Found dims={list(da.dims)}")
+
+        return da
+
+    @staticmethod
+    def _is_dask(da: xr.DataArray) -> bool:
+        return hasattr(da.data, "chunks")
+
+    @staticmethod
+    def _choose_spatial_chunks(ny: int, nx: int, nb_cores: int) -> Tuple[int, int]:
+        """
+        Simple heuristic for chunking across space: sqrt(nb_cores) x sqrt(nb_cores)
+        """
+        nsplit = max(1, int(np.ceil(np.sqrt(max(1, nb_cores)))))
+        cy = max(1, int(np.ceil(ny / nsplit)))
+        cx = max(1, int(np.ceil(nx / nsplit)))
+        return cy, cx
+
+    # -------------------------------------------------------------------------
+    # Threshold computation (day-of-year)
+    # -------------------------------------------------------------------------
+    def _compute_thresholds_dayofyear(
+        self,
+        da: xr.DataArray,
         percentile: float,
-        var_name: str = "TX"
-    ) -> pd.DataFrame:
+        parallel: bool,
+        nb_cores: int,
+    ) -> xr.DataArray:
         """
-        Calculate temperature thresholds using 5-day centered window.
-        
-        Parameters
-        ----------
-        df_temp : pd.DataFrame
-            Temperature data with columns: DATE, STATION, VALUE
-        percentile : float
-            Percentile to calculate (e.g., 90 for 90th percentile)
-        var_name : str
-            Variable name for metadata
-        
-        Returns
-        -------
-        pd.DataFrame
-            Thresholds for each day of year and station
+        Returns thresholds(dayofyear, lat, lon) for da(time, lat, lon).
+        Compatible across xarray versions (no dask_gufunc_kwargs).
         """
-        # Pivot to wide format
-        wide = df_temp.pivot(index="DATE", columns="STATION", values="VALUE")
-        
-        # Handle leap days
-        doy_series = wide.index.dayofyear.replace(366, 365)
-        wide_doy = wide.copy()
-        wide_doy.index = doy_series
-        
-        # Calculate thresholds for each day of year (1-365) using 5-day window
-        thresholds = {}
-        
-        for doy in range(1, 366):
-            # Create 5-day centered window (circular for year boundaries)
-            window_days = []
-            for offset in [-2, -1, 0, 1, 2]:
-                window_doy = ((doy + offset - 1) % 365) + 1
-                window_days.append(window_doy)
-            
-            # Get data for this window
-            window_mask = wide_doy.index.isin(window_days)
-            window_data = wide_doy[window_mask]
-            
-            if len(window_data) > 0:
-                # Calculate percentile for each station
-                threshold_values = np.nanpercentile(
-                    window_data.values, 
-                    percentile, 
-                    axis=0
-                )
-                thresholds[doy] = threshold_values
-        
-        # Convert to DataFrame
-        thresholds_df = pd.DataFrame(thresholds, index=wide.columns).T
-        thresholds_df.index.name = "DOY"
-        thresholds_df = thresholds_df.reset_index().melt(
-            id_vars="DOY",
-            var_name="STATION",
-            value_name=f"{var_name}_THRESHOLD"
+
+        # chunk across space (optional)
+        if parallel and self._is_dask(da):
+            ny, nx = int(da.sizes["lat"]), int(da.sizes["lon"])
+            cy, cx = self._choose_spatial_chunks(ny, nx, nb_cores)
+            da = da.chunk({"lat": cy, "lon": cx})
+
+        # critical: time must be single chunk for quantile core dim
+        if parallel and self._is_dask(da):
+            da = da.chunk({"time": -1})
+
+        # 5-day centered window
+        w = da.rolling(time=5, center=True, min_periods=1).construct("window")
+        if parallel and self._is_dask(w):
+            # window is tiny; keep single-chunk
+            w = w.chunk({"window": -1})
+
+        q = float(percentile) / 100.0
+
+        thr = w.groupby("time.dayofyear").quantile(
+            q,
+            dim=["time", "window"],
+            method="linear",
+            skipna=True,
         )
-        
-        return thresholds_df
-    
-    def _identify_hot_days(
-        self,
-        df_temp: pd.DataFrame,
-        thresholds: pd.DataFrame,
-        var_name: str = "TX"
-    ) -> pd.DataFrame:
+
+        # clean possible quantile dim/coord
+        if "quantile" in thr.dims:
+            thr = thr.isel(quantile=0, drop=True)
+        if "quantile" in thr.coords:
+            thr = thr.drop_vars("quantile")
+
+        return thr
+
+    # -------------------------------------------------------------------------
+    # 1D run logic (correct ETCCDI spell counting)
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _spell_stats_1d(arr: np.ndarray, minlen: int) -> Tuple[int, int, int]:
         """
-        Identify days when temperature exceeds threshold.
+        For a 1D hot-indicator array (float with {0,1} and possibly NaN),
+        return (wsdi_days, hwf_events, hwdi_maxlen).
         """
-        # Merge thresholds with data
-        df_temp["DOY"] = df_temp["DATE"].dt.dayofyear.replace(366, 365)
-        merged = pd.merge(
-            df_temp, 
-            thresholds, 
-            on=["STATION", "DOY"], 
-            how="left"
-        )
-        
-        # Identify hot days (temperature > threshold)
-        threshold_col = f"{var_name}_THRESHOLD"
-        merged["IS_HOT"] = (merged["VALUE"] > merged[threshold_col]).astype(float)
-        merged.loc[merged["VALUE"].isna(), "IS_HOT"] = np.nan
-        
-        return merged
-    
-    def _detect_heat_waves(
-        self,
-        df_hot_days: pd.DataFrame,
-        intensity_col: Optional[str] = None
-    ) -> pd.DataFrame:
-        """
-        Detect heat wave events from sequence of hot days.
-        
-        Parameters
-        ----------
-        df_hot_days : pd.DataFrame
-            DataFrame with IS_HOT column (0/1 for non-hot/hot days)
-        intensity_col : str, optional
-            Column with intensity values for filtering
-        
-        Returns
-        -------
-        pd.DataFrame
-            DataFrame with heat wave events detected
-        """
-        # Sort by station and date
-        df_hot_days = df_hot_days.sort_values(["STATION", "DATE"])
-        
-        heat_waves = []
-        
-        for station, group in df_hot_days.groupby("STATION"):
-            # Get hot day sequence
-            is_hot = group["IS_HOT"].values
-            dates = group["DATE"].values
-            
-            # Identify runs of hot days
-            if len(is_hot) == 0:
-                continue
-            
-            # Find start and end of hot spells
-            # Pad with False at both ends for edge detection
-            padded = np.concatenate(([0], is_hot, [0]))
-            diff = np.diff(padded)
-            
-            starts = np.where(diff == 1)[0]
-            ends = np.where(diff == -1)[0]
-            
-            # Check each potential heat wave
-            for start_idx, end_idx in zip(starts, ends):
-                duration = end_idx - start_idx
-                
-                # Apply minimum duration filter
-                if duration >= self.min_consecutive_days:
-                    # Extract heat wave period
-                    heat_wave_dates = dates[start_idx:end_idx]
-                    heat_wave_data = group.iloc[start_idx:end_idx]
-                    
-                    # Optional intensity filter
-                    if self.min_intensity is not None and intensity_col is not None:
-                        mean_intensity = heat_wave_data[intensity_col].mean()
-                        if mean_intensity < self.min_intensity:
-                            continue
-                    
-                    # Create heat wave record
-                    heat_wave = {
-                        "STATION": station,
-                        "START_DATE": heat_wave_dates[0],
-                        "END_DATE": heat_wave_dates[-1],
-                        "DURATION": duration,
-                        "YEAR": heat_wave_dates[0].year,
-                        "LAT": group["LAT"].iloc[0],
-                        "LON": group["LON"].iloc[0]
-                    }
-                    
-                    # Add intensity metrics if available
-                    if "VALUE" in heat_wave_data.columns:
-                        heat_wave["MAX_TEMP"] = heat_wave_data["VALUE"].max()
-                        heat_wave["MEAN_TEMP"] = heat_wave_data["VALUE"].mean()
-                        heat_wave["INTENSITY"] = (
-                            heat_wave_data["VALUE"] - 
-                            heat_wave_data[f"TX_THRESHOLD"]
-                        ).mean()
-                    
-                    heat_waves.append(heat_wave)
-        
-        return pd.DataFrame(heat_waves) if heat_waves else pd.DataFrame()
-    
-    def compute_insitu(
-        self,
-        df_cdt_tx: pd.DataFrame,
-        df_cdt_tn: Optional[pd.DataFrame] = None,
-        metric: str = "WSDI"
-    ) -> pd.DataFrame:
-        """
-        Compute heat wave indices for in-situ data.
-        
-        Parameters
-        ----------
-        df_cdt_tx : pd.DataFrame
-            Daily maximum temperature in CDT format
-        df_cdt_tn : pd.DataFrame, optional
-            Daily minimum temperature in CDT format (for compound heat waves)
-        metric : str
-            Heat wave metric to compute: "WSDI", "HWF", or "HWDI"
-        
-        Returns
-        -------
-        pd.DataFrame
-            Results in CDT format
-        """
-        # Transform CDT data
-        df_tx = self.transform_cdt(df_cdt_tx)
-        
-        # Filter base period for threshold calculation
-        base_start = int(self.base_period.start)
-        base_stop = int(self.base_period.stop)
-        df_tx_base = df_tx[
-            df_tx["DATE"].dt.year.between(base_start, base_stop)
-        ].copy()
-        
-        # Calculate TX thresholds
-        tx_thresholds = self._calculate_temperature_thresholds(
-            df_tx_base, self.tx_percentile, "TX"
-        )
-        
-        # Identify hot days based on TX
-        df_hot_days = self._identify_hot_days(df_tx, tx_thresholds, "TX")
-        
-        # If TN data provided for compound heat waves
-        if df_cdt_tn is not None and self.require_both_tx_tn:
-            df_tn = self.transform_cdt(df_cdt_tn)
-            df_tn_base = df_tn[
-                df_tn["DATE"].dt.year.between(base_start, base_stop)
-            ].copy()
-            
-            # Calculate TN thresholds
-            tn_thresholds = self._calculate_temperature_thresholds(
-                df_tn_base, self.tn_percentile or 90, "TN"
-            )
-            
-            # Identify hot nights
-            df_hot_nights = self._identify_hot_days(df_tn, tn_thresholds, "TN")
-            
-            # Merge TX and TN data
-            df_merged = pd.merge(
-                df_hot_days,
-                df_hot_nights[["DATE", "STATION", "IS_HOT"]],
-                on=["DATE", "STATION"],
-                suffixes=("_TX", "_TN")
-            )
-            
-            # Compound condition: both TX and TN exceed thresholds
-            df_merged["IS_HOT"] = (
-                (df_merged["IS_HOT_TX"] == 1) & 
-                (df_merged["IS_HOT_TN"] == 1)
-            ).astype(float)
-            
-            df_hot_days = df_merged
-        
-        # Apply seasonal filter
-        if self.season:
-            df_hot_days = df_hot_days[
-                df_hot_days["DATE"].dt.month.isin(self.season)
-            ]
-        
-        # Detect heat waves
-        heat_waves = self._detect_heat_waves(df_hot_days)
-        
-        if heat_waves.empty:
-            # Return empty result with proper structure
-            empty_df = pd.DataFrame(columns=["STATION", "YEAR", "LAT", "LON", metric])
-            return self._format_to_cdt(empty_df, metric)
-        
-        # Calculate requested metric
-        if metric == "WSDI":
-            # WSDI: Annual total number of hot days in heat waves
-            result = heat_waves.groupby(["STATION", "YEAR", "LAT", "LON"]).agg(
-                WSDI=("DURATION", "sum")
-            ).reset_index()
-        
-        elif metric == "HWF":
-            # HWF: Annual count of heat wave events
-            result = heat_waves.groupby(["STATION", "YEAR", "LAT", "LON"]).agg(
-                HWF=("DURATION", "count")
-            ).reset_index()
-        
-        elif metric == "HWDI":
-            # HWDI: Annual maximum duration of heat waves
-            result = heat_waves.groupby(["STATION", "YEAR", "LAT", "LON"]).agg(
-                HWDI=("DURATION", "max")
-            ).reset_index()
-        
-        else:
-            raise ValueError(f"Unknown metric: {metric}. Use 'WSDI', 'HWF', or 'HWDI'.")
-        
-        # Fill NaN for years without heat waves
-        result[metric] = result[metric].fillna(0)
-        
-        return self._format_to_cdt(result, metric)
-    
-    def compute_xarray(
+        if arr.size == 0:
+            return 0, 0, 0
+
+        valid = np.isfinite(arr)
+        hot = (arr == 1) & valid
+        if not np.any(hot):
+            return 0, 0, 0
+
+        a = hot.astype(np.int8)
+        padded = np.concatenate(([0], a, [0]))
+        d = np.diff(padded)
+
+        starts = np.where(d == 1)[0]
+        ends   = np.where(d == -1)[0]
+        lens = ends - starts
+
+        good = lens >= minlen
+        if not np.any(good):
+            return 0, 0, 0
+
+        good_lens = lens[good]
+        wsdi = int(good_lens.sum())
+        hwf = int(good_lens.size)
+        hwdi = int(good_lens.max())
+        return wsdi, hwf, hwdi
+
+    # -------------------------------------------------------------------------
+    # Public API: compute
+    # -------------------------------------------------------------------------
+    def compute(
         self,
         ds_tx: Union[xr.Dataset, xr.DataArray],
         ds_tn: Optional[Union[xr.Dataset, xr.DataArray]] = None,
         metric: str = "WSDI",
-        # chunk_size: Optional[Dict[str, int]] = None,
         parallel: bool = True,
-        nb_cores: int = 4
+        nb_cores: int = 4,
+        compute: bool = True,
     ) -> xr.DataArray:
         """
-        Compute heat wave indices for xarray data.
-        
+        Compute metric on gridded data.
+
         Parameters
         ----------
-        ds_tx : xr.Dataset or xr.DataArray
-            Daily maximum temperature
-        ds_tn : xr.Dataset or xr.DataArray, optional
-            Daily minimum temperature (for compound heat waves)
+        ds_tx : Dataset/DataArray
+            Daily max temperature (tasmax/TMAX).
+        ds_tn : Dataset/DataArray, optional
+            Daily min temperature (tasmin/TMIN) for compound events.
         metric : str
-            Heat wave metric to compute
-        chunk_size : dict, optional
-            Chunk sizes for parallel processing
+            "WSDI", "HWF", "HWDI" (also accepts "HWN" alias for HWF).
         parallel : bool
-            Whether to use Dask for parallel processing
-        
+            Use dask parallelization across space.
+        nb_cores : int
+            Used to choose spatial chunk sizes.
+        compute : bool
+            If True, triggers compute() at the end.
+
         Returns
         -------
-        xr.DataArray
-            Heat wave index values
+        xr.DataArray with dims (T,Y,X)
         """
-        # Extract TX DataArray
-        if isinstance(ds_tx, xr.Dataset):
-            da_tx = ds_tx["TMAX"] if "TMAX" in ds_tx else ds_tx[list(ds_tx.data_vars)[0]]
-        else:
-            da_tx = ds_tx
-        
-        # Standardize dimension names
+        m = metric.upper()
+        if m == "HWN":
+            m = "HWF"
+        if m not in {"WSDI", "HWF", "HWDI"}:
+            raise ValueError("metric must be one of: WSDI, HWF, HWDI (or HWN as alias of HWF)")
+
+        # --- TX
+        da_tx = self._extract_da(ds_tx, ["TMAX", "tasmax", "TX"])
         da_tx = self._standardize_dims(da_tx)
-        
-        # Apply seasonal mask if specified
+
+        # seasonal filter
         if self.season:
-            da_tx = da_tx.where(da_tx.time.dt.month.isin(self.season), drop=True)
-        
-        # # Handle chunking for Dask
-        # if parallel and hasattr(da_tx.data, 'chunks'):
-        #     if chunk_size is None:
-        #         chunk_size = {'lat': 50, 'lon': 50}
-        #     da_tx = da_tx.chunk({'time': -1, **chunk_size})
+            da_tx = da_tx.where(da_tx["time"].dt.month.isin(self.season), drop=True)
 
-        if parallel:# and hasattr(da.data, 'chunks'):
-            chunk_size = {'y': int(np.round(len(da_tx.get_index("y")) / nb_cores)), 'x': int(np.round(len(da_tx.get_index("x")) / nb_cores))}
-            da_tx = da_tx.chunk({'time': -1, **chunk_size})
-        
-        # Select base period
+        # spatial chunking early (time chunk enforced where needed)
+        if parallel and self._is_dask(da_tx):
+            ny, nx = int(da_tx.sizes["lat"]), int(da_tx.sizes["lon"])
+            cy, cx = self._choose_spatial_chunks(ny, nx, nb_cores)
+            da_tx = da_tx.chunk({"lat": cy, "lon": cx})
+
+        # base period
         da_tx_base = da_tx.sel(time=self.base_period)
-        
-        # Calculate TX thresholds using 5-day centered window
-        windowed_tx = da_tx_base.rolling(time=5, center=True, min_periods=1).construct("window")
-        tx_thresholds = windowed_tx.groupby("time.dayofyear").quantile(
-            self.tx_percentile / 100.0,
-            dim=["time", "window"],
-            method='linear',
-            skipna=True
-        )
-        
-        # Handle leap days
-        doy = da_tx.time.dt.dayofyear
-        doy_fixed = xr.where(doy == 366, 365, doy)
-        
-        # Map thresholds to all time steps
-        full_tx_thresholds = tx_thresholds.sel(dayofyear=doy_fixed)
-        full_tx_thresholds = full_tx_thresholds.drop_vars("dayofyear")
-        full_tx_thresholds = full_tx_thresholds.assign_coords(time=da_tx.time)
-        
-        # Identify hot days based on TX
-        is_hot_tx = (da_tx > full_tx_thresholds).astype(float)
-        is_hot_tx = is_hot_tx.where(da_tx.notnull())
-        
-        # If TN data provided for compound heat waves
-        if ds_tn is not None and self.require_both_tx_tn:
-            # Extract TN DataArray
-            if isinstance(ds_tn, xr.Dataset):
-                da_tn = ds_tn["TMIN"] if "TMIN" in ds_tn else ds_tn[list(ds_tn.data_vars)[0]]
-            else:
-                da_tn = ds_tn
-            
-            da_tn = self._standardize_dims(da_tn)
-            
-            if self.season:
-                da_tn = da_tn.where(da_tn.time.dt.month.isin(self.season), drop=True)
-            
-            # Calculate TN thresholds
-            da_tn_base = da_tn.sel(time=self.base_period)
-            windowed_tn = da_tn_base.rolling(time=5, center=True, min_periods=1).construct("window")
-            tn_thresholds = windowed_tn.groupby("time.dayofyear").quantile(
-                (self.tn_percentile or 90) / 100.0,
-                dim=["time", "window"],
-                method='linear',
-                skipna=True
-            )
-            
-            # Map TN thresholds
-            full_tn_thresholds = tn_thresholds.sel(dayofyear=doy_fixed)
-            full_tn_thresholds = full_tn_thresholds.drop_vars("dayofyear")
-            full_tn_thresholds = full_tn_thresholds.assign_coords(time=da_tn.time)
-            
-            # Identify hot nights
-            is_hot_tn = (da_tn > full_tn_thresholds).astype(float)
-            is_hot_tn = is_hot_tn.where(da_tn.notnull())
-            
-            # Compound condition: both TX and TN exceed thresholds
-            is_hot = (is_hot_tx == 1) & (is_hot_tn == 1)
-        else:
-            is_hot = (is_hot_tx == 1)
-        
-        # Apply minimum consecutive days filter
-        # Use rolling sum to identify periods with at least min_consecutive_days
-        rolling_hot = is_hot.rolling(time=self.min_consecutive_days, center=False).sum()
-        heat_wave_mask = (rolling_hot >= self.min_consecutive_days)
-        
-        # Extend mask to include all days in heat waves
-        # For each heat wave start, mark the next min_consecutive_days-1 days
-        heat_wave_extended = heat_wave_mask.copy()
-        
-        # Calculate metric
-        if metric == "WSDI":
-            # WSDI: Annual count of hot days in heat waves
-            result = heat_wave_extended.resample(time='YS').sum(dim='time', skipna=True)
-            result = result.astype(int)
-        
-        elif metric == "HWF":
-            # HWF: Annual count of heat wave events
-            # Find start of each heat wave
-            heat_wave_start = heat_wave_mask & (~heat_wave_mask.shift(time=1, fill_value=False))
-            result = heat_wave_start.resample(time='YS').sum(dim='time', skipna=True)
-            result = result.astype(int)
-        
-        elif metric == "HWDI":
-            # HWDI: Annual maximum duration of heat waves
-            # This is more complex - need to find longest consecutive sequence
-            # We'll use apply_ufunc for this
-            def max_consecutive(arr):
-                """Find maximum consecutive True values in 1D array."""
-                if np.all(np.isnan(arr)):
-                    return 0
-                
-                arr_bool = arr.astype(bool)
-                if not np.any(arr_bool):
-                    return 0
-                
-                # Find runs of True
-                diff = np.diff(np.concatenate(([False], arr_bool, [False])))
-                starts = np.where(diff == 1)[0]
-                ends = np.where(diff == -1)[0]
-                durations = ends - starts
-                
-                return np.max(durations) if len(durations) > 0 else 0
-            
-            # Apply to each year
-            years = np.unique(heat_wave_extended.time.dt.year.values)
-            results = []
-            
-            for year in years:
-                year_data = heat_wave_extended.sel(
-                    time=heat_wave_extended.time.dt.year == year
-                )
-                
-                # Apply function to each grid cell
-                max_durations = xr.apply_ufunc(
-                    max_consecutive,
-                    year_data,
-                    input_core_dims=[['time']],
-                    output_core_dims=[[]],
-                    vectorize=True,
-                    dask='parallelized' if parallel else 'allowed'
-                )
-                
-                # Add year coordinate
-                max_durations = max_durations.expand_dims(
-                    time=[pd.Timestamp(f"{year}-01-01")]
-                )
-                results.append(max_durations)
-            
-            result = xr.concat(results, dim='time')
-        
-        else:
-            raise ValueError(f"Unknown metric: {metric}. Use 'WSDI', 'HWF', or 'HWDI'.")
-        
-        # Set metadata
-        result.name = metric
-        result.attrs.update(self._get_metadata(metric))
-        
-        return result.compute().drop_vars("quantile").rename({"time": "T", "x": "X", "y": "Y"})
-    
-    def _standardize_dims(self, da: xr.DataArray) -> xr.DataArray:
-        """Standardize dimension names."""
-        dim_map = {}
-        
-        # Identify time dimension
-        time_candidates = ['time', 'T', 'date', 'Date']
-        for tc in time_candidates:
-            if tc in da.dims:
-                dim_map[tc] = 'time'
-                break
-        
-        # Identify spatial dimensions
-        spatial_pairs = [
-            (['lat', 'y', 'latitude', 'Y'], 'lat'),
-            (['lon', 'x', 'longitude', 'X'], 'lon')
-        ]
-        
-        for candidates, std_name in spatial_pairs:
-            for cand in candidates:
-                if cand in da.dims:
-                    dim_map[cand] = std_name
-                    break
-        
-        # Rename dimensions if needed
-        if dim_map:
-            da = da.rename(dim_map)
-        
-        if 'time' not in da.dims:
-            raise ValueError(f"DataArray must have 'time' dimension. Found: {list(da.dims)}")
-        
-        return da
-    
-    def _get_metadata(self, metric: str) -> Dict:
-        """Get metadata dictionary for the index."""
-        metadata = {
-            'long_name': f'{metric} Heat Wave Index',
-            'units': 'days' if metric == 'WSDI' else 'count',
-            'base_period': f'{self.base_period.start}-{self.base_period.stop}',
-            'tx_percentile': self.tx_percentile,
-            'tn_percentile': self.tn_percentile,
-            'min_consecutive_days': self.min_consecutive_days,
-            'max_break_days': self.max_break_days,
-            'season': self.season if self.season else 'all months',
-            'require_both_tx_tn': self.require_both_tx_tn,
-            'reference': 'ETCCDI Climate Change Indices (2009)',
-            'definition': self._get_index_definition(metric)
-        }
-        
-        return metadata
-    
-    def _get_index_definition(self, metric: str) -> str:
-        """Get definition string for the index."""
-        definitions = {
-            'WSDI': f'Annual count of days with at least {self.min_consecutive_days} '
-                    f'consecutive days when TX > {self.tx_percentile}th percentile',
-            'HWF': f'Annual number of heat wave events (≥{self.min_consecutive_days} '
-                   f'consecutive days when TX > {self.tx_percentile}th percentile)',
-            'HWDI': f'Annual maximum length of heat waves (consecutive days '
-                    f'when TX > {self.tx_percentile}th percentile)'
-        }
-        
-        if self.require_both_tx_tn:
-            for key in definitions:
-                definitions[key] = definitions[key].replace('TX', 'TX and TN')
-        
-        return definitions.get(metric, 'Custom heat wave index')
-    
-    def _format_to_cdt(self, df: pd.DataFrame, metric: str) -> pd.DataFrame:
-        """Convert to CDT format."""
-        if df.empty:
-            # Return empty CDT structure
-            return pd.DataFrame(columns=["ID"])
-        
-        # Pivot to wide format
-        pivot = df.pivot(
-            index="YEAR",
-            columns="STATION",
-            values=metric
-        ).reset_index()
-        
-        # Create metadata rows
-        meta = df.groupby("STATION")[["LAT", "LON"]].first()
-        stations = pivot.columns[1:]  # Exclude YEAR column
-        meta = meta.reindex(stations)
-        
-        # Create metadata rows
-        lat_row = pd.DataFrame([["LAT"] + meta["LAT"].tolist()], 
-                              columns=pivot.columns)
-        lon_row = pd.DataFrame([["LON"] + meta["LON"].tolist()], 
-                              columns=pivot.columns)
-        
-        # Rename YEAR column to ID for CDT format
-        pivot = pivot.rename(columns={"YEAR": "ID"})
-        lat_row = lat_row.rename(columns={"YEAR": "ID"})
-        lon_row = lon_row.rename(columns={"YEAR": "ID"})
-        
-        # Combine all rows
-        result = pd.concat([lat_row, lon_row, pivot], ignore_index=True)
-        
-        return result
 
-# Convenience class for standard ETCCDI WSDI
+        # thresholds(dayofyear,lat,lon)
+        tx_thr_doy = self._compute_thresholds_dayofyear(
+            da_tx_base, self.tx_percentile, parallel=parallel, nb_cores=nb_cores
+        )
+
+        # map thresholds to each time
+        doy = da_tx["time"].dt.dayofyear
+        doy_fixed = xr.where(doy == 366, 365, doy)
+
+        tx_thr_full = tx_thr_doy.sel(dayofyear=doy_fixed)
+        tx_thr_full = tx_thr_full.drop_vars("dayofyear", errors="ignore")
+        tx_thr_full = tx_thr_full.assign_coords(time=da_tx["time"])
+
+        is_hot_tx = (da_tx > tx_thr_full).astype(np.float32)
+        is_hot_tx = is_hot_tx.where(da_tx.notnull())
+
+        # --- optional TN compound
+        if (ds_tn is not None) and self.require_both_tx_tn:
+            da_tn = self._extract_da(ds_tn, ["TMIN", "tasmin", "TN"])
+            da_tn = self._standardize_dims(da_tn)
+
+            if self.season:
+                da_tn = da_tn.where(da_tn["time"].dt.month.isin(self.season), drop=True)
+
+            if parallel and self._is_dask(da_tn):
+                # align spatial chunking with TX if possible
+                if self._is_dask(da_tx):
+                    # use first chunk sizes
+                    cy = da_tx.chunksizes["lat"][0]
+                    cx = da_tx.chunksizes["lon"][0]
+                    da_tn = da_tn.chunk({"lat": cy, "lon": cx})
+
+            da_tn_base = da_tn.sel(time=self.base_period)
+
+            tn_thr_doy = self._compute_thresholds_dayofyear(
+                da_tn_base, self.tn_percentile, parallel=parallel, nb_cores=nb_cores
+            )
+
+            doy_tn = da_tn["time"].dt.dayofyear
+            doy_tn_fixed = xr.where(doy_tn == 366, 365, doy_tn)
+
+            tn_thr_full = tn_thr_doy.sel(dayofyear=doy_tn_fixed)
+            tn_thr_full = tn_thr_full.drop_vars("dayofyear", errors="ignore")
+            tn_thr_full = tn_thr_full.assign_coords(time=da_tn["time"])
+
+            is_hot_tn = (da_tn > tn_thr_full).astype(np.float32)
+            is_hot_tn = is_hot_tn.where(da_tn.notnull())
+
+            is_hot = ((is_hot_tx == 1) & (is_hot_tn == 1)).astype(np.float32)
+            is_hot = is_hot.where(is_hot_tx.notnull() & is_hot_tn.notnull())
+        else:
+            is_hot = (is_hot_tx == 1).astype(np.float32)
+            is_hot = is_hot.where(is_hot_tx.notnull())
+
+        # for apply_ufunc core dim safety: time single chunk
+        if parallel and self._is_dask(is_hot):
+            is_hot = is_hot.chunk({"time": -1})
+
+        years = np.unique(is_hot["time"].dt.year.values)
+
+        annual_list = []
+        for yr in years:
+            hot_yr = is_hot.sel(time=is_hot["time"].dt.year == yr)
+
+            def _metric_1d(arr: np.ndarray) -> np.int32:
+                wsdi, hwf, hwdi = WAS_HeatWaveIndices._spell_stats_1d(arr, self.min_consecutive_days)
+                if m == "WSDI":
+                    return np.int32(wsdi)
+                if m == "HWF":
+                    return np.int32(hwf)
+                return np.int32(hwdi)
+
+            out_yr = xr.apply_ufunc(
+                _metric_1d,
+                hot_yr,
+                input_core_dims=[["time"]],
+                output_core_dims=[[]],
+                vectorize=True,
+                dask="parallelized" if (parallel and self._is_dask(hot_yr)) else "allowed",
+                output_dtypes=[np.int32],
+            )
+
+            out_yr = out_yr.expand_dims(time=[pd.Timestamp(f"{int(yr)}-01-01")])
+            annual_list.append(out_yr)
+
+        out = xr.concat(annual_list, dim="time")
+        out.name = m
+        out.attrs.update(self._get_metadata(m))
+
+        # WAS naming convention
+        out = out.rename({"time": "T", "lat": "Y", "lon": "X"})
+
+        return out.compute() if compute else out
+
+    # -------------------------------------------------------------------------
+    # Metadata
+    # -------------------------------------------------------------------------
+    def _get_metadata(self, metric: str) -> Dict:
+        units = "days" if metric in {"WSDI", "HWDI"} else "count"
+        base = f"{self.base_period.start}-{self.base_period.stop}"
+        return {
+            "long_name": f"{metric} Heat Wave Index",
+            "units": units,
+            "base_period": base,
+            "tx_percentile": self.tx_percentile,
+            "tn_percentile": self.tn_percentile,
+            "min_consecutive_days": self.min_consecutive_days,
+            "season": self.season if self.season else "all months",
+            "require_both_tx_tn": self.require_both_tx_tn,
+            "reference": "ETCCDI Climate Change Indices",
+            "definition": self._definition(metric),
+        }
+
+    def _definition(self, metric: str) -> str:
+        cond = f"TX > {self.tx_percentile}th percentile"
+        if self.require_both_tx_tn:
+            cond = f"TX > {self.tx_percentile}th AND TN > {self.tn_percentile}th percentile"
+        k = self.min_consecutive_days
+        if metric == "WSDI":
+            return f"Annual total number of days in spells of at least {k} consecutive days with {cond}."
+        if metric == "HWF":
+            return f"Annual number of events (spells) of at least {k} consecutive days with {cond}."
+        if metric == "HWDI":
+            return f"Annual maximum duration (days) among spells of at least {k} consecutive days with {cond}."
+        return "Heat wave index."
+
+
+# =============================================================================
+# Factory
+# =============================================================================
+
 class ETCCDIHeatWaveIndices:
-    """Factory for creating standard ETCCDI heat wave indices."""
-    
+    """Factory helpers for standard configurations."""
+
     @staticmethod
     def wsdi(
         base_period: slice,
         tx_percentile: float = 90,
         min_consecutive_days: int = 6,
-        season: Optional[List[int]] = None
+        season: Optional[List[int]] = None,
     ) -> WAS_HeatWaveIndices:
-        """Create calculator for WSDI (Warm Spell Duration Index)."""
         return WAS_HeatWaveIndices(
             base_period=base_period,
             tx_percentile=tx_percentile,
             min_consecutive_days=min_consecutive_days,
-            season=season
+            season=season,
         )
-    
+
     @staticmethod
     def heat_wave_frequency(
         base_period: slice,
         tx_percentile: float = 90,
         min_consecutive_days: int = 3,
-        season: Optional[List[int]] = None
+        season: Optional[List[int]] = None,
     ) -> WAS_HeatWaveIndices:
-        """Create calculator for Heat Wave Frequency."""
         return WAS_HeatWaveIndices(
             base_period=base_period,
             tx_percentile=tx_percentile,
             min_consecutive_days=min_consecutive_days,
-            season=season
+            season=season,
         )
-    
+
+    @staticmethod
+    def heat_wave_duration_index(
+        base_period: slice,
+        tx_percentile: float = 90,
+        min_consecutive_days: int = 3,
+        season: Optional[List[int]] = None,
+    ) -> WAS_HeatWaveIndices:
+        return WAS_HeatWaveIndices(
+            base_period=base_period,
+            tx_percentile=tx_percentile,
+            min_consecutive_days=min_consecutive_days,
+            season=season,
+        )
+
     @staticmethod
     def compound_heat_wave(
         base_period: slice,
         tx_percentile: float = 90,
         tn_percentile: float = 90,
         min_consecutive_days: int = 3,
-        season: Optional[List[int]] = None
+        season: Optional[List[int]] = None,
     ) -> WAS_HeatWaveIndices:
-        """Create calculator for compound heat waves (both TX and TN)."""
         return WAS_HeatWaveIndices(
             base_period=base_period,
             tx_percentile=tx_percentile,
             tn_percentile=tn_percentile,
             min_consecutive_days=min_consecutive_days,
             season=season,
-            require_both_tx_tn=True
+            require_both_tx_tn=True,
         )
+
+###############################################################################################################
+###############################################################################################################
+
+
+        
+# class HeatWaveMetric(Enum):
+#     """ETCCDI Heat Wave Indices."""
+#     HWDI = "HWDI"  # Heat Wave Duration Index (days in longest heat wave)
+#     HWF = "HWF"    # Heat Wave Frequency (number of heat waves)
+#     HWN = "HWN"    # Heat Wave Number (not standard ETCCDI, but sometimes used)
+#     WSDI = "WSDI"  # Warm Spell Duration Index (ETCCDI standard)
+
+# @dataclass
+# class HeatWaveDefinition:
+#     """Definition of a heat wave event."""
+#     start_date: pd.Timestamp
+#     end_date: pd.Timestamp
+#     duration: int
+#     max_temp: float
+#     mean_temp: float
+
+# class WAS_HeatWaveIndices:
+#     """
+#     Implementation of ETCCDI heat wave indices for daily temperature data.
+
+#     This class computes standard ETCCDI heat wave indices based on daily maximum
+#     temperature (TX) and optionally daily minimum temperature (TN) for compound events.
+
+#     Supported Indices (ETCCDI definitions):
+
+#     - **WSDI** (Warm Spell Duration Index): Annual count of days in spells of at least
+#       6 consecutive days where TX > 90th percentile (default).
+#     - **HWF** (Heat Wave Frequency): Annual count of heat wave events (≥ min_consecutive_days).
+#     - **HWDI** (Heat Wave Duration Index): Annual maximum duration of any heat wave.
+
+#     Key Features:
+#     - Uses 5-day centered window for percentile calculation (standard ETCCDI practice)
+#     - Handles leap years (maps Feb 29 → Feb 28 for thresholds)
+#     - Supports seasonal filtering
+#     - Supports compound heat waves (both TX and TN exceed thresholds)
+#     - Optional minimum intensity filter
+#     - Works with both in-situ (CDT format) and gridded (xarray) data
+
+#     References:
+#     - ETCCDI Climate Change Indices (2009)
+#     - Perkins & Alexander (2013): On the measurement of heat waves
+#     - Zhang et al. (2011): Indices for monitoring changes in extremes
+
+#     Parameters
+#     ----------
+#     base_period : slice
+#         Climatological base period for percentile calculation, e.g. slice("1961", "1990")
+#     tx_percentile : float, default=90
+#         Percentile threshold for daily maximum temperature (TX)
+#     tn_percentile : float, optional
+#         Percentile threshold for daily minimum temperature (TN) — for compound events
+#     min_consecutive_days : int, default=3
+#         Minimum number of consecutive days to define a heat wave
+#         (ETCCDI uses 6 for WSDI)
+#     max_break_days : int, default=1
+#         Maximum number of non-hot days allowed within a heat wave (currently not used)
+#     season : list of int, optional
+#         Months to consider (e.g., [5,6,7,8,9] for May–Sep)
+#     require_both_tx_tn : bool, default=False
+#         If True, requires both TX and TN to exceed their percentiles (compound heat wave)
+#     min_intensity : float, optional
+#         Minimum mean temperature anomaly required for a heat wave to be counted
+
+#     Examples
+#     --------
+#     Standard WSDI (ETCCDI definition):
+
+#     >>> calc = WAS_HeatWaveIndices(
+#     ...     base_period=slice("1961", "1990"),
+#     ...     tx_percentile=90,
+#     ...     min_consecutive_days=6
+#     ... )
+#     >>> wsdi = calc.compute(ds_tx, metric="WSDI")
+
+#     Compound heat waves (TX + TN):
+
+#     >>> compound = WAS_HeatWaveIndices(
+#     ...     base_period=slice("1961", "1990"),
+#     ...     tx_percentile=90,
+#     ...     tn_percentile=90,
+#     ...     min_consecutive_days=3,
+#     ...     require_both_tx_tn=True
+#     ... )
+#     >>> hwf_compound = compound.compute(ds_tx, ds_tn, metric="HWF")
+#     """
+    
+#     def __init__(
+#         self,
+#         base_period: slice,
+#         tx_percentile: float = 90,        # Percentile for TX (usually 90)
+#         tn_percentile: Optional[float] = None,  # Optional: for TN in compound heat waves
+#         min_consecutive_days: int = 3,    # Min days for a heat wave (ETCCDI uses 6 for WSDI)
+#         max_break_days: int = 1,          # Max break days allowed within a heat wave
+#         season: Optional[List[int]] = None,  # Months to consider (e.g., [5, 6, 7, 8, 9])
+#         require_both_tx_tn: bool = False,  # If True, requires both TX and TN exceed percentiles
+#         min_intensity: Optional[float] = None  # Optional minimum intensity threshold
+#     ):
+#         """
+#         Parameters
+#         ----------
+#         base_period : slice
+#             Base period for percentile calculation, e.g., slice("1961", "1990")
+#         tx_percentile : float
+#             Percentile for daily maximum temperature (TX)
+#         tn_percentile : float, optional
+#             Percentile for daily minimum temperature (TN) for compound heat waves
+#         min_consecutive_days : int
+#             Minimum consecutive days for a heat wave (ETCCDI WSDI uses 6)
+#         max_break_days : int
+#             Maximum number of break days allowed within a heat wave
+#         season : list, optional
+#             Months to consider for heat wave analysis
+#         require_both_tx_tn : bool
+#             If True, requires both TX and TN to exceed percentiles (compound heat wave)
+#         min_intensity : float, optional
+#             Minimum intensity (e.g., temperature anomaly) for a heat wave
+#         """
+#         self.base_period = base_period
+#         self.tx_percentile = tx_percentile
+#         self.tn_percentile = tn_percentile
+#         self.min_consecutive_days = min_consecutive_days
+#         self.max_break_days = max_break_days
+#         self.season = season
+#         self.require_both_tx_tn = require_both_tx_tn
+#         self.min_intensity = min_intensity
+        
+#         # Validate inputs
+#         self._validate_inputs()
+    
+#     def _validate_inputs(self):
+#         """Validate all input parameters."""
+#         if self.min_consecutive_days < 1:
+#             raise ValueError(f"min_consecutive_days must be >= 1, got {self.min_consecutive_days}")
+        
+#         if self.max_break_days < 0:
+#             raise ValueError(f"max_break_days must be >= 0, got {self.max_break_days}")
+        
+#         if not (0 < self.tx_percentile < 100):
+#             raise ValueError(f"tx_percentile must be between 0 and 100, got {self.tx_percentile}")
+        
+#         if self.tn_percentile is not None and not (0 < self.tn_percentile < 100):
+#             raise ValueError(f"tn_percentile must be between 0 and 100, got {self.tn_percentile}")
+    
+#     @staticmethod
+#     def transform_cdt(df: pd.DataFrame) -> pd.DataFrame:
+#         """Transform CDT format to long format DataFrame."""
+#         # Extract metadata
+#         meta = df.iloc[:3].set_index("ID").T.reset_index()
+#         meta.columns = ["STATION", "LON", "LAT", "ELEV"]
+        
+#         # Extract data
+#         data = df.iloc[3:].rename(columns={"ID": "DATE"})
+#         data = data.melt(
+#             id_vars=["DATE"],
+#             var_name="STATION",
+#             value_name="VALUE"
+#         )
+        
+#         # Merge and clean
+#         final = pd.merge(data, meta, on="STATION")
+#         final["DATE"] = pd.to_datetime(final["DATE"], format="%Y%m%d")
+#         final["VALUE"] = pd.to_numeric(final["VALUE"], errors='coerce')
+        
+#         # Convert -99.0 to NaN
+#         final["VALUE"] = final["VALUE"].replace(-99.0, np.nan)
+        
+#         return final
+    
+#     def _calculate_temperature_thresholds(
+#         self, 
+#         df_temp: pd.DataFrame,
+#         percentile: float,
+#         var_name: str = "TX"
+#     ) -> pd.DataFrame:
+#         """
+#         Calculate temperature thresholds using 5-day centered window.
+        
+#         Parameters
+#         ----------
+#         df_temp : pd.DataFrame
+#             Temperature data with columns: DATE, STATION, VALUE
+#         percentile : float
+#             Percentile to calculate (e.g., 90 for 90th percentile)
+#         var_name : str
+#             Variable name for metadata
+        
+#         Returns
+#         -------
+#         pd.DataFrame
+#             Thresholds for each day of year and station
+#         """
+#         # Pivot to wide format
+#         wide = df_temp.pivot(index="DATE", columns="STATION", values="VALUE")
+        
+#         # Handle leap days
+#         doy_series = wide.index.dayofyear.replace(366, 365)
+#         wide_doy = wide.copy()
+#         wide_doy.index = doy_series
+        
+#         # Calculate thresholds for each day of year (1-365) using 5-day window
+#         thresholds = {}
+        
+#         for doy in range(1, 366):
+#             # Create 5-day centered window (circular for year boundaries)
+#             window_days = []
+#             for offset in [-2, -1, 0, 1, 2]:
+#                 window_doy = ((doy + offset - 1) % 365) + 1
+#                 window_days.append(window_doy)
+            
+#             # Get data for this window
+#             window_mask = wide_doy.index.isin(window_days)
+#             window_data = wide_doy[window_mask]
+            
+#             if len(window_data) > 0:
+#                 # Calculate percentile for each station
+#                 threshold_values = np.nanpercentile(
+#                     window_data.values, 
+#                     percentile, 
+#                     axis=0
+#                 )
+#                 thresholds[doy] = threshold_values
+        
+#         # Convert to DataFrame
+#         thresholds_df = pd.DataFrame(thresholds, index=wide.columns).T
+#         thresholds_df.index.name = "DOY"
+#         thresholds_df = thresholds_df.reset_index().melt(
+#             id_vars="DOY",
+#             var_name="STATION",
+#             value_name=f"{var_name}_THRESHOLD"
+#         )
+        
+#         return thresholds_df
+    
+#     def _identify_hot_days(
+#         self,
+#         df_temp: pd.DataFrame,
+#         thresholds: pd.DataFrame,
+#         var_name: str = "TX"
+#     ) -> pd.DataFrame:
+#         """
+#         Identify days when temperature exceeds threshold.
+#         """
+#         # Merge thresholds with data
+#         df_temp["DOY"] = df_temp["DATE"].dt.dayofyear.replace(366, 365)
+#         merged = pd.merge(
+#             df_temp, 
+#             thresholds, 
+#             on=["STATION", "DOY"], 
+#             how="left"
+#         )
+        
+#         # Identify hot days (temperature > threshold)
+#         threshold_col = f"{var_name}_THRESHOLD"
+#         merged["IS_HOT"] = (merged["VALUE"] > merged[threshold_col]).astype(float)
+#         merged.loc[merged["VALUE"].isna(), "IS_HOT"] = np.nan
+        
+#         return merged
+    
+#     def _detect_heat_waves(
+#         self,
+#         df_hot_days: pd.DataFrame,
+#         intensity_col: Optional[str] = None
+#     ) -> pd.DataFrame:
+#         """
+#         Detect heat wave events from sequence of hot days.
+        
+#         Parameters
+#         ----------
+#         df_hot_days : pd.DataFrame
+#             DataFrame with IS_HOT column (0/1 for non-hot/hot days)
+#         intensity_col : str, optional
+#             Column with intensity values for filtering
+        
+#         Returns
+#         -------
+#         pd.DataFrame
+#             DataFrame with heat wave events detected
+#         """
+#         # Sort by station and date
+#         df_hot_days = df_hot_days.sort_values(["STATION", "DATE"])
+        
+#         heat_waves = []
+        
+#         for station, group in df_hot_days.groupby("STATION"):
+#             # Get hot day sequence
+#             is_hot = group["IS_HOT"].values
+#             dates = group["DATE"].values
+            
+#             # Identify runs of hot days
+#             if len(is_hot) == 0:
+#                 continue
+            
+#             # Find start and end of hot spells
+#             # Pad with False at both ends for edge detection
+#             padded = np.concatenate(([0], is_hot, [0]))
+#             diff = np.diff(padded)
+            
+#             starts = np.where(diff == 1)[0]
+#             ends = np.where(diff == -1)[0]
+            
+#             # Check each potential heat wave
+#             for start_idx, end_idx in zip(starts, ends):
+#                 duration = end_idx - start_idx
+                
+#                 # Apply minimum duration filter
+#                 if duration >= self.min_consecutive_days:
+#                     # Extract heat wave period
+#                     heat_wave_dates = dates[start_idx:end_idx]
+#                     heat_wave_data = group.iloc[start_idx:end_idx]
+                    
+#                     # Optional intensity filter
+#                     if self.min_intensity is not None and intensity_col is not None:
+#                         mean_intensity = heat_wave_data[intensity_col].mean()
+#                         if mean_intensity < self.min_intensity:
+#                             continue
+                    
+#                     # Create heat wave record
+#                     heat_wave = {
+#                         "STATION": station,
+#                         "START_DATE": heat_wave_dates[0],
+#                         "END_DATE": heat_wave_dates[-1],
+#                         "DURATION": duration,
+#                         "YEAR": heat_wave_dates[0].year,
+#                         "LAT": group["LAT"].iloc[0],
+#                         "LON": group["LON"].iloc[0]
+#                     }
+                    
+#                     # Add intensity metrics if available
+#                     if "VALUE" in heat_wave_data.columns:
+#                         heat_wave["MAX_TEMP"] = heat_wave_data["VALUE"].max()
+#                         heat_wave["MEAN_TEMP"] = heat_wave_data["VALUE"].mean()
+#                         heat_wave["INTENSITY"] = (
+#                             heat_wave_data["VALUE"] - 
+#                             heat_wave_data[f"TX_THRESHOLD"]
+#                         ).mean()
+                    
+#                     heat_waves.append(heat_wave)
+        
+#         return pd.DataFrame(heat_waves) if heat_waves else pd.DataFrame()
+    
+#     def compute_insitu(
+#         self,
+#         df_cdt_tx: pd.DataFrame,
+#         df_cdt_tn: Optional[pd.DataFrame] = None,
+#         metric: str = "WSDI"
+#     ) -> pd.DataFrame:
+#         """
+#         Compute heat wave indices for in-situ data.
+        
+#         Parameters
+#         ----------
+#         df_cdt_tx : pd.DataFrame
+#             Daily maximum temperature in CDT format
+#         df_cdt_tn : pd.DataFrame, optional
+#             Daily minimum temperature in CDT format (for compound heat waves)
+#         metric : str
+#             Heat wave metric to compute: "WSDI", "HWF", or "HWDI"
+        
+#         Returns
+#         -------
+#         pd.DataFrame
+#             Results in CDT format
+#         """
+#         # Transform CDT data
+#         df_tx = self.transform_cdt(df_cdt_tx)
+        
+#         # Filter base period for threshold calculation
+#         base_start = int(self.base_period.start)
+#         base_stop = int(self.base_period.stop)
+#         df_tx_base = df_tx[
+#             df_tx["DATE"].dt.year.between(base_start, base_stop)
+#         ].copy()
+        
+#         # Calculate TX thresholds
+#         tx_thresholds = self._calculate_temperature_thresholds(
+#             df_tx_base, self.tx_percentile, "TX"
+#         )
+        
+#         # Identify hot days based on TX
+#         df_hot_days = self._identify_hot_days(df_tx, tx_thresholds, "TX")
+        
+#         # If TN data provided for compound heat waves
+#         if df_cdt_tn is not None and self.require_both_tx_tn:
+#             df_tn = self.transform_cdt(df_cdt_tn)
+#             df_tn_base = df_tn[
+#                 df_tn["DATE"].dt.year.between(base_start, base_stop)
+#             ].copy()
+            
+#             # Calculate TN thresholds
+#             tn_thresholds = self._calculate_temperature_thresholds(
+#                 df_tn_base, self.tn_percentile or 90, "TN"
+#             )
+            
+#             # Identify hot nights
+#             df_hot_nights = self._identify_hot_days(df_tn, tn_thresholds, "TN")
+            
+#             # Merge TX and TN data
+#             df_merged = pd.merge(
+#                 df_hot_days,
+#                 df_hot_nights[["DATE", "STATION", "IS_HOT"]],
+#                 on=["DATE", "STATION"],
+#                 suffixes=("_TX", "_TN")
+#             )
+            
+#             # Compound condition: both TX and TN exceed thresholds
+#             df_merged["IS_HOT"] = (
+#                 (df_merged["IS_HOT_TX"] == 1) & 
+#                 (df_merged["IS_HOT_TN"] == 1)
+#             ).astype(float)
+            
+#             df_hot_days = df_merged
+        
+#         # Apply seasonal filter
+#         if self.season:
+#             df_hot_days = df_hot_days[
+#                 df_hot_days["DATE"].dt.month.isin(self.season)
+#             ]
+        
+#         # Detect heat waves
+#         heat_waves = self._detect_heat_waves(df_hot_days)
+        
+#         if heat_waves.empty:
+#             # Return empty result with proper structure
+#             empty_df = pd.DataFrame(columns=["STATION", "YEAR", "LAT", "LON", metric])
+#             return self._format_to_cdt(empty_df, metric)
+        
+#         # Calculate requested metric
+#         if metric == "WSDI":
+#             # WSDI: Annual total number of hot days in heat waves
+#             result = heat_waves.groupby(["STATION", "YEAR", "LAT", "LON"]).agg(
+#                 WSDI=("DURATION", "sum")
+#             ).reset_index()
+        
+#         elif metric == "HWF":
+#             # HWF: Annual count of heat wave events
+#             result = heat_waves.groupby(["STATION", "YEAR", "LAT", "LON"]).agg(
+#                 HWF=("DURATION", "count")
+#             ).reset_index()
+        
+#         elif metric == "HWDI":
+#             # HWDI: Annual maximum duration of heat waves
+#             result = heat_waves.groupby(["STATION", "YEAR", "LAT", "LON"]).agg(
+#                 HWDI=("DURATION", "max")
+#             ).reset_index()
+        
+#         else:
+#             raise ValueError(f"Unknown metric: {metric}. Use 'WSDI', 'HWF', or 'HWDI'.")
+        
+#         # Fill NaN for years without heat waves
+#         result[metric] = result[metric].fillna(0)
+        
+#         return self._format_to_cdt(result, metric)
+    
+#     def compute(
+#         self,
+#         ds_tx: Union[xr.Dataset, xr.DataArray],
+#         ds_tn: Optional[Union[xr.Dataset, xr.DataArray]] = None,
+#         metric: str = "WSDI",
+#         # chunk_size: Optional[Dict[str, int]] = None,
+#         parallel: bool = True,
+#         nb_cores: int = 4
+#     ) -> xr.DataArray:
+#         """
+#         Compute heat wave indices for xarray data.
+        
+#         Parameters
+#         ----------
+#         ds_tx : xr.Dataset or xr.DataArray
+#             Daily maximum temperature
+#         ds_tn : xr.Dataset or xr.DataArray, optional
+#             Daily minimum temperature (for compound heat waves)
+#         metric : str
+#             Heat wave metric to compute
+#         chunk_size : dict, optional
+#             Chunk sizes for parallel processing
+#         parallel : bool
+#             Whether to use Dask for parallel processing
+        
+#         Returns
+#         -------
+#         xr.DataArray
+#             Heat wave index values
+#         """
+#         # Extract TX DataArray
+#         if isinstance(ds_tx, xr.Dataset):
+#             da_tx = ds_tx["TMAX"] if "TMAX" in ds_tx else ds_tx[list(ds_tx.data_vars)[0]]
+#         else:
+#             da_tx = ds_tx
+        
+#         # Standardize dimension names
+#         da_tx = self._standardize_dims(da_tx)
+        
+#         # Apply seasonal mask if specified
+#         if self.season:
+#             da_tx = da_tx.where(da_tx.time.dt.month.isin(self.season), drop=True)
+        
+#         # # Handle chunking for Dask
+#         # if parallel and hasattr(da_tx.data, 'chunks'):
+#         #     if chunk_size is None:
+#         #         chunk_size = {'lat': 50, 'lon': 50}
+#         #     da_tx = da_tx.chunk({'time': -1, **chunk_size})
+
+#         # if parallel:# and hasattr(da.data, 'chunks'):
+#         #     chunk_size = {'y': int(np.round(len(da_tx.get_index("y")) / nb_cores)), 'x': int(np.round(len(da_tx.get_index("x")) / nb_cores))}
+#         #     da_tx = da_tx.chunk({'time': -1, **chunk_size})
+
+
+#         if parallel:
+#             # After _standardize_dims(), expect ('time','lat','lon')
+#             if ("lat" not in da_tx.dims) or ("lon" not in da_tx.dims):
+#                 raise ValueError(f"Expected spatial dims ('lat','lon') after standardization; got {da_tx.dims}")
+        
+#             ny = int(da_tx.sizes["lat"])
+#             nx = int(da_tx.sizes["lon"])
+        
+#             # Split the 2D grid across workers more sensibly than dividing each dim by nb_cores
+#             nsplit = max(1, int(np.ceil(np.sqrt(nb_cores))))
+#             cy = max(1, int(np.ceil(ny / nsplit)))
+#             cx = max(1, int(np.ceil(nx / nsplit)))
+        
+#             da_tx = da_tx.chunk({"time": -1, "lat": cy, "lon": cx})
+
+        
+#         # Select base period
+#         da_tx_base = da_tx.sel(time=self.base_period)
+        
+#         # Calculate TX thresholds using 5-day centered window
+#         windowed_tx = da_tx_base.rolling(time=5, center=True, min_periods=1).construct("window")
+#         tx_thresholds = windowed_tx.groupby("time.dayofyear").quantile(
+#             self.tx_percentile / 100.0,
+#             dim=["time", "window"],
+#             method='linear',
+#             skipna=True
+#         )
+        
+#         # Handle leap days
+#         doy = da_tx.time.dt.dayofyear
+#         doy_fixed = xr.where(doy == 366, 365, doy)
+        
+#         # Map thresholds to all time steps
+#         full_tx_thresholds = tx_thresholds.sel(dayofyear=doy_fixed)
+#         full_tx_thresholds = full_tx_thresholds.drop_vars("dayofyear")
+#         full_tx_thresholds = full_tx_thresholds.assign_coords(time=da_tx.time)
+        
+#         # Identify hot days based on TX
+#         is_hot_tx = (da_tx > full_tx_thresholds).astype(float)
+#         is_hot_tx = is_hot_tx.where(da_tx.notnull())
+        
+#         # If TN data provided for compound heat waves
+#         if ds_tn is not None and self.require_both_tx_tn:
+#             # Extract TN DataArray
+#             if isinstance(ds_tn, xr.Dataset):
+#                 da_tn = ds_tn["TMIN"] if "TMIN" in ds_tn else ds_tn[list(ds_tn.data_vars)[0]]
+#             else:
+#                 da_tn = ds_tn
+            
+#             da_tn = self._standardize_dims(da_tn)
+            
+#             if self.season:
+#                 da_tn = da_tn.where(da_tn.time.dt.month.isin(self.season), drop=True)
+            
+#             # Calculate TN thresholds
+#             da_tn_base = da_tn.sel(time=self.base_period)
+#             windowed_tn = da_tn_base.rolling(time=5, center=True, min_periods=1).construct("window")
+#             tn_thresholds = windowed_tn.groupby("time.dayofyear").quantile(
+#                 (self.tn_percentile or 90) / 100.0,
+#                 dim=["time", "window"],
+#                 method='linear',
+#                 skipna=True
+#             )
+            
+#             # Map TN thresholds
+#             full_tn_thresholds = tn_thresholds.sel(dayofyear=doy_fixed)
+#             full_tn_thresholds = full_tn_thresholds.drop_vars("dayofyear")
+#             full_tn_thresholds = full_tn_thresholds.assign_coords(time=da_tn.time)
+            
+#             # Identify hot nights
+#             is_hot_tn = (da_tn > full_tn_thresholds).astype(float)
+#             is_hot_tn = is_hot_tn.where(da_tn.notnull())
+            
+#             # Compound condition: both TX and TN exceed thresholds
+#             is_hot = (is_hot_tx == 1) & (is_hot_tn == 1)
+#         else:
+#             is_hot = (is_hot_tx == 1)
+        
+#         # Apply minimum consecutive days filter
+#         # Use rolling sum to identify periods with at least min_consecutive_days
+#         rolling_hot = is_hot.rolling(time=self.min_consecutive_days, center=False).sum()
+#         heat_wave_mask = (rolling_hot >= self.min_consecutive_days)
+        
+#         # Extend mask to include all days in heat waves
+#         # For each heat wave start, mark the next min_consecutive_days-1 days
+#         heat_wave_extended = heat_wave_mask.copy()
+        
+#         # Calculate metric
+#         if metric == "WSDI":
+#             # WSDI: Annual count of hot days in heat waves
+#             result = heat_wave_extended.resample(time='YS').sum(dim='time', skipna=True)
+#             result = result.astype(int)
+        
+#         elif metric == "HWF":
+#             # HWF: Annual count of heat wave events
+#             # Find start of each heat wave
+#             heat_wave_start = heat_wave_mask & (~heat_wave_mask.shift(time=1, fill_value=False))
+#             result = heat_wave_start.resample(time='YS').sum(dim='time', skipna=True)
+#             result = result.astype(int)
+        
+#         elif metric == "HWDI":
+#             # HWDI: Annual maximum duration of heat waves
+#             # This is more complex - need to find longest consecutive sequence
+#             # We'll use apply_ufunc for this
+#             def max_consecutive(arr):
+#                 """Find maximum consecutive True values in 1D array."""
+#                 if np.all(np.isnan(arr)):
+#                     return 0
+                
+#                 arr_bool = arr.astype(bool)
+#                 if not np.any(arr_bool):
+#                     return 0
+                
+#                 # Find runs of True
+#                 diff = np.diff(np.concatenate(([False], arr_bool, [False])))
+#                 starts = np.where(diff == 1)[0]
+#                 ends = np.where(diff == -1)[0]
+#                 durations = ends - starts
+                
+#                 return np.max(durations) if len(durations) > 0 else 0
+            
+#             # Apply to each year
+#             years = np.unique(heat_wave_extended.time.dt.year.values)
+#             results = []
+            
+#             for year in years:
+#                 year_data = heat_wave_extended.sel(
+#                     time=heat_wave_extended.time.dt.year == year
+#                 )
+                
+#                 # Apply function to each grid cell
+#                 max_durations = xr.apply_ufunc(
+#                     max_consecutive,
+#                     year_data,
+#                     input_core_dims=[['time']],
+#                     output_core_dims=[[]],
+#                     vectorize=True,
+#                     dask='parallelized' if parallel else 'allowed'
+#                 )
+                
+#                 # Add year coordinate
+#                 max_durations = max_durations.expand_dims(
+#                     time=[pd.Timestamp(f"{year}-01-01")]
+#                 )
+#                 results.append(max_durations)
+            
+#             result = xr.concat(results, dim='time')
+        
+#         else:
+#             raise ValueError(f"Unknown metric: {metric}. Use 'WSDI', 'HWF', or 'HWDI'.")
+        
+#         # Set metadata
+#         result.name = metric
+#         result.attrs.update(self._get_metadata(metric))
+
+#         out = result
+        
+#         # If quantile is present (xarray often keeps it even when scalar), squeeze it safely
+#         if "quantile" in out.dims:
+#             out = out.isel(quantile=0, drop=True)
+#         if "quantile" in out.coords:
+#             out = out.drop_vars("quantile")
+        
+#         return out.compute().rename({"time": "T", "lon": "X", "lat": "Y"})
+#         # return result.compute().drop_vars("quantile").rename({"time": "T", "x": "X", "y": "Y"})
+    
+#     def _standardize_dims(self, da: xr.DataArray) -> xr.DataArray:
+#         """Standardize dimension names."""
+#         dim_map = {}
+        
+#         # Identify time dimension
+#         time_candidates = ['time', 'T', 'date', 'Date']
+#         for tc in time_candidates:
+#             if tc in da.dims:
+#                 dim_map[tc] = 'time'
+#                 break
+        
+#         # Identify spatial dimensions
+#         spatial_pairs = [
+#             (['lat', 'y', 'latitude', 'Y'], 'lat'),
+#             (['lon', 'x', 'longitude', 'X'], 'lon')
+#         ]
+        
+#         for candidates, std_name in spatial_pairs:
+#             for cand in candidates:
+#                 if cand in da.dims:
+#                     dim_map[cand] = std_name
+#                     break
+        
+#         # Rename dimensions if needed
+#         if dim_map:
+#             da = da.rename(dim_map)
+        
+#         if 'time' not in da.dims:
+#             raise ValueError(f"DataArray must have 'time' dimension. Found: {list(da.dims)}")
+        
+#         return da
+    
+#     def _get_metadata(self, metric: str) -> Dict:
+#         """Get metadata dictionary for the index."""
+#         metadata = {
+#             'long_name': f'{metric} Heat Wave Index',
+#             'units': 'days' if metric == 'WSDI' else 'count',
+#             'base_period': f'{self.base_period.start}-{self.base_period.stop}',
+#             'tx_percentile': self.tx_percentile,
+#             'tn_percentile': self.tn_percentile,
+#             'min_consecutive_days': self.min_consecutive_days,
+#             'max_break_days': self.max_break_days,
+#             'season': self.season if self.season else 'all months',
+#             'require_both_tx_tn': self.require_both_tx_tn,
+#             'reference': 'ETCCDI Climate Change Indices (2009)',
+#             'definition': self._get_index_definition(metric)
+#         }
+        
+#         return metadata
+    
+#     def _get_index_definition(self, metric: str) -> str:
+#         """Get definition string for the index."""
+#         definitions = {
+#             'WSDI': f'Annual count of days with at least {self.min_consecutive_days} '
+#                     f'consecutive days when TX > {self.tx_percentile}th percentile',
+#             'HWF': f'Annual number of heat wave events (≥{self.min_consecutive_days} '
+#                    f'consecutive days when TX > {self.tx_percentile}th percentile)',
+#             'HWDI': f'Annual maximum length of heat waves (consecutive days '
+#                     f'when TX > {self.tx_percentile}th percentile)'
+#         }
+        
+#         if self.require_both_tx_tn:
+#             for key in definitions:
+#                 definitions[key] = definitions[key].replace('TX', 'TX and TN')
+        
+#         return definitions.get(metric, 'Custom heat wave index')
+    
+#     def _format_to_cdt(self, df: pd.DataFrame, metric: str) -> pd.DataFrame:
+#         """Convert to CDT format."""
+#         if df.empty:
+#             # Return empty CDT structure
+#             return pd.DataFrame(columns=["ID"])
+        
+#         # Pivot to wide format
+#         pivot = df.pivot(
+#             index="YEAR",
+#             columns="STATION",
+#             values=metric
+#         ).reset_index()
+        
+#         # Create metadata rows
+#         meta = df.groupby("STATION")[["LAT", "LON"]].first()
+#         stations = pivot.columns[1:]  # Exclude YEAR column
+#         meta = meta.reindex(stations)
+        
+#         # Create metadata rows
+#         lat_row = pd.DataFrame([["LAT"] + meta["LAT"].tolist()], 
+#                               columns=pivot.columns)
+#         lon_row = pd.DataFrame([["LON"] + meta["LON"].tolist()], 
+#                               columns=pivot.columns)
+        
+#         # Rename YEAR column to ID for CDT format
+#         pivot = pivot.rename(columns={"YEAR": "ID"})
+#         lat_row = lat_row.rename(columns={"YEAR": "ID"})
+#         lon_row = lon_row.rename(columns={"YEAR": "ID"})
+        
+#         # Combine all rows
+#         result = pd.concat([lat_row, lon_row, pivot], ignore_index=True)
+        
+#         return result
+
+# # Convenience class for standard ETCCDI WSDI
+# class ETCCDIHeatWaveIndices:
+#     """Factory for creating standard ETCCDI heat wave indices."""
+    
+#     @staticmethod
+#     def wsdi(
+#         base_period: slice,
+#         tx_percentile: float = 90,
+#         min_consecutive_days: int = 6,
+#         season: Optional[List[int]] = None
+#     ) -> WAS_HeatWaveIndices:
+#         """Create calculator for WSDI (Warm Spell Duration Index)."""
+#         return WAS_HeatWaveIndices(
+#             base_period=base_period,
+#             tx_percentile=tx_percentile,
+#             min_consecutive_days=min_consecutive_days,
+#             season=season
+#         )
+    
+#     @staticmethod
+#     def heat_wave_frequency(
+#         base_period: slice,
+#         tx_percentile: float = 90,
+#         min_consecutive_days: int = 3,
+#         season: Optional[List[int]] = None
+#     ) -> WAS_HeatWaveIndices:
+#         """Create calculator for Heat Wave Frequency."""
+#         return WAS_HeatWaveIndices(
+#             base_period=base_period,
+#             tx_percentile=tx_percentile,
+#             min_consecutive_days=min_consecutive_days,
+#             season=season
+#         )
+    
+#     @staticmethod
+#     def compound_heat_wave(
+#         base_period: slice,
+#         tx_percentile: float = 90,
+#         tn_percentile: float = 90,
+#         min_consecutive_days: int = 3,
+#         season: Optional[List[int]] = None
+#     ) -> WAS_HeatWaveIndices:
+#         """Create calculator for compound heat waves (both TX and TN)."""
+#         return WAS_HeatWaveIndices(
+#             base_period=base_period,
+#             tx_percentile=tx_percentile,
+#             tn_percentile=tn_percentile,
+#             min_consecutive_days=min_consecutive_days,
+#             season=season,
+#             require_both_tx_tn=True
+#         )
         
 # #### look this part again -----
 # class WAS_compute_HWSDI:
