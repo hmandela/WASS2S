@@ -19,8 +19,8 @@ dependencies:
   - xcast
 
   # --- IO / Compression / Parallel ---
-  - dask=2024.6.*
-  - distributed=2024.6.*
+  - dask=2025.1.*
+  - distributed=2025.1.*
   - h5py
   - h5netcdf
   - netcdf4
