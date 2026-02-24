@@ -1325,380 +1325,730 @@ class WAS_ProbWeighted:
 
 
 
-
-
 class WAS_Min2009_ProbWeighted:
     """
-    Implementation of Min et al. (2009) Probability-Weighted Multi-Model Ensemble.
-    
-    Based on: "Probabilistic Multimodel Ensemble (PMME) forecasting at APCC"
-    Journal: Weather and Forecasting, 2009
-    
-    Key methodology:
-    1. Individual model probabilistic forecasts are computed using Gaussian approximation
-    2. Model weights are proportional to sqrt(ensemble_size) [Eq. 6 in paper]
-    3. Tercile probabilities (BN, NN, AN) are combined using total probability formula
-    
-    Notes:
-    - For temperature: Gaussian assumption is reasonable
-    - For precipitation: Consider using log-normal, Gamma distribution, or empirical methods
-    - The χ² test uses configurable n (ensemble size) - avoid overly conservative n=1
-    - Cross-validation is recommended for hindcast statistics
+    Min et al. (2009) Probability-Weighted Multi-Model Ensemble (PMME).
+
+    What this class does
+    --------------------
+    1) For each model:
+       - compute tercile probabilities (BN/NN/AN) at each gridpoint
+         from its ensemble forecast using:
+           * 'gaussian'  : Gaussian approximation (good for temperature anomalies)
+           * 'lognormal' : log-normal approximation (better for precip amounts)
+           * 'empirical' : hindcast terciles (q33/q66) + deterministic 0/1 probs
+    2) Combine model probabilities with weights:
+         w_m ∝ sqrt(Nm)  (Nm = ensemble size), then normalized to sum to 1
+    3) Optionally compute a combined categorical map with a chi-square significance test.
+
+    Key robustness fixes (vs your failing version)
+    ----------------------------------------------
+    A) No more time:0 outputs:
+       - If CV stats carry 'time' (LOO/rolling) and forecast time is real-time (not in hindcast),
+         xarray alignment yields empty intersection. We detect this and fallback to spatial-only stats
+         computed from full hindcast, then broadcast to forecast time.
+
+    B) No more "All-NaN slice encountered" in argmax:
+       - We do argmax on probs filled with -inf, then mask invalid pixels to 0.
+
+    C) Safe normalization:
+       - Probabilities are clipped to [0,1] and renormalized only where total>0 and finite.
+
+    Assumed dims
+    ------------
+    Each model DataArray should have at least:
+      - forecasts[m]: dims include ('ensemble',) and optionally 'time'
+      - hindcasts[m]: dims include ('time','ensemble')
+    Spatial dims can be ('lat','lon') or ('Y','X') or anything; the code is generic.
+
+    Notes
+    -----
+    - For temperature terciles, Min et al. uses ±0.4307*σ around climatological mean (Gaussian terciles).
+    - For precipitation, 'lognormal' or a proper Gamma/empirical approach is usually preferable.
     """
-    
-    def __init__(self, distribution='gaussian', cv_method=None, n_samples_for_chisq='total_ensemble'):
-        """
-        Initialize PMME processor.
-        
-        Parameters
-        ----------
-        distribution : str
-            Distribution assumption: 'gaussian', 'gamma', 'lognormal', or 'empirical'
-        cv_method : str or None
-            Cross-validation method: None, 'leave_one_out', or 'rolling_window'
-        n_samples_for_chisq : str or int
-            How to compute n for χ² test: 
-            'total_ensemble' (default), 'effective_sample_size', or integer value
-        """
+
+    def __init__(
+        self,
+        distribution: Literal["gaussian", "lognormal", "empirical"] = "gaussian",
+        cv_method: Optional[Literal[None, "leave_one_out", "rolling_window"]] = None,
+        rolling_window_size: int = 15,
+        n_samples_for_chisq: Literal["total_ensemble", "effective_sample_size"] | float | int = "total_ensemble",
+        eps_lognormal: float = 1e-2,
+        sigma_floor: float = 1e-12,
+    ):
         self.distribution = distribution
         self.cv_method = cv_method
+        self.rolling_window_size = int(rolling_window_size)
         self.n_samples_for_chisq = n_samples_for_chisq
-        
-    def _compute_cross_validated_stats(self, hindcasts, climatology):
-        """
-        Compute cross-validated mean and standard deviation from hindcasts.
-        
-        Parameters
-        ----------
-        hindcasts : xarray.DataArray
-            Hindcast ensemble data with dimensions (T, M, Y, X)
-        climatology : xarray.DataArray
-            Climatological data with dimensions (Y, X)
-            
-        Returns
-        -------
-        mu_cv : xarray.DataArray
-            Cross-validated mean with dimensions (T, Y, X)
-        sigma_cv : xarray.DataArray
-            Cross-validated standard deviation with dimensions (T, Y, X)
-        """
-        n_times = hindcasts.sizes['time']
-        
-        if self.cv_method is None:
-            # Use full hindcast period (not recommended for operational use)
-            mu_cv = hindcasts.mean(dim=['time', 'ensemble'])
-            sigma_cv = hindcasts.std(dim=['time', 'ensemble'])
-            # Expand to match time dimension
-            mu_cv = mu_cv.expand_dims(time=hindcasts.time).transpose('time', 'lat', 'lon')
-            sigma_cv = sigma_cv.expand_dims(time=hindcasts.time).transpose('time', 'lat', 'lon')
-            
-        elif self.cv_method == 'leave_one_out':
-            # Leave-one-out cross-validation
-            mu_list = []
-            sigma_list = []
-            
-            for i in range(n_times):
-                # Leave out year i
-                hindcast_train = hindcasts.isel(time=[j for j in range(n_times) if j != i])
-                mu_i = hindcast_train.mean(dim=['time', 'ensemble'])
-                sigma_i = hindcast_train.std(dim=['time', 'ensemble'])
-                mu_list.append(mu_i)
-                sigma_list.append(sigma_i)
-            
-            mu_cv = xr.concat(mu_list, dim=hindcasts.time)
-            sigma_cv = xr.concat(sigma_list, dim=hindcasts.time)
-            
-        elif self.cv_method == 'rolling_window':
-            # Rolling window validation (e.g., 15-year window)
-            window_size = 15
-            mu_list = []
-            sigma_list = []
-            
-            for i in range(n_times):
-                start = max(0, i - window_size // 2)
-                end = min(n_times, i + window_size // 2 + 1)
-                hindcast_train = hindcasts.isel(time=slice(start, end))
-                # Exclude the current year if possible
-                hindcast_train = hindcast_train.isel(time=[j for j in range(hindcast_train.sizes['time']) 
-                                                          if start + j != i])
-                
-                mu_i = hindcast_train.mean(dim=['time', 'ensemble'])
-                sigma_i = hindcast_train.std(dim=['time', 'ensemble'])
-                mu_list.append(mu_i)
-                sigma_list.append(sigma_i)
-            
-            mu_cv = xr.concat(mu_list, dim=hindcasts.time)
-            sigma_cv = xr.concat(sigma_list, dim=hindcasts.time)
-        
-        return mu_cv, sigma_cv
-    
-    def _compute_tercile_probabilities(self, forecasts, hindcasts, climatology):
-        """
-        Compute tercile probabilities for individual models.
-        
-        Parameters
-        ----------
-        forecasts : xarray.DataArray
-            Forecast ensemble data with dimensions (T, M, Y, X)
-        hindcasts : xarray.DataArray
-            Hindcast ensemble data with dimensions (T, M, Y, X)
-        climatology : xarray.DataArray
-            Climatological data with dimensions (Y, X)
-            
-        Returns
-        -------
-        probs_bn : xarray.DataArray
-            Probability of below-normal category
-        probs_nn : xarray.DataArray
-            Probability of near-normal category
-        probs_an : xarray.DataArray
-            Probability of above-normal category
-        """
-        # Compute cross-validated statistics
-        mu_cv, sigma_cv = self._compute_cross_validated_stats(hindcasts, climatology)
-        
-        # Compute forecast ensemble mean
-        forecast_mean = forecasts.mean(dim='ensemble')
-        
-        if self.distribution == 'gaussian':
-            # Gaussian approximation (suitable for temperature)
-            # Tercile boundaries at approximately ±0.43σ (for Gaussian)
-            # Actually, for terciles, boundaries are at Φ⁻¹(1/3) ≈ -0.43 and Φ⁻¹(2/3) ≈ 0.43
-            # The paper uses ±1.43σ which seems incorrect - this would be for much wider intervals
-            # Let's use the correct tercile boundaries:
-            lower_boundary = -0.4307  # Φ⁻¹(1/3)
-            upper_boundary = 0.4307   # Φ⁻¹(2/3)
-            
-            # Standardized anomalies
-            z_lower = (mu_cv + lower_boundary * sigma_cv - forecast_mean) / sigma_cv
-            z_upper = (mu_cv + upper_boundary * sigma_cv - forecast_mean) / sigma_cv
-            
-            # Gaussian CDF probabilities
-            probs_bn = stats.norm.cdf(z_lower)
-            probs_an = 1 - stats.norm.cdf(z_upper)
-            probs_nn = 1 - probs_bn - probs_an
-            
-        elif self.distribution == 'lognormal':
-            # Log-normal distribution (suitable for precipitation)
-            # Transform to log space
-            log_hindcasts = xr.where(hindcasts > 0, np.log(hindcasts), np.log(0.01))
-            log_mu_cv, log_sigma_cv = self._compute_cross_validated_stats(log_hindcasts, climatology)
-            log_forecast = xr.where(forecasts > 0, np.log(forecasts), np.log(0.01))
-            log_forecast_mean = log_forecast.mean(dim='ensemble')
-            
-            # Compute tercile boundaries in log space
-            lower_boundary = -0.4307
-            upper_boundary = 0.4307
-            
-            z_lower = (log_mu_cv + lower_boundary * log_sigma_cv - log_forecast_mean) / log_sigma_cv
-            z_upper = (log_mu_cv + upper_boundary * log_sigma_cv - log_forecast_mean) / log_sigma_cv
-            
-            probs_bn = stats.norm.cdf(z_lower)
-            probs_an = 1 - stats.norm.cdf(z_upper)
-            probs_nn = 1 - probs_bn - probs_an
-            
-        elif self.distribution == 'empirical':
-            # Empirical quantile mapping
-            # This is a simplified version - consider more sophisticated methods
-            forecast_flat = forecasts.stack(sample=('time', 'ensemble')).transpose('sample', 'lat', 'lon')
-            hindcast_flat = hindcasts.stack(sample=('time', 'ensemble')).transpose('sample', 'lat', 'lon')
-            
-            # Compute empirical CDF for each grid point
-            probs_bn = xr.full_like(forecast_mean, fill_value=np.nan)
-            probs_nn = xr.full_like(forecast_mean, fill_value=np.nan)
-            probs_an = xr.full_like(forecast_mean, fill_value=np.nan)
-            
-            # This is computationally intensive - consider optimization
-            for lat in forecast_mean.lat.values:
-                for lon in forecast_mean.lon.values:
-                    hindcast_vals = hindcast_flat.sel(lat=lat, lon=lon).values
-                    forecast_val = forecast_mean.sel(lat=lat, lon=lon).values
-                    
-                    # Compute empirical terciles from hindcast
-                    lower_tercile = np.percentile(hindcast_vals, 100/3)
-                    upper_tercile = np.percentile(hindcast_vals, 100*2/3)
-                    
-                    # Empirical probabilities
-                    probs_bn.loc[dict(lat=lat, lon=lon)] = np.mean(forecast_val < lower_tercile)
-                    probs_an.loc[dict(lat=lat, lon=lon)] = np.mean(forecast_val > upper_tercile)
-                    probs_nn.loc[dict(lat=lat, lon=lon)] = 1 - probs_bn.loc[dict(lat=lat, lon=lon)] - probs_an.loc[dict(lat=lat, lon=lon)]
-        
-        # Ensure probabilities are between 0 and 1
-        probs_bn = xr.where(probs_bn < 0, 0, xr.where(probs_bn > 1, 1, probs_bn))
-        probs_an = xr.where(probs_an < 0, 0, xr.where(probs_an > 1, 1, probs_an))
-        probs_nn = xr.where(probs_nn < 0, 0, xr.where(probs_nn > 1, 1, probs_nn))
-        
-        # Renormalize to ensure sum to 1 (accounting for numerical errors)
-        total = probs_bn + probs_nn + probs_an
-        probs_bn = probs_bn / total
-        probs_nn = probs_nn / total
-        probs_an = probs_an / total
-        
-        return probs_bn, probs_nn, probs_an
-    
-    def _compute_model_weights(self, ensemble_sizes):
-        """
-        Compute model weights according to Min et al. (2009) Eq. 6.
-        
-        Parameters
-        ----------
-        ensemble_sizes : dict
-            Dictionary mapping model names to ensemble sizes
-            
-        Returns
-        -------
-        weights : dict
-            Dictionary mapping model names to normalized weights
-        """
-        # Weight proportional to sqrt(ensemble_size)
-        sqrt_sizes = {model: np.sqrt(size) for model, size in ensemble_sizes.items()}
-        total = sum(sqrt_sizes.values())
-        
-        # Normalize so weights sum to 1
-        weights = {model: sqrt_sizes[model] / total for model in ensemble_sizes.keys()}
-        
-        return weights
-    
-    def _compute_n_for_chisq(self, ensemble_sizes, model_names):
-        """
-        Compute n for χ² test based on configuration.
-        
-        Parameters
-        ----------
-        ensemble_sizes : dict
-            Dictionary mapping model names to ensemble sizes
-        model_names : list
-            List of model names
-            
-        Returns
-        -------
-        n : float
-            Value to use for n in χ² test
-        """
+        self.eps_lognormal = float(eps_lognormal)
+        self.sigma_floor = float(sigma_floor)
+
+    # ---------------------------------------------------------------------
+    # internal helpers
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def _require_dims(da: xr.DataArray, required: Tuple[str, ...], name: str = "DataArray") -> None:
+        missing = [d for d in required if d not in da.dims]
+        if missing:
+            raise ValueError(f"{name}: missing required dims {missing}. Got dims={da.dims}")
+
+    @staticmethod
+    def _norm_cdf(z: xr.DataArray) -> xr.DataArray:
+        return xr.apply_ufunc(stats.norm.cdf, z)
+
+    @staticmethod
+    def _safe_clip_and_renorm(p_bn: xr.DataArray, p_nn: xr.DataArray, p_an: xr.DataArray) -> Tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
+        p_bn = p_bn.clip(0.0, 1.0)
+        p_nn = p_nn.clip(0.0, 1.0)
+        p_an = p_an.clip(0.0, 1.0)
+
+        total = p_bn + p_nn + p_an
+        ok = xr.ufuncs.isfinite(total) & (total > 0.0)
+
+        p_bn = xr.where(ok, p_bn / total, np.nan)
+        p_nn = xr.where(ok, p_nn / total, np.nan)
+        p_an = xr.where(ok, p_an / total, np.nan)
+        return p_bn, p_nn, p_an
+
+    def _compute_model_weights(self, ensemble_sizes: Dict[str, int]) -> Dict[str, float]:
+        sqrt_sizes = {m: np.sqrt(float(n)) for m, n in ensemble_sizes.items()}
+        tot = float(sum(sqrt_sizes.values()))
+        if tot <= 0:
+            raise ValueError("Sum of sqrt(ensemble_sizes) must be > 0.")
+        return {m: sqrt_sizes[m] / tot for m in ensemble_sizes}
+
+    def _compute_n_for_chisq(self, ensemble_sizes: Dict[str, int], model_names: List[str]) -> float:
+        total_ensemble = float(sum(float(ensemble_sizes[m]) for m in model_names))
         if isinstance(self.n_samples_for_chisq, (int, float)):
             return float(self.n_samples_for_chisq)
-        elif self.n_samples_for_chisq == 'total_ensemble':
-            # Sum of all ensemble members across models
-            return sum(ensemble_sizes[model] for model in model_names)
-        elif self.n_samples_for_chisq == 'effective_sample_size':
-            # Approximate effective sample size
-            total_ensemble = sum(ensemble_sizes[model] for model in model_names)
-            n_models = len(model_names)
-            # Simple approximation: account for correlation between models
-            return total_ensemble / np.sqrt(n_models)
-        else:
-            # Default to total ensemble size
-            return sum(ensemble_sizes[model] for model in model_names)
-    
-    def compute_pmme_probabilities(self, forecasts, hindcasts, climatology, ensemble_sizes):
+        if self.n_samples_for_chisq == "effective_sample_size":
+            k = max(1, len(model_names))
+            return total_ensemble / np.sqrt(float(k))
+        return total_ensemble
+
+    # ---------------------------------------------------------------------
+    # cross-validated stats
+    # ---------------------------------------------------------------------
+    def _compute_cross_validated_stats(self, hindcasts: xr.DataArray) -> Tuple[xr.DataArray, xr.DataArray]:
         """
-        Compute PMME probabilities according to Min et al. (2009).
-        
-        Parameters
-        ----------
-        forecasts : dict of xarray.DataArray
-            Dictionary of forecast ensembles for each model
-        hindcasts : dict of xarray.DataArray
-            Dictionary of hindcast ensembles for each model
-        climatology : xarray.DataArray
-            Climatological data
-        ensemble_sizes : dict
-            Dictionary mapping model names to ensemble sizes
-            
+        Return (mu, sigma). If cv_method is None -> spatial-only stats.
+        If cv_method in {leave_one_out, rolling_window} -> returns stats with a 'time' dim.
+        """
+        self._require_dims(hindcasts, ("time", "ensemble"), name="hindcasts")
+
+        if self.cv_method is None:
+            mu = hindcasts.mean(dim=("time", "ensemble"))
+            sigma = hindcasts.std(dim=("time", "ensemble"))
+            return mu, sigma
+
+        n_times = hindcasts.sizes["time"]
+
+        if self.cv_method == "leave_one_out":
+            mu_list, sig_list = [], []
+            for i in range(n_times):
+                h_train = hindcasts.isel(time=[j for j in range(n_times) if j != i])
+                mu_list.append(h_train.mean(dim=("time", "ensemble")))
+                sig_list.append(h_train.std(dim=("time", "ensemble")))
+            mu = xr.concat(mu_list, dim=hindcasts["time"])
+            sigma = xr.concat(sig_list, dim=hindcasts["time"])
+            return mu, sigma
+
+        if self.cv_method == "rolling_window":
+            w = self.rolling_window_size
+            mu_list, sig_list = [], []
+            for i in range(n_times):
+                start = max(0, i - w // 2)
+                end = min(n_times, i + w // 2 + 1)
+                h_win = hindcasts.isel(time=slice(start, end))
+                local_i = i - start
+                if 0 <= local_i < h_win.sizes["time"]:
+                    h_train = h_win.isel(time=[j for j in range(h_win.sizes["time"]) if j != local_i])
+                else:
+                    h_train = h_win
+                mu_list.append(h_train.mean(dim=("time", "ensemble")))
+                sig_list.append(h_train.std(dim=("time", "ensemble")))
+            mu = xr.concat(mu_list, dim=hindcasts["time"])
+            sigma = xr.concat(sig_list, dim=hindcasts["time"])
+            return mu, sigma
+
+        raise ValueError(f"Unknown cv_method={self.cv_method!r}")
+
+    def _align_or_fallback_stats(
+        self,
+        mu: xr.DataArray,
+        sigma: xr.DataArray,
+        f_mean: xr.DataArray,
+        hindcasts: xr.DataArray,
+    ) -> Tuple[xr.DataArray, xr.DataArray]:
+        """
+        Ensure mu/sigma align with f_mean without producing time:0 outputs.
+        If mu has time and forecast time doesn't overlap, fallback to spatial-only stats.
+        """
+        # clamp sigma early
+        sigma = xr.where(sigma <= self.sigma_floor, np.nan, sigma)
+
+        if "time" in mu.dims and "time" in f_mean.dims:
+            overlap = np.intersect1d(mu["time"].values, f_mean["time"].values)
+            if overlap.size == 0:
+                # operational forecast date, not in hindcast -> use full hindcast stats
+                mu = hindcasts.mean(dim=("time", "ensemble"))
+                sigma = hindcasts.std(dim=("time", "ensemble"))
+                sigma = xr.where(sigma <= self.sigma_floor, np.nan, sigma)
+
+        mu = mu.broadcast_like(f_mean)
+        sigma = sigma.broadcast_like(f_mean)
+        return mu, sigma
+
+    # ---------------------------------------------------------------------
+    # probabilities for one model
+    # ---------------------------------------------------------------------
+    def _compute_tercile_probabilities_one_model(
+        self,
+        forecasts: xr.DataArray,
+        hindcasts: xr.DataArray,
+    ) -> Tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
+        """
+        Compute BN/NN/AN for a single model, returning three DataArrays
+        aligned to the forecast mean (and its time, if present).
+        """
+        self._require_dims(forecasts, ("ensemble",), name="forecasts")
+        self._require_dims(hindcasts, ("time", "ensemble"), name="hindcasts")
+
+        f_mean = forecasts.mean(dim="ensemble")
+        lower_k, upper_k = -0.4307, 0.4307
+
+        if self.distribution == "gaussian":
+            mu, sigma = self._compute_cross_validated_stats(hindcasts)
+            mu, sigma = self._align_or_fallback_stats(mu, sigma, f_mean, hindcasts)
+
+            z_lower = (mu + lower_k * sigma - f_mean) / sigma
+            z_upper = (mu + upper_k * sigma - f_mean) / sigma
+
+            p_bn = self._norm_cdf(z_lower)
+            p_an = 1.0 - self._norm_cdf(z_upper)
+            p_nn = 1.0 - p_bn - p_an
+            return self._safe_clip_and_renorm(p_bn, p_nn, p_an)
+
+        if self.distribution == "lognormal":
+            eps = self.eps_lognormal
+
+            h_pos = xr.where(hindcasts > 0, hindcasts, eps)
+            f_pos = xr.where(forecasts > 0, forecasts, eps)
+
+            log_h = np.log(h_pos)
+            log_f_mean = np.log(f_pos).mean(dim="ensemble")
+
+            mu, sigma = self._compute_cross_validated_stats(log_h)
+            mu, sigma = self._align_or_fallback_stats(mu, sigma, log_f_mean, log_h)
+
+            z_lower = (mu + lower_k * sigma - log_f_mean) / sigma
+            z_upper = (mu + upper_k * sigma - log_f_mean) / sigma
+
+            p_bn = self._norm_cdf(z_lower)
+            p_an = 1.0 - self._norm_cdf(z_upper)
+            p_nn = 1.0 - p_bn - p_an
+            return self._safe_clip_and_renorm(p_bn, p_nn, p_an)
+
+        if self.distribution == "empirical":
+            # empirical terciles from hindcasts
+            q33 = hindcasts.quantile(1 / 3, dim=("time", "ensemble"))
+            q66 = hindcasts.quantile(2 / 3, dim=("time", "ensemble"))
+
+            q33 = q33.broadcast_like(f_mean)
+            q66 = q66.broadcast_like(f_mean)
+
+            p_bn = xr.where(f_mean < q33, 1.0, 0.0)
+            p_an = xr.where(f_mean > q66, 1.0, 0.0)
+            p_nn = 1.0 - p_bn - p_an
+            return self._safe_clip_and_renorm(p_bn, p_nn, p_an)
+
+        raise ValueError(f"Unknown distribution={self.distribution!r}")
+
+    # ---------------------------------------------------------------------
+    # public API
+    # ---------------------------------------------------------------------
+    def compute_pmme_probabilities(
+        self,
+        forecasts: Dict[str, xr.DataArray],
+        hindcasts: Dict[str, xr.DataArray],
+        climatology: Optional[xr.DataArray] = None,  # placeholder for your pipeline
+        ensemble_sizes: Optional[Dict[str, int]] = None,
+        strict_models: bool = True,
+    ) -> Dict[str, xr.DataArray]:
+        """
+        Compute PMME probabilities (BN/NN/AN) across models.
+
         Returns
         -------
-        pmme_probs : dict
-            Dictionary with keys 'BN', 'NN', 'AN' containing PMME probabilities
+        pmme_probs : dict with keys 'BN','NN','AN' (DataArray maps)
         """
-        # Get model names
-        model_names = list(forecasts.keys())
-        
-        # Compute individual model probabilities
-        model_probs = {}
-        for model in model_names:
-            probs_bn, probs_nn, probs_an = self._compute_tercile_probabilities(
-                forecasts[model], hindcasts[model], climatology
-            )
-            model_probs[model] = {
-                'BN': probs_bn,
-                'NN': probs_nn,
-                'AN': probs_an
-            }
-        
-        # Compute model weights (Eq. 6)
+        if strict_models and set(forecasts.keys()) != set(hindcasts.keys()):
+            raise ValueError("forecasts and hindcasts must have the same model keys when strict_models=True.")
+
+        model_names = [m for m in forecasts.keys() if m in hindcasts]
+        if not model_names:
+            raise ValueError("No common models between forecasts and hindcasts.")
+
+        if ensemble_sizes is None:
+            ensemble_sizes = {m: int(forecasts[m].sizes["ensemble"]) for m in model_names}
+
         weights = self._compute_model_weights(ensemble_sizes)
-        
-        # Combine probabilities using total probability formula (Eq. 1)
+
+        # compute per-model probs
+        per_model = {}
+        for m in model_names:
+            p_bn, p_nn, p_an = self._compute_tercile_probabilities_one_model(forecasts[m], hindcasts[m])
+            per_model[m] = {"BN": p_bn, "NN": p_nn, "AN": p_an}
+
+        # weighted sum
+        template = per_model[model_names[0]]["BN"]
         pmme_probs = {}
-        for category in ['BN', 'NN', 'AN']:
-            weighted_sum = xr.zeros_like(next(iter(model_probs.values()))[category])
-            for model in model_names:
-                weighted_prob = model_probs[model][category] * weights[model]
-                weighted_sum = weighted_sum + weighted_prob
-            
-            pmme_probs[category] = weighted_sum
-        
+        for cat in ("BN", "NN", "AN"):
+            wsum = xr.zeros_like(template)
+            for m in model_names:
+                wsum = wsum + per_model[m][cat] * float(weights[m])
+            pmme_probs[cat] = wsum
+
+        # (optional) ensure valid probs
+        pmme_probs["BN"], pmme_probs["NN"], pmme_probs["AN"] = self._safe_clip_and_renorm(
+            pmme_probs["BN"], pmme_probs["NN"], pmme_probs["AN"]
+        )
         return pmme_probs
-    
-    def compute_combined_map(self, pmme_probs, ensemble_sizes, model_names, significance_level=0.05):
+
+    def compute_combined_map(
+        self,
+        pmme_probs: Dict[str, xr.DataArray],
+        ensemble_sizes: Dict[str, int],
+        model_names: List[str],
+        significance_level: float = 0.05,
+    ) -> Tuple[xr.DataArray, xr.DataArray]:
         """
-        Compute combined map with significance testing (χ² test).
-        
-        Parameters
-        ----------
-        pmme_probs : dict
-            PMME probabilities for BN, NN, AN categories
-        ensemble_sizes : dict
-            Dictionary mapping model names to ensemble sizes
-        model_names : list
-            List of model names
-        significance_level : float
-            Significance level for χ² test (default 0.05)
-            
+        Combined categorical map with chi-square significance test.
+
         Returns
         -------
-        combined_map : xarray.DataArray
-            Combined map showing dominant category where significant
-        chi_square : xarray.DataArray
-            χ² statistic values
+        combined_map : DataArray
+            values: 0=no significant deviation, 1=BN, 2=NN, 3=AN
+        chi_square : DataArray
+            chi-square statistic
         """
-        # Find dominant category
-        probs_array = xr.concat([pmme_probs['BN'], pmme_probs['NN'], pmme_probs['AN']], 
-                               dim='category')
-        dominant_category = probs_array.argmax(dim='category')
-        
-        # Compute n for χ² test
+        for k in ("BN", "NN", "AN"):
+            if k not in pmme_probs:
+                raise ValueError(f"pmme_probs missing key {k!r}")
+
+        # stack probs
+        probs_array = xr.concat(
+            [pmme_probs["BN"], pmme_probs["NN"], pmme_probs["AN"]],
+            dim=xr.DataArray(["BN", "NN", "AN"], dims="category", name="category"),
+        )
+
+        # valid pixels = at least one category not null
+        valid_any = probs_array.notnull().any("category")
+
+        # SAFE argmax: fill NaNs with -inf just for argmax
+        dominant = probs_array.fillna(-np.inf).argmax(dim="category", skipna=False)
+
+        # chi-square
         n = self._compute_n_for_chisq(ensemble_sizes, model_names)
-        
-        # Compute χ² statistic (Eq. in section 5)
-        # χ² = n * Σ (P(Ej) - 1/3)² / (1/3)
-        expected_prob = 1/3
-        
+        expected = 1.0 / 3.0
+
         chi_square = n * (
-            (pmme_probs['BN'] - expected_prob)**2 / expected_prob +
-            (pmme_probs['NN'] - expected_prob)**2 / expected_prob +
-            (pmme_probs['AN'] - expected_prob)**2 / expected_prob
+            (pmme_probs["BN"] - expected) ** 2 / expected
+            + (pmme_probs["NN"] - expected) ** 2 / expected
+            + (pmme_probs["AN"] - expected) ** 2 / expected
         )
-        
-        # Critical value for χ² with 2 degrees of freedom
-        critical_value = stats.chi2.ppf(1 - significance_level, df=2)
-        
-        # Create combined map: show dominant category where significant
-        combined_map = xr.where(
-            chi_square > critical_value,
-            dominant_category + 1,  # 1 for BN, 2 for NN, 3 for AN
-            0  # No significant deviation from climatology
-        )
-        
-        # Add attributes for interpretation
-        combined_map.attrs = {
-            'description': 'PMME combined forecast map',
-            'values': '0=no significant deviation, 1=BN, 2=NN, 3=AN',
-            'significance_level': significance_level,
-            'chi2_critical_value': critical_value
+
+        critical = float(stats.chi2.ppf(1.0 - float(significance_level), df=2))
+
+        combined = xr.where(valid_any & (chi_square > critical), dominant + 1, 0)
+
+        combined.attrs = {
+            "description": "PMME combined forecast map (Min et al. 2009 probability-weighted)",
+            "values": "0=no significant deviation, 1=BN, 2=NN, 3=AN",
+            "significance_level": float(significance_level),
+            "chi2_critical_value": critical,
         }
+        chi_square.attrs = {
+            "description": "Chi-square statistic for PMME categorical significance",
+            "df": 2,
+            "n_samples_used": float(n),
+        }
+        return combined, chi_square
+
+
+
+# class WAS_Min2009_ProbWeighted:
+#     """
+#     Implementation of Min et al. (2009) Probability-Weighted Multi-Model Ensemble.
+    
+#     Based on: "Probabilistic Multimodel Ensemble (PMME) forecasting at APCC"
+#     Journal: Weather and Forecasting, 2009
+    
+#     Key methodology:
+#     1. Individual model probabilistic forecasts are computed using Gaussian approximation
+#     2. Model weights are proportional to sqrt(ensemble_size) [Eq. 6 in paper]
+#     3. Tercile probabilities (BN, NN, AN) are combined using total probability formula
+    
+#     Notes:
+#     - For temperature: Gaussian assumption is reasonable
+#     - For precipitation: Consider using log-normal, Gamma distribution, or empirical methods
+#     - The χ² test uses configurable n (ensemble size) - avoid overly conservative n=1
+#     - Cross-validation is recommended for hindcast statistics
+#     """
+    
+#     def __init__(self, distribution='gaussian', cv_method=None, n_samples_for_chisq='total_ensemble'):
+#         """
+#         Initialize PMME processor.
         
-        return combined_map, chi_square
+#         Parameters
+#         ----------
+#         distribution : str
+#             Distribution assumption: 'gaussian', 'gamma', 'lognormal', or 'empirical'
+#         cv_method : str or None
+#             Cross-validation method: None, 'leave_one_out', or 'rolling_window'
+#         n_samples_for_chisq : str or int
+#             How to compute n for χ² test: 
+#             'total_ensemble' (default), 'effective_sample_size', or integer value
+#         """
+#         self.distribution = distribution
+#         self.cv_method = cv_method
+#         self.n_samples_for_chisq = n_samples_for_chisq
+        
+#     def _compute_cross_validated_stats(self, hindcasts, climatology):
+#         """
+#         Compute cross-validated mean and standard deviation from hindcasts.
+        
+#         Parameters
+#         ----------
+#         hindcasts : xarray.DataArray
+#             Hindcast ensemble data with dimensions (T, M, Y, X)
+#         climatology : xarray.DataArray
+#             Climatological data with dimensions (Y, X)
+            
+#         Returns
+#         -------
+#         mu_cv : xarray.DataArray
+#             Cross-validated mean with dimensions (T, Y, X)
+#         sigma_cv : xarray.DataArray
+#             Cross-validated standard deviation with dimensions (T, Y, X)
+#         """
+#         n_times = hindcasts.sizes['time']
+        
+#         if self.cv_method is None:
+#             # Use full hindcast period (not recommended for operational use)
+#             mu_cv = hindcasts.mean(dim=['time', 'ensemble'])
+#             sigma_cv = hindcasts.std(dim=['time', 'ensemble'])
+#             # Expand to match time dimension
+#             mu_cv = mu_cv.expand_dims(time=hindcasts.time).transpose('time', 'lat', 'lon')
+#             sigma_cv = sigma_cv.expand_dims(time=hindcasts.time).transpose('time', 'lat', 'lon')
+            
+#         elif self.cv_method == 'leave_one_out':
+#             # Leave-one-out cross-validation
+#             mu_list = []
+#             sigma_list = []
+            
+#             for i in range(n_times):
+#                 # Leave out year i
+#                 hindcast_train = hindcasts.isel(time=[j for j in range(n_times) if j != i])
+#                 mu_i = hindcast_train.mean(dim=['time', 'ensemble'])
+#                 sigma_i = hindcast_train.std(dim=['time', 'ensemble'])
+#                 mu_list.append(mu_i)
+#                 sigma_list.append(sigma_i)
+            
+#             mu_cv = xr.concat(mu_list, dim=hindcasts.time)
+#             sigma_cv = xr.concat(sigma_list, dim=hindcasts.time)
+            
+#         elif self.cv_method == 'rolling_window':
+#             # Rolling window validation (e.g., 15-year window)
+#             window_size = 15
+#             mu_list = []
+#             sigma_list = []
+            
+#             for i in range(n_times):
+#                 start = max(0, i - window_size // 2)
+#                 end = min(n_times, i + window_size // 2 + 1)
+#                 hindcast_train = hindcasts.isel(time=slice(start, end))
+#                 # Exclude the current year if possible
+#                 hindcast_train = hindcast_train.isel(time=[j for j in range(hindcast_train.sizes['time']) 
+#                                                           if start + j != i])
+                
+#                 mu_i = hindcast_train.mean(dim=['time', 'ensemble'])
+#                 sigma_i = hindcast_train.std(dim=['time', 'ensemble'])
+#                 mu_list.append(mu_i)
+#                 sigma_list.append(sigma_i)
+            
+#             mu_cv = xr.concat(mu_list, dim=hindcasts.time)
+#             sigma_cv = xr.concat(sigma_list, dim=hindcasts.time)
+        
+#         return mu_cv, sigma_cv
+    
+#     def _compute_tercile_probabilities(self, forecasts, hindcasts, climatology):
+#         """
+#         Compute tercile probabilities for individual models.
+        
+#         Parameters
+#         ----------
+#         forecasts : xarray.DataArray
+#             Forecast ensemble data with dimensions (T, M, Y, X)
+#         hindcasts : xarray.DataArray
+#             Hindcast ensemble data with dimensions (T, M, Y, X)
+#         climatology : xarray.DataArray
+#             Climatological data with dimensions (Y, X)
+            
+#         Returns
+#         -------
+#         probs_bn : xarray.DataArray
+#             Probability of below-normal category
+#         probs_nn : xarray.DataArray
+#             Probability of near-normal category
+#         probs_an : xarray.DataArray
+#             Probability of above-normal category
+#         """
+#         # Compute cross-validated statistics
+#         mu_cv, sigma_cv = self._compute_cross_validated_stats(hindcasts, climatology)
+        
+#         # Compute forecast ensemble mean
+#         forecast_mean = forecasts.mean(dim='ensemble')
+        
+#         if self.distribution == 'gaussian':
+#             # Gaussian approximation (suitable for temperature)
+#             # Tercile boundaries at approximately ±0.43σ (for Gaussian)
+#             # Actually, for terciles, boundaries are at Φ⁻¹(1/3) ≈ -0.43 and Φ⁻¹(2/3) ≈ 0.43
+#             # The paper uses ±1.43σ which seems incorrect - this would be for much wider intervals
+#             # Let's use the correct tercile boundaries:
+#             lower_boundary = -0.4307  # Φ⁻¹(1/3)
+#             upper_boundary = 0.4307   # Φ⁻¹(2/3)
+            
+#             # Standardized anomalies
+#             z_lower = (mu_cv + lower_boundary * sigma_cv - forecast_mean) / sigma_cv
+#             z_upper = (mu_cv + upper_boundary * sigma_cv - forecast_mean) / sigma_cv
+            
+#             # Gaussian CDF probabilities
+#             probs_bn = stats.norm.cdf(z_lower)
+#             probs_an = 1 - stats.norm.cdf(z_upper)
+#             probs_nn = 1 - probs_bn - probs_an
+            
+#         elif self.distribution == 'lognormal':
+#             # Log-normal distribution (suitable for precipitation)
+#             # Transform to log space
+#             log_hindcasts = xr.where(hindcasts > 0, np.log(hindcasts), np.log(0.01))
+#             log_mu_cv, log_sigma_cv = self._compute_cross_validated_stats(log_hindcasts, climatology)
+#             log_forecast = xr.where(forecasts > 0, np.log(forecasts), np.log(0.01))
+#             log_forecast_mean = log_forecast.mean(dim='ensemble')
+            
+#             # Compute tercile boundaries in log space
+#             lower_boundary = -0.4307
+#             upper_boundary = 0.4307
+            
+#             z_lower = (log_mu_cv + lower_boundary * log_sigma_cv - log_forecast_mean) / log_sigma_cv
+#             z_upper = (log_mu_cv + upper_boundary * log_sigma_cv - log_forecast_mean) / log_sigma_cv
+            
+#             probs_bn = stats.norm.cdf(z_lower)
+#             probs_an = 1 - stats.norm.cdf(z_upper)
+#             probs_nn = 1 - probs_bn - probs_an
+            
+#         elif self.distribution == 'empirical':
+#             # Empirical quantile mapping
+#             # This is a simplified version - consider more sophisticated methods
+#             forecast_flat = forecasts.stack(sample=('time', 'ensemble')).transpose('sample', 'lat', 'lon')
+#             hindcast_flat = hindcasts.stack(sample=('time', 'ensemble')).transpose('sample', 'lat', 'lon')
+            
+#             # Compute empirical CDF for each grid point
+#             probs_bn = xr.full_like(forecast_mean, fill_value=np.nan)
+#             probs_nn = xr.full_like(forecast_mean, fill_value=np.nan)
+#             probs_an = xr.full_like(forecast_mean, fill_value=np.nan)
+            
+#             # This is computationally intensive - consider optimization
+#             for lat in forecast_mean.lat.values:
+#                 for lon in forecast_mean.lon.values:
+#                     hindcast_vals = hindcast_flat.sel(lat=lat, lon=lon).values
+#                     forecast_val = forecast_mean.sel(lat=lat, lon=lon).values
+                    
+#                     # Compute empirical terciles from hindcast
+#                     lower_tercile = np.percentile(hindcast_vals, 100/3)
+#                     upper_tercile = np.percentile(hindcast_vals, 100*2/3)
+                    
+#                     # Empirical probabilities
+#                     probs_bn.loc[dict(lat=lat, lon=lon)] = np.mean(forecast_val < lower_tercile)
+#                     probs_an.loc[dict(lat=lat, lon=lon)] = np.mean(forecast_val > upper_tercile)
+#                     probs_nn.loc[dict(lat=lat, lon=lon)] = 1 - probs_bn.loc[dict(lat=lat, lon=lon)] - probs_an.loc[dict(lat=lat, lon=lon)]
+        
+#         # Ensure probabilities are between 0 and 1
+#         probs_bn = xr.where(probs_bn < 0, 0, xr.where(probs_bn > 1, 1, probs_bn))
+#         probs_an = xr.where(probs_an < 0, 0, xr.where(probs_an > 1, 1, probs_an))
+#         probs_nn = xr.where(probs_nn < 0, 0, xr.where(probs_nn > 1, 1, probs_nn))
+        
+#         # Renormalize to ensure sum to 1 (accounting for numerical errors)
+#         total = probs_bn + probs_nn + probs_an
+#         probs_bn = probs_bn / total
+#         probs_nn = probs_nn / total
+#         probs_an = probs_an / total
+        
+#         return probs_bn, probs_nn, probs_an
+    
+#     def _compute_model_weights(self, ensemble_sizes):
+#         """
+#         Compute model weights according to Min et al. (2009) Eq. 6.
+        
+#         Parameters
+#         ----------
+#         ensemble_sizes : dict
+#             Dictionary mapping model names to ensemble sizes
+            
+#         Returns
+#         -------
+#         weights : dict
+#             Dictionary mapping model names to normalized weights
+#         """
+#         # Weight proportional to sqrt(ensemble_size)
+#         sqrt_sizes = {model: np.sqrt(size) for model, size in ensemble_sizes.items()}
+#         total = sum(sqrt_sizes.values())
+        
+#         # Normalize so weights sum to 1
+#         weights = {model: sqrt_sizes[model] / total for model in ensemble_sizes.keys()}
+        
+#         return weights
+    
+#     def _compute_n_for_chisq(self, ensemble_sizes, model_names):
+#         """
+#         Compute n for χ² test based on configuration.
+        
+#         Parameters
+#         ----------
+#         ensemble_sizes : dict
+#             Dictionary mapping model names to ensemble sizes
+#         model_names : list
+#             List of model names
+            
+#         Returns
+#         -------
+#         n : float
+#             Value to use for n in χ² test
+#         """
+#         if isinstance(self.n_samples_for_chisq, (int, float)):
+#             return float(self.n_samples_for_chisq)
+#         elif self.n_samples_for_chisq == 'total_ensemble':
+#             # Sum of all ensemble members across models
+#             return sum(ensemble_sizes[model] for model in model_names)
+#         elif self.n_samples_for_chisq == 'effective_sample_size':
+#             # Approximate effective sample size
+#             total_ensemble = sum(ensemble_sizes[model] for model in model_names)
+#             n_models = len(model_names)
+#             # Simple approximation: account for correlation between models
+#             return total_ensemble / np.sqrt(n_models)
+#         else:
+#             # Default to total ensemble size
+#             return sum(ensemble_sizes[model] for model in model_names)
+    
+#     def compute_pmme_probabilities(self, forecasts, hindcasts, climatology, ensemble_sizes):
+#         """
+#         Compute PMME probabilities according to Min et al. (2009).
+        
+#         Parameters
+#         ----------
+#         forecasts : dict of xarray.DataArray
+#             Dictionary of forecast ensembles for each model
+#         hindcasts : dict of xarray.DataArray
+#             Dictionary of hindcast ensembles for each model
+#         climatology : xarray.DataArray
+#             Climatological data
+#         ensemble_sizes : dict
+#             Dictionary mapping model names to ensemble sizes
+            
+#         Returns
+#         -------
+#         pmme_probs : dict
+#             Dictionary with keys 'BN', 'NN', 'AN' containing PMME probabilities
+#         """
+#         # Get model names
+#         model_names = list(forecasts.keys())
+        
+#         # Compute individual model probabilities
+#         model_probs = {}
+#         for model in model_names:
+#             probs_bn, probs_nn, probs_an = self._compute_tercile_probabilities(
+#                 forecasts[model], hindcasts[model], climatology
+#             )
+#             model_probs[model] = {
+#                 'BN': probs_bn,
+#                 'NN': probs_nn,
+#                 'AN': probs_an
+#             }
+        
+#         # Compute model weights (Eq. 6)
+#         weights = self._compute_model_weights(ensemble_sizes)
+        
+#         # Combine probabilities using total probability formula (Eq. 1)
+#         pmme_probs = {}
+#         for category in ['BN', 'NN', 'AN']:
+#             weighted_sum = xr.zeros_like(next(iter(model_probs.values()))[category])
+#             for model in model_names:
+#                 weighted_prob = model_probs[model][category] * weights[model]
+#                 weighted_sum = weighted_sum + weighted_prob
+            
+#             pmme_probs[category] = weighted_sum
+        
+#         return pmme_probs
+    
+#     def compute_combined_map(self, pmme_probs, ensemble_sizes, model_names, significance_level=0.05):
+#         """
+#         Compute combined map with significance testing (χ² test).
+        
+#         Parameters
+#         ----------
+#         pmme_probs : dict
+#             PMME probabilities for BN, NN, AN categories
+#         ensemble_sizes : dict
+#             Dictionary mapping model names to ensemble sizes
+#         model_names : list
+#             List of model names
+#         significance_level : float
+#             Significance level for χ² test (default 0.05)
+            
+#         Returns
+#         -------
+#         combined_map : xarray.DataArray
+#             Combined map showing dominant category where significant
+#         chi_square : xarray.DataArray
+#             χ² statistic values
+#         """
+#         # Find dominant category
+#         probs_array = xr.concat([pmme_probs['BN'], pmme_probs['NN'], pmme_probs['AN']], 
+#                                dim='category')
+#         dominant_category = probs_array.argmax(dim='category')
+        
+#         # Compute n for χ² test
+#         n = self._compute_n_for_chisq(ensemble_sizes, model_names)
+        
+#         # Compute χ² statistic (Eq. in section 5)
+#         # χ² = n * Σ (P(Ej) - 1/3)² / (1/3)
+#         expected_prob = 1/3
+        
+#         chi_square = n * (
+#             (pmme_probs['BN'] - expected_prob)**2 / expected_prob +
+#             (pmme_probs['NN'] - expected_prob)**2 / expected_prob +
+#             (pmme_probs['AN'] - expected_prob)**2 / expected_prob
+#         )
+        
+#         # Critical value for χ² with 2 degrees of freedom
+#         critical_value = stats.chi2.ppf(1 - significance_level, df=2)
+        
+#         # Create combined map: show dominant category where significant
+#         combined_map = xr.where(
+#             chi_square > critical_value,
+#             dominant_category + 1,  # 1 for BN, 2 for NN, 3 for AN
+#             0  # No significant deviation from climatology
+#         )
+        
+#         # Add attributes for interpretation
+#         combined_map.attrs = {
+#             'description': 'PMME combined forecast map',
+#             'values': '0=no significant deviation, 1=BN, 2=NN, 3=AN',
+#             'significance_level': significance_level,
+#             'chi2_critical_value': critical_value
+#         }
+        
+#         return combined_map, chi_square
 
 
 # # Example usage function
@@ -1746,226 +2096,6 @@ class WAS_Min2009_ProbWeighted:
     
 #     return pmme_probs, combined_map, chi_square
 
-# class WAS_Min2009_ProbWeighted_:
-#     """
-#     Implementation of Min et al. (2009) Probability-Weighted Multi-Model Ensemble.
-    
-#     Based on: "Probabilistic Multimodel Ensemble (PMME) forecasting at APCC"
-#     Journal: Weather and Forecasting, 2009
-    
-#     Key methodology:
-#     1. Individual model probabilistic forecasts are computed using Gaussian approximation
-#     2. Model weights are proportional to sqrt(ensemble_size) [Eq. 6 in paper]
-#     3. Tercile probabilities (BN, NN, AN) are combined using total probability formula
-#     """
-    
-#     def __init__(self):
-#         pass
-    
-#     def _compute_tercile_probabilities(self, forecasts, hindcasts, climatology):
-#         """
-#         Compute tercile probabilities for individual models using Gaussian approximation.
-        
-#         Parameters
-#         ----------
-#         forecasts : xarray.DataArray
-#             Forecast ensemble data with dimensions (T, M, Y, X)
-#         hindcasts : xarray.DataArray
-#             Hindcast ensemble data with dimensions (T, M, Y, X)
-#         climatology : xarray.DataArray
-#             Climatological data with dimensions (Y, X)
-            
-#         Returns
-#         -------
-#         probs_bn : xarray.DataArray
-#             Probability of below-normal category
-#         probs_nn : xarray.DataArray
-#             Probability of near-normal category
-#         probs_an : xarray.DataArray
-#             Probability of above-normal category
-#         """
-#         # Compute mean and std from hindcasts (cross-validated)
-#         mu = hindcasts.mean(dim='ensemble')  # Model ensemble mean
-#         sigma = hindcasts.std(dim='ensemble')  # Model ensemble spread
-        
-#         # Compute tercile boundaries (Eq. in section 5)
-#         # Lower tercile: μ - 1.43σ, Upper tercile: μ + 1.43σ
-#         lower_tercile = mu - 1.43 * sigma
-#         upper_tercile = mu + 1.43 * sigma
-        
-#         # Compute forecast ensemble mean
-#         forecast_mean = forecasts.mean(dim='ensemble')
-        
-#         # For Gaussian approximation, compute probabilities using CDF
-#         # Probability of below-normal: Φ((lower_tercile - forecast_mean)/sigma)
-#         # Probability of above-normal: 1 - Φ((upper_tercile - forecast_mean)/sigma)
-#         # Probability of near-normal: 1 - P(BN) - P(AN)
-        
-#         # Standardized anomalies
-#         z_lower = (lower_tercile - forecast_mean) / sigma
-#         z_upper = (upper_tercile - forecast_mean) / sigma
-        
-#         # Gaussian CDF probabilities
-#         probs_bn = stats.norm.cdf(z_lower)
-#         probs_an = 1 - stats.norm.cdf(z_upper)
-#         probs_nn = 1 - probs_bn - probs_an
-        
-#         # Ensure probabilities are between 0 and 1
-#         probs_bn = xr.where(probs_bn < 0, 0, xr.where(probs_bn > 1, 1, probs_bn))
-#         probs_an = xr.where(probs_an < 0, 0, xr.where(probs_an > 1, 1, probs_an))
-#         probs_nn = xr.where(probs_nn < 0, 0, xr.where(probs_nn > 1, 1, probs_nn))
-        
-#         return probs_bn, probs_nn, probs_an
-    
-#     def _compute_model_weights(self, ensemble_sizes):
-#         """
-#         Compute model weights according to Min et al. (2009) Eq. 6.
-        
-#         Parameters
-#         ----------
-#         ensemble_sizes : dict
-#             Dictionary mapping model names to ensemble sizes
-            
-#         Returns
-#         -------
-#         weights : dict
-#             Dictionary mapping model names to normalized weights
-#         """
-#         # Weight proportional to sqrt(ensemble_size)
-#         sqrt_sizes = {model: np.sqrt(size) for model, size in ensemble_sizes.items()}
-#         total = sum(sqrt_sizes.values())
-        
-#         # Normalize so weights sum to 1
-#         weights = {model: sqrt_sizes[model] / total for model in ensemble_sizes.keys()}
-        
-#         return weights
-    
-#     def compute_pmme_probabilities(self, forecasts, hindcasts, climatology, ensemble_sizes):
-#         """
-#         Compute PMME probabilities according to Min et al. (2009).
-        
-#         Parameters
-#         ----------
-#         forecasts : dict of xarray.DataArray
-#             Dictionary of forecast ensembles for each model
-#         hindcasts : dict of xarray.DataArray
-#             Dictionary of hindcast ensembles for each model
-#         climatology : xarray.DataArray
-#             Climatological data
-#         ensemble_sizes : dict
-#             Dictionary mapping model names to ensemble sizes
-            
-#         Returns
-#         -------
-#         pmme_probs : dict
-#             Dictionary with keys 'BN', 'NN', 'AN' containing PMME probabilities
-#         """
-#         # Get model names
-#         model_names = list(forecasts.keys())
-        
-#         # Compute individual model probabilities
-#         model_probs = {}
-#         for model in model_names:
-#             probs_bn, probs_nn, probs_an = self._compute_tercile_probabilities(
-#                 forecasts[model], hindcasts[model], climatology
-#             )
-#             model_probs[model] = {
-#                 'BN': probs_bn,
-#                 'NN': probs_nn,
-#                 'AN': probs_an
-#             }
-        
-#         # Compute model weights (Eq. 6)
-#         weights = self._compute_model_weights(ensemble_sizes)
-        
-#         # Combine probabilities using total probability formula (Eq. 1)
-#         pmme_probs = {}
-#         for category in ['BN', 'NN', 'AN']:
-#             weighted_sum = None
-#             for model in model_names:
-#                 weighted_prob = model_probs[model][category] * weights[model]
-#                 if weighted_sum is None:
-#                     weighted_sum = weighted_prob
-#                 else:
-#                     weighted_sum = weighted_sum + weighted_prob
-            
-#             pmme_probs[category] = weighted_sum
-        
-#         return pmme_probs
-    
-#     def compute_combined_map(self, pmme_probs, significance_level=0.05):
-#         """
-#         Compute combined map with significance testing (χ² test).
-        
-#         Parameters
-#         ----------
-#         pmme_probs : dict
-#             PMME probabilities for BN, NN, AN categories
-#         significance_level : float
-#             Significance level for χ² test (default 0.05)
-            
-#         Returns
-#         -------
-#         combined_map : xarray.DataArray
-#             Combined map showing dominant category where significant
-#         """
-#         # Find dominant category
-#         probs_array = xr.concat([pmme_probs['BN'], pmme_probs['NN'], pmme_probs['AN']], 
-#                                dim='category')
-#         dominant_category = probs_array.argmax(dim='category')
-        
-#         # Compute χ² statistic (Eq. in section 5)
-#         # χ² = n * Σ (P(Ej) - 1/3)² / (1/3)
-#         n = 1  # This should be total ensemble size across all models
-#         expected_prob = 1/3
-        
-#         chi_square = n * (
-#             (pmme_probs['BN'] - expected_prob)**2 / expected_prob +
-#             (pmme_probs['NN'] - expected_prob)**2 / expected_prob +
-#             (pmme_probs['AN'] - expected_prob)**2 / expected_prob
-#         )
-        
-#         # Critical value for χ² with 2 degrees of freedom
-#         critical_value = stats.chi2.ppf(1 - significance_level, df=2)
-        
-#         # Create combined map: show dominant category where significant
-#         combined_map = xr.where(
-#             chi_square > critical_value,
-#             dominant_category + 1,  # 1 for BN, 2 for NN, 3 for AN
-#             0  # No significant deviation from climatology
-#         )
-        
-#         return combined_map
-    
-# # Example 
-# forecasts = {
-#     'model1': xr.DataArray(...),  # dimensions: (time, ensemble, lat, lon)
-#     'model2': xr.DataArray(...),
-#     # ... more models
-# }
-
-# hindcasts = {
-#     'model1': xr.DataArray(...),  # cross-validated hindcasts
-#     'model2': xr.DataArray(...),
-#     # ... more models
-# }
-
-# ensemble_sizes = {
-#     'model1': 20,
-#     'model2': 10,
-#     # ... ensemble sizes for each model
-# }
-
-# # Initialize and compute
-# pmme = WAS_Min2009_ProbWeighted()
-
-# # Compute PMME probabilities
-# pmme_probs = pmme.compute_pmme_probabilities(
-#     forecasts, hindcasts, climatology, ensemble_sizes
-# )
-
-# # Get combined map
-# combined_map = pmme.compute_combined_map(pmme_probs)
 
 
 

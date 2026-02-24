@@ -1148,7 +1148,7 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name,
                         labels=["Below-Normal", "Near-Normal", "Above-Normal"], 
                         reverse_cmap=True, hspace=None, logo=None, 
                         logo_size=("10%", "10%"), logo_position="lower left", 
-                        sigma=None, res=None, stations_df=None):
+                        sigma=None, res=None, stations_df=None, out="pdf"):
 
     # 3. Spatial Smoothing
     if sigma:
@@ -1305,10 +1305,8 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name,
     ax.set_title(f"Probabilistic Seasonal Forecast\n{model_name}", fontsize=14, pad=20, fontweight='bold')
     ax.add_feature(cfeature.OCEAN.with_scale('50m'), facecolor='#e0f3ff')
     ax.coastlines(resolution='10m')
-
     
-    
-    plt.savefig(os.path.join(dir_to_save, f"{model_name}.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(dir_to_save, f"{model_name}.{out}"), dpi=300, bbox_inches='tight')
     plt.show()
 
 ######################################################################################################################
@@ -3947,9 +3945,22 @@ def plot_georeferenced_forecast_map(
 
     return fig, ax, gdf
 #########################################################################
+import inspect
 
-
-def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization, year_start, year_end, year_forecast, nb_cores=2, agrometparam="Onset"):
+def process_model_for_other_params(
+    agmParamModel, 
+    dir_to_save, 
+    hdcst_file_path, 
+    fcst_file_path, 
+    obs_hdcst, 
+    obs_fcst_year, 
+    month_of_initialization, 
+    year_start, 
+    year_end, 
+    year_forecast, 
+    nb_cores=2, 
+    agrometparam="Onset"
+):
     """
     Process model hindcast and forecast data for agrometeorological parameters.
 
@@ -3985,6 +3996,26 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
     tuple
         Tuple of dictionaries (saved_hindcast_paths, saved_forecast_paths) mapping model names to saved file paths.
     """
+    
+    # =========================================================================
+    # DYNAMIC ARGUMENT EXTRACTION
+    # Automatically varying arguments based on the specific agmParamModel passed
+    # =========================================================================
+    sig = inspect.signature(agmParamModel.compute)
+    valid_compute_args = sig.parameters.keys()
+    model_attributes = vars(agmParamModel)
+    
+    dynamic_kwargs = {
+        key: model_attributes[key] 
+        for key in valid_compute_args 
+        if key in model_attributes
+    }
+    
+    # Add nb_cores manually if the compute method accepts it
+    if "nb_cores" in valid_compute_args:
+        dynamic_kwargs["nb_cores"] = nb_cores
+    # =========================================================================
+
     mask = xr.where(~np.isnan(obs_fcst_year.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
     t_coord = pd.date_range(start=f"{year_forecast}-01-01", end=f"{year_forecast}-12-31", freq="D")
     y_coords = obs_fcst_year.Y
@@ -4011,6 +4042,7 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
     abb_mont_ini = calendar.month_abbr[int(month_of_initialization)]
     dir_to_save = Path(f"{dir_to_save}/model_data")
     os.makedirs(dir_to_save, exist_ok=True)
+    
     saved_hindcast_paths = {}
     for i in hdcst_file_path.keys():
         save_path = f"{dir_to_save}/hindcast_{i}_{agrometparam}_{abb_mont_ini}Ic.nc"
@@ -4024,12 +4056,16 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
             ds1_aligned, ds2_aligned = xr.align(hdcst, obs_hdcst_interp, join='outer')
             filled_ds = ds1_aligned.fillna(ds2_aligned)
             ds_filled = filled_ds.copy()
-            agpm_model = agmParamModel.compute(daily_data=ds_filled.sortby("T"), nb_cores=nb_cores)
+            
+            # Use dynamic_kwargs here
+            agpm_model = agmParamModel.compute(ds_filled.sortby("T"), **dynamic_kwargs)
+            
             ds_processed = agpm_model.to_dataset(name=agrometparam)
             ds_processed.to_netcdf(save_path)
         else:
             print(f"[SKIP] {save_path} already exists.")
         saved_hindcast_paths[i] = save_path
+        
     saved_forecast_paths = {}
     for i in fcst_file_path.keys():
         save_path = f"{dir_to_save}/forecast_{i}_{agrometparam}_{abb_mont_ini}Ic.nc"
@@ -4049,13 +4085,125 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
             filled_fcst_ = ds1_aligned.fillna(ds2_aligned)
             ds_filled = filled_fcst_.copy()
             ds_filled = ds_filled.sortby("T")
-            agpm_model = agmParamModel.compute(daily_data=ds_filled, nb_cores=nb_cores)
+            
+            # Use dynamic_kwargs here
+            agpm_model = agmParamModel.compute(ds_filled, **dynamic_kwargs)
+            
             ds_processed = agpm_model.to_dataset(name=agrometparam)
             ds_processed.to_netcdf(save_path)
         else:
             print(f"[SKIP] {save_path} already exists.")
         saved_forecast_paths[i] = save_path
+        
     return saved_hindcast_paths, saved_forecast_paths
+
+# def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization, year_start, year_end, year_forecast, nb_cores=2, agrometparam="Onset"):
+#     """
+#     Process model hindcast and forecast data for agrometeorological parameters.
+
+#     Parameters
+#     ----------
+#     agmParamModel : object
+#         Model object with a compute method for processing agrometeorological parameters.
+#     dir_to_save : str
+#         Directory path to save processed data.
+#     hdcst_file_path : dict
+#         Dictionary mapping model names to hindcast file paths.
+#     fcst_file_path : dict
+#         Dictionary mapping model names to forecast file paths.
+#     obs_hdcst : xarray.Dataset
+#         Observational hindcast dataset.
+#     obs_fcst_year : xarray.Dataset
+#         Observational forecast dataset for the specified year.
+#     month_of_initialization : int
+#         Month of model initialization.
+#     year_start : int
+#         Start year of the hindcast data.
+#     year_end : int
+#         End year of the hindcast data.
+#     year_forecast : int
+#         Forecast year.
+#     nb_cores : int, optional
+#         Number of CPU cores for parallel processing (default is 2).
+#     agrometparam : str, optional
+#         Name of the agrometeorological parameter (default is 'Onset').
+
+#     Returns
+#     -------
+#     tuple
+#         Tuple of dictionaries (saved_hindcast_paths, saved_forecast_paths) mapping model names to saved file paths.
+#     """
+#     mask = xr.where(~np.isnan(obs_fcst_year.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+#     t_coord = pd.date_range(start=f"{year_forecast}-01-01", end=f"{year_forecast}-12-31", freq="D")
+#     y_coords = obs_fcst_year.Y
+#     x_coords = obs_fcst_year.X
+
+#     if calendar.isleap(year_forecast):
+#         daily_climatology = obs_hdcst.groupby('T.dayofyear').mean(dim='T')
+#         data = daily_climatology.to_numpy()
+#         dummy = xr.DataArray(
+#             data=data,
+#             coords={"T": t_coord, "Y": y_coords, "X": x_coords},
+#             dims=["T", "Y", "X"]
+#         ) * mask
+#     else:
+#         daily_climatology = obs_hdcst.groupby('T.dayofyear').mean(dim='T')
+#         daily_climatology = daily_climatology.sel(dayofyear=~((daily_climatology['dayofyear'] == 60)))
+#         data = daily_climatology.to_numpy()
+#         dummy = xr.DataArray(
+#             data=data,
+#             coords={"T": t_coord, "Y": y_coords, "X": x_coords},
+#             dims=["T", "Y", "X"]
+#         ) * mask
+
+#     abb_mont_ini = calendar.month_abbr[int(month_of_initialization)]
+#     dir_to_save = Path(f"{dir_to_save}/model_data")
+#     os.makedirs(dir_to_save, exist_ok=True)
+#     saved_hindcast_paths = {}
+#     for i in hdcst_file_path.keys():
+#         save_path = f"{dir_to_save}/hindcast_{i}_{agrometparam}_{abb_mont_ini}Ic.nc"
+#         if not os.path.exists(save_path):
+#             hdcst = xr.open_dataset(hdcst_file_path[i])
+#             if 'number' in hdcst.dims:
+#                 hdcst = hdcst.mean(dim="number")
+#             hdcst = hdcst.to_array().drop_vars("variable").squeeze()
+#             obs_hdcst_sel = obs_hdcst.sel(T=slice(str(year_start), str(year_end)))
+#             obs_hdcst_interp = obs_hdcst_sel.interp(Y=hdcst.Y, X=hdcst.X, method="linear", kwargs={"fill_value": "extrapolate"})
+#             ds1_aligned, ds2_aligned = xr.align(hdcst, obs_hdcst_interp, join='outer')
+#             filled_ds = ds1_aligned.fillna(ds2_aligned)
+#             ds_filled = filled_ds.copy()
+#             agpm_model = agmParamModel.compute(ds_filled.sortby("T"), nb_cores=nb_cores)
+#             ds_processed = agpm_model.to_dataset(name=agrometparam)
+#             ds_processed.to_netcdf(save_path)
+#         else:
+#             print(f"[SKIP] {save_path} already exists.")
+#         saved_hindcast_paths[i] = save_path
+#     saved_forecast_paths = {}
+#     for i in fcst_file_path.keys():
+#         save_path = f"{dir_to_save}/forecast_{i}_{agrometparam}_{abb_mont_ini}Ic.nc"
+#         if not os.path.exists(save_path):
+#             fcst = xr.open_dataset(fcst_file_path[i])
+#             if 'number' in fcst.dims:
+#                 fcst = fcst.mean(dim="number")
+#             fcst = fcst.to_array().drop_vars("variable").squeeze()
+#             obs_fcst_sel = obs_fcst_year.sortby("T").sel(T=str(year_forecast))
+#             obs_fcst_interp = obs_fcst_sel.interp(Y=fcst.Y, X=fcst.X, method="linear", kwargs={"fill_value": "extrapolate"})
+#             ds1_aligned, ds2_aligned = xr.align(fcst, obs_fcst_interp, join='outer')
+#             filled_fcst = ds1_aligned.fillna(ds2_aligned)
+#             ds_filled = filled_fcst.copy()
+#             ds_filled = ds_filled.sortby("T")
+#             dummy = dummy.interp(Y=fcst.Y, X=fcst.X, method="linear", kwargs={"fill_value": "extrapolate"})
+#             ds1_aligned, ds2_aligned = xr.align(ds_filled, dummy, join='outer')
+#             filled_fcst_ = ds1_aligned.fillna(ds2_aligned)
+#             ds_filled = filled_fcst_.copy()
+#             ds_filled = ds_filled.sortby("T")
+#             agpm_model = agmParamModel.compute(ds_filled, nb_cores=nb_cores)
+#             ds_processed = agpm_model.to_dataset(name=agrometparam)
+#             ds_processed.to_netcdf(save_path)
+#         else:
+#             print(f"[SKIP] {save_path} already exists.")
+#         saved_forecast_paths[i] = save_path
+#     return saved_hindcast_paths, saved_forecast_paths
 
 
 def plot_date(A):
