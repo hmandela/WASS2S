@@ -1752,6 +1752,9 @@ class WAS_Download:
             pivot = season_months[0]
             # For naming
             season_str = "".join([calendar.month_abbr[m] for m in season_months])
+
+            now = datetime.datetime.now()
+            curr_yr, curr_mon = now.year, now.month
     
             for c, v in zip(centers, vars_):
                 # =================================================================
@@ -1776,15 +1779,20 @@ class WAS_Download:
                     
                     # Loop through the "Seasonal Years"
                     for s_year in range(year_start, year_end + 1):
+                        
                         for month in season_months:
-                            # Calculate actual calendar year for this month
-                            # If month is >= pivot, it belongs to s_year (e.g. Nov 2000)
-                            # If month is < pivot, it belongs to s_year + 1 (e.g. Jan 2001)
                             if month >= pivot:
                                 cal_year = s_year
                             else:
                                 cal_year = s_year + 1
-                            
+
+                            if cal_year == year_end + 1 and month >= pivot:
+                                continue
+                            if cal_year > year_end + 1:
+                                continue
+                            if (cal_year > curr_yr) or (cal_year == curr_yr and month > curr_mon):
+                                continue
+                                
                             # ERSST v5 filename format: ersst.v5.YYYYMM.nc
                             fname = f"ersst.v6.{cal_year}{month:02d}.nc"
                             required_files.append((cal_year, month, fname))

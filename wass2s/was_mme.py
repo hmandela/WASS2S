@@ -463,7 +463,8 @@ class WAS_mme_Weighted:
         forecast_det : xarray.DataArray
             Weighted forecast data with dimensions (T, Y, X).
         """
-
+        if "M" in rainfall.coords:
+            rainfall = rainfall.isel(M=0).drop_vars("M").squeeze()
         # Adjust time coordinates as needed.
         year = fcst.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
         T_value_1 = rainfall.isel(T=0).coords['T'].values
@@ -475,7 +476,7 @@ class WAS_mme_Weighted:
         hdcst['T'] = rainfall['T'].astype('datetime64[ns]')
         
         # Create a mask based on non-NaN values in the rainfall data.
-        mask = xr.where(~np.isnan(rainfall.isel(T=0, M=0)), 1, np.nan)\
+        mask = xr.where(~np.isnan(rainfall.isel(T=0)), 1, np.nan)\
                  .drop_vars(['T']).squeeze().to_numpy()
 
         if self.equal_weighted:
@@ -547,13 +548,19 @@ class WAS_mme_Weighted:
                 mask_fc = xr.where(np.isnan(forecast_det), 1, 0)
                 hindcast_det = hindcast_det.fillna(0) + hindcast_det_unweighted * mask_hd
                 forecast_det = forecast_det.fillna(0) + forecast_det_unweighted * mask_fc
-                
-        if "M" in hindcast_det.coords:
-            hindcast_det = hindcast_det.drop_vars('M')
-        if "M" in forecast_det.coords:
-            forecast_det = forecast_det.drop_vars('M')
+
+        # Drop any coordinate not in ("T", "Y", "X") for hindcast_det
+        extra_coords_h = [c for c in hindcast_det.coords if c not in ("T", "Y", "X")]
+        if extra_coords_h:
+            hindcast_det = hindcast_det.drop_vars(extra_coords_h)
+
+        # Drop any coordinate not in ("T", "Y", "X") for forecast_det
+        extra_coords_f = [c for c in forecast_det.coords if c not in ("T", "Y", "X")]
+        if extra_coords_f:
+            forecast_det = forecast_det.drop_vars(extra_coords_f)  
+
                          
-        return hindcast_det * mask, forecast_det * mask
+        return hindcast_det , forecast_det 
 
 
     # ------------------ Probability Calculation Methods ------------------
@@ -1332,7 +1339,7 @@ class WAS_Min2009_ProbWeighted:
     What this class does
     --------------------
     1) For each model:
-       - compute tercile probabilities (BN/NN/AN) at each gridpoint
+       - compute tercile probabilities (PB/PN/PA) at each gridpoint
          from its ensemble forecast using:
            * 'gaussian'  : Gaussian approximation (good for temperature anomalies)
            * 'lognormal' : log-normal approximation (better for precip amounts)
@@ -1341,24 +1348,11 @@ class WAS_Min2009_ProbWeighted:
          w_m ∝ sqrt(Nm)  (Nm = ensemble size), then normalized to sum to 1
     3) Optionally compute a combined categorical map with a chi-square significance test.
 
-    Key robustness fixes (vs your failing version)
-    ----------------------------------------------
-    A) No more time:0 outputs:
-       - If CV stats carry 'time' (LOO/rolling) and forecast time is real-time (not in hindcast),
-         xarray alignment yields empty intersection. We detect this and fallback to spatial-only stats
-         computed from full hindcast, then broadcast to forecast time.
-
-    B) No more "All-NaN slice encountered" in argmax:
-       - We do argmax on probs filled with -inf, then mask invalid pixels to 0.
-
-    C) Safe normalization:
-       - Probabilities are clipped to [0,1] and renormalized only where total>0 and finite.
-
     Assumed dims
     ------------
     Each model DataArray should have at least:
-      - forecasts[m]: dims include ('ensemble',) and optionally 'time'
-      - hindcasts[m]: dims include ('time','ensemble')
+      - forecasts[m]: dims include ('M',) and optionally 'time'
+      - hindcasts[m]: dims include ('T','M')
     Spatial dims can be ('lat','lon') or ('Y','X') or anything; the code is generic.
 
     Notes
@@ -1434,23 +1428,23 @@ class WAS_Min2009_ProbWeighted:
         Return (mu, sigma). If cv_method is None -> spatial-only stats.
         If cv_method in {leave_one_out, rolling_window} -> returns stats with a 'time' dim.
         """
-        self._require_dims(hindcasts, ("time", "ensemble"), name="hindcasts")
+        self._require_dims(hindcasts, ("T", "M"), name="hindcasts")
 
         if self.cv_method is None:
-            mu = hindcasts.mean(dim=("time", "ensemble"))
-            sigma = hindcasts.std(dim=("time", "ensemble"))
+            mu = hindcasts.mean(dim=("T", "M"))
+            sigma = hindcasts.std(dim=("T", "M"))
             return mu, sigma
 
-        n_times = hindcasts.sizes["time"]
+        n_times = hindcasts.sizes["T"]
 
         if self.cv_method == "leave_one_out":
             mu_list, sig_list = [], []
             for i in range(n_times):
-                h_train = hindcasts.isel(time=[j for j in range(n_times) if j != i])
-                mu_list.append(h_train.mean(dim=("time", "ensemble")))
-                sig_list.append(h_train.std(dim=("time", "ensemble")))
-            mu = xr.concat(mu_list, dim=hindcasts["time"])
-            sigma = xr.concat(sig_list, dim=hindcasts["time"])
+                h_train = hindcasts.isel(T=[j for j in range(n_times) if j != i])
+                mu_list.append(h_train.mean(dim=("T", "M")))
+                sig_list.append(h_train.std(dim=("T", "M")))
+            mu = xr.concat(mu_list, dim=hindcasts["T"])
+            sigma = xr.concat(sig_list, dim=hindcasts["T"])
             return mu, sigma
 
         if self.cv_method == "rolling_window":
@@ -1459,16 +1453,16 @@ class WAS_Min2009_ProbWeighted:
             for i in range(n_times):
                 start = max(0, i - w // 2)
                 end = min(n_times, i + w // 2 + 1)
-                h_win = hindcasts.isel(time=slice(start, end))
+                h_win = hindcasts.isel(T=slice(start, end))
                 local_i = i - start
-                if 0 <= local_i < h_win.sizes["time"]:
-                    h_train = h_win.isel(time=[j for j in range(h_win.sizes["time"]) if j != local_i])
+                if 0 <= local_i < h_win.sizes["T"]:
+                    h_train = h_win.isel(T=[j for j in range(h_win.sizes["T"]) if j != local_i])
                 else:
                     h_train = h_win
-                mu_list.append(h_train.mean(dim=("time", "ensemble")))
-                sig_list.append(h_train.std(dim=("time", "ensemble")))
-            mu = xr.concat(mu_list, dim=hindcasts["time"])
-            sigma = xr.concat(sig_list, dim=hindcasts["time"])
+                mu_list.append(h_train.mean(dim=("T", "M")))
+                sig_list.append(h_train.std(dim=("T", "M")))
+            mu = xr.concat(mu_list, dim=hindcasts["T"])
+            sigma = xr.concat(sig_list, dim=hindcasts["T"])
             return mu, sigma
 
         raise ValueError(f"Unknown cv_method={self.cv_method!r}")
@@ -1487,12 +1481,12 @@ class WAS_Min2009_ProbWeighted:
         # clamp sigma early
         sigma = xr.where(sigma <= self.sigma_floor, np.nan, sigma)
 
-        if "time" in mu.dims and "time" in f_mean.dims:
-            overlap = np.intersect1d(mu["time"].values, f_mean["time"].values)
+        if "T" in mu.dims and "T" in f_mean.dims:
+            overlap = np.intersect1d(mu["T"].values, f_mean["T"].values)
             if overlap.size == 0:
                 # operational forecast date, not in hindcast -> use full hindcast stats
-                mu = hindcasts.mean(dim=("time", "ensemble"))
-                sigma = hindcasts.std(dim=("time", "ensemble"))
+                mu = hindcasts.mean(dim=("T", "M"))
+                sigma = hindcasts.std(dim=("T", "M"))
                 sigma = xr.where(sigma <= self.sigma_floor, np.nan, sigma)
 
         mu = mu.broadcast_like(f_mean)
@@ -1511,10 +1505,10 @@ class WAS_Min2009_ProbWeighted:
         Compute BN/NN/AN for a single model, returning three DataArrays
         aligned to the forecast mean (and its time, if present).
         """
-        self._require_dims(forecasts, ("ensemble",), name="forecasts")
-        self._require_dims(hindcasts, ("time", "ensemble"), name="hindcasts")
+        self._require_dims(forecasts, ("M",), name="forecasts")
+        self._require_dims(hindcasts, ("T", "M"), name="hindcasts")
 
-        f_mean = forecasts.mean(dim="ensemble")
+        f_mean = forecasts.mean(dim="M")
         lower_k, upper_k = -0.4307, 0.4307
 
         if self.distribution == "gaussian":
@@ -1536,7 +1530,7 @@ class WAS_Min2009_ProbWeighted:
             f_pos = xr.where(forecasts > 0, forecasts, eps)
 
             log_h = np.log(h_pos)
-            log_f_mean = np.log(f_pos).mean(dim="ensemble")
+            log_f_mean = np.log(f_pos).mean(dim="M")
 
             mu, sigma = self._compute_cross_validated_stats(log_h)
             mu, sigma = self._align_or_fallback_stats(mu, sigma, log_f_mean, log_h)
@@ -1551,8 +1545,8 @@ class WAS_Min2009_ProbWeighted:
 
         if self.distribution == "empirical":
             # empirical terciles from hindcasts
-            q33 = hindcasts.quantile(1 / 3, dim=("time", "ensemble"))
-            q66 = hindcasts.quantile(2 / 3, dim=("time", "ensemble"))
+            q33 = hindcasts.quantile(1 / 3, dim=("T", "M"))
+            q66 = hindcasts.quantile(2 / 3, dim=("T", "M"))
 
             q33 = q33.broadcast_like(f_mean)
             q66 = q66.broadcast_like(f_mean)
@@ -1576,11 +1570,11 @@ class WAS_Min2009_ProbWeighted:
         strict_models: bool = True,
     ) -> Dict[str, xr.DataArray]:
         """
-        Compute PMME probabilities (BN/NN/AN) across models.
+        Compute PMME probabilities (PB/PN/PA) across models.
 
         Returns
         -------
-        pmme_probs : dict with keys 'BN','NN','AN' (DataArray maps)
+        pmme_probs : dict with keys 'PB','PN','PA' (DataArray maps)
         """
         if strict_models and set(forecasts.keys()) != set(hindcasts.keys()):
             raise ValueError("forecasts and hindcasts must have the same model keys when strict_models=True.")
@@ -1590,7 +1584,7 @@ class WAS_Min2009_ProbWeighted:
             raise ValueError("No common models between forecasts and hindcasts.")
 
         if ensemble_sizes is None:
-            ensemble_sizes = {m: int(forecasts[m].sizes["ensemble"]) for m in model_names}
+            ensemble_sizes = {m: int(forecasts[m].sizes["M"]) for m in model_names}
 
         weights = self._compute_model_weights(ensemble_sizes)
 
@@ -1598,20 +1592,20 @@ class WAS_Min2009_ProbWeighted:
         per_model = {}
         for m in model_names:
             p_bn, p_nn, p_an = self._compute_tercile_probabilities_one_model(forecasts[m], hindcasts[m])
-            per_model[m] = {"BN": p_bn, "NN": p_nn, "AN": p_an}
+            per_model[m] = {"PB": p_bn, "PN": p_nn, "PA": p_an}
 
         # weighted sum
-        template = per_model[model_names[0]]["BN"]
+        template = per_model[model_names[0]]["PB"]
         pmme_probs = {}
-        for cat in ("BN", "NN", "AN"):
+        for cat in ("PB", "PN", "PA"):
             wsum = xr.zeros_like(template)
             for m in model_names:
                 wsum = wsum + per_model[m][cat] * float(weights[m])
             pmme_probs[cat] = wsum
 
         # (optional) ensure valid probs
-        pmme_probs["BN"], pmme_probs["NN"], pmme_probs["AN"] = self._safe_clip_and_renorm(
-            pmme_probs["BN"], pmme_probs["NN"], pmme_probs["AN"]
+        pmme_probs["PB"], pmme_probs["PN"], pmme_probs["PA"] = self._safe_clip_and_renorm(
+            pmme_probs["PB"], pmme_probs["PN"], pmme_probs["PA"]
         )
         return pmme_probs
 
@@ -1628,34 +1622,34 @@ class WAS_Min2009_ProbWeighted:
         Returns
         -------
         combined_map : DataArray
-            values: 0=no significant deviation, 1=BN, 2=NN, 3=AN
+            values: 0=no significant deviation, 1=PB, 2=PN, 3=PA
         chi_square : DataArray
             chi-square statistic
         """
-        for k in ("BN", "NN", "AN"):
+        for k in ("PB", "PN", "PA"):
             if k not in pmme_probs:
                 raise ValueError(f"pmme_probs missing key {k!r}")
 
         # stack probs
         probs_array = xr.concat(
-            [pmme_probs["BN"], pmme_probs["NN"], pmme_probs["AN"]],
-            dim=xr.DataArray(["BN", "NN", "AN"], dims="category", name="category"),
+            [pmme_probs["PB"], pmme_probs["PN"], pmme_probs["PA"]],
+            dim=xr.DataArray(["PB", "PN", "PA"], dims="probability", name="probability"),
         )
 
         # valid pixels = at least one category not null
-        valid_any = probs_array.notnull().any("category")
+        valid_any = probs_array.notnull().any("probability")
 
         # SAFE argmax: fill NaNs with -inf just for argmax
-        dominant = probs_array.fillna(-np.inf).argmax(dim="category", skipna=False)
+        dominant = probs_array.fillna(-np.inf).argmax(dim="probability", skipna=False)
 
         # chi-square
         n = self._compute_n_for_chisq(ensemble_sizes, model_names)
         expected = 1.0 / 3.0
 
         chi_square = n * (
-            (pmme_probs["BN"] - expected) ** 2 / expected
-            + (pmme_probs["NN"] - expected) ** 2 / expected
-            + (pmme_probs["AN"] - expected) ** 2 / expected
+            (pmme_probs["PB"] - expected) ** 2 / expected
+            + (pmme_probs["PN"] - expected) ** 2 / expected
+            + (pmme_probs["PA"] - expected) ** 2 / expected
         )
 
         critical = float(stats.chi2.ppf(1.0 - float(significance_level), df=2))
@@ -1664,7 +1658,7 @@ class WAS_Min2009_ProbWeighted:
 
         combined.attrs = {
             "description": "PMME combined forecast map (Min et al. 2009 probability-weighted)",
-            "values": "0=no significant deviation, 1=BN, 2=NN, 3=AN",
+            "values": "0=no significant deviation, 1=PB, 2=PN, 3=PA",
             "significance_level": float(significance_level),
             "chi2_critical_value": critical,
         }

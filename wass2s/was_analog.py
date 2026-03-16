@@ -655,6 +655,8 @@ class WAS_Analog:
     
         months = [f"{m:02d}" for m in range(1, 13)]
         season = "".join([calendar.month_abbr[int(m)] for m in months])
+        now = datetime.datetime.now()
+        curr_yr, curr_mon = now.year, now.month
         store_file_path = {}
 
         for center, var, area in zip(centers, variables, areas):
@@ -687,6 +689,13 @@ class WAS_Analog:
                             cal_year = s_year
                         else:
                             cal_year = s_year + 1
+
+                        if cal_year == year_end and month >= pivot:
+                            continue
+                        if cal_year > year_end:
+                            continue
+                        if (cal_year > curr_yr) or (cal_year == curr_yr and month > curr_mon):
+                            continue
                         
                         # ERSST v6 filename format: ersst.v6.YYYYMM.nc
                         fname = f"ersst.v6.{cal_year}{month:02d}.nc"
@@ -737,7 +746,7 @@ class WAS_Analog:
                     
                     ds = ds.rename(rename_dict)
 
-                    print(ds)
+                    # print(ds)
                     
                     # 3. Slice the Area
                     # Area format: [N, W, S, E]
@@ -749,7 +758,7 @@ class WAS_Analog:
 
                         
                     ds["T"] = ds["T"].astype("datetime64[ns]")
-                    print(ds)
+                    # print(ds)
                     # ds = ds.rename({'SST': 'sst'})
                     store_file_path[var] = ds
                     ds.to_netcdf(combined_output_path)
@@ -2265,8 +2274,8 @@ class WAS_Analog:
         ireference_year = 2100
 
         similar_years = method_map[self.method_analog](predictant, itrain, ireference_year)
-        if len(similar_years)>2:
-            similar_years = similar_years[:2]
+        if len(similar_years)>4:
+            similar_years = similar_years[:4]
         else:
             similar_years = similar_years[:len(similar_years)]
 

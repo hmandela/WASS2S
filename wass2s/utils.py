@@ -38,6 +38,7 @@ from matplotlib.patches import Rectangle
 from matplotlib import gridspec
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from matplotlib.colors import ListedColormap, BoundaryNorm
+# from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 import cartopy.crs as ccrs
@@ -823,7 +824,7 @@ def retrieve_several_zones_for_PCR(dir_to_data, indices_dict, variables_list, ye
 def retrieve_single_zone_for_PCR(dir_to_data, indices_dict, variables_list, year_start, year_end, season=None, clim_year_start=None, clim_year_end=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None, standardize=True):
     """
     Retrieve data for a single zone for Principal Component Regression (PCR) with interpolation.
-
+skill_mask
     Parameters
     ----------
     dir_to_data : str
@@ -1143,12 +1144,16 @@ def get_shapefile(country_code, admin_level=0, source="naturalearth"):
         
         return gpd.read_file(shp_file)
 
-def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, 
+
+
+
+
+def plot_prob_forecastsAlpha(dir_to_save, forecast_prob, model_name, 
                         country_code="GHA", admin_level=0, source="naturalearth",
                         labels=["Below-Normal", "Near-Normal", "Above-Normal"], 
                         reverse_cmap=True, hspace=None, logo=None, 
                         logo_size=("10%", "10%"), logo_position="lower left", 
-                        sigma=None, res=None, stations_df=None, out="pdf"):
+                        sigma=None, res=None, stations_df=None, out="pdf", dynamic_scalebar=False):
 
     # 3. Spatial Smoothing
     if sigma:
@@ -1176,25 +1181,6 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name,
     mask = regionmask.mask_3D_geopandas(gdf, forecast_prob.X, forecast_prob.Y)
     forecast_prob = forecast_prob.where(mask.any(dim='region'))
 
-
-    # # 3. Spatial Smoothing
-    # if sigma:
-    #     for p in forecast_prob.probability:
-    #         forecast_prob.loc[{'probability': p}] = gaussian_filter(forecast_prob.sel(probability=p), sigma=sigma)
-
-    # if res is not None:
-    #     min_X = forecast_prob['X'].min().values
-    #     max_X = forecast_prob['X'].max().values
-    #     min_Y = forecast_prob['Y'].min().values
-    #     max_Y = forecast_prob['Y'].max().values
-    #     num_X = int((max_X - min_X) / res) + 1
-    #     num_Y = int((max_Y - min_Y) / res) + 1
-    #     new_X = np.linspace(min_X, max_X, num_X)
-    #     new_Y = np.linspace(min_Y, max_Y, num_Y)
-    #     forecast_prob = forecast_prob.interp(X=new_X, Y=new_Y, method='linear',
-    #                                             kwargs={'fill_value': 'extrapolate'}    
-    #                                         )
-
     # 4. Tercile Selection
     max_prob = forecast_prob.max(dim="probability")
     max_cat = forecast_prob.fillna(-1).argmax(dim="probability")
@@ -1203,35 +1189,57 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name,
     plotted_floats = max_prob.values.flatten()
     plotted_floats = plotted_floats[~np.isnan(plotted_floats)] * 100
     
-    if len(plotted_floats) > 0:
+    if dynamic_scalebar and len(plotted_floats) > 0:
         g_vmin = max(35, np.floor(plotted_floats.min() / 5) * 5)
         g_vmax = min(100, np.ceil(plotted_floats.max() / 5) * 5)
+        # Create ticks based on dynamic g_vmin and g_vmax with 5% intervals
+        cbar_ticks_bn = np.arange(g_vmin, g_vmax + 1, 5)
+        cbar_ticks_nn = np.arange(g_vmin, g_vmax + 1, 5)
+        cbar_ticks_an = np.arange(g_vmin, g_vmax + 1, 5)
     else:
-        g_vmin, g_vmax = 35, 85
+        cbar_ticks_bn = np.arange(35, 85 + 1, 5)
+        cbar_ticks_nn = np.arange(35, 65 + 1, 5)
+        cbar_ticks_an = np.arange(35, 85 + 1, 5)
 
+    num_bins_bn = len(cbar_ticks_bn) - 1
+    num_bins_nn = len(cbar_ticks_nn) - 1
+    num_bins_an = len(cbar_ticks_an) - 1
+    
     # 6. Plotting Infrastructure
     fig = plt.figure(figsize=(12, 10))
-    gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.4], hspace=hspace or -0.5, wspace=0.3)
+    gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2],hspace=hspace or -0.5, wspace=0.3)
     ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
     
     # Zoom to shapefile
     bounds = gdf.total_bounds
     ax.set_extent([bounds[0]-0.1, bounds[2]+0.1, bounds[1]-0.1, bounds[3]+0.1])
 
-    # Colormaps
-    # an_colors = ["#fff7bc", "#662506"] if reverse_cmap else ["#e5f5f9", "#00441b"]
-    # bn_colors = ["#e5f5f9", "#00441b"] if reverse_cmap else ["#fff7bc", "#662506"]
-
-    an_colors = ["#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"] if reverse_cmap else ["#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"]
-    bn_colors = ["#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"] if reverse_cmap else ["#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]
+    # ---- DISCRETE COLORMAP AND BOUNDARY NORM SETUP ----
     
+
+    # Base Colors
+    an_colors = ['#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443', '#006837', '#004529']
+    bn_colors = ['#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026']
+    nn_colors = ["#ffeda0", "#f7fcb9"]
+    
+    if reverse_cmap:
+        an_colors, bn_colors = bn_colors, an_colors
+
+    # Build discrete colormaps matching the exact number of required bins
     cmaps = [
-        mcolors.LinearSegmentedColormap.from_list('BN', bn_colors),
-        mcolors.LinearSegmentedColormap.from_list('NN', ["#d9d9d9", "#525252"]),
-        mcolors.LinearSegmentedColormap.from_list('AN', an_colors)
+        mcolors.LinearSegmentedColormap.from_list('BN', bn_colors, N=num_bins_bn),
+        mcolors.LinearSegmentedColormap.from_list('NN', nn_colors, N=num_bins_nn),
+        mcolors.LinearSegmentedColormap.from_list('AN', an_colors, N=num_bins_an)
+    ]
+    
+    # Create BoundaryNorms to strictly enforce discrete color blocks
+    norms = [
+        mcolors.BoundaryNorm(cbar_ticks_bn, cmaps[0].N),
+        mcolors.BoundaryNorm(cbar_ticks_nn, cmaps[1].N),
+        mcolors.BoundaryNorm(cbar_ticks_an, cmaps[2].N)
     ]
 
-    # Plot terciles with shared Vmin/Vmax
+    # Plot terciles using the discrete norms
     data_layers = [
         (max_prob.where(max_cat == 0)*100), 
         (max_prob.where(max_cat == 1)*100), 
@@ -1240,9 +1248,13 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name,
     
     ims = []
     for i, data in enumerate(data_layers):
-        im = ax.pcolormesh(forecast_prob.X, forecast_prob.Y, data, 
-                           cmap=cmaps[i], vmin=g_vmin, vmax=g_vmax, 
-                           transform=ccrs.PlateCarree(), alpha=0.9, zorder=2)
+        if np.any(~np.isnan(data.values)):
+            im = ax.pcolormesh(forecast_prob.X, forecast_prob.Y, data, 
+                               cmap=cmaps[i], norm=norms[i], 
+                               transform=ccrs.PlateCarree(), alpha=0.9, zorder=2)
+        else:
+            im = cm.ScalarMappable(norm=norms[i], cmap=cmaps[i])
+            im.set_array([])
         ims.append(im)
 
     # 7. Add Boundary & Stations
@@ -1259,47 +1271,37 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name,
                 txt = ax.text(lon + 0.02, lat + 0.02, col, fontsize=8, transform=ccrs.PlateCarree(), zorder=11)
                 txt.set_path_effects([path_effects.withStroke(linewidth=2, foreground='w')])
 
-
     # 8. Add logo if provided
-    
     if logo is not None:
         ax_logo = inset_axes(ax,
-                            width=logo_size[0],  # Width of the logo    
-                            height=logo_size[1],  # Height of the logo        
+                            width=logo_size[0],    
+                            height=logo_size[1],        
                             loc=logo_position,
                             borderpad=0)        
         ax_logo.imshow(mpimg.imread(logo))
         ax_logo.axis("off") 
-    if logo is not None:
-        logo_size=  ("21%","21%")  # Default logo size if not provided
-    else:
-        logo_size = logo_size  # Use the provided logo size
-        
 
-    # 9. Unified Colorbars
-    cbar_ticks = np.linspace(g_vmin, g_vmax, 6).astype(int)
+
+
+
+    # 9. Unified Discrete Colorbars with Inward Ticks
+    all_ticks = [cbar_ticks_bn, cbar_ticks_nn, cbar_ticks_an]
+
     for i, label in enumerate(labels):
+        current_ticks = all_ticks[i]  # Fetch the specific ticks for this category
+        
         cax = fig.add_subplot(gs[1, i])
-        cb = plt.colorbar(ims[i], cax=cax, orientation='horizontal')
+        
+        cb = plt.colorbar(ims[i], cax=cax, orientation='horizontal', 
+                          spacing='uniform', ticks=current_ticks)
+        
         cb.set_label(f"{label} (%)", fontsize=10)
-        cb.set_ticks(cbar_ticks)
-
-    # for i, label in enumerate(labels):
-    #         cax = fig.add_subplot(gs[1, i])
-    #         cb = plt.colorbar(ims[i], cax=cax, orientation='horizontal')
-    #         cb.set_label(f"{label} (%)", fontsize=10, fontweight='bold')
-    #         cb.set_ticks(cbar_ticks)
-    #         cb.ax.tick_params(labelsize=9, length=0) # Hide default tick marks
-            
-    #         # --- THE FIX: Draw blank fine lines (white separators) ---
-    #         # We normalize the tick values to the 0-1 range of the colorbar axis
-    #         tick_locs = (cbar_ticks - g_vmin) / (g_vmax - g_vmin)
-    #         cb.ax.vlines(tick_locs, 0, 1, colors='white', linewidth=1.5, zorder=10)
-            
-    #         # Optional: Outline the colorbar for a "boxed" look
-    #         for spine in cb.ax.spines.values():
-    #             spine.set_visible(True)
-    #             spine.set_linewidth(0.5)
+        cb.set_ticklabels([f"{int(t)}" for t in current_ticks])
+        cb.ax.tick_params(axis='x', direction='in', length=6, color='black')
+        
+        # INVERT THE BN AXIS (First loop iteration)s
+        if i == 0:
+            cax.invert_xaxis()
 
     # 10. Final Aesthetics
     ax.set_title(f"Probabilistic Seasonal Forecast\n{model_name}", fontsize=14, pad=20, fontweight='bold')
@@ -1308,9 +1310,198 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name,
     
     plt.savefig(os.path.join(dir_to_save, f"{model_name}.{out}"), dpi=300, bbox_inches='tight')
     plt.show()
+    plt.close('all')
+
+
+def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, title = "Seasonal Forecast for Gulf of Guinea Countries \n Valid for March-April-May 2026, Issued February 27, 2026" ,
+                        country_code="GHA", admin_level=0, source="naturalearth",
+                        labels=["Below-Normal", "Near-Normal", "Above-Normal"], 
+                        reverse_cmap=True, hspace=None, 
+                        logo=None, logo_size=("10%", "10%"), logo_position="lower left", 
+                        logo_left=None, logo_left_size=("12%", "12%"), 
+                        logo_right=None, logo_right_size=("12%", "12%"),
+                        sigma=None, res=None, stations_df=None, out="pdf", dynamic_scalebar=False):
+
+    # 3. Spatial Smoothing
+    if sigma:
+        for p in forecast_prob.probability:
+            forecast_prob.loc[{'probability': p}] = gaussian_filter(forecast_prob.sel(probability=p), sigma=sigma)
+
+    if res is not None:
+        min_X = forecast_prob['X'].min().values
+        max_X = forecast_prob['X'].max().values
+        min_Y = forecast_prob['Y'].min().values
+        max_Y = forecast_prob['Y'].max().values
+        num_X = int((max_X - min_X) / res) + 1
+        num_Y = int((max_Y - min_Y) / res) + 1
+        new_X = np.linspace(min_X, max_X, num_X)
+        new_Y = np.linspace(min_Y, max_Y, num_Y)
+        forecast_prob = forecast_prob.interp(X=new_X, Y=new_Y, method='linear',
+                                                kwargs={'fill_value': 'extrapolate'}    
+                                            )
+    
+    # 1. Automatic Shapefile Ingestion
+    gdf = get_shapefile(country_code, admin_level, source)
+    if gdf.crs != "EPSG:4326": gdf = gdf.to_crs("EPSG:4326")
+
+    # 2. Map Cutting (Masking)
+    mask = regionmask.mask_3D_geopandas(gdf, forecast_prob.X, forecast_prob.Y)
+    forecast_prob = forecast_prob.where(mask.any(dim='region'))
+
+    # 4. Tercile Selection
+    max_prob = forecast_prob.max(dim="probability")
+    max_cat = forecast_prob.fillna(-1).argmax(dim="probability")
+    
+    # 5. Global Dynamic Scaling (Calculated ONLY from values inside boundary)
+    plotted_floats = max_prob.values.flatten()
+    plotted_floats = plotted_floats[~np.isnan(plotted_floats)] * 100
+    
+    if dynamic_scalebar and len(plotted_floats) > 0:
+        g_vmin = max(35, np.floor(plotted_floats.min() / 5) * 5)
+        g_vmax = min(100, np.ceil(plotted_floats.max() / 5) * 5)
+        # Create ticks based on dynamic g_vmin and g_vmax with 5% intervals
+        cbar_ticks_bn = np.arange(g_vmin, g_vmax + 1, 5)
+        cbar_ticks_nn = np.arange(g_vmin, g_vmax + 1, 5)
+        cbar_ticks_an = np.arange(g_vmin, g_vmax + 1, 5)
+    else:
+        cbar_ticks_bn = np.arange(35, 85 + 1, 5)
+        cbar_ticks_nn = np.arange(35, 65 + 1, 5)
+        cbar_ticks_an = np.arange(35, 85 + 1, 5)
+
+    num_bins_bn = len(cbar_ticks_bn) - 1
+    num_bins_nn = len(cbar_ticks_nn) - 1
+    num_bins_an = len(cbar_ticks_an) - 1
+    
+    # 6. Plotting Infrastructure
+    fig = plt.figure(figsize=(12, 10))
+    gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2],hspace=hspace or -0.5, wspace=0.3)
+    ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
+    
+    # Zoom to shapefile
+    bounds = gdf.total_bounds
+    ax.set_extent([bounds[0]-0.1, bounds[2]+0.1, bounds[1]-0.1, bounds[3]+0.1])
+
+    # ---- DISCRETE COLORMAP AND BOUNDARY NORM SETUP ----
+    
+    # Base Colors
+    an_colors = ['#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443', '#006837', '#004529']
+    bn_colors = ['#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026']
+    nn_colors = ["#ffeda0", "#f7fcb9"]
+    
+    if reverse_cmap:
+        an_colors, bn_colors, nn_colors  = bn_colors, an_colors, colors_nn[::-1]
+
+    # Build discrete colormaps matching the exact number of required bins
+    cmaps = [
+        mcolors.LinearSegmentedColormap.from_list('BN', bn_colors, N=num_bins_bn),
+        mcolors.LinearSegmentedColormap.from_list('NN', nn_colors, N=num_bins_nn),
+        mcolors.LinearSegmentedColormap.from_list('AN', an_colors, N=num_bins_an)
+    ]
+    
+    # Create BoundaryNorms to strictly enforce discrete color blocks
+    norms = [
+        mcolors.BoundaryNorm(cbar_ticks_bn, cmaps[0].N),
+        mcolors.BoundaryNorm(cbar_ticks_nn, cmaps[1].N),
+        mcolors.BoundaryNorm(cbar_ticks_an, cmaps[2].N)
+    ]
+
+    # Plot terciles using the discrete norms
+    data_layers = [
+        (max_prob.where(max_cat == 0)*100), 
+        (max_prob.where(max_cat == 1)*100), 
+        (max_prob.where(max_cat == 2)*100)
+    ]
+    
+    ims = []
+    for i, data in enumerate(data_layers):
+        if np.any(~np.isnan(data.values)):
+            im = ax.pcolormesh(forecast_prob.X, forecast_prob.Y, data, 
+                               cmap=cmaps[i], norm=norms[i], 
+                               transform=ccrs.PlateCarree(), alpha=0.9, zorder=2)
+        else:
+            im = cm.ScalarMappable(norm=norms[i], cmap=cmaps[i])
+            im.set_array([])
+        ims.append(im)
+
+    # 7. Add Boundary & Stations
+    ax.add_feature(ShapelyFeature(gdf.geometry, ccrs.PlateCarree(), facecolor='none', edgecolor='black', lw=1.5), zorder=5)
+    gl = ax.gridlines(draw_labels=True, linewidth=0.01, color='gray', alpha=0.8)
+    gl.top_labels = False
+    gl.right_labels = False
+    
+    if stations_df is not None:
+        for col in stations_df.columns[1:]:
+            lat, lon = stations_df.loc[0, col], stations_df.loc[1, col]
+            if not np.isnan(lat):
+                ax.plot(lon, lat, 'ro', markersize=4, markeredgecolor='w', transform=ccrs.PlateCarree(), zorder=10)
+                txt = ax.text(lon + 0.02, lat + 0.02, col, fontsize=8, transform=ccrs.PlateCarree(), zorder=11)
+                txt.set_path_effects([path_effects.withStroke(linewidth=2, foreground='w')])
+
+    # ==========================================
+    # 8. ADD LOGOS (Inside and Outside Options)
+    # ==========================================
+    
+    # Original: Logo inside the map
+    if logo is not None:
+        ax_logo = inset_axes(ax, width=logo_size[0], height=logo_size[1], 
+                             loc=logo_position, borderpad=0)        
+        ax_logo.imshow(mpimg.imread(logo))
+        ax_logo.axis("off") 
+
+    # New: Outside Left Logo
+    if logo_left is not None:
+        # bbox_to_anchor creates a bounding box starting slightly above the top-left of the axis (y=1.02)
+        ax_logo_l = inset_axes(ax, width=logo_left_size[0], height=logo_left_size[1],
+                               loc='lower left', bbox_to_anchor=(0.0, 1.06, 1, 1),
+                               bbox_transform=ax.transAxes, borderpad=0)
+        ax_logo_l.imshow(mpimg.imread(logo_left))
+        ax_logo_l.axis("off")
+
+    # New: Outside Right Logo
+    if logo_right is not None:
+        # Pinned to the lower right of the bounding box placed above the axis
+        ax_logo_r = inset_axes(ax, width=logo_right_size[0], height=logo_right_size[1],
+                               loc='lower right', bbox_to_anchor=(0.0, 1.06, 1, 1),
+                               bbox_transform=ax.transAxes, borderpad=0)
+        ax_logo_r.imshow(mpimg.imread(logo_right))
+        ax_logo_r.axis("off")
+
+
+    # 9. Unified Discrete Colorbars with Inward Ticks
+    all_ticks = [cbar_ticks_bn, cbar_ticks_nn, cbar_ticks_an]
+
+    for i, label in enumerate(labels):
+        current_ticks = all_ticks[i]  # Fetch the specific ticks for this category
+        
+        cax = fig.add_subplot(gs[1, i])
+        
+        cb = plt.colorbar(ims[i], cax=cax, orientation='horizontal', 
+                          spacing='uniform', ticks=current_ticks)
+        
+        cb.set_label(f"{label} (%)", fontsize=10)
+        cb.set_ticklabels([f"{int(t)}" for t in current_ticks])
+        cb.ax.tick_params(axis='x', direction='in', length=6, color='black')
+        
+        # INVERT THE BN AXIS (First loop iteration)s
+        if i == 0:
+            cax.invert_xaxis()
+
+    # 10. Final Aesthetics
+    # Dynamically increase title padding if top outside logos are active
+    t_pad = 30 if (logo_left is not None or logo_right is not None) else 20
+    ax.set_title(title.upper(), fontsize=14, pad=t_pad, fontweight='bold')
+    
+    ax.add_feature(cfeature.OCEAN.with_scale('50m'), facecolor='#e0f3ff')
+    ax.coastlines(resolution='10m')
+    
+    # bbox_inches='tight' will automatically ensure the outside logos and new padding are saved cleanly
+    plt.savefig(os.path.join(dir_to_save, f"{model_name}.{out}"), dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close('all')
+
 
 ######################################################################################################################
-####################### To use after deleting your xcast from the tools scipy 1.10 is a limit right now ##############
+####################### To use after deleting  xcast from the tools scipy 1.10 is a limit right now ##############
 
 # """
 # WAS probabilistic tercile plotting utilities (global functions)
@@ -3083,47 +3274,9 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name,
 #     )
 
 
-
-
 def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, hspace=None, logo=None, logo_size=(None,None), logo_position="lower left", sigma=None, res=None):
     """
-    Plot probabilistic forecasts with tercile categories.
-
-    Parameters
-    ----------
-    dir_to_save : str
-        Directory path to save the plot.
-    forecast_prob : xarray.DataArray
-        Data array containing probability forecasts with a 'probability' dimension.
-    model_name : str or numpy.ndarray
-        Name of the model for the plot title.
-    labels : list, optional
-        Labels for the tercile categories (default is ["Below-Normal", "Near-Normal", "Above-Normal"]).
-    reverse_cmap : bool, optional
-        If True, reverse the colormap order for categories (default is True).
-    hspace : float, optional
-        Height space between the main plot and the colorbar (default is -0.6).
-    sigma : float, optional
-        Standard deviation for Gaussian smoothing of probabilities (default is None, no smoothing).
-    res : float, optional
-        Resolution for interpolation of the forecast probabilities (default is None, no interpolation). 
-    logo : str, optional
-        Path to the logo image to be added to the plot (default is None).
-    logo_size : float, optional
-        Size of the logo image in the plot (default is 0.5).    
-    logo_position : str, optional
-        Position of the logo image in the plot (default is "lower left").       
-    logo_size : tuple, optional
-        Size of the logo image in the plot as (width, height) in inches (default is (None, None)).
-
-    Returns
-    -------
-    None
-
-    Notes
-    -----
-    Saves the plot as a PNG file and displays it.
-    Uses custom colormaps for each tercile category.
+    Plot probabilistic forecasts with tercile categories using discrete block colorbars.
     """
 
     if res is not None:
@@ -3141,7 +3294,7 @@ def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name, labels=["Below-
 
     if sigma is not None:
         # Create a smoothed copy
-        forecast_prob_smoothed = forecast_prob * 0.0  # Initialize with same shape and coords
+        forecast_prob_smoothed = forecast_prob * 0.0  
         
         # Smooth each probability layer spatially
         for p in forecast_prob.probability.values:
@@ -3158,15 +3311,11 @@ def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name, labels=["Below-
         # Normalize smoothed probabilities to sum to 1 at each grid point
         sum_probs = forecast_prob_smoothed.sum('probability')
         forecast_prob_smoothed = forecast_prob_smoothed / sum_probs.where(sum_probs != 0, 1.0)
-        
-        # Replace original with smoothed
         forecast_prob = forecast_prob_smoothed
 
     # Step 1: Extract maximum probability and category
-    max_prob = forecast_prob.max(dim="probability", skipna=True)  # Maximum probability at each grid point
-    # Fill NaN values with a very low value 
+    max_prob = forecast_prob.max(dim="probability", skipna=True) 
     filled_prob = forecast_prob.fillna(-9999)
-    # Compute argmax
     max_category = filled_prob.argmax(dim="probability")
     
     # Step 2: Create masks for each category
@@ -3174,37 +3323,48 @@ def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name, labels=["Below-
     mask_nn = max_category == 1  # Near Normal (NN)
     mask_an = max_category == 2  # Above Normal (AN)
     
-    # Step 3: Define custom colormaps
+    # Step 3: Define Custom Colors and Ticks for Discrete Bins
+    def create_ticks(vn=35, vx=86, step=5):
+        return np.arange(vn, vx, step)
+
+    ticks_bn = create_ticks(vn=35, vx=86, step=5) # 11 ticks, 10 bins
+    ticks_nn = create_ticks(vn=35, vx=66, step=5) # 7 ticks, 6 bins
+    ticks_an = create_ticks(vn=35, vx=86, step=5) # 11 ticks, 10 bins
+
+    # Requested Hex Codes
+    colors_bn = ['#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026']
+    colors_nn = ["#ffeda0", "#f7fcb9"] #['#ffeda0', '#ffffcc', '#ffeda0', '#fed976', '#f7fcb9']
+    colors_an = ['#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443', '#006837', '#004529']
+
+    # Build colormaps to have exactly the number of bins as our ticks
     if reverse_cmap:
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ["#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ["#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252"])
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ["#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"])  
+        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', colors_an, N=len(ticks_bn)-1)
+        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', colors_nn[::-1], N=len(ticks_nn)-1)
+        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', colors_bn, N=len(ticks_an)-1)
     else:
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ["#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ["#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252"])
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ["#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"])          
+        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', colors_bn, N=len(ticks_bn)-1)
+        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', colors_nn, N=len(ticks_nn)-1)
+        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', colors_an, N=len(ticks_an)-1)
+        
+    # NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', colors_nn, N=len(ticks_nn)-1)
+
+    # BoundaryNorm maps the exact tick intervals to the discrete colors
+    norm_bn = mcolors.BoundaryNorm(ticks_bn, BN_cmap.N)
+    norm_nn = mcolors.BoundaryNorm(ticks_nn, NN_cmap.N)
+    norm_an = mcolors.BoundaryNorm(ticks_an, AN_cmap.N)
     
     # Create a figure with GridSpec
     fig = plt.figure(figsize=(10, 8))
-
     if hspace is None:
-        hspace = -0.6  # Default height space if not provided
-    else:
-        hspace = hspace  # Use the provided height space
+        hspace = -0.6  
+    if logo is not None and logo_size == (None, None):
+        logo_size = ("7%", "21%") 
 
-    if logo is not None:
-        logo_size=  ("7%","21%")  # Default logo size if not provided
-    else:
-        logo_size = logo_size  # Use the provided logo size
-
-    # Define the GridSpec layout
     import matplotlib.gridspec as gridspec
-
     gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2], hspace=hspace, wspace=0.2)
 
     # Main map axis
     ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
-
     gl = ax.gridlines(draw_labels=True, linewidth=0.05, color='gray', alpha=0.8)
     gl.top_labels = False
     gl.right_labels = False
@@ -3213,111 +3373,83 @@ def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name, labels=["Below-
     nn_data = (max_prob.where(mask_nn) * 100).values
     an_data = (max_prob.where(mask_an) * 100).values
 
-    # Step 4: Plot each category
-   # def clip_prob(data, mask):
-   #     prob = max_prob.where(mask)
-   #     prob = xr.where(prob > 0.6, 0.6, prob) * 100
-   #     prob = xr.where(prob < 25, 25, prob)
-   #     return prob.values
-
-   # bn_data = clip_prob(max_prob, mask_bn)
-   # nn_data = clip_prob(max_prob, mask_nn)
-   # an_data = clip_prob(max_prob, mask_an)
-
-
-    # Step _: Add  Land colors
-    ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#fde0dd", edgecolor="black", zorder=0) # #dfc27d
+    # Add Land colors
+    ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#fde0dd", edgecolor="black", zorder=0) 
     
-    # # Define the data ranges for color normalization  
-    # vmin = 25  # Minimum probability percentage
-    # vmax = 65  # Maximum probability percentage
-
-    # Plot BN (Below Normal)
+    # Step 4: Plot Discrete Blocks (vmin/vmax are replaced by our custom norms)
     if np.any(~np.isnan(bn_data)):
         bn_plot = ax.pcolormesh(
             forecast_prob['X'], forecast_prob['Y'], bn_data,
-            cmap=BN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=35, vmax=85
+            cmap=BN_cmap, norm=norm_bn, transform=ccrs.PlateCarree(), alpha=0.9
         )
     else:
-        bn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=35, vmax=85), cmap=BN_cmap)
+        bn_plot = cm.ScalarMappable(norm=norm_bn, cmap=BN_cmap)
         bn_plot.set_array([])
 
-    # Plot NN (Near Normal)
     if np.any(~np.isnan(nn_data)):
         nn_plot = ax.pcolormesh(
             forecast_prob['X'], forecast_prob['Y'], nn_data,
-            cmap=NN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=35, vmax=65
+            cmap=NN_cmap, norm=norm_nn, transform=ccrs.PlateCarree(), alpha=0.9
         )
     else:
-        nn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=35, vmax=65), cmap=NN_cmap)
+        nn_plot = cm.ScalarMappable(norm=norm_nn, cmap=NN_cmap)
         nn_plot.set_array([])
 
-    # Plot AN (Above Normal)
     if np.any(~np.isnan(an_data)):
         an_plot = ax.pcolormesh(
             forecast_prob['X'], forecast_prob['Y'], an_data,
-            cmap=AN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=35, vmax=85
+            cmap=AN_cmap, norm=norm_an, transform=ccrs.PlateCarree(), alpha=0.9
         )
     else:
-        an_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=35, vmax=85), cmap=AN_cmap)
+        an_plot = cm.ScalarMappable(norm=norm_an, cmap=AN_cmap)
         an_plot.set_array([])
 
-    # Step 5: Add coastlines and borders and Land
+    # Add coastlines and borders
     ax.coastlines()
     ax.add_feature(cfeature.BORDERS, edgecolor='black', linewidth=1.0, linestyle='solid')
     ax.add_feature(cfeature.OCEAN, facecolor="lightblue")
     
-    # Step 6: Add individual colorbars with fixed ticks
-    def create_ticks(vn=35, vx=86, step=5):
-        ticks = np.arange(vn, vx, step)
-        return ticks
-
-    #ticks = create_ticks(vn=35, vx=86, step=5)
-
+    # Step 6: Add individual colorbars with exact tick snapping
+    
     # For BN (Below Normal)
-    ticks = create_ticks(vn=35, vx=86, step=5)
     cbar_ax_bn = fig.add_subplot(gs[1, 0])
-    cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal')
+    cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal', spacing='uniform', ticks=ticks_bn)
     cbar_bn.set_label(f'{labels[0]} (%)')
-    cbar_bn.set_ticks(ticks)
-    cbar_bn.set_ticklabels([f"{tick}" for tick in ticks])
+    cbar_bn.set_ticklabels([f"{tick}" for tick in ticks_bn])
+    cbar_ax_bn.invert_xaxis() # Invert scale from 85 down to 35
+    cbar_bn.ax.tick_params(axis='x', direction='in', length=6, color='black') # Ticks inward
 
     # For NN (Near Normal)
-    ticks = create_ticks(vn=35, vx=66, step=5)
     cbar_ax_nn = fig.add_subplot(gs[1, 1])
-    cbar_nn = plt.colorbar(nn_plot, cax=cbar_ax_nn, orientation='horizontal')
+    cbar_nn = plt.colorbar(nn_plot, cax=cbar_ax_nn, orientation='horizontal', spacing='uniform', ticks=ticks_nn)
     cbar_nn.set_label(f'{labels[1]} (%)')
-    cbar_nn.set_ticks(ticks)
-    cbar_nn.set_ticklabels([f"{tick}" for tick in ticks])
+    cbar_nn.set_ticklabels([f"{tick}" for tick in ticks_nn])
+    cbar_nn.ax.tick_params(axis='x', direction='in', length=6, color='black') # Ticks inward
 
     # For AN (Above Normal)
-    ticks = create_ticks(vn=35, vx=86, step=5)
     cbar_ax_an = fig.add_subplot(gs[1, 2])
-    cbar_an = plt.colorbar(an_plot, cax=cbar_ax_an, orientation='horizontal')
+    cbar_an = plt.colorbar(an_plot, cax=cbar_ax_an, orientation='horizontal', spacing='uniform', ticks=ticks_an)
     cbar_an.set_label(f'{labels[2]} (%)')
-    cbar_an.set_ticks(ticks)
-    cbar_an.set_ticklabels([f"{tick}" for tick in ticks])
+    cbar_an.set_ticklabels([f"{tick}" for tick in ticks_an])
+    cbar_an.ax.tick_params(axis='x', direction='in', length=6, color='black') # Ticks inward
     
-    # Set the title with the formatted model_name
+    # Set the title
     if isinstance(model_name, np.ndarray):
         model_name_str = str(model_name.item())
     else:
         model_name_str = str(model_name)
     ax.set_title(f"{model_name_str}", fontsize=13, pad=20)
 
-
-    # Step 7: Add logo if provided
-    
+    # Add logo if provided
     if logo is not None:
         ax_logo = inset_axes(ax,
-                            width=logo_size[0],  # Width of the logo    
-                            height=logo_size[1],  # Height of the logo        
+                            width=logo_size[0],        
+                            height=logo_size[1],       
                             loc=logo_position,
                             borderpad=0.1)        
         ax_logo.imshow(mpimg.imread(logo))
         ax_logo.axis("off") 
 
-    # plt.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.03, wspace=0.03)
     plt.subplots_adjust(top=0.95, bottom=0.08, left=0.06, right=0.94, hspace=-0.6, wspace=0.2)
     plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.pdf", dpi=300, bbox_inches='tight')
     plt.show()
