@@ -6,22 +6,24 @@ import gc
 import datetime
 import warnings
 from dataclasses import dataclass
-from typing import Literal, Tuple, Optional, Dict, List
+from typing import Literal, Tuple, Optional, Dict, List, Sequence, Callable
+
+
+
 
 import numpy as np
 import pandas as pd
 import xarray as xr
-import pymc as pm
-import arviz as az
+
 
 from scipy import stats
-from scipy.optimize import minimize, minimize_scalar, fsolve
+from scipy.optimize import minimize, minimize_scalar, fsolve, root_scalar, brentq
 from scipy.special import gamma as gamma_function
-from scipy.special import expit
+from scipy.special import expit, softmax
 from scipy.stats import (
     norm, lognorm, expon, gamma, weibull_min, t, poisson, nbinom,
     logistic, genextreme, laplace, pareto, loguniform, randint, uniform,
-    linregress, t as tdist
+    linregress, t as tdist, gamma as sp_gamma, gamma as gamma_dist, boxcox_normmax
 )
 
 from tqdm.auto import tqdm
@@ -86,9 +88,23 @@ from wass2s.utils import *
 from wass2s.was_verification import *
 import xcast as xc
 
+
+# full-Bayesian backend
+try:
+    import pymc as pm
+    import arviz as az
+    HAS_PYMC = True
+except Exception:
+    HAS_PYMC = False
+    pm = None
+    az = None
+    
 # Suppress specific warnings for cleaner output
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 warnings.filterwarnings('ignore', category=ConvergenceWarning)
+
+
+
 
 def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None, 
                              gcm=False, agroparam=False, Prob=False, hydro=False,
@@ -15976,972 +15992,1673 @@ class WAS_mme_Stacking_:
         forecast_prob = forecast_prob.assign_coords(probability=("probability", ["PB","PN","PA"]))
         return result_da * mask, (forecast_prob * mask).transpose("probability","T","Y","X")
 
+ 
 
 
-
-def _ensemble_crps(ens, obs, fair=True):
+def _crps_gaussian(y, mu, sigma):
     """
-    Compute the Continuous Ranked Probability Score (CRPS) for an ensemble.
-    
-    Parameters
-    ----------
-    ens : array-like
-        Ensemble forecast members
-    obs : float
-        Observation value
-    fair : bool, default=True
-        Apply fair CRPS correction (m/(m-1)) for finite ensemble sizes
-        
-    Returns
-    -------
-    crps : float
-        CRPS value
+    Analytic CRPS for a Gaussian predictive distribution N(mu, sigma^2).
+    """
+    y = np.asarray(y, dtype=float)
+    mu = np.asarray(mu, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+
+    eps = np.finfo(float).eps * 100.0
+    sigma = np.maximum(sigma, eps)
+
+    z = (y - mu) / sigma
+    return sigma * (z * (2.0 * norm.cdf(z) - 1.0) + 2.0 * norm.pdf(z) - 1.0 / np.sqrt(np.pi))
+
+
+def _pairwise_abs_sum_sorted(x):
+    """
+    Sum_{i<j} |x_j - x_i| for a 1D array, computed in O(m log m).
+    """
+    x = np.sort(np.asarray(x, dtype=float))
+    m = x.size
+    if m < 2:
+        return 0.0
+    k = np.arange(1, m + 1, dtype=float)
+    return float(np.sum((2.0 * k - m - 1.0) * x))
+
+
+def _crps_ensemble(ens, obs):
+    """
+    Standard ensemble CRPS:
+        mean |X - y| - 1/2 mean |X - X'|
     """
     ens = np.asarray(ens, dtype=float)
+    ens = ens[np.isfinite(ens)]
     m = ens.size
-    
-    # Handle edge cases
+
     if m == 0:
         return np.nan
-    elif m == 1:
-        return np.abs(ens[0] - obs)
-    
-    # Traditional CRPS formula for ensemble
+    if m == 1:
+        return abs(ens[0] - obs)
+
     term1 = np.mean(np.abs(ens - obs))
-    
-    # Efficient computation of pairwise differences
-    if m <= 1000:  # Use matrix for small ensembles
-        # This computes all pairwise absolute differences
-        # Using broadcasting: ens[:, None] - ens[None, :] creates m x m matrix
-        term2 = 0.5 * np.mean(np.abs(ens[:, None] - ens[None, :]))
-    else:  
-        # Use sorted method for O(m log m) complexity (Gneiting et al. 2005)
-        sorted_ens = np.sort(ens)
-        k = np.arange(1, m + 1)
-        # Formula: (1/m^2) * Σ (2k - m - 1) * x_(k)
-        term2 = np.sum((2 * k - m - 1) * sorted_ens) / (m ** 2)
-    
-    crps = term1 - term2
-    
-    # Fair CRPS correction for finite ensemble size (Ferro et al. 2005)
-    if fair and m > 1:
-        crps *= m / (m - 1.0)
-        
-    return crps
+    pairwise_sum = _pairwise_abs_sum_sorted(ens)
+    term2 = pairwise_sum / (m * m)
+    return term1 - term2
 
 
-def _gauss_crps(obs, mu, sig):
+def _fair_crps_ensemble(ens, obs):
     """
-    Compute the CRPS for a Gaussian distribution.
-    
-    Parameters
-    ----------
-    obs : float or array-like
-        Observation value(s)
-    mu : float or array-like
-        Mean of the Gaussian distribution
-    sig : float or array-like
-        Standard deviation of the Gaussian distribution
-        
-    Returns
-    -------
-    crps : float or array-like
-        CRPS value(s)
+    Fair ensemble CRPS (finite-ensemble correction):
+        mean |X - y| - 1/(m(m-1)) sum_{i<j} |x_i - x_j|
     """
-    # Ensure inputs are numpy arrays
-    obs = np.asarray(obs)
-    mu = np.asarray(mu)
-    sig = np.asarray(sig)
-    
-    # Enhanced numerical stability
-    eps = np.finfo(float).eps * 100
-    sig = np.maximum(sig, eps)
-    
-    z = (obs - mu) / sig
-    pdf = norm.pdf(z)
-    cdf = norm.cdf(z)
-    
-    return sig * (z * (2 * cdf - 1) + 2 * pdf - 1 / np.sqrt(np.pi))
+    ens = np.asarray(ens, dtype=float)
+    ens = ens[np.isfinite(ens)]
+    m = ens.size
+
+    if m == 0:
+        return np.nan
+    if m == 1:
+        return abs(ens[0] - obs)
+
+    term1 = np.mean(np.abs(ens - obs))
+    pairwise_sum = _pairwise_abs_sum_sorted(ens)
+    term2 = pairwise_sum / (m * (m - 1.0))
+    return term1 - term2
 
 
-class WAS_mme_NGR:
+class WAS_mme_NGR_Gaussian:
     """
-    Operational WAS_mme_NGR calibration for ensemble post-processing.
-    
-    Implements Non-homogeneous Gaussian Regression (NGR) with two variants:
-    - "NGR": Minimize Gaussian CRPS (parametric)
-    - "ensNGR": Minimize ensemble CRPS (non-parametric)
-    
-    The calibration model: 
-    μ = a + b * ensemble_mean
-    σ = sqrt(c² + d² * ensemble_variance)
-    
-    Parameters
-    ----------
-    type : {'NGR', 'ensNGR'}, default='NGR'
-        CRPS minimization method
-    apply_to : {'all', 'sig', 'pos', 'neg'}, default='all'
-        When to apply calibration:
-        - 'all': Always apply calibration
-        - 'sig': Only apply if regression is statistically significant
-        - 'pos': Only apply if positive correlation is significant
-        - 'neg': Only apply if negative correlation is significant
-    alpha : float, default=0.1
-        Significance level for statistical tests (0 < alpha < 1)
-    test_direction : {'two-sided', 'greater', 'less'}, default='two-sided'
-        Direction of statistical test for regression significance
-    param_bounds : dict or None, default=None
-        Custom bounds for parameters [a, b, c, d]
-        Example: {'a': (-10, 10), 'b': (0, 5), 'c': (0, 5), 'd': (0, 5)}
-        
-    Attributes
-    ----------
-    params : xarray.DataArray or numpy.ndarray
-        Calibration parameters [a, b, c, d]
-    clim_terciles : xarray.DataArray or numpy.ndarray
-        Climate terciles computed from observations
-    fitted : bool
-        Whether the model has been fitted
+    Canonical Gaussian EMOS / NGR with gridwise fitting.
+
+    Model
+    -----
+    Y_t | f_t ~ N(mu_t, sigma_t^2)
+
+    mu_t      = a + b * fbar_t
+    sigma_t^2 = c + d * s_t^2
+
+    where
+        fbar_t = ensemble mean
+        s_t^2  = ensemble variance
+
+    This class is intended for predictands that are approximately Gaussian
+    after anomaly/standardization preprocessing. For nonnegative or
+    zero-inflated variables such as precipitation totals, prefer a truncated,
+    censored, gamma, or transformed variant instead of plain Gaussian EMOS.
     """
-    
-    # Default parameter bounds ensuring physical plausibility
-    DEFAULT_BOUNDS = {
-        'a': (-np.inf, np.inf),  # Intercept can be any value
-        'b': (0.0, np.inf),      # Regression coefficient should be non-negative
-        'c': (0.0, np.inf),      # Spread adjustment should be non-negative
-        'd': (0.0, np.inf),      # Spread scaling should be non-negative
-    }
-    
-    def __init__(self, type="NGR", apply_to="all", alpha=0.1, 
-                 test_direction="two-sided", param_bounds=None):
-        # Validate inputs
-        if type not in {"NGR", "ensNGR"}:
-            raise ValueError("type must be 'NGR' or 'ensNGR'")
-        if apply_to not in {"all", "sig", "pos", "neg"}:
-            raise ValueError("apply_to must be 'all', 'sig', 'pos', or 'neg'")
-        if not 0 < alpha < 1:
+
+    def __init__(
+        self,
+        apply_to="all",
+        alpha=0.10,
+        test_direction="two-sided",
+        bounds=None,
+    ):
+        valid_apply = {"all", "sig", "pos", "neg"}
+        valid_test = {"two-sided", "greater", "less"}
+
+        if apply_to not in valid_apply:
+            raise ValueError(f"apply_to must be one of {valid_apply}")
+        if test_direction not in valid_test:
+            raise ValueError(f"test_direction must be one of {valid_test}")
+        if not (0.0 < alpha < 1.0):
             raise ValueError("alpha must be between 0 and 1")
-        if test_direction not in {"two-sided", "greater", "less"}:
-            raise ValueError("test_direction must be 'two-sided', 'greater', or 'less'")
-            
-        self.type = type
+
         self.apply_to = apply_to
-        self.alpha = alpha
+        self.alpha = float(alpha)
         self.test_direction = test_direction
-        self.is_gaussian = (type == "NGR")
-        self.is_ensemble = (type == "ensNGR")
-        
-        # Set parameter bounds
-        self.param_bounds = self.DEFAULT_BOUNDS.copy()
-        if param_bounds:
-            for param, bounds in param_bounds.items():
-                if param in self.param_bounds:
-                    self.param_bounds[param] = bounds
-        
-        # Initialize state
+
+        self.bounds = {
+            "a": (-np.inf, np.inf),
+            "b": (-np.inf, np.inf),
+            "c": (0.0, np.inf),
+            "d": (0.0, np.inf),
+        }
+        if bounds is not None:
+            self.bounds.update(bounds)
+
         self.params = None
         self.clim_terciles = None
         self.fitted = False
         self._xarray = False
-        self._optimization_stats = None
+        self._fit_stats = None
         self.attrs = {}
-        
-        # Dimension names (configurable)
-        self._param_dim = 'parameter'
-        self._lat_dim = 'Y'
-        self._lon_dim = 'X'
-        self._time_dim = 'T'
-        self._member_dim = 'M'
+
+        self._member_dim = "M"
+        self._time_dim = "T"
+        self._lat_dim = "Y"
+        self._lon_dim = "X"
+        self._param_dim = "parameter"
         self._lat_coords = None
         self._lon_coords = None
-        
+
     def __repr__(self):
         status = "fitted" if self.fitted else "unfitted"
-        return (f"WAS_mme_NGR(type='{self.type}', apply_to='{self.apply_to}', "
-                f"alpha={self.alpha}, {status})")
-    
-    def _create_objective_function(self, fmn, fsd, fanom, o_train):
-        """Create objective function for parameter optimization."""
-        n_times = len(o_train)
-        
-        if self.is_ensemble:
-            def obj(pars):
-                a, b, c, d = pars
-                mu = a + b * fmn
-                sigma = np.sqrt(c**2 + d**2 * fsd**2)
-                
-                # Vectorized ensemble CRPS calculation
-                cal_ens = mu[None, :] + sigma[None, :] * fanom
-                
-                # Compute CRPS for all time steps at once
-                crps_vals = np.zeros(n_times)
-                for k in range(n_times):
-                    crps_vals[k] = _ensemble_crps(cal_ens[:, k], o_train[k], fair=True)
-                
-                return np.mean(crps_vals)
-        else:
-            def obj(pars):
-                a, b, c, d = pars
-                mu = a + b * fmn
-                sigma = np.sqrt(c**2 + d**2 * fsd**2)
-                return np.mean(_gauss_crps(o_train, mu, sigma))
-        
-        return obj
-    
-    def _test_regression_significance(self, r, n, test_direction):
-        """Test if regression correlation is statistically significant."""
-        if n <= 2:
+        return (
+            f"WAS_mme_NGR_Gaussian(apply_to={self.apply_to!r}, "
+            f"alpha={self.alpha}, test_direction={self.test_direction!r}, "
+            f"{status})"
+        )
+
+    @staticmethod
+    def _safe_ens_stats(h):
+        """
+        h: array (M, T)
+        returns mean(T), variance(T), std(T), valid_member_count(T)
+        """
+        fbar = np.nanmean(h, axis=0)
+        counts = np.sum(np.isfinite(h), axis=0)
+        var = np.full(h.shape[1], np.nan, dtype=float)
+
+        for t in range(h.shape[1]):
+            col = h[:, t]
+            col = col[np.isfinite(col)]
+            if col.size == 0:
+                var[t] = np.nan
+            elif col.size == 1:
+                var[t] = 0.0
+            else:
+                var[t] = np.var(col, ddof=1)
+
+        std = np.sqrt(np.maximum(var, 0.0))
+        return fbar, var, std, counts
+
+    def _regression_significant(self, r, n, direction=None):
+        if direction is None:
+            direction = self.test_direction
+
+        if n <= 2 or not np.isfinite(r):
             return False
-            
-        # Handle perfect correlation
-        if np.abs(r) >= 1.0 - 1e-12:
+        if abs(r) >= 1.0 - 1e-12:
             return True
-            
-        # Compute t-statistic
-        t_stat = r * np.sqrt((n - 2) / max(1 - r**2, 1e-12))
-        
-        # Compute p-value based on test direction
-        if test_direction == "two-sided":
-            p_value = 2 * tdist.sf(np.abs(t_stat), n - 2)
-        elif test_direction == "greater":
-            p_value = tdist.sf(t_stat, n - 2)
-        else:  # "less"
-            p_value = tdist.cdf(t_stat, n - 2)
-            
-        return p_value < self.alpha
-    
-    def _apply_calibration_decision(self, lm, n_valid):
-        """Decide whether to apply calibration based on statistical test."""
+
+        t_stat = r * np.sqrt((n - 2.0) / max(1.0 - r * r, 1e-12))
+        if direction == "two-sided":
+            p = 2.0 * tdist.sf(abs(t_stat), df=n - 2)
+        elif direction == "greater":
+            p = tdist.sf(t_stat, df=n - 2)
+        else:
+            p = tdist.cdf(t_stat, df=n - 2)
+        return bool(p < self.alpha)
+
+    def _should_calibrate(self, r, n):
         if self.apply_to == "all":
             return True
-        elif self.apply_to == "sig":
-            return self._test_regression_significance(lm.rvalue, n_valid, self.test_direction)
-        elif self.apply_to == "pos":
-            return (lm.rvalue > 0 and 
-                    self._test_regression_significance(lm.rvalue, n_valid, "greater"))
-        else:  # "neg"
-            return (lm.rvalue < 0 and 
-                    self._test_regression_significance(lm.rvalue, n_valid, "less"))
-    
-    def fit(self, hcst_grid, obs_grid, clim_terciles=False,
-            member_dim='M', time_dim='T', lat_dim='Y', lon_dim='X',
-            show_progress=True):
+        if self.apply_to == "sig":
+            return self._regression_significant(r, n, self.test_direction)
+        if self.apply_to == "pos":
+            return (r > 0.0) and self._regression_significant(r, n, "greater")
+        if self.apply_to == "neg":
+            return (r < 0.0) and self._regression_significant(r, n, "less")
+        return True
+
+    def _objective_one_grid(self, pars, fbar, svar, obs):
+        a, b, c, d = pars
+        mu = a + b * fbar
+        sig2 = c + d * svar
+        sigma = np.sqrt(np.maximum(sig2, 0.0))
+        return float(np.nanmean(_crps_gaussian(obs, mu, sigma)))
+
+    def _fit_one_grid(self, h_gp, o_gp):
         """
-        Fit calibration parameters using hindcast data.
-        
-        Parameters
-        ----------
-        hcst_grid : xarray.DataArray or numpy.ndarray
-            Hindcast ensemble data with dimensions (member, time, lat, lon)
-        obs_grid : xarray.DataArray or numpy.ndarray
-            Observations with dimensions (time, lat, lon)
-        clim_terciles : bool, default=False
-            Compute climate terciles from observations
-        member_dim, time_dim, lat_dim, lon_dim : str
-            Dimension names
-        show_progress : bool, default=True
-            Show progress bar during fitting
-            
-        Returns
-        -------
-        self : WAS_mme_NGR
-            Fitted model
+        h_gp: (M, T)
+        o_gp: (T,)
         """
-        # Check if xarray is available and inputs are DataArrays
-        use_xarray = (xr is not None and 
-                     isinstance(hcst_grid, xr.DataArray) and 
-                     isinstance(obs_grid, xr.DataArray))
-        
+        valid_time = np.isfinite(o_gp) & np.any(np.isfinite(h_gp), axis=0)
+        if valid_time.sum() < 3:
+            return np.array([0.0, 1.0, 0.0, 1.0]), {
+                "success": False,
+                "n_valid": int(valid_time.sum()),
+                "initial_score": np.nan,
+                "final_score": np.nan,
+                "score_reduction": np.nan,
+                "r": np.nan,
+                "nit": 0,
+            }
+
+        h = h_gp[:, valid_time]
+        y = o_gp[valid_time]
+
+        fbar, svar, sstd, counts = self._safe_ens_stats(h)
+        mask = np.isfinite(fbar) & np.isfinite(svar) & np.isfinite(y)
+
+        if mask.sum() < 3:
+            return np.array([0.0, 1.0, 0.0, 1.0]), {
+                "success": False,
+                "n_valid": int(mask.sum()),
+                "initial_score": np.nan,
+                "final_score": np.nan,
+                "score_reduction": np.nan,
+                "r": np.nan,
+                "nit": 0,
+            }
+
+        fbar = fbar[mask]
+        svar = svar[mask]
+        y = y[mask]
+
+        lm = linregress(fbar, y)
+        r = float(lm.rvalue)
+
+        if not self._should_calibrate(r, int(mask.sum())):
+            pars = np.array([0.0, 1.0, 0.0, 1.0], dtype=float)
+            base_score = self._objective_one_grid(pars, fbar, svar, y)
+            return pars, {
+                "success": True,
+                "n_valid": int(mask.sum()),
+                "initial_score": base_score,
+                "final_score": base_score,
+                "score_reduction": 0.0,
+                "r": r,
+                "nit": 0,
+            }
+
+        resid = y - (lm.intercept + lm.slope * fbar)
+        resid_var = float(np.nanvar(resid, ddof=1)) if resid.size > 1 else 1.0
+        init = np.array([
+            float(lm.intercept),
+            float(lm.slope),
+            max(resid_var * 0.25, 1e-6),
+            0.75,
+        ])
+
+        bounds = [
+            self.bounds["a"],
+            self.bounds["b"],
+            self.bounds["c"],
+            self.bounds["d"],
+        ]
+
+        base_pars = np.array([0.0, 1.0, 0.0, 1.0], dtype=float)
+        base_score = self._objective_one_grid(base_pars, fbar, svar, y)
+
+        res = minimize(
+            self._objective_one_grid,
+            x0=init,
+            args=(fbar, svar, y),
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 1000, "ftol": 1e-10, "gtol": 1e-7},
+        )
+
+        if res.success and np.all(np.isfinite(res.x)):
+            final_pars = np.asarray(res.x, dtype=float)
+            final_score = float(res.fun)
+            nit = int(getattr(res, "nit", 0))
+            success = True
+        else:
+            final_pars = base_pars
+            final_score = base_score
+            nit = int(getattr(res, "nit", 0))
+            success = False
+
+        red = np.nan
+        if np.isfinite(base_score) and base_score > 0.0:
+            red = (base_score - final_score) / base_score
+
+        return final_pars, {
+            "success": success,
+            "n_valid": int(mask.sum()),
+            "initial_score": base_score,
+            "final_score": final_score,
+            "score_reduction": red,
+            "r": r,
+            "nit": nit,
+        }
+
+    def fit(
+        self,
+        hcst_grid,
+        obs_grid,
+        clim_terciles=False,
+        member_dim="M",
+        time_dim="T",
+        lat_dim="Y",
+        lon_dim="X",
+    ):
+        use_xarray = (
+            xr is not None
+            and isinstance(hcst_grid, xr.DataArray)
+            and isinstance(obs_grid, xr.DataArray)
+        )
+
+        self._member_dim = member_dim
+        self._time_dim = time_dim
+        self._lat_dim = lat_dim
+        self._lon_dim = lon_dim
+
         if use_xarray:
-            # Ensure correct dimension order and extract values
             hcst = hcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim).values
             obs = obs_grid.transpose(time_dim, lat_dim, lon_dim).values
-            
-            # Store metadata
-            self._lat_dim = lat_dim
-            self._lon_dim = lon_dim
-            self._time_dim = time_dim
-            self._member_dim = member_dim
             self._lat_coords = hcst_grid.coords[lat_dim]
             self._lon_coords = hcst_grid.coords[lon_dim]
-            self.attrs = hcst_grid.attrs.copy()
+            self.attrs = dict(hcst_grid.attrs)
             self._xarray = True
         else:
-            # Convert to numpy arrays
             hcst = np.asarray(hcst_grid, dtype=float)
             obs = np.asarray(obs_grid, dtype=float)
-            
-            # Store dimension names
-            self._lat_dim = lat_dim
-            self._lon_dim = lon_dim
-            self._time_dim = time_dim
-            self._member_dim = member_dim
-        
-        # Get dimensions
-        nmemb, ntimes, nlat, nlon = hcst.shape
-        
-        # Validate shapes
-        if obs.shape != (ntimes, nlat, nlon):
-            raise ValueError(f"obs_grid must have shape (time, lat, lon) = ({ntimes}, {nlat}, {nlon})")
-        
-        # Initialize parameter array and optimization statistics
-        params = np.full((4, nlat, nlon), np.nan)
-        opt_stats = {
-            'success': np.zeros((nlat, nlon), dtype=bool),
-            'iterations': np.zeros((nlat, nlon), dtype=int),
-            'crps_reduction': np.zeros((nlat, nlon), dtype=float),
-            'final_crps': np.zeros((nlat, nlon), dtype=float)
+            self._xarray = False
+
+        if hcst.ndim != 4:
+            raise ValueError("hcst_grid must be 4D with shape (M, T, Y, X)")
+        if obs.ndim != 3:
+            raise ValueError("obs_grid must be 3D with shape (T, Y, X)")
+
+        m, t, ny, nx = hcst.shape
+        if obs.shape != (t, ny, nx):
+            raise ValueError(f"obs_grid must have shape {(t, ny, nx)}, got {obs.shape}")
+
+        params = np.full((4, ny, nx), np.nan, dtype=float)
+        fit_stats = {
+            "success": np.zeros((ny, nx), dtype=bool),
+            "n_valid": np.zeros((ny, nx), dtype=int),
+            "initial_score": np.full((ny, nx), np.nan, dtype=float),
+            "final_score": np.full((ny, nx), np.nan, dtype=float),
+            "score_reduction": np.full((ny, nx), np.nan, dtype=float),
+            "r": np.full((ny, nx), np.nan, dtype=float),
+            "nit": np.zeros((ny, nx), dtype=int),
         }
-        
-        # Compute climate terciles if requested
+
+        for iy in range(ny):
+            for ix in range(nx):
+                pars, stat = self._fit_one_grid(hcst[:, :, iy, ix], obs[:, iy, ix])
+                params[:, iy, ix] = pars
+                for key in fit_stats:
+                    fit_stats[key][iy, ix] = stat[key]
+
         if clim_terciles:
-            # Compute terciles along time dimension
-            terc_np = np.nanpercentile(obs, [100/3, 200/3], axis=0)
+            terc = np.nanpercentile(obs, [100.0 / 3.0, 200.0 / 3.0], axis=0)
             if use_xarray:
                 self.clim_terciles = xr.DataArray(
-                    terc_np,
-                    dims=('tercile', self._lat_dim, self._lon_dim),
+                    terc,
+                    dims=("tercile", lat_dim, lon_dim),
                     coords={
-                        'tercile': ['lower', 'upper'],
-                        self._lat_dim: self._lat_coords,
-                        self._lon_dim: self._lon_coords
-                    }
+                        "tercile": ["lower", "upper"],
+                        lat_dim: self._lat_coords,
+                        lon_dim: self._lon_coords,
+                    },
+                    name="climatological_terciles",
                 )
             else:
-                self.clim_terciles = terc_np
-        
-        # Prepare bounds for optimization
-        bounds = [
-            self.param_bounds['a'],
-            self.param_bounds['b'],
-            self.param_bounds['c'],
-            self.param_bounds['d']
-        ]
-        
-        # Fit parameters for each grid point
-        if show_progress:
-            print(f"Fitting WAS_mme_NGR parameters ({self.type})...")
-            print(f"Grid: {nlat} x {nlon} ({nlat * nlon} points)")
-            lat_iter = tqdm(range(nlat), desc="Latitude")
-        else:
-            lat_iter = range(nlat)
-        
-        for ilat in lat_iter:
-            for ilon in range(nlon):
-                try:
-                    # Extract data for this grid point
-                    o_gp = obs[:, ilat, ilon].copy()
-                    h_gp = hcst[:, :, ilat, ilon].copy()
-                    
-                    # Find valid (non-NaN) time steps
-                    valid = ~np.isnan(o_gp)
-                    n_valid = valid.sum()
-                    
-                    # Need at least 3 valid points for regression
-                    if n_valid < 3:
-                        params[:, ilat, ilon] = [0.0, 1.0, 0.0, 1.0]  # No calibration
-                        opt_stats['success'][ilat, ilon] = False
-                        continue
-                    
-                    # Extract valid data
-                    o_train = o_gp[valid]
-                    h_gp_valid = h_gp[:, valid]
-                    
-                    # Compute ensemble statistics for valid time steps
-                    ens_mean = np.nanmean(h_gp_valid, axis=0)
-                    sigma_e = np.nanstd(h_gp_valid, axis=0, ddof=1)
-                    
-                    # Standardize ensemble anomalies with numerical stability
-                    eps = np.finfo(float).eps * 100
-                    sigma_e_safe = np.maximum(sigma_e, eps)
-                    anom = (h_gp_valid - ens_mean[np.newaxis, :]) / sigma_e_safe[np.newaxis, :]
-                    
-                    # Extract training data
-                    fmn = ens_mean
-                    fsd = sigma_e
-                    fanom = anom
-                    
-                    # Initial guess from linear regression
-                    mask_lm = ~np.isnan(fmn)
-                    if mask_lm.sum() < 3:
-                        params[:, ilat, ilon] = [0.0, 1.0, 0.0, 1.0]
-                        opt_stats['success'][ilat, ilon] = False
-                        continue
-                    
-                    lm = linregress(fmn[mask_lm], o_train[mask_lm])
-                    initial = np.array([lm.intercept, lm.slope, 0.0, 1.0])
-                    
-                    # Ensure initial b parameter is non-negative
-                    initial[1] = max(initial[1], 0.0)
-                    
-                    # Decide whether to apply calibration
-                    if not self._apply_calibration_decision(lm, mask_lm.sum()):
-                        params[:, ilat, ilon] = [0.0, 1.0, 0.0, 1.0]
-                        opt_stats['success'][ilat, ilon] = True  # Considered successful (no calibration needed)
-                        continue
-                    
-                    # Create objective function
-                    obj_func = self._create_objective_function(fmn, fsd, fanom, o_train)
-                    
-                    # Compute initial CRPS (no calibration)
-                    initial_crps = obj_func([0.0, 1.0, 0.0, 1.0])
-                    
-                    # Optimize parameters
-                    res = minimize(
-                        obj_func, 
-                        initial, 
-                        method="L-BFGS-B",  # Supports bounds
-                        bounds=bounds,
-                        options={
-                            "maxiter": 1000, 
-                            "ftol": 1e-8,
-                            "gtol": 1e-6,
-                            "disp": False
-                        }
-                    )
-                    
-                    # Store results
-                    params[:, ilat, ilon] = res.x
-                    opt_stats['success'][ilat, ilon] = res.success
-                    opt_stats['iterations'][ilat, ilon] = res.nit
-                    opt_stats['final_crps'][ilat, ilon] = res.fun if res.success else initial_crps
-                    
-                    # Compute CRPS reduction
-                    if initial_crps > 0:
-                        crps_reduction = (initial_crps - opt_stats['final_crps'][ilat, ilon]) / initial_crps
-                    else:
-                        crps_reduction = 0.0
-                    opt_stats['crps_reduction'][ilat, ilon] = crps_reduction
-                    
-                except Exception as e:
-                    # Fallback to no calibration
-                    params[:, ilat, ilon] = [0.0, 1.0, 0.0, 1.0]
-                    opt_stats['success'][ilat, ilon] = False
-        
-        # Store parameters
+                self.clim_terciles = terc
+
         if use_xarray:
             self.params = xr.DataArray(
                 params,
-                dims=(self._param_dim, self._lat_dim, self._lon_dim),
+                dims=(self._param_dim, lat_dim, lon_dim),
                 coords={
-                    self._param_dim: ['a', 'b', 'c', 'd'],
-                    self._lat_dim: self._lat_coords,
-                    self._lon_dim: self._lon_coords
+                    self._param_dim: ["a", "b", "c", "d"],
+                    lat_dim: self._lat_coords,
+                    lon_dim: self._lon_coords,
                 },
-                attrs=self.attrs
+                name="emos_parameters",
+                attrs=self.attrs,
             )
         else:
             self.params = params
-        
-        # Store optimization statistics
-        self._optimization_stats = opt_stats
+
+        self._fit_stats = fit_stats
         self.fitted = True
-        
-        # Print summary statistics
-        if show_progress:
-            success_rate = np.mean(opt_stats['success']) * 100
-            success_mask = opt_stats['success']
-            if np.any(success_mask):
-                avg_crps_reduction = np.nanmean(opt_stats['crps_reduction'][success_mask]) * 100
-                avg_iterations = np.nanmean(opt_stats['iterations'][success_mask])
-                print(f"Fit complete: Success rate = {success_rate:.1f}%, "
-                      f"Average CRPS reduction = {avg_crps_reduction:.1f}%, "
-                      f"Avg iterations = {avg_iterations:.1f}")
-            else:
-                print(f"Fit complete: Success rate = {success_rate:.1f}%")
-        
         return self
-    
-    def transform(self, fcst_grid, member_dim='M', time_dim='T', lat_dim='Y', lon_dim='X'):
-        """
-        Apply calibration to forecast data (returns calibrated ensemble only).
-        
-        Parameters
-        ----------
-        fcst_grid : xarray.DataArray or numpy.ndarray
-            Forecast ensemble data
-        member_dim, time_dim, lat_dim, lon_dim : str
-            Dimension names
-            
-        Returns
-        -------
-        cal_ens : xarray.DataArray or numpy.ndarray
-            Calibrated ensemble
-        mu : xarray.DataArray or numpy.ndarray
-            Calibrated mean
-        sigma : xarray.DataArray or numpy.ndarray
-            Calibrated standard deviation
-        """
-        result = self.predict(
-            fcst_grid,
-            quantiles=None,
-            clim_terciles=False,
-            parametric=None,
-            member_dim=member_dim,
-            time_dim=time_dim,
-            lat_dim=lat_dim,
-            lon_dim=lon_dim
-        )
-        
-        if self._xarray:
-            return result['calibrated_ensemble'], result['calibrated_mean'], result['calibrated_std']
-        else:
-            return result[0], result[1], result[2]
-    
-    def predict(self, fcst_grid, quantiles=None, clim_terciles=False,
-                parametric=None, member_dim='M', time_dim='T', 
-                lat_dim='Y', lon_dim='X', show_progress=True):
-        """
-        Apply calibration and compute requested outputs.
-        
-        Parameters
-        ----------
-        fcst_grid : xarray.DataArray or numpy.ndarray
-            Forecast ensemble data
-        quantiles : list of float or None, default=None
-            Quantile levels to compute (e.g., [0.05, 0.5, 0.95])
-        clim_terciles : bool, default=False
-            Compute tercile probabilities
-        parametric : bool or None, default=None
-            Use parametric (Gaussian) method for quantiles/terciles
-            If None, uses the model type (NGR=parametric, ensNGR=non-parametric)
-        member_dim, time_dim, lat_dim, lon_dim : str
-            Dimension names
-        show_progress : bool, default=True
-            Show progress bar
-            
-        Returns
-        -------
-        results : xarray.Dataset or tuple
-            Calibrated products
-        """
+
+    def _predict_numpy(
+        self,
+        fcst,
+        quantiles=None,
+        clim_terciles=False,
+        return_synthetic_ensemble=False,
+    ):
         if not self.fitted:
-            raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
-        
-        # Determine whether to use parametric method
-        if parametric is None:
-            parametric = self.is_gaussian
-        
-        # Check what outputs are needed
-        need_ensemble = False
-        if quantiles is not None and not parametric:
-            need_ensemble = True
-        if clim_terciles and not parametric:
-            need_ensemble = True
-        if not any([need_ensemble, quantiles is not None, clim_terciles]):
-            need_ensemble = True  # At least return the calibrated ensemble
-        
-        # Handle xarray or numpy input
-        use_xarray = (xr is not None and isinstance(fcst_grid, xr.DataArray))
-        
+            raise RuntimeError("Call fit() before predict().")
+
+        fcst = np.asarray(fcst, dtype=float)
+        if fcst.ndim != 4:
+            raise ValueError("fcst_grid must be 4D with shape (M, T, Y, X)")
+
+        m, t, ny, nx = fcst.shape
+        param_np = self.params.values if hasattr(self.params, "values") else self.params
+
+        if param_np.shape != (4, ny, nx):
+            raise ValueError(
+                f"Parameter shape must be (4, {ny}, {nx}), got {param_np.shape}"
+            )
+
+        mu = np.full((t, ny, nx), np.nan, dtype=float)
+        sigma = np.full((t, ny, nx), np.nan, dtype=float)
+        synth = np.full((m, t, ny, nx), np.nan, dtype=float) if return_synthetic_ensemble else None
+
+        for iy in range(ny):
+            for ix in range(nx):
+                h = fcst[:, :, iy, ix]
+                fbar, svar, sstd, counts = self._safe_ens_stats(h)
+                a, b, c, d = param_np[:, iy, ix]
+
+                mu_gp = a + b * fbar
+                sig2_gp = c + d * svar
+                sigma_gp = np.sqrt(np.maximum(sig2_gp, 0.0))
+
+                mu[:, iy, ix] = mu_gp
+                sigma[:, iy, ix] = sigma_gp
+
+                if return_synthetic_ensemble:
+                    eps = np.finfo(float).eps * 100.0
+                    sstd_safe = np.maximum(sstd, eps)
+                    z = (h - fbar[None, :]) / sstd_safe[None, :]
+                    synth[:, :, iy, ix] = mu_gp[None, :] + sigma_gp[None, :] * z
+
+        out = {
+            "calibrated_mean": mu,
+            "calibrated_std": sigma,
+        }
+
+        if quantiles is not None:
+            q = np.asarray(quantiles, dtype=float)
+            qv = norm.ppf(q)[:, None, None, None] * sigma[None, :, :, :] + mu[None, :, :, :]
+            out["calibrated_quantiles"] = qv
+
+        if clim_terciles:
+            if self.clim_terciles is None:
+                raise RuntimeError("fit(..., clim_terciles=True) or set clim_terciles first.")
+            terc = self.clim_terciles.values if hasattr(self.clim_terciles, "values") else self.clim_terciles
+            lower = terc[0][None, :, :]
+            upper = terc[1][None, :, :]
+
+            scale = np.maximum(sigma, np.finfo(float).eps * 100.0)
+            p_below = norm.cdf(lower, loc=mu, scale=scale)
+            p_above = norm.sf(upper, loc=mu, scale=scale)
+            p_near = 1.0 - p_below - p_above
+
+            probs = np.stack([p_below, p_near, p_above], axis=0)
+            probs = np.clip(probs, 0.0, 1.0)
+            denom = np.sum(probs, axis=0, keepdims=True)
+            denom = np.where(denom <= 0.0, 1.0, denom)
+            probs = probs / denom
+            out["tercile_probability"] = probs
+
+        if return_synthetic_ensemble:
+            out["synthetic_calibrated_ensemble"] = synth
+
+        return out
+
+    def predict(
+        self,
+        fcst_grid,
+        quantiles=None,
+        clim_terciles=False,
+        return_synthetic_ensemble=False,
+        member_dim="M",
+        time_dim="T",
+        lat_dim="Y",
+        lon_dim="X",
+    ):
+        use_xarray = xr is not None and isinstance(fcst_grid, xr.DataArray)
+
         if use_xarray:
-            fcst_trans = fcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim)
-            fcst = fcst_trans.values
-            time_coords = fcst_trans.coords[time_dim]
-            member_coords = fcst_trans.coords[member_dim]
-            attrs = fcst_grid.attrs.copy()
-            name = fcst_grid.name or "forecast"
-        else:
-            fcst = np.asarray(fcst_grid, dtype=float)
-        
-        nmemb, ntimes, nlat, nlon = fcst.shape
-        
-        # Validate parameter dimensions
-        if self.params.shape[1:] != (nlat, nlon):
-            raise ValueError(f"Parameter dimensions {self.params.shape[1:]} don't match forecast dimensions {nlat, nlon}")
-        
-        # Initialize output arrays
-        cal_ens = np.full(fcst.shape, np.nan) if need_ensemble else None
-        mu = np.full((ntimes, nlat, nlon), np.nan)
-        sigma = np.full_like(mu, np.nan)
-        
-        # Extract parameters for fast access
-        if hasattr(self.params, 'values'):
-            param_np = self.params.values
-        else:
-            param_np = self.params
-        
-        # Apply calibration to each grid point
-        if show_progress:
-            print("Applying calibration to forecast...")
-            lat_iter = tqdm(range(nlat), desc="Latitude")
-        else:
-            lat_iter = range(nlat)
-        
-        for ilat in lat_iter:
-            for ilon in range(nlon):
-                try:
-                    f_gp = fcst[:, :, ilat, ilon].copy()
-                    
-                    # Skip if all data is NaN
-                    if np.isnan(f_gp).all():
-                        continue
-                    
-                    # Compute ensemble statistics
-                    ens_mean = np.nanmean(f_gp, axis=0)
-                    sigma_e = np.nanstd(f_gp, axis=0, ddof=1)
-                    
-                    # Handle cases where std is zero
-                    eps = np.finfo(float).eps * 100
-                    sigma_e_safe = np.maximum(sigma_e, eps)
-                    
-                    # Standardize anomalies
-                    anom = (f_gp - ens_mean[np.newaxis, :]) / sigma_e_safe[np.newaxis, :]
-                    
-                    # Get parameters for this grid point
-                    a, b, c, d = param_np[:, ilat, ilon]
-                    
-                    # Check for NaN parameters (no calibration applied)
-                    if np.isnan(a):
-                        mu[:, ilat, ilon] = ens_mean
-                        sigma[:, ilat, ilon] = sigma_e
-                        if need_ensemble:
-                            cal_ens[:, :, ilat, ilon] = f_gp
-                    else:
-                        # Apply calibration
-                        mu[:, ilat, ilon] = a + b * ens_mean
-                        sigma[:, ilat, ilon] = np.sqrt(c**2 + d**2 * sigma_e**2)
-                        if need_ensemble:
-                            cal_ens[:, :, ilat, ilon] = (mu[:, ilat, ilon][None, :] + 
-                                                         sigma[:, ilat, ilon][None, :] * anom)
-                            
-                except Exception:
-                    # Fallback to raw forecast
-                    mu[:, ilat, ilon] = np.nanmean(fcst[:, :, ilat, ilon], axis=0)
-                    sigma[:, ilat, ilon] = np.nanstd(fcst[:, :, ilat, ilon], axis=0, ddof=1)
-                    if need_ensemble:
-                        cal_ens[:, :, ilat, ilon] = fcst[:, :, ilat, ilon]
-        
-        # Package results
-        if use_xarray:
-            ds = xr.Dataset(attrs=attrs)
-            
-            if need_ensemble:
-                ens_da = xr.DataArray(
-                    cal_ens,
+            fc = fcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim)
+            fc_np = fc.values
+            out = self._predict_numpy(
+                fc_np,
+                quantiles=quantiles,
+                clim_terciles=clim_terciles,
+                return_synthetic_ensemble=return_synthetic_ensemble,
+            )
+
+            ds = xr.Dataset(attrs=dict(fcst_grid.attrs))
+            time_coords = fc.coords[time_dim]
+            member_coords = fc.coords[member_dim]
+            lat_coords = fc.coords[lat_dim]
+            lon_coords = fc.coords[lon_dim]
+
+            ds["calibrated_mean"] = xr.DataArray(
+                out["calibrated_mean"],
+                dims=(time_dim, lat_dim, lon_dim),
+                coords={time_dim: time_coords, lat_dim: lat_coords, lon_dim: lon_coords},
+            )
+            ds["calibrated_std"] = xr.DataArray(
+                out["calibrated_std"],
+                dims=(time_dim, lat_dim, lon_dim),
+                coords={time_dim: time_coords, lat_dim: lat_coords, lon_dim: lon_coords},
+            )
+
+            if "calibrated_quantiles" in out:
+                ds["calibrated_quantiles"] = xr.DataArray(
+                    out["calibrated_quantiles"],
+                    dims=("quantile", time_dim, lat_dim, lon_dim),
+                    coords={
+                        "quantile": list(np.asarray(quantiles, dtype=float)),
+                        time_dim: time_coords,
+                        lat_dim: lat_coords,
+                        lon_dim: lon_coords,
+                    },
+                )
+
+            if "tercile_probability" in out:
+                ds["tercile_probability"] = xr.DataArray(
+                    out["tercile_probability"],
+                    dims=("probability", time_dim, lat_dim, lon_dim),
+                    coords={
+                        "probability": ["PB", "PN", "PA"],
+                        time_dim: time_coords,
+                        lat_dim: lat_coords,
+                        lon_dim: lon_coords,
+                    },
+                )
+
+            if "synthetic_calibrated_ensemble" in out:
+                ds["synthetic_calibrated_ensemble"] = xr.DataArray(
+                    out["synthetic_calibrated_ensemble"],
                     dims=(member_dim, time_dim, lat_dim, lon_dim),
                     coords={
                         member_dim: member_coords,
                         time_dim: time_coords,
-                        lat_dim: self._lat_coords,
-                        lon_dim: self._lon_coords
+                        lat_dim: lat_coords,
+                        lon_dim: lon_coords,
                     },
-                    name='calibrated_ensemble'
                 )
-                ds['calibrated_ensemble'] = ens_da
-            
-            # Add mean and std
-            mu_da = xr.DataArray(
-                mu,
-                dims=(time_dim, lat_dim, lon_dim),
-                coords={
-                    time_dim: time_coords,
-                    lat_dim: self._lat_coords,
-                    lon_dim: self._lon_coords
-                },
-                name='calibrated_mean'
-            )
-            ds['calibrated_mean'] = mu_da
-            
-            sigma_da = xr.DataArray(
-                sigma,
-                dims=(time_dim, lat_dim, lon_dim),
-                coords=mu_da.coords,
-                name='calibrated_std'
-            )
-            ds['calibrated_std'] = sigma_da
-            
-            # Compute quantiles if requested
-            if quantiles is not None:
-                q_levels = np.asarray(quantiles)
-                if parametric:
-                    # Parametric quantiles from Gaussian distribution
-                    quant_np = norm.ppf(q_levels)[:, None, None, None] * sigma[None, ...] + mu[None, ...]
-                else:
-                    # Empirical quantiles from calibrated ensemble
-                    quant_np = np.nanquantile(cal_ens, q_levels, axis=0)
-                
-                quant_da = xr.DataArray(
-                    quant_np,
-                    dims=('quantile', time_dim, lat_dim, lon_dim),
-                    coords={
-                        'quantile': list(q_levels),
-                        time_dim: time_coords,
-                        lat_dim: self._lat_coords,
-                        lon_dim: self._lon_coords
-                    },
-                    name='calibrated_quantiles'
-                )
-                ds['calibrated_quantiles'] = quant_da
-            
-            # Compute tercile probabilities if requested
-            if clim_terciles:
-                if self.clim_terciles is None:
-                    raise RuntimeError("clim_terciles=True in fit() required for tercile probabilities")
-                
-                # Extract climate terciles
-                if hasattr(self.clim_terciles, 'isel'):
-                    lower_np = self.clim_terciles.isel(tercile=0).values
-                    upper_np = self.clim_terciles.isel(tercile=1).values
-                else:
-                    lower_np = self.clim_terciles[0]
-                    upper_np = self.clim_terciles[1]
-                
-                if parametric:
-                    # Parametric probabilities from Gaussian distribution
-                    p_below = norm.cdf(lower_np[np.newaxis, :, :], loc=mu, scale=sigma)
-                    p_above = norm.sf(upper_np[np.newaxis, :, :], loc=mu, scale=sigma)
-                    p_near = 1.0 - p_below - p_above
-                else:
-                    # Empirical probabilities from calibrated ensemble
-                    lower_b = lower_np[None, None, :, :]
-                    upper_b = upper_np[None, None, :, :]
-                    p_below = np.nanmean(cal_ens < lower_b, axis=0)
-                    p_above = np.nanmean(cal_ens > upper_b, axis=0)
-                    p_near = 1.0 - p_below - p_above
-                
-                # Package probabilities
-                cat_np = np.stack([p_below, p_near, p_above])
-                cat_da = xr.DataArray(
-                    cat_np,
-                    dims=('probability', time_dim, lat_dim, lon_dim),
-                    coords={
-                        'probability': ['PB', 'PN', 'PA'],
-                        time_dim: time_coords,
-                        lat_dim: self._lat_coords,
-                        lon_dim: self._lon_coords
-                    },
-                    name='tercile_probability'
-                )
-                ds['tercile_probability'] = cat_da
-            
+
             return ds
-        
-        else:
-            # Return numpy arrays
-            results = []
-            
-            if need_ensemble:
-                results.append(cal_ens)
-            
-            results.append(mu)
-            results.append(sigma)
-            
-            if quantiles is not None:
-                q_levels = np.asarray(quantiles)
-                if parametric:
-                    quant_np = norm.ppf(q_levels)[:, None, None, None] * sigma[None, ...] + mu[None, ...]
-                else:
-                    quant_np = np.nanquantile(cal_ens, q_levels, axis=0)
-                results.append(quant_np)
-            
-            if clim_terciles:
-                if self.clim_terciles is None:
-                    raise RuntimeError("clim_terciles=True in fit() required")
-                
-                if hasattr(self.clim_terciles, 'isel'):
-                    lower_np = self.clim_terciles.isel(tercile=0).values
-                    upper_np = self.clim_terciles.isel(tercile=1).values
-                else:
-                    lower_np = self.clim_terciles[0]
-                    upper_np = self.clim_terciles[1]
-                
-                if parametric:
-                    p_below = norm.cdf(lower_np[np.newaxis, :, :], loc=mu, scale=sigma)
-                    p_above = norm.sf(upper_np[np.newaxis, :, :], loc=mu, scale=sigma)
-                    p_near = 1.0 - p_below - p_above
-                else:
-                    lower_b = lower_np[None, None, :, :]
-                    upper_b = upper_np[None, None, :, :]
-                    p_below = np.nanmean(cal_ens < lower_b, axis=0)
-                    p_above = np.nanmean(cal_ens > upper_b, axis=0)
-                    p_near = 1.0 - p_below - p_above
-                
-                cat_np = np.stack([p_below, p_near, p_above])
-                results.append(cat_np)
-            
-            return tuple(results) if len(results) > 1 else results[0]
-    
-    def get_optimization_stats(self):
-        """
-        Get optimization statistics from fitting.
-        
-        Returns
-        -------
-        stats : dict or None
-            Dictionary containing optimization statistics if model is fitted
-        """
-        if not self.fitted:
-            warnings.warn("Model not fitted yet. Call fit() first.")
+
+        return self._predict_numpy(
+            fcst_grid,
+            quantiles=quantiles,
+            clim_terciles=clim_terciles,
+            return_synthetic_ensemble=return_synthetic_ensemble,
+        )
+
+    def transform(self, fcst_grid, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs["return_synthetic_ensemble"] = True
+        out = self.predict(fcst_grid, **kwargs)
+
+        if xr is not None and isinstance(out, xr.Dataset):
+            return (
+                out["synthetic_calibrated_ensemble"],
+                out["calibrated_mean"],
+                out["calibrated_std"],
+            )
+
+        return (
+            out["synthetic_calibrated_ensemble"],
+            out["calibrated_mean"],
+            out["calibrated_std"],
+        )
+
+    def compute_model(
+        self,
+        X_train,
+        y_train,
+        X_test,
+        obs_for_terciles=None,
+        quantiles=None,
+        clim_terciles=False,
+        member_dim="M",
+        time_dim="T",
+        lat_dim="Y",
+        lon_dim="X",
+        return_synthetic_ensemble=False,
+    ):
+        self.fit(
+            X_train,
+            y_train,
+            clim_terciles=bool(clim_terciles or (obs_for_terciles is not None)),
+            member_dim=member_dim,
+            time_dim=time_dim,
+            lat_dim=lat_dim,
+            lon_dim=lon_dim,
+        )
+
+        if obs_for_terciles is not None:
+            if xr is not None and isinstance(obs_for_terciles, xr.DataArray):
+                obs_np = obs_for_terciles.transpose(time_dim, lat_dim, lon_dim).values
+                terc = np.nanpercentile(obs_np, [100.0 / 3.0, 200.0 / 3.0], axis=0)
+                self.clim_terciles = xr.DataArray(
+                    terc,
+                    dims=("tercile", lat_dim, lon_dim),
+                    coords={
+                        "tercile": ["lower", "upper"],
+                        lat_dim: obs_for_terciles.coords[lat_dim],
+                        lon_dim: obs_for_terciles.coords[lon_dim],
+                    },
+                )
+            else:
+                obs_np = np.asarray(obs_for_terciles, dtype=float)
+                self.clim_terciles = np.nanpercentile(obs_np, [100.0 / 3.0, 200.0 / 3.0], axis=0)
+
+        return self.predict(
+            X_test,
+            quantiles=quantiles,
+            clim_terciles=clim_terciles,
+            return_synthetic_ensemble=return_synthetic_ensemble,
+            member_dim=member_dim,
+            time_dim=time_dim,
+            lat_dim=lat_dim,
+            lon_dim=lon_dim,
+        )
+
+    forecast = predict
+
+    def get_fit_stats(self):
+        if not self.fitted or self._fit_stats is None:
             return None
-        
-        stats = self._optimization_stats.copy()
-        
-        # Convert to xarray if using xarray
-        if self._xarray and self.params is not None:
-            for key, value in stats.items():
-                if isinstance(value, np.ndarray):
-                    stats[key] = xr.DataArray(
-                        value,
-                        dims=(self._lat_dim, self._lon_dim),
-                        coords={
-                            self._lat_dim: self._lat_coords,
-                            self._lon_dim: self._lon_coords
-                        },
-                        name=key
-                    )
-        
-        return stats
-    
+
+        if self._xarray and self._lat_coords is not None and self._lon_coords is not None:
+            out = {}
+            for key, arr in self._fit_stats.items():
+                out[key] = xr.DataArray(
+                    arr,
+                    dims=(self._lat_dim, self._lon_dim),
+                    coords={self._lat_dim: self._lat_coords, self._lon_dim: self._lon_coords},
+                    name=key,
+                )
+            return out
+
+        return self._fit_stats
+
     def summary(self):
-        """
-        Print summary of the fitted model.
-        """
         if not self.fitted:
             print("Model not fitted.")
             return
-        
-        print(f"WAS_mme_NGR Model Summary")
-        print(f"========================")
-        print(f"Type: {self.type}")
-        print(f"Apply to: {self.apply_to}")
-        print(f"Alpha: {self.alpha}")
-        print(f"Test direction: {self.test_direction}")
+
+        print("WAS_mme_NGR_Gaussian")
+        print("=================")
+        print(f"apply_to       : {self.apply_to}")
+        print(f"alpha          : {self.alpha}")
+        print(f"test_direction : {self.test_direction}")
+
+        stats = self.get_fit_stats()
+        if stats is None:
+            return
+
+        def _as_np(x):
+            return x.values if hasattr(x, "values") else x
+
+        success = _as_np(stats["success"])
+        reduction = _as_np(stats["score_reduction"])
+        nit = _as_np(stats["nit"])
+
         print()
-        
-        if self._optimization_stats:
-            success_rate = np.mean(self._optimization_stats['success']) * 100
-            valid_mask = self._optimization_stats['success']
-            if np.any(valid_mask):
-                avg_crps_reduction = np.nanmean(self._optimization_stats['crps_reduction'][valid_mask]) * 100
-                avg_iterations = np.nanmean(self._optimization_stats['iterations'][valid_mask])
-                print(f"Optimization Statistics:")
-                print(f"  Success rate: {success_rate:.1f}%")
-                print(f"  Avg CRPS reduction: {avg_crps_reduction:.1f}%")
-                print(f"  Avg iterations: {avg_iterations:.1f}")
-            else:
-                print("No successful optimizations.")
-        
-        if self.params is not None:
-            print(f"\nParameter Statistics:")
-            param_names = ['a', 'b', 'c', 'd']
-            for i, name in enumerate(param_names):
-                if hasattr(self.params, 'values'):
-                    param_data = self.params.values[i]
-                else:
-                    param_data = self.params[i]
-                valid_params = param_data[~np.isnan(param_data)]
-                if len(valid_params) > 0:
-                    print(f"  {name}: mean={np.mean(valid_params):.3f}, "
-                          f"std={np.std(valid_params):.3f}, "
-                          f"range=({np.min(valid_params):.3f}, {np.max(valid_params):.3f})")
-
-
-# Optional: Add parallel processing support for large grids
-try:
-    import numba as nb
-    
-    @nb.njit(parallel=True, fastmath=True)
-    def _apply_calibration_numba(fcst, params, mu, sigma, cal_ens):
-        """Numba-accelerated calibration application."""
-        nmemb, ntimes, nlat, nlon = fcst.shape
-        
-        for ilat in nb.prange(nlat):
-            for ilon in range(nlon):
-                # Get parameters for this grid point
-                a, b, c, d = params[0, ilat, ilon], params[1, ilat, ilon], params[2, ilat, ilon], params[3, ilat, ilon]
-                
-                for itime in range(ntimes):
-                    # Extract ensemble members for this time and grid point
-                    members = fcst[:, itime, ilat, ilon]
-                    
-                    # Check for NaN values
-                    valid = ~np.isnan(members)
-                    n_valid = np.sum(valid)
-                    
-                    if n_valid == 0:
-                        mu[itime, ilat, ilon] = np.nan
-                        sigma[itime, ilat, ilon] = np.nan
-                        if cal_ens is not None:
-                            for imemb in range(nmemb):
-                                cal_ens[imemb, itime, ilat, ilon] = np.nan
-                        continue
-                    
-                    # Compute mean and std of valid members
-                    valid_members = members[valid]
-                    ens_mean = np.mean(valid_members)
-                    ens_std = np.std(valid_members, ddof=1)
-                    
-                    # Avoid division by zero
-                    if ens_std < 1e-12:
-                        ens_std = 1.0
-                    
-                    # Compute calibrated mean and std
-                    mu_val = a + b * ens_mean
-                    sigma_val = np.sqrt(c**2 + d**2 * ens_std**2)
-                    
-                    mu[itime, ilat, ilon] = mu_val
-                    sigma[itime, ilat, ilon] = sigma_val
-                    
-                    # Generate calibrated ensemble if needed
-                    if cal_ens is not None:
-                        # Standardize anomalies
-                        anom = (valid_members - ens_mean) / ens_std
-                        cal_members = mu_val + sigma_val * anom
-                        
-                        # Fill calibrated members back
-                        idx = 0
-                        for imemb in range(nmemb):
-                            if valid[imemb]:
-                                cal_ens[imemb, itime, ilat, ilon] = cal_members[idx]
-                                idx += 1
-                            else:
-                                cal_ens[imemb, itime, ilat, ilon] = np.nan
-        
-        return mu, sigma, cal_ens
-    
-    def predict_fast(self, fcst_grid, **kwargs):
-        """Accelerated prediction using Numba (if available)."""
-        if not self.fitted:
-            raise RuntimeError("Model must be fitted before prediction.")
-        
-        # Fall back to regular predict if Numba not available or inputs are xarray
-        if xr is not None and isinstance(fcst_grid, xr.DataArray):
-            return self.predict(fcst_grid, **kwargs)
-        
-        # Extract arrays
-        fcst = np.asarray(fcst_grid, dtype=float)
-        if hasattr(self.params, 'values'):
-            params = self.params.values
-        else:
-            params = self.params
-        
-        nmemb, ntimes, nlat, nlon = fcst.shape
-        
-        # Validate parameter dimensions
-        if params.shape[1:] != (nlat, nlon):
-            raise ValueError(f"Parameter dimensions {params.shape[1:]} don't match forecast dimensions {nlat, nlon}")
-        
-        # Initialize output arrays
-        mu = np.full((ntimes, nlat, nlon), np.nan)
-        sigma = np.full_like(mu, np.nan)
-        cal_ens = np.full(fcst.shape, np.nan)
-        
-        # Apply calibration using Numba
-        mu, sigma, cal_ens = _apply_calibration_numba(fcst, params, mu, sigma, cal_ens)
-        
-        return cal_ens, mu, sigma
-    
-    # Add the method to the class
-    WAS_mme_NGR.predict_fast = predict_fast
-    
-except ImportError:
-    # Numba not available, use regular implementation
-    pass
+        print(f"success rate   : {100.0 * np.mean(success):.1f}%")
+        if np.any(success):
+            print(f"mean score gain: {100.0 * np.nanmean(reduction[success]):.2f}%")
+            print(f"mean iterations: {np.nanmean(nit[success]):.1f}")
 
 ######################################################################################################################################################################################################################################################################################
 
-#################################################################################################################################################### MVA ############################################################
+
+def _softplus(x):
+    x = np.asarray(x, dtype=float)
+    return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0.0)
+
+
+def _sigmoid(x):
+    x = np.asarray(x, dtype=float)
+    out = np.empty_like(x)
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    ex = np.exp(x[~pos])
+    out[~pos] = ex / (1.0 + ex)
+    return out
+
+
+def _rankdata_average(a):
+    a = np.asarray(a, dtype=float)
+    n = a.size
+    order = np.argsort(a, kind="mergesort")
+    ranks = np.empty(n, dtype=float)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and a[order[j + 1]] == a[order[i]]:
+            j += 1
+        avg_rank = 0.5 * (i + j) + 1.0
+        ranks[order[i : j + 1]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _boxcox_forward(y, lmbda, shift=1e-6):
+    x = np.asarray(y, dtype=float) + shift
+    if np.any(x <= 0):
+        raise ValueError("Box-Cox requires y + shift > 0.")
+    if abs(lmbda) < 1e-12:
+        return np.log(x)
+    return (np.power(x, lmbda) - 1.0) / lmbda
+
+
+def _boxcox_inverse(z, lmbda, shift=1e-6):
+    z = np.asarray(z, dtype=float)
+    if abs(lmbda) < 1e-12:
+        x = np.exp(z)
+    else:
+        base = 1.0 + lmbda * z
+        base = np.maximum(base, 1e-12)
+        x = np.power(base, 1.0 / lmbda)
+    return np.maximum(x - shift, 0.0)
+
+
+def _boxcox_log_jacobian(y, lmbda, shift=1e-6):
+    x = np.asarray(y, dtype=float) + shift
+    if np.any(x <= 0):
+        return -np.inf
+    if abs(lmbda) < 1e-12:
+        return -np.log(x)
+    return (lmbda - 1.0) * np.log(x)
+
+
+def _censored_normal_logpdf(y, mu, sigma, dry_threshold=0.0):
+    y = np.asarray(y, dtype=float)
+    mu = np.asarray(mu, dtype=float)
+    sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-8)
+
+    zt = (dry_threshold - mu) / sigma
+    out = np.empty_like(np.broadcast_arrays(y, mu, sigma)[0], dtype=float)
+
+    dry = y <= dry_threshold
+    if np.any(dry):
+        p0 = norm.cdf(zt[dry] if np.ndim(zt) else zt)
+        p0 = np.maximum(p0, 1e-15)
+        out[dry] = np.log(p0)
+
+    wet = ~dry
+    if np.any(wet):
+        yw = y[wet]
+        muw = mu[wet] if np.ndim(mu) else mu
+        sw = sigma[wet] if np.ndim(sigma) else sigma
+        out[wet] = norm.logpdf(yw, loc=muw, scale=sw)
+
+    return out
+
+
+def _truncated_normal_logpdf(y, mu, sigma, dry_threshold=0.0):
+    y = np.asarray(y, dtype=float)
+    mu = np.asarray(mu, dtype=float)
+    sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-8)
+
+    alpha = (dry_threshold - mu) / sigma
+    denom = np.maximum(1.0 - norm.cdf(alpha), 1e-15)
+    out = norm.logpdf(y, loc=mu, scale=sigma) - np.log(denom)
+    out = np.where(y > dry_threshold, out, -np.inf)
+    return out
+
+
+def _truncated_normal_mean_var(mu, sigma, dry_threshold=0.0):
+    sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-8)
+    alpha = (dry_threshold - mu) / sigma
+    z = np.maximum(1.0 - norm.cdf(alpha), 1e-15)
+    lam = norm.pdf(alpha) / z
+    mean = mu + sigma * lam
+    var = sigma**2 * (1.0 + alpha * lam - lam**2)
+    return mean, np.maximum(var, 0.0)
+
+
+def _gamma_from_mean_var(mean, var):
+    mean = np.maximum(np.asarray(mean, dtype=float), 1e-10)
+    var = np.maximum(np.asarray(var, dtype=float), 1e-10)
+    shape = mean**2 / var
+    scale = var / mean
+    return shape, scale
+
+
+def _gamma_logpdf(y, mean, var, dry_threshold=0.0):
+    y = np.asarray(y, dtype=float)
+    x = y - dry_threshold
+    x = np.maximum(x, 1e-12)
+    k, theta = _gamma_from_mean_var(mean, var)
+    return gamma_dist.logpdf(x, a=k, scale=theta)
+
+
+def _fit_occurrence_logistic(wet_frac, fbar, is_dry, l2=1e-6):
+    wet_frac = np.asarray(wet_frac, dtype=float)
+    fbar = np.asarray(fbar, dtype=float)
+    is_dry = np.asarray(is_dry, dtype=float)
+
+    x = np.column_stack(
+        [
+            np.ones_like(wet_frac),
+            wet_frac,
+            np.nan_to_num(fbar, nan=np.nanmedian(fbar) if np.any(np.isfinite(fbar)) else 0.0),
+        ]
+    )
+
+    means = np.zeros(x.shape[1], dtype=float)
+    stds = np.ones(x.shape[1], dtype=float)
+    for j in range(1, x.shape[1]):
+        means[j] = np.nanmean(x[:, j])
+        stds[j] = np.nanstd(x[:, j])
+        if not np.isfinite(stds[j]) or stds[j] < 1e-10:
+            stds[j] = 1.0
+        x[:, j] = (x[:, j] - means[j]) / stds[j]
+
+    def obj(beta):
+        eta = x @ beta
+        p = np.clip(_sigmoid(eta), 1e-10, 1.0 - 1e-10)
+        nll = -np.sum(is_dry * np.log(p) + (1.0 - is_dry) * np.log(1.0 - p))
+        pen = 0.5 * l2 * np.sum(beta[1:] ** 2)
+        return nll + pen
+
+    res = minimize(obj, x0=np.zeros(x.shape[1]), method="BFGS")
+    beta = res.x if res.success else np.zeros(x.shape[1])
+
+    return {
+        "beta": beta,
+        "means": means,
+        "stds": stds,
+        "success": bool(res.success),
+    }
+
+
+class WAS_mme_NGR_NonGaussian:
+    """
+    Precipitation-oriented EMOS-style postprocessor with optional predictive families:
+
+    - family='censored_normal'
+    - family='truncated_normal'
+    - family='gamma'
+    - family='transformed_gaussian'
+
+    Notes
+    -----
+    1) Designed for nonnegative predictands such as precipitation.
+    2) For families without an intrinsic atom at zero, a hurdle occurrence model
+       is used by default:
+           P(Y = 0) = p0
+           Y | Y > 0  ~ positive family
+    3) Fitting uses log-likelihood rather than analytic CRPS, so one coherent
+       implementation can cover all families.
+    """
+
+    VALID_FAMILIES = {
+        "censored_normal",
+        "truncated_normal",
+        "gamma",
+        "transformed_gaussian",
+    }
+    VALID_OCC = {"auto", "none", "climatology", "logistic"}
+
+    def __init__(
+        self,
+        family="censored_normal",
+        occurrence_model="auto",
+        dry_threshold=0.0,
+        transform="boxcox",
+        transform_shift=1e-6,
+        alpha=0.10,
+        apply_to="all",
+        bounds=None,
+    ):
+        if family not in self.VALID_FAMILIES:
+            raise ValueError(f"family must be one of {self.VALID_FAMILIES}")
+        if occurrence_model not in self.VALID_OCC:
+            raise ValueError(f"occurrence_model must be one of {self.VALID_OCC}")
+        if apply_to not in {"all", "sig", "pos", "neg"}:
+            raise ValueError("apply_to must be one of {'all', 'sig', 'pos', 'neg'}")
+
+        self.family = family
+        self.occurrence_model = occurrence_model
+        self.dry_threshold = float(dry_threshold)
+        self.transform = transform
+        self.transform_shift = float(transform_shift)
+        self.alpha = float(alpha)
+        self.apply_to = apply_to
+
+        self.bounds = {
+            "a": (-np.inf, np.inf),
+            "b": (-np.inf, np.inf),
+            "c": (-10.0, 20.0),
+            "d": (-10.0, 20.0),
+        }
+        if bounds is not None:
+            self.bounds.update(bounds)
+
+        self.params = None
+        self.occ_params = None
+        self._occ_feature_means = None
+        self._occ_feature_stds = None
+        self.transform_param = None
+        self.clim_terciles = None
+        self.fitted = False
+        self._fit_stats = None
+        self._xarray = False
+        self.attrs = {}
+
+        self._member_dim = "M"
+        self._time_dim = "T"
+        self._lat_dim = "Y"
+        self._lon_dim = "X"
+        self._param_dim = "parameter"
+        self._lat_coords = None
+        self._lon_coords = None
+
+    def __repr__(self):
+        status = "fitted" if self.fitted else "unfitted"
+        return (
+            f"WAS_mme_NGR_NonGaussian(family={self.family!r}, "
+            f"occurrence_model={self.occurrence_model!r}, {status})"
+        )
+
+    def _needs_hurdle(self):
+        if self.family == "censored_normal":
+            return False
+        if self.occurrence_model == "none":
+            return False
+        return True
+
+    @staticmethod
+    def _safe_ens_stats(h, dry_threshold=0.0):
+        fbar = np.nanmean(h, axis=0)
+        s2 = np.full(h.shape[1], np.nan, dtype=float)
+        wet_frac = np.full(h.shape[1], np.nan, dtype=float)
+        for t in range(h.shape[1]):
+            x = h[:, t]
+            good = np.isfinite(x)
+            xx = x[good]
+            if xx.size == 0:
+                s2[t] = np.nan
+                wet_frac[t] = np.nan
+            elif xx.size == 1:
+                s2[t] = 0.0
+                wet_frac[t] = np.mean(xx > dry_threshold)
+            else:
+                s2[t] = np.var(xx, ddof=1)
+                wet_frac[t] = np.mean(xx > dry_threshold)
+        return fbar, np.maximum(s2, 0.0), wet_frac
+
+    def _regression_significant(self, r, n):
+        if n <= 2 or not np.isfinite(r):
+            return False
+        if abs(r) >= 1.0 - 1e-12:
+            return True
+        t_stat = r * np.sqrt((n - 2.0) / max(1.0 - r * r, 1e-12))
+        if self.apply_to == "sig" or self.apply_to == "all":
+            p = 2.0 * tdist.sf(abs(t_stat), df=n - 2)
+            return bool(p < self.alpha)
+        if self.apply_to == "pos":
+            p = tdist.sf(t_stat, df=n - 2)
+            return bool((r > 0.0) and (p < self.alpha))
+        if self.apply_to == "neg":
+            p = tdist.cdf(t_stat, df=n - 2)
+            return bool((r < 0.0) and (p < self.alpha))
+        return False
+
+    def _should_calibrate(self, fbar, y):
+        good = np.isfinite(fbar) & np.isfinite(y)
+        if good.sum() < 3:
+            return False
+        if self.apply_to == "all":
+            return True
+        lm = linregress(fbar[good], y[good])
+        return self._regression_significant(float(lm.rvalue), int(good.sum()))
+
+    def _mu_var_from_pars(self, pars, fbar, s2):
+        a, b, c, d = pars
+        mu = a + b * fbar
+        var = _softplus(c + d * s2) + 1e-10
+        return mu, var
+
+    def _pos_nll(self, pars, fbar, s2, y_all, wet_mask, lmbda=None):
+        mu, var = self._mu_var_from_pars(pars, fbar, s2)
+        sigma = np.sqrt(var)
+
+        if self.family == "censored_normal":
+            ll = _censored_normal_logpdf(y_all, mu, sigma, dry_threshold=self.dry_threshold)
+            return -np.sum(ll[np.isfinite(ll)])
+
+        fmu = mu[wet_mask]
+        fvar = var[wet_mask]
+        fsig = sigma[wet_mask]
+        yy = y_all[wet_mask]
+
+        if yy.size == 0:
+            return np.inf
+
+        if self.family == "truncated_normal":
+            ll = _truncated_normal_logpdf(yy, fmu, fsig, dry_threshold=self.dry_threshold)
+            return -np.sum(ll[np.isfinite(ll)])
+
+        if self.family == "gamma":
+            mean_pos = np.maximum(fmu, 1e-8)
+            ll = _gamma_logpdf(yy, mean_pos, fvar, dry_threshold=self.dry_threshold)
+            return -np.sum(ll[np.isfinite(ll)])
+
+        if self.family == "transformed_gaussian":
+            if self.transform != "boxcox":
+                raise NotImplementedError("Only Box-Cox is implemented here.")
+            yy_shift = np.maximum(yy - self.dry_threshold, 0.0)
+            z = _boxcox_forward(yy_shift, lmbda=lmbda, shift=self.transform_shift)
+            ll = norm.logpdf(z, loc=fmu, scale=fsig) + _boxcox_log_jacobian(
+                yy_shift, lmbda=lmbda, shift=self.transform_shift
+            )
+            return -np.sum(ll[np.isfinite(ll)])
+
+        raise ValueError(f"Unknown family {self.family}")
+
+    def _fit_one_grid(self, h_gp, o_gp):
+        valid = np.isfinite(o_gp) & np.any(np.isfinite(h_gp), axis=0)
+        if valid.sum() < 5:
+            return (
+                np.array([0.0, 1.0, np.log(np.expm1(1e-4)), 0.0]),
+                None,
+                np.nan,
+                {"success": False, "n_valid": int(valid.sum()), "final_nll": np.nan},
+            )
+
+        h = h_gp[:, valid]
+        y = o_gp[valid]
+        fbar, s2, wet_frac = self._safe_ens_stats(h, dry_threshold=self.dry_threshold)
+        dry = y <= self.dry_threshold
+        wet = ~dry
+
+        lmbda = np.nan
+        if self.family == "transformed_gaussian":
+            y_pos = y[wet] - self.dry_threshold
+            if y_pos.size < 5:
+                return (
+                    np.array([0.0, 1.0, np.log(np.expm1(1e-4)), 0.0]),
+                    None,
+                    np.nan,
+                    {"success": False, "n_valid": int(valid.sum()), "final_nll": np.nan},
+                )
+            try:
+                lmbda = float(boxcox_normmax(np.maximum(y_pos, self.transform_shift)))
+            except Exception:
+                lmbda = 0.0
+
+        occ_model = None
+        if self._needs_hurdle():
+            occ_mode = self.occurrence_model
+            if occ_mode == "auto":
+                occ_mode = "logistic"
+            if occ_mode == "climatology":
+                occ_model = {"kind": "climatology", "p0": float(np.mean(dry))}
+            elif occ_mode == "logistic":
+                occ_fit = _fit_occurrence_logistic(wet_frac, fbar, dry.astype(float))
+                occ_fit["kind"] = "logistic"
+                occ_model = occ_fit
+
+        target_for_gate = np.where(wet, y, 0.0)
+        if not self._should_calibrate(fbar, target_for_gate):
+            base = np.array([0.0, 1.0, np.log(np.expm1(np.nanvar(target_for_gate) + 1e-6)), 0.0])
+            return base, occ_model, lmbda, {
+                "success": True,
+                "n_valid": int(valid.sum()),
+                "final_nll": np.nan,
+            }
+
+        wet_target = y if self.family == "censored_normal" else y[wet]
+        wet_fbar = fbar if self.family == "censored_normal" else fbar[wet]
+        mask = np.isfinite(wet_fbar) & np.isfinite(wet_target)
+        if wet_target.size < 3 or mask.sum() < 3:
+            init_a, init_b = 0.0, 1.0
+        else:
+            lm = linregress(wet_fbar[mask], wet_target[mask])
+            init_a, init_b = float(lm.intercept), float(lm.slope)
+
+        init_var = np.nanvar(np.where(np.isfinite(y), y, np.nan))
+        init_c = np.log(np.expm1(max(init_var, 1e-4)))
+        init_d = 0.1
+        x0 = np.array([init_a, init_b, init_c, init_d], dtype=float)
+
+        bounds = [self.bounds["a"], self.bounds["b"], self.bounds["c"], self.bounds["d"]]
+
+        res = minimize(
+            self._pos_nll,
+            x0=x0,
+            args=(fbar, s2, y, wet, lmbda),
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 600, "ftol": 1e-9, "gtol": 1e-6},
+        )
+
+        pars = res.x if res.success else x0
+        return pars, occ_model, lmbda, {
+            "success": bool(res.success),
+            "n_valid": int(valid.sum()),
+            "final_nll": float(res.fun) if np.isfinite(res.fun) else np.nan,
+        }
+
+    def fit(
+        self,
+        hcst_grid,
+        obs_grid,
+        clim_terciles=False,
+        member_dim="M",
+        time_dim="T",
+        lat_dim="Y",
+        lon_dim="X",
+    ):
+        use_xarray = (
+            xr is not None
+            and isinstance(hcst_grid, xr.DataArray)
+            and isinstance(obs_grid, xr.DataArray)
+        )
+
+        self._member_dim = member_dim
+        self._time_dim = time_dim
+        self._lat_dim = lat_dim
+        self._lon_dim = lon_dim
+
+        if use_xarray:
+            hcst = hcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim).values
+            obs = obs_grid.transpose(time_dim, lat_dim, lon_dim).values
+            self._lat_coords = hcst_grid.coords[lat_dim]
+            self._lon_coords = hcst_grid.coords[lon_dim]
+            self.attrs = dict(hcst_grid.attrs)
+            self._xarray = True
+        else:
+            hcst = np.asarray(hcst_grid, dtype=float)
+            obs = np.asarray(obs_grid, dtype=float)
+            self._xarray = False
+
+        if hcst.ndim != 4:
+            raise ValueError("hcst_grid must have shape (M, T, Y, X)")
+        if obs.ndim != 3:
+            raise ValueError("obs_grid must have shape (T, Y, X)")
+
+        m, t, ny, nx = hcst.shape
+        if obs.shape != (t, ny, nx):
+            raise ValueError(f"obs_grid must have shape {(t, ny, nx)}, got {obs.shape}")
+
+        params = np.full((4, ny, nx), np.nan, dtype=float)
+        occ_params = np.full((3, ny, nx), np.nan, dtype=float)
+        occ_feature_means = np.full((2, ny, nx), np.nan, dtype=float)
+        occ_feature_stds = np.full((2, ny, nx), np.nan, dtype=float)
+        transform_param = np.full((ny, nx), np.nan, dtype=float)
+
+        fit_stats = {
+            "success": np.zeros((ny, nx), dtype=bool),
+            "n_valid": np.zeros((ny, nx), dtype=int),
+            "final_nll": np.full((ny, nx), np.nan, dtype=float),
+        }
+
+        for iy in range(ny):
+            for ix in range(nx):
+                pars, occ, lmbda, stat = self._fit_one_grid(hcst[:, :, iy, ix], obs[:, iy, ix])
+                params[:, iy, ix] = pars
+                transform_param[iy, ix] = lmbda
+                fit_stats["success"][iy, ix] = stat["success"]
+                fit_stats["n_valid"][iy, ix] = stat["n_valid"]
+                fit_stats["final_nll"][iy, ix] = stat["final_nll"]
+
+                if occ is not None:
+                    if occ["kind"] == "climatology":
+                        occ_params[:, iy, ix] = [occ["p0"], np.nan, np.nan]
+                    elif occ["kind"] == "logistic":
+                        beta = occ["beta"]
+                        occ_params[: len(beta), iy, ix] = beta
+                        occ_feature_means[:, iy, ix] = occ["means"][1:]
+                        occ_feature_stds[:, iy, ix] = occ["stds"][1:]
+
+        self.params = params
+        self.occ_params = occ_params if self._needs_hurdle() else None
+        self._occ_feature_means = occ_feature_means if self._needs_hurdle() else None
+        self._occ_feature_stds = occ_feature_stds if self._needs_hurdle() else None
+        self.transform_param = transform_param if self.family == "transformed_gaussian" else None
+
+        if clim_terciles:
+            terc = np.nanpercentile(obs, [100.0 / 3.0, 200.0 / 3.0], axis=0)
+            self.clim_terciles = terc
+
+        if use_xarray:
+            self.params = xr.DataArray(
+                params,
+                dims=(self._param_dim, lat_dim, lon_dim),
+                coords={
+                    self._param_dim: ["a", "b", "c", "d"],
+                    lat_dim: self._lat_coords,
+                    lon_dim: self._lon_coords,
+                },
+                name="precip_emos_parameters",
+                attrs=self.attrs,
+            )
+            if self.occ_params is not None:
+                self.occ_params = xr.DataArray(
+                    occ_params,
+                    dims=("occ_parameter", lat_dim, lon_dim),
+                    coords={
+                        "occ_parameter": ["p0_or_b0", "b1", "b2"],
+                        lat_dim: self._lat_coords,
+                        lon_dim: self._lon_coords,
+                    },
+                    name="occurrence_parameters",
+                )
+            if self.transform_param is not None:
+                self.transform_param = xr.DataArray(
+                    transform_param,
+                    dims=(lat_dim, lon_dim),
+                    coords={lat_dim: self._lat_coords, lon_dim: self._lon_coords},
+                    name="transform_parameter",
+                )
+            if self.clim_terciles is not None:
+                self.clim_terciles = xr.DataArray(
+                    self.clim_terciles,
+                    dims=("tercile", lat_dim, lon_dim),
+                    coords={
+                        "tercile": ["lower", "upper"],
+                        lat_dim: self._lat_coords,
+                        lon_dim: self._lon_coords,
+                    },
+                    name="climatological_terciles",
+                )
+
+        self._fit_stats = fit_stats
+        self.fitted = True
+        return self
+
+    def _cdf_positive(self, y, mu, var, family, lmbda=None):
+        sigma = np.sqrt(np.maximum(var, 1e-10))
+        y = np.asarray(y, dtype=float)
+
+        if family == "censored_normal":
+            return norm.cdf(y, loc=mu, scale=sigma)
+
+        if family == "truncated_normal":
+            alpha = (self.dry_threshold - mu) / sigma
+            denom = np.maximum(1.0 - norm.cdf(alpha), 1e-15)
+            num = np.maximum(norm.cdf((y - mu) / sigma) - norm.cdf(alpha), 0.0)
+            return np.clip(num / denom, 0.0, 1.0)
+
+        if family == "gamma":
+            mean_pos = np.maximum(mu, 1e-8)
+            k, theta = _gamma_from_mean_var(mean_pos, var)
+            return gamma_dist.cdf(np.maximum(y - self.dry_threshold, 0.0), a=k, scale=theta)
+
+        if family == "transformed_gaussian":
+            yp = np.maximum(y - self.dry_threshold, 0.0)
+            z = _boxcox_forward(yp, lmbda=lmbda, shift=self.transform_shift)
+            return norm.cdf(z, loc=mu, scale=sigma)
+
+        raise ValueError(f"Unknown family {family}")
+
+    def _ppf_positive(self, p, mu, var, family, lmbda=None):
+        p = np.clip(np.asarray(p, dtype=float), 1e-12, 1.0 - 1e-12)
+        sigma = np.sqrt(np.maximum(var, 1e-10))
+
+        if family == "censored_normal":
+            q = norm.ppf(p, loc=mu, scale=sigma)
+            return np.maximum(q, self.dry_threshold)
+
+        if family == "truncated_normal":
+            alpha = (self.dry_threshold - mu) / sigma
+            pa = norm.cdf(alpha)
+            z = norm.ppf(pa + p * (1.0 - pa))
+            return mu + sigma * z
+
+        if family == "gamma":
+            mean_pos = np.maximum(mu, 1e-8)
+            k, theta = _gamma_from_mean_var(mean_pos, var)
+            return self.dry_threshold + gamma_dist.ppf(p, a=k, scale=theta)
+
+        if family == "transformed_gaussian":
+            z = norm.ppf(p, loc=mu, scale=sigma)
+            return self.dry_threshold + _boxcox_inverse(z, lmbda=lmbda, shift=self.transform_shift)
+
+        raise ValueError(f"Unknown family {family}")
+
+    def _positive_mean_var(self, mu, var, family, lmbda=None):
+        sigma = np.sqrt(np.maximum(var, 1e-10))
+
+        if family == "censored_normal":
+            a = mu / sigma
+            mean = sigma * norm.pdf(a) + mu * norm.cdf(a)
+            e2 = (mu**2 + var) * norm.cdf(a) + mu * sigma * norm.pdf(a)
+            v = np.maximum(e2 - mean**2, 0.0)
+            return mean, v
+
+        if family == "truncated_normal":
+            return _truncated_normal_mean_var(mu, sigma, dry_threshold=self.dry_threshold)
+
+        if family == "gamma":
+            mean_pos = np.maximum(mu, 1e-8)
+            return mean_pos + self.dry_threshold, np.maximum(var, 0.0)
+
+        if family == "transformed_gaussian":
+            p = np.linspace(0.01, 0.99, 51)
+            mu_ex = np.expand_dims(np.asarray(mu, dtype=float), axis=-1)
+            var_ex = np.expand_dims(np.asarray(var, dtype=float), axis=-1)
+            yq = self._ppf_positive(p, mu_ex, var_ex, family, lmbda=lmbda)
+            mean = np.nanmean(yq, axis=-1)
+            vv = np.nanvar(yq, axis=-1, ddof=0)
+            return mean, np.maximum(vv, 0.0)
+
+        raise ValueError(f"Unknown family {family}")
+
+    def _predict_numpy(
+        self,
+        fcst,
+        quantiles=None,
+        clim_terciles=False,
+        return_synthetic_ensemble=False,
+    ):
+        if not self.fitted:
+            raise RuntimeError("Call fit() before predict().")
+
+        fcst = np.asarray(fcst, dtype=float)
+        if fcst.ndim != 4:
+            raise ValueError("fcst must have shape (M, T, Y, X)")
+
+        m, t, ny, nx = fcst.shape
+
+        param_np = self.params.values if hasattr(self.params, "values") else self.params
+        occ_np = None if self.occ_params is None else (
+            self.occ_params.values if hasattr(self.occ_params, "values") else self.occ_params
+        )
+        occ_mean_np = None if self._occ_feature_means is None else self._occ_feature_means
+        occ_std_np = None if self._occ_feature_stds is None else self._occ_feature_stds
+        lam_np = None if self.transform_param is None else (
+            self.transform_param.values if hasattr(self.transform_param, "values") else self.transform_param
+        )
+
+        mean_out = np.full((t, ny, nx), np.nan, dtype=float)
+        std_out = np.full((t, ny, nx), np.nan, dtype=float)
+        probs_out = None
+        q_out = None
+        synth_out = np.full((m, t, ny, nx), np.nan, dtype=float) if return_synthetic_ensemble else None
+
+        if quantiles is not None:
+            q_levels = np.asarray(quantiles, dtype=float)
+            q_out = np.full((q_levels.size, t, ny, nx), np.nan, dtype=float)
+
+        if clim_terciles:
+            probs_out = np.full((3, t, ny, nx), np.nan, dtype=float)
+            terc = self.clim_terciles.values if hasattr(self.clim_terciles, "values") else self.clim_terciles
+
+        for iy in range(ny):
+            for ix in range(nx):
+                f_gp = fcst[:, :, iy, ix]
+                fbar, s2, wet_frac = self._safe_ens_stats(f_gp, dry_threshold=self.dry_threshold)
+                pars = param_np[:, iy, ix]
+                mu, var = self._mu_var_from_pars(pars, fbar, s2)
+
+                lmbda = None if lam_np is None else lam_np[iy, ix]
+                p0 = np.zeros_like(fbar)
+
+                if self._needs_hurdle():
+                    if self.occurrence_model == "climatology":
+                        p0[:] = occ_np[0, iy, ix]
+                    else:
+                        beta = np.where(np.isfinite(occ_np[:, iy, ix]), occ_np[:, iy, ix], 0.0)
+                        m1, m2 = occ_mean_np[:, iy, ix]
+                        s1, s2s = occ_std_np[:, iy, ix]
+                        if not np.isfinite(s1) or s1 < 1e-10:
+                            s1 = 1.0
+                        if not np.isfinite(s2s) or s2s < 1e-10:
+                            s2s = 1.0
+                        x1 = (wet_frac - m1) / s1
+                        x2 = (np.nan_to_num(fbar, nan=0.0) - m2) / s2s
+                        eta = beta[0] + beta[1] * x1 + beta[2] * x2
+                        p0[:] = np.clip(_sigmoid(eta), 1e-10, 1.0 - 1e-10)
+
+                if self.family == "censored_normal":
+                    sigma = np.sqrt(np.maximum(var, 1e-10))
+                    p0 = norm.cdf((self.dry_threshold - mu) / sigma)
+
+                pos_mean, pos_var = self._positive_mean_var(mu, var, self.family, lmbda=lmbda)
+                if self.family == "censored_normal":
+                    full_mean = pos_mean
+                    full_var = pos_var
+                else:
+                    qwet = 1.0 - np.clip(p0, 0.0, 1.0)
+                    full_mean = qwet * pos_mean
+                    full_var = qwet * pos_var + qwet * (1.0 - qwet) * pos_mean**2
+
+                mean_out[:, iy, ix] = full_mean
+                std_out[:, iy, ix] = np.sqrt(np.maximum(full_var, 0.0))
+
+                if quantiles is not None:
+                    for iq, q in enumerate(q_levels):
+                        if self.family == "censored_normal":
+                            sigma = np.sqrt(np.maximum(var, 1e-10))
+                            q_out[iq, :, iy, ix] = np.where(
+                                q <= p0,
+                                self.dry_threshold,
+                                np.maximum(norm.ppf(q, loc=mu, scale=sigma), self.dry_threshold),
+                            )
+                        else:
+                            r = np.where(q <= p0, np.nan, (q - p0) / np.maximum(1.0 - p0, 1e-12))
+                            vals = np.where(
+                                q <= p0,
+                                self.dry_threshold,
+                                self._ppf_positive(r, mu, var, self.family, lmbda=lmbda),
+                            )
+                            q_out[iq, :, iy, ix] = vals
+
+                if clim_terciles:
+                    lower = terc[0, iy, ix]
+                    upper = terc[1, iy, ix]
+
+                    if self.family == "censored_normal":
+                        p_below = self._cdf_positive(lower, mu, var, self.family, lmbda=lmbda)
+                        p_above = 1.0 - self._cdf_positive(upper, mu, var, self.family, lmbda=lmbda)
+                    else:
+                        f_lower = np.where(
+                            lower <= self.dry_threshold,
+                            p0,
+                            p0 + (1.0 - p0) * self._cdf_positive(lower, mu, var, self.family, lmbda=lmbda),
+                        )
+                        f_upper = np.where(
+                            upper <= self.dry_threshold,
+                            p0,
+                            p0 + (1.0 - p0) * self._cdf_positive(upper, mu, var, self.family, lmbda=lmbda),
+                        )
+                        p_below = f_lower
+                        p_above = 1.0 - f_upper
+
+                    p_near = 1.0 - p_below - p_above
+                    probs = np.stack([p_below, p_near, p_above], axis=0)
+                    probs = np.clip(probs, 0.0, 1.0)
+                    denom = np.sum(probs, axis=0, keepdims=True)
+                    denom = np.where(denom <= 0.0, 1.0, denom)
+                    probs_out[:, :, iy, ix] = probs / denom
+
+                if return_synthetic_ensemble:
+                    for tt in range(t):
+                        raw = f_gp[:, tt]
+                        good = np.isfinite(raw)
+                        if not np.any(good):
+                            continue
+                        ranks = _rankdata_average(raw[good])
+                        probs = (ranks - 0.5) / good.sum()
+
+                        if self.family == "censored_normal":
+                            sigma = np.sqrt(max(var[tt], 1e-10))
+                            vals = np.maximum(norm.ppf(probs, loc=mu[tt], scale=sigma), self.dry_threshold)
+                        else:
+                            vals = np.where(
+                                probs <= p0[tt],
+                                self.dry_threshold,
+                                self._ppf_positive(
+                                    (probs - p0[tt]) / max(1.0 - p0[tt], 1e-12),
+                                    mu[tt],
+                                    var[tt],
+                                    self.family,
+                                    lmbda=lmbda,
+                                ),
+                            )
+                        tmp = np.full(m, np.nan)
+                        tmp[good] = vals
+                        synth_out[:, tt, iy, ix] = tmp
+
+        out = {
+            "calibrated_mean": mean_out,
+            "calibrated_std": std_out,
+        }
+        if q_out is not None:
+            out["calibrated_quantiles"] = q_out
+        if probs_out is not None:
+            out["tercile_probability"] = probs_out
+        if synth_out is not None:
+            out["synthetic_calibrated_ensemble"] = synth_out
+        return out
+
+    def predict(
+        self,
+        fcst_grid,
+        quantiles=None,
+        clim_terciles=False,
+        return_synthetic_ensemble=False,
+        member_dim="M",
+        time_dim="T",
+        lat_dim="Y",
+        lon_dim="X",
+    ):
+        use_xarray = xr is not None and isinstance(fcst_grid, xr.DataArray)
+
+        if use_xarray:
+            fc = fcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim)
+            out = self._predict_numpy(
+                fc.values,
+                quantiles=quantiles,
+                clim_terciles=clim_terciles,
+                return_synthetic_ensemble=return_synthetic_ensemble,
+            )
+
+            ds = xr.Dataset(attrs=dict(fcst_grid.attrs))
+            ds["calibrated_mean"] = xr.DataArray(
+                out["calibrated_mean"],
+                dims=(time_dim, lat_dim, lon_dim),
+                coords={
+                    time_dim: fc.coords[time_dim],
+                    lat_dim: fc.coords[lat_dim],
+                    lon_dim: fc.coords[lon_dim],
+                },
+            )
+            ds["calibrated_std"] = xr.DataArray(
+                out["calibrated_std"],
+                dims=(time_dim, lat_dim, lon_dim),
+                coords={
+                    time_dim: fc.coords[time_dim],
+                    lat_dim: fc.coords[lat_dim],
+                    lon_dim: fc.coords[lon_dim],
+                },
+            )
+
+            if "calibrated_quantiles" in out:
+                ds["calibrated_quantiles"] = xr.DataArray(
+                    out["calibrated_quantiles"],
+                    dims=("quantile", time_dim, lat_dim, lon_dim),
+                    coords={
+                        "quantile": list(np.asarray(quantiles, dtype=float)),
+                        time_dim: fc.coords[time_dim],
+                        lat_dim: fc.coords[lat_dim],
+                        lon_dim: fc.coords[lon_dim],
+                    },
+                )
+
+            if "tercile_probability" in out:
+                ds["tercile_probability"] = xr.DataArray(
+                    out["tercile_probability"],
+                    dims=("probability", time_dim, lat_dim, lon_dim),
+                    coords={
+                        "probability": ["PB", "PN", "PA"],
+                        time_dim: fc.coords[time_dim],
+                        lat_dim: fc.coords[lat_dim],
+                        lon_dim: fc.coords[lon_dim],
+                    },
+                )
+
+            if "synthetic_calibrated_ensemble" in out:
+                ds["synthetic_calibrated_ensemble"] = xr.DataArray(
+                    out["synthetic_calibrated_ensemble"],
+                    dims=(member_dim, time_dim, lat_dim, lon_dim),
+                    coords={
+                        member_dim: fc.coords[member_dim],
+                        time_dim: fc.coords[time_dim],
+                        lat_dim: fc.coords[lat_dim],
+                        lon_dim: fc.coords[lon_dim],
+                    },
+                )
+            return ds
+
+        return self._predict_numpy(
+            fcst_grid,
+            quantiles=quantiles,
+            clim_terciles=clim_terciles,
+            return_synthetic_ensemble=return_synthetic_ensemble,
+        )
+
+    forecast = predict
+
+    def compute_model(
+        self,
+        X_train,
+        y_train,
+        X_test,
+        obs_for_terciles=None,
+        quantiles=None,
+        clim_terciles=False,
+        member_dim="M",
+        time_dim="T",
+        lat_dim="Y",
+        lon_dim="X",
+        return_synthetic_ensemble=False,
+    ):
+        self.fit(
+            X_train,
+            y_train,
+            clim_terciles=bool(clim_terciles or (obs_for_terciles is not None)),
+            member_dim=member_dim,
+            time_dim=time_dim,
+            lat_dim=lat_dim,
+            lon_dim=lon_dim,
+        )
+
+        if obs_for_terciles is not None:
+            if xr is not None and isinstance(obs_for_terciles, xr.DataArray):
+                obs_np = obs_for_terciles.transpose(time_dim, lat_dim, lon_dim).values
+            else:
+                obs_np = np.asarray(obs_for_terciles, dtype=float)
+
+            terc = np.nanpercentile(obs_np, [100.0 / 3.0, 200.0 / 3.0], axis=0)
+
+            if xr is not None and isinstance(self.clim_terciles, xr.DataArray):
+                self.clim_terciles = xr.DataArray(
+                    terc,
+                    dims=("tercile", lat_dim, lon_dim),
+                    coords={
+                        "tercile": ["lower", "upper"],
+                        lat_dim: obs_for_terciles.coords[lat_dim],
+                        lon_dim: obs_for_terciles.coords[lon_dim],
+                    },
+                )
+            else:
+                self.clim_terciles = terc
+
+        return self.predict(
+            X_test,
+            quantiles=quantiles,
+            clim_terciles=clim_terciles,
+            return_synthetic_ensemble=return_synthetic_ensemble,
+            member_dim=member_dim,
+            time_dim=time_dim,
+            lat_dim=lat_dim,
+            lon_dim=lon_dim,
+        )
+
+    def get_fit_stats(self):
+        if self._fit_stats is None:
+            return None
+        if self._xarray and self._lat_coords is not None:
+            out = {}
+            for key, arr in self._fit_stats.items():
+                out[key] = xr.DataArray(
+                    arr,
+                    dims=(self._lat_dim, self._lon_dim),
+                    coords={self._lat_dim: self._lat_coords, self._lon_dim: self._lon_coords},
+                    name=key,
+                )
+            return out
+        return self._fit_stats
+
+    def summary(self):
+        print("WAS_mme_NGR_NonGaussian")
+        print("================")
+        print(f"family           : {self.family}")
+        print(f"occurrence_model : {self.occurrence_model}")
+        print(f"dry_threshold    : {self.dry_threshold}")
+        if self.family == "transformed_gaussian":
+            print(f"transform        : {self.transform}")
+        if self._fit_stats is not None:
+            succ = self._fit_stats["success"]
+            print(f"success rate     : {100.0 * np.mean(succ):.1f}%")
+
+
+################################################################################ MVA ############################################################
 
 from typing import Optional, Literal
 
@@ -17552,907 +18269,118 @@ class WAS_mme_MVA:
         return (fc_mean * mask), (forecast_prob * mask).transpose("probability","T","Y","X")
 
     
-# ==========================================================
-# Roebber (2015) procedural EP/GA implementation
-#   - Sexual selection
-#   - Paternal coefficients retained in crossover
-#   - Mutation + transposition (copy error)
-#   - Survivors define predictive distribution
-# ==========================================================
-
-CONST1 = "__CONST1__"
 
 
-def _safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return float("nan")
-
-
-def _norm01(a: np.ndarray) -> Tuple[np.ndarray, float, float]:
-    """Normalize to [0,1] using min/max; return (norm, min, max)."""
-    a = np.asarray(a, dtype=float)
-    mn = np.nanmin(a)
-    mx = np.nanmax(a)
-    if (not np.isfinite(mn)) or (not np.isfinite(mx)) or mx == mn:
-        return np.zeros_like(a, dtype=float), float(mn), float(mx)
-    out = (a - mn) / (mx - mn)
-    out = np.clip(out, 0.0, 1.0)
-    return out, float(mn), float(mx)
-
-
-def _inv_norm01(a01: np.ndarray, mn: float, mx: float) -> np.ndarray:
-    a01 = np.asarray(a01, dtype=float)
-    if (not np.isfinite(mn)) or (not np.isfinite(mx)) or mx == mn:
-        return np.full_like(a01, np.nan, dtype=float)
-    return a01 * (mx - mn) + mn
-
-
-# ==========================================================
-# EP Gene (faithful roles):
-#   Gate uses (V1, OR, V2)
-#   Expression uses (C1*V3 O1 C2*V4) O2 C3*V5
-#   Variables may be predictors or CONST1
-# ==========================================================
-class EP_Gene:
-    OPERATORS = {
-        "ADD": operator.add,
-        "MULTIPLY": operator.mul,
-    }
-    REL_OPS = {
-        "<=": operator.le,
-        ">": operator.gt,
-    }
-
-    def __init__(self, predictor_names: List[str], rng: random.Random):
-        if not predictor_names:
-            raise ValueError("predictor_names must be non-empty")
-        self.predictor_names = list(predictor_names)
-        self.rng = rng
-
-        # gate vars
-        self.v1 = rng.choice(self.predictor_names)
-        self.v2 = rng.choice(self.predictor_names)
-        self.OR = rng.choice(list(self.REL_OPS.keys()))
-
-        # expression vars
-        self.v3 = rng.choice(self.predictor_names)
-        self.v4 = rng.choice(self.predictor_names)
-        self.v5 = rng.choice(self.predictor_names)
-
-        # coefficients in [-1,1]
-        self.c1 = rng.uniform(-1.0, 1.0)
-        self.c2 = rng.uniform(-1.0, 1.0)
-        self.c3 = rng.uniform(-1.0, 1.0)
-
-        self.O1 = rng.choice(list(self.OPERATORS.keys()))
-        self.O2 = rng.choice(list(self.OPERATORS.keys()))
-
-    def copy(self) -> "EP_Gene":
-        g = EP_Gene(self.predictor_names, self.rng)
-        g.v1, g.v2, g.OR = self.v1, self.v2, self.OR
-        g.v3, g.v4, g.v5 = self.v3, self.v4, self.v5
-        g.c1, g.c2, g.c3 = self.c1, self.c2, self.c3
-        g.O1, g.O2 = self.O1, self.O2
-        return g
-
-    def _get_val(self, row: Dict[str, float], name: str) -> float:
-        if name == CONST1:
-            return 1.0
-        return _safe_float(row.get(name, np.nan))
-
-    def evaluate(self, row: Dict[str, float]) -> float:
-        v1 = self._get_val(row, self.v1)
-        v2 = self._get_val(row, self.v2)
-        if not (np.isfinite(v1) and np.isfinite(v2)):
-            return 0.0
-
-        # gate: v1 OR v2 (relational comparison)
-        # Example: if OR is "<=", then check if v1 <= v2
-        try:
-            gate_result = self.REL_OPS[self.OR](v1, v2)
-        except (TypeError, ValueError):
-            gate_result = False
-        
-        if not gate_result:
-            return 0.0
-
-        v3 = self._get_val(row, self.v3)
-        v4 = self._get_val(row, self.v4)
-        v5 = self._get_val(row, self.v5)
-        if not (np.isfinite(v3) and np.isfinite(v4) and np.isfinite(v5)):
-            return 0.0
-
-        t1 = self.c1 * v3
-        t2 = self.c2 * v4
-        t3 = self.c3 * v5
-        
-        try:
-            # First operation
-            res = self.OPERATORS[self.O1](t1, t2)
-            # Second operation
-            res = self.OPERATORS[self.O2](res, t3)
-            return float(res)
-        except (ZeroDivisionError, ValueError, OverflowError):
-            return 0.0
-
-    # ---- Roebber (2015) crossover rule helper
-    def replace_structure_from_maternal_keep_paternal_coeffs(self, maternal: "EP_Gene") -> None:
-        # keep c1,c2,c3; replace variables + operators
-        self.v1, self.v2, self.OR = maternal.v1, maternal.v2, maternal.OR
-        self.v3, self.v4, self.v5 = maternal.v3, maternal.v4, maternal.v5
-        self.O1, self.O2 = maternal.O1, maternal.O2
-
-    # ---- Roebber (2015) mutation (at most one gene; element-wise weights)
-    def mutate_element(self, rng: random.Random) -> None:
-        """
-        Implements the mutation menu and approximate weights from Roebber (2015):
-          overall mutation is handled by the caller (50%).
-          then select ONE element type to mutate in this gene.
-        """
-        # weights (relative) — we use exact probabilities as weights
-        choices = [
-            ("V1", 0.03125),
-            ("OR", 0.03125),
-            ("O1", 0.03125),
-            ("O2", 0.03125),
-
-            ("V2", 0.015625),
-            ("V3", 0.015625),
-            ("V4", 0.015625),
-            ("V5", 0.015625),
-
-            ("V2_TO_CONST1", 0.015625),
-            ("V3_TO_CONST1", 0.015625),
-            ("V4_TO_CONST1", 0.015625),
-            ("V5_TO_CONST1", 0.015625),
-
-            ("C1", 0.0833),
-            ("C2", 0.0833),
-            ("C3", 0.0833),
-        ]
-        labels, weights = zip(*choices)
-        pick = rng.choices(labels, weights=weights, k=1)[0]
-
-        if pick == "V1":
-            self.v1 = rng.choice(self.predictor_names)
-        elif pick == "V2":
-            self.v2 = rng.choice(self.predictor_names)
-        elif pick == "V3":
-            self.v3 = rng.choice(self.predictor_names)
-        elif pick == "V4":
-            self.v4 = rng.choice(self.predictor_names)
-        elif pick == "V5":
-            self.v5 = rng.choice(self.predictor_names)
-        elif pick == "V2_TO_CONST1":
-            self.v2 = CONST1
-        elif pick == "V3_TO_CONST1":
-            self.v3 = CONST1
-        elif pick == "V4_TO_CONST1":
-            self.v4 = CONST1
-        elif pick == "V5_TO_CONST1":
-            self.v5 = CONST1
-        elif pick == "OR":
-            self.OR = rng.choice(list(self.REL_OPS.keys()))
-        elif pick == "O1":
-            self.O1 = rng.choice(list(self.OPERATORS.keys()))
-        elif pick == "O2":
-            self.O2 = rng.choice(list(self.OPERATORS.keys()))
-        elif pick == "C1":
-            self.c1 = rng.uniform(-1.0, 1.0)
-        elif pick == "C2":
-            self.c2 = rng.uniform(-1.0, 1.0)
-        elif pick == "C3":
-            self.c3 = rng.uniform(-1.0, 1.0)
-
-
-# ==========================================================
-# Individual (algorithm) = sum of EP-genes
-# ==========================================================
-class EP_Individual:
-    def __init__(self, predictor_names: List[str], num_genes: int, rng: random.Random, sex: str):
-        self.predictor_names = list(predictor_names)
-        self.rng = rng
-        self.sex = sex  # "M" or "F"
-        self.genes: List[EP_Gene] = [EP_Gene(self.predictor_names, rng) for _ in range(int(num_genes))]
-        self.mse: float = float("inf")
-
-    def copy(self) -> "EP_Individual":
-        c = EP_Individual(self.predictor_names, num_genes=len(self.genes), rng=self.rng, sex=self.sex)
-        c.genes = [g.copy() for g in self.genes]
-        c.mse = self.mse
-        return c
-
-    def predict_row(self, row: Dict[str, float]) -> float:
-        if not row:
-            return 0.0
-        total = 0.0
-        for g in self.genes:
-            val = g.evaluate(row)
-            if np.isfinite(val):
-                total += val
-        return float(total)
-
-    def compute_mse(self, rows: List[Dict[str, float]], y_norm: np.ndarray) -> None:
-        n = len(rows)
-        if n == 0:
-            self.mse = float("inf")
-            return
-        preds = np.fromiter((self.predict_row(rows[i]) for i in range(n)), dtype=float, count=n)
-        preds = np.clip(preds, 0.0, 1.0)  # work in normalized [0,1] space
-        err = y_norm - preds
-        self.mse = float(np.mean(err * err))
-
-    # ---- Roebber (2015) crossover
-    @staticmethod
-    def crossover(paternal: "EP_Individual", maternal: "EP_Individual", rng: random.Random) -> "EP_Individual":
-        child = paternal.copy()  # seed with paternal EP-genes
-        # per gene: 50% replace structure with maternal gene but keep paternal coefficients
-        for j in range(len(child.genes)):
-            if rng.random() < 0.5:
-                child.genes[j].replace_structure_from_maternal_keep_paternal_coeffs(maternal.genes[j])
-        return child
-
-    # ---- Roebber (2015) transposition (copy error)
-    @staticmethod
-    def transposition(child: "EP_Individual", rng: random.Random) -> None:
-        """
-        Copy one EP-gene segment from one line to another.
-        Segment set (as in Roebber 2015 text):
-          A: (V1, OR, V2)
-          B: (C1, V3, O1)
-          C: (C2, V4, O2)
-          D: (C3, V5)
-        """
-        if len(child.genes) < 2:
-            return
-        src = rng.randrange(len(child.genes))
-        dst = rng.randrange(len(child.genes))
-        while dst == src:
-            dst = rng.randrange(len(child.genes))
-
-        seg = rng.choice(["A", "B", "C", "D"])
-        gs = child.genes[src]
-        gd = child.genes[dst]
-
-        if seg == "A":
-            gd.v1, gd.OR, gd.v2 = gs.v1, gs.OR, gs.v2
-        elif seg == "B":
-            gd.c1, gd.v3, gd.O1 = gs.c1, gs.v3, gs.O1
-        elif seg == "C":
-            gd.c2, gd.v4, gd.O2 = gs.c2, gs.v4, gs.O2
-        else:  # "D"
-            gd.c3, gd.v5 = gs.c3, gs.v5
-
-
-# ==========================================================
-# Main Driver Class (Roebber 2015 faithful evolution)
-# ==========================================================
-@dataclass
-class Roebber2015Config:
-    population_size: int = 50
-    num_genes: int = 10
-    max_iter: int = 100
-
-    max_mates_per_male: int = 10  # top male can mate up to 10 females (and similarly for next males)
-    qualify_quantile: float = 0.50  # starting point for an MSE threshold (tightened each generation)
-    tighten_factor: float = 0.97    # decreases threshold each generation (stricter)
-    relax_factor: float = 1.10      # if qualifying pop < min_qualify, relax threshold upward by 10%
-    min_qualify: int = 10           # "critical number" mentioned in Roebber 2015
-
-    p_mutation: float = 0.50        # overall mutation probability
-    p_transposition: float = 0.50   # overall transposition probability
-
-    random_state: int = 42
-
-
-class WAS_mme_Roebber2015:
+class WAS_mme_FastBMA:
     """
-    Procedurally faithful Roebber (2015) EP / GA trainer for gridded xarray inputs.
+    Bayesian Model Averaging (BMA) for ensemble forecasts on a grid (xarray-friendly).
 
-      - sexual selection mating system
-      - paternal coefficients retained in crossover
-      - mutation + transposition rules
-      - probabilistic output uses surviving population predictions
+    Supported model_type:
+      - 'normal' : Gaussian mixture around each member forecast (temperature, pressure)
+      - 'gamma'  : Gamma mixture using member forecast as component mean (wind speed, etc.)
+      - 'gamma0' : Zero-adjusted Gamma mixture (precipitation): POP via logistic + Gamma for positive part
+
+    Gridpoint terciles only:
+      - You can provide clim_terciles (dims: ('tercile', Y, X)) OR
+      - provide obs_for_terciles (dims include time_dim, Y, X), and terciles are computed per gridpoint.
     """
 
-    def __init__(self, config: Roebber2015Config = Roebber2015Config()):
-        self.cfg = config
-        self._rng = random.Random(int(config.random_state))
-        np.random.seed(int(config.random_state))
-
-        # Stored normalization for later prediction
-        self._y_minmax: Optional[Tuple[float, float]] = None
-        self._pred_minmax: Dict[str, Tuple[float, float]] = {}
-
-        # survivors after training at a gridpoint
-        self._survivors: Optional[List[EP_Individual]] = None
-        self._threshold_final: Optional[float] = None
-        self._predictor_names: Optional[List[str]] = None
-
-    # -------------------------
-    # data prep per grid-point
-    # -------------------------
-    def _prep_rows(
-        self,
-        X_train_1d: np.ndarray,  # (n, M)
-        y_train_1d: np.ndarray,  # (n,)
-        predictor_names: List[str],
-    ) -> Tuple[List[Dict[str, float]], np.ndarray]:
-        # normalize y to [0,1]
-        y_norm, y_min, y_max = _norm01(y_train_1d)
-        self._y_minmax = (y_min, y_max)
-
-        # normalize each predictor to [0,1]
-        rows: List[Dict[str, float]] = []
-        self._pred_minmax = {}
-        Xn = np.empty_like(X_train_1d, dtype=float)
-
-        for j, name in enumerate(predictor_names):
-            col = X_train_1d[:, j]
-            coln, mn, mx = _norm01(col)
-            self._pred_minmax[name] = (mn, mx)
-            Xn[:, j] = coln
-
-        # build rows; drop samples with any NaN predictor or y
-        valid = np.isfinite(y_norm) & np.all(np.isfinite(Xn), axis=1)
-        Xn = Xn[valid]
-        y_norm = y_norm[valid]
-
-        for i in range(Xn.shape[0]):
-            row = {predictor_names[j]: float(Xn[i, j]) for j in range(Xn.shape[1])}
-            rows.append(row)
-
-        return rows, y_norm
-
-    def _norm_test_rows(self, X_test_1d: np.ndarray, predictor_names: List[str]) -> Tuple[List[Dict[str, float]], np.ndarray]:
-        Xn = np.empty_like(X_test_1d, dtype=float)
-        for j, name in enumerate(predictor_names):
-            mn, mx = self._pred_minmax.get(name, (np.nan, np.nan))
-            col = X_test_1d[:, j].astype(float)
-            if (not np.isfinite(mn)) or (not np.isfinite(mx)) or mx == mn:
-                Xn[:, j] = 0.0
-            else:
-                with np.errstate(invalid='ignore'):
-                    normed = (col - mn) / (mx - mn)
-                    Xn[:, j] = np.clip(normed, 0.0, 1.0)
-
-        valid = np.all(np.isfinite(Xn), axis=1)
-        rows = [{predictor_names[j]: float(Xn[i, j]) for j in range(Xn.shape[1])} 
-                for i, is_valid in enumerate(valid) if is_valid]
-        return rows, valid
-
-    # -------------------------
-    # Evolution: sexual selection + replacement + thresholds
-    # -------------------------
-    def _init_population(self, predictor_names: List[str]) -> List[EP_Individual]:
-        pop = []
-        for _ in range(int(self.cfg.population_size)):
-            sex = "M" if self._rng.random() < 0.5 else "F"
-            pop.append(EP_Individual(predictor_names, num_genes=self.cfg.num_genes, rng=self._rng, sex=sex))
-        return pop
-
-    def _compute_threshold(self, mses: np.ndarray, prev_threshold: Optional[float]) -> float:
-        mses = np.asarray(mses, dtype=float)
-        mses = mses[np.isfinite(mses)]
-        if mses.size == 0:
-            return float("inf")
-        
-        base = float(np.quantile(mses, self.cfg.qualify_quantile))
-        
-        if prev_threshold is None or not np.isfinite(prev_threshold):
-            thr = base
-        else:
-            # tighten by factor (stricter = smaller MSE allowed)
-            thr = prev_threshold * float(self.cfg.tighten_factor)
-        
-        # Never let threshold go below base quantile
-        thr = min(thr, base)
-        
-        return thr
-
-    def _evolve(
-        self,
-        rows: List[Dict[str, float]],
-        y_norm: np.ndarray,
-        predictor_names: List[str],
-    ) -> List[EP_Individual]:
-        pop = self._init_population(predictor_names)
-        thr: Optional[float] = None
-        
-        for gen in range(int(self.cfg.max_iter)):
-            # evaluate MSE
-            for ind in pop:
-                ind.compute_mse(rows, y_norm)
-            
-            mses = np.array([ind.mse for ind in pop], dtype=float)
-            thr = self._compute_threshold(mses, thr)
-            
-            # Count qualifying individuals
-            qualify = np.array([ind.mse <= thr for ind in pop], dtype=bool)
-            qcount = int(np.sum(qualify))
-            
-            # Relax threshold if too few qualify
-            relax_loops = 0
-            while qcount < int(self.cfg.min_qualify) and relax_loops < 20:
-                thr *= float(self.cfg.relax_factor)  # +10% relaxation
-                qualify = np.array([ind.mse <= thr for ind in pop], dtype=bool)
-                qcount = int(np.sum(qualify))
-                relax_loops += 1
-            
-            # If still not enough qualifiers, use all individuals
-            if qcount < int(self.cfg.min_qualify):
-                # Keep all individuals for this generation
-                pass
-            
-            # partition qualifying males/females
-            males = [pop[i] for i in range(len(pop)) if qualify[i] and pop[i].sex == "M"]
-            females = [pop[i] for i in range(len(pop)) if qualify[i] and pop[i].sex == "F"]
-            
-            # rank males by MSE (lower is better)
-            males.sort(key=lambda z: z.mse)
-            
-            offspring: List[EP_Individual] = []
-            
-            # cloning of top-ranked male (if available)
-            if males:
-                offspring.append(males[0].copy())
-            
-            # mating loop
-            remaining_females = females[:]
-            for m in males:
-                if not remaining_females:
-                    break
-                n_mates = min(int(self.cfg.max_mates_per_male), len(remaining_females))
-                mates = self._rng.sample(remaining_females, k=n_mates)
-                # remove females after mating
-                remaining_females = [f for f in remaining_females if f not in mates]
-                
-                for f in mates:
-                    child = EP_Individual.crossover(m, f, self._rng)
-                    child.sex = "M" if self._rng.random() < 0.5 else "F"
-                    
-                    # mutation (50% overall; at most one gene)
-                    if self._rng.random() < float(self.cfg.p_mutation):
-                        gidx = self._rng.randrange(len(child.genes))
-                        child.genes[gidx].mutate_element(self._rng)
-                    
-                    # transposition (50% overall; independent)
-                    if self._rng.random() < float(self.cfg.p_transposition):
-                        EP_Individual.transposition(child, self._rng)
-                    
-                    offspring.append(child)
-            
-            # Create new population with qualifying individuals
-            new_pop = []
-            qualified_indices = [i for i, ok in enumerate(qualify) if ok]
-            non_qualified_indices = [i for i, ok in enumerate(qualify) if not ok]
-            
-            # Keep all qualified individuals
-            for idx in qualified_indices:
-                new_pop.append(pop[idx])
-            
-            # Replace non-qualified with offspring (up to available offspring)
-            offspring_to_use = min(len(offspring), len(non_qualified_indices))
-            for i in range(offspring_to_use):
-                if i < len(non_qualified_indices):
-                    new_pop.append(offspring[i])
-                else:
-                    break
-            
-            # If more offspring than non-qualified slots, add to population (capped at population_size)
-            if len(offspring) > offspring_to_use:
-                extra = offspring[offspring_to_use:]
-                for ind in extra:
-                    if len(new_pop) < self.cfg.population_size:
-                        new_pop.append(ind)
-            
-            # Fill remaining slots with random individuals from old population if needed
-            if len(new_pop) < self.cfg.population_size:
-                needed = self.cfg.population_size - len(new_pop)
-                available = [pop[i] for i in range(len(pop)) if pop[i] not in new_pop]
-                if available:
-                    selected = self._rng.sample(available, min(needed, len(available)))
-                    new_pop.extend(selected)
-            
-            # Trim to population size if needed
-            if len(new_pop) > self.cfg.population_size:
-                # Sort by MSE and keep best
-                new_pop.sort(key=lambda z: z.mse)
-                new_pop = new_pop[:self.cfg.population_size]
-            
-            pop = new_pop
-        
-        # Final evaluation
-        for ind in pop:
-            ind.compute_mse(rows, y_norm)
-        mses = np.array([ind.mse for ind in pop], dtype=float)
-        
-        # Final threshold with relaxation safeguard
-        valid_mses = mses[np.isfinite(mses)]
-        if len(valid_mses) > 0:
-            thr = float(np.quantile(valid_mses, self.cfg.qualify_quantile))
-            qualify = np.array([ind.mse <= thr for ind in pop], dtype=bool)
-            qcount = int(np.sum(qualify))
-            
-            # Relax if needed
-            relax_loops = 0
-            while qcount < int(self.cfg.min_qualify) and relax_loops < 20:
-                thr *= float(self.cfg.relax_factor)
-                qualify = np.array([ind.mse <= thr for ind in pop], dtype=bool)
-                qcount = int(np.sum(qualify))
-                relax_loops += 1
-            
-            survivors = [pop[i] for i in range(len(pop)) if qualify[i]]
-        else:
-            survivors = []
-        
-        if not survivors:
-            # Fallback: keep best individuals
-            pop.sort(key=lambda z: z.mse)
-            survivors = pop[:max(1, min(len(pop), int(self.cfg.population_size * 0.2)))]  # Keep top 20%
-        
-        self._threshold_final = thr if 'thr' in locals() else None
-        return survivors
-
-    # -------------------------
-    # Core API: compute_model
-    # -------------------------
-    def compute_model(
-        self,
-        X_train: xr.DataArray,   # (T,M,Y,X) preferred
-        y_train: xr.DataArray,   # (T,Y,X)
-        X_test: xr.DataArray,    # (T,M,Y,X) or (T=1,M,Y,X)
-        return_ensemble: bool = True,
-        max_members: Optional[int] = None,
-    ) -> Tuple[xr.DataArray, Optional[xr.DataArray]]:
-        """
-        Returns:
-          y_mean: (T,Y,X) mean of survivors' predictions
-          y_ens:  (member,T,Y,X) survivors' predictions (optional)
-
-        Note: This is *probabilistic* by construction (survivors define predictive distribution).
-        """
-        if "M" not in X_train.dims:
-            raise ValueError("X_train must have dimension 'M' (predictor/member)")
-        if not set(["T", "Y", "X"]).issubset(set(y_train.dims)):
-            raise ValueError("y_train must have dims including (T,Y,X)")
-
-        # enforce ordering
-        Xtr = X_train.transpose("T", "M", "Y", "X")
-        Ytr = y_train.transpose("T", "Y", "X")
-        Xte = X_test.transpose("T", "M", "Y", "X")
-
-        predictor_names = [str(v) for v in Xtr["M"].values.tolist()]
-        self._predictor_names = predictor_names
-
-        # stack samples for training and testing
-        Xtr2 = Xtr.stack(sample=("T", "Y", "X")).transpose("sample", "M").values
-        Ytr1 = Ytr.stack(sample=("T", "Y", "X")).values
-
-        Xte2 = Xte.stack(sample=("T", "Y", "X")).transpose("sample", "M").values
-
-        # drop NaNs in training
-        train_valid = np.isfinite(Ytr1) & np.all(np.isfinite(Xtr2), axis=1)
-        Xtr2 = Xtr2[train_valid]
-        Ytr1 = Ytr1[train_valid]
-
-        if Xtr2.shape[0] < 10:
-            # too few samples
-            y_mean = xr.full_like(Xte.isel(M=0), np.nan).drop_vars("M", errors="ignore")
-            y_ens = None if not return_ensemble else xr.DataArray(
-                np.full((1,) + y_mean.shape, np.nan, dtype=float),
-                coords={"member": [0], "T": y_mean["T"], "Y": y_mean["Y"], "X": y_mean["X"]},
-                dims=("member", "T", "Y", "X"),
-            )
-            return y_mean, y_ens
-
-        rows, y_norm = self._prep_rows(Xtr2, Ytr1, predictor_names)
-
-        # evolve survivors
-        survivors = self._evolve(rows, y_norm, predictor_names)
-        self._survivors = survivors
-
-        # predict on test
-        test_rows, test_valid = self._norm_test_rows(Xte2, predictor_names)
-        # map back into the full sample layout
-        n_full = Xte2.shape[0]
-        preds_members = []
-
-        survivors_use = survivors
-        if max_members is not None and len(survivors_use) > int(max_members):
-            # keep best max_members by training MSE
-            survivors_use = sorted(survivors_use, key=lambda z: z.mse)[: int(max_members)]
-
-        for ind in survivors_use:
-            p = np.full(n_full, np.nan, dtype=float)
-            # predict only valid rows
-            if test_rows:
-                vals = np.fromiter((ind.predict_row(test_rows[i]) for i in range(len(test_rows))), dtype=float, count=len(test_rows))
-                vals = np.clip(vals, 0.0, 1.0)
-                # place back
-                p[test_valid] = vals
-            preds_members.append(p)
-
-        preds_members = np.asarray(preds_members, dtype=float)  # (member, sample)
-        # inverse normalize y
-        y_min, y_max = self._y_minmax if self._y_minmax is not None else (np.nan, np.nan)
-        preds_members_phys = _inv_norm01(preds_members, y_min, y_max)
-
-        # reshape to (member,T,Y,X)
-        Tn, Yn, Xn = Xte.sizes["T"], Xte.sizes["Y"], Xte.sizes["X"]
-        preds_members_phys = preds_members_phys.reshape(preds_members_phys.shape[0], Tn, Yn, Xn)
-
-        y_ens = None
-        if return_ensemble:
-            y_ens = xr.DataArray(
-                preds_members_phys,
-                coords={"member": np.arange(preds_members_phys.shape[0]), "T": Xte["T"], "Y": Xte["Y"], "X": Xte["X"]},
-                dims=("member", "T", "Y", "X"),
-                name="roebber2015_ens",
-            )
-
-        y_mean = xr.DataArray(
-            np.nanmean(preds_members_phys, axis=0),
-            coords={"T": Xte["T"], "Y": Xte["Y"], "X": Xte["X"]},
-            dims=("T", "Y", "X"),
-            name="roebber2015_mean",
-        )
-        return y_mean, y_ens
-
-    # -------------------------
-    # Probabilities from evolved predictive distribution (terciles)
-    # -------------------------
-    @staticmethod
-    def tercile_thresholds_from_obs(
-        Predictant: xr.DataArray,
-        clim_year_start: int,
-        clim_year_end: int,
-    ) -> Tuple[xr.DataArray, xr.DataArray]:
-        Y = Predictant.transpose("T", "Y", "X").sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        q33 = Y.quantile(1 / 3, dim="T")
-        q66 = Y.quantile(2 / 3, dim="T")
-        return q33, q66
-
-    @staticmethod
-    def tercile_probs_from_ensemble(
-        ens: xr.DataArray,   # (member,T,Y,X)
-        q33: xr.DataArray,   # (Y,X)
-        q66: xr.DataArray,   # (Y,X)
-    ) -> xr.DataArray:
-        # Broadcast thresholds
-        below = (ens < q33).mean(dim="member")
-        above = (ens > q66).mean(dim="member")
-        normal = 1.0 - below - above
-
-        below = below.drop_vars("quantile", errors="ignore")
-        above = above.drop_vars("quantile", errors="ignore")
-        normal = normal.drop_vars("quantile", errors="ignore")
-        
-        prob = xr.concat([below, normal, above], dim="probability")
-        prob = prob.assign_coords(probability=["PB", "PN", "PA"])
-        return prob.transpose("probability", "T", "Y", "X")
-
-    # -------------------------
-    # Forecast wrapper 
-    # -------------------------
-    def forecast(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start: int,
-        clim_year_end: int,
-        hindcast_det: xr.DataArray,        # (T,M,Y,X)
-        hindcast_det_cross: xr.DataArray,  # kept for API compatibility 
-        Predictor_for_year: xr.DataArray,  # (T,M,Y,X) typically T=1
-    ) -> Tuple[xr.DataArray, xr.DataArray]:
-        # deterministic + ensemble
-        y_mean, y_ens = self.compute_model(
-            X_train=hindcast_det,
-            y_train=Predictant,
-            X_test=Predictor_for_year,
-            return_ensemble=True,
-        )
-        if y_ens is None:
-            prob = xr.full_like(y_mean.expand_dims(probability=["PB", "PN", "PA"]), np.nan)
-            return y_mean, prob
-
-        # enforce your forecast time logic
-        if "T" in Predictor_for_year.coords:
-            year = int(Predictor_for_year["T"].values.astype("datetime64[Y]").astype(int)[0] + 1970)
-        else:
-            year = 1970
-        month_1 = int(Predictant["T"].values[0].astype("datetime64[M]").astype(int) % 12 + 1)
-        new_T = np.datetime64(f"{year}-{month_1:02d}-01")
-
-        y_mean = y_mean.assign_coords(T=xr.DataArray([new_T], dims=["T"]))
-        y_mean["T"] = y_mean["T"].astype("datetime64[ns]")
-
-        y_ens = y_ens.assign_coords(T=y_mean["T"])
-
-        # tercile thresholds and probabilities from evolved predictive distribution
-        q33, q66 = self.tercile_thresholds_from_obs(Predictant, clim_year_start, clim_year_end)
-        prob = self.tercile_probs_from_ensemble(y_ens, q33, q66)
-
-        return y_mean, prob
-
-# ============================================================
-# BMA Shared utilities
-# ============================================================
-
-def _require_dims(da: xr.DataArray, dims: Sequence[str], name: str) -> None:
-    missing = [d for d in dims if d not in da.dims]
-    if missing:
-        raise ValueError(f"{name} is missing required dims: {missing}. Found dims={da.dims}")
-
-
-def _normalize_weights(w: np.ndarray) -> np.ndarray:
-    w = np.asarray(w, dtype=float)
-    w = np.clip(w, 0.0, np.inf)
-    s = np.sum(w)
-    if not np.isfinite(s) or s <= 0:
-        return np.full_like(w, 1.0 / w.size)
-    return w / s
-
-
-def compute_gridpoint_terciles_from_obs(
-    obs: xr.DataArray,
-    *,
-    time_dim: str = "T",
-    lat_dim: str = "Y",
-    lon_dim: str = "X",
-    q: Tuple[float, float] = (1.0 / 3.0, 2.0 / 3.0),
-    labels: Tuple[str, str] = ("lower", "upper"),
-) -> xr.DataArray:
-    """
-    Compute gridpoint tercile thresholds from observations.
-
-    Returns
-    -------
-    xr.DataArray
-        dims ('tercile', Y, X) with tercile labels ['lower','upper'] (by default).
-    """
-    _require_dims(obs, [time_dim, lat_dim, lon_dim], "obs_for_terciles")
-    thr = obs.quantile([q[0], q[1]], dim=time_dim, skipna=True)  # dim name 'quantile'
-    if "quantile" in thr.dims and "tercile" not in thr.dims:
-        thr = thr.rename({"quantile": "tercile"})
-    if thr.sizes.get("tercile", None) == 2:
-        thr = thr.assign_coords(tercile=list(labels))
-    return thr.transpose("tercile", lat_dim, lon_dim)
-
-
-def _invert_cdf(cdf_fn, p: float, lo: float, hi: float) -> float:
-    return brentq(lambda z: cdf_fn(z) - p, lo, hi)
-
-
-def _fit_linear_bias_memberwise(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Memberwise OLS: y = a_k + b_k x_{k}
-    x: (M,N), y: (N,)
-    """
-    M, _N = x.shape
-    a = np.zeros(M, dtype=float)
-    b = np.ones(M, dtype=float)
-    for k in range(M):
-        Xk = x[k, :]
-        A = np.vstack([np.ones_like(Xk), Xk]).T
-        beta, *_ = np.linalg.lstsq(A, y, rcond=None)
-        a[k], b[k] = float(beta[0]), float(beta[1])
-    return a, b
-
-
-def _fit_linear_bias_exchangeable(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
-    """
-    Exchangeable pooled OLS: treat members as replicates.
-    x: (M,N), y: (N,)
-    """
-    M, N = x.shape
-    X = x.reshape(-1)
-    Y = np.tile(y, M)
-    A = np.vstack([np.ones_like(X), X]).T
-    beta, *_ = np.linalg.lstsq(A, Y, rcond=None)
-    return float(beta[0]), float(beta[1])
-
-
-def _apply_bias(x: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    return a[:, None] + b[:, None] * x
-
-
-def _resolve_terciles_for_prediction(
-    *,
-    new_forecasts: xr.DataArray,
-    lat_dim: str,
-    lon_dim: str,
-    time_dim: str,
-    clim_terciles: Optional[xr.DataArray],
-    obs_for_terciles: Optional[xr.DataArray],
-    stored_terciles: Optional[xr.DataArray],
-    tercile_q: Tuple[float, float],
-) -> Optional[xr.DataArray]:
-    """
-    Priority:
-      1) obs_for_terciles -> compute
-      2) clim_terciles -> use
-      3) stored_terciles -> use
-    """
-    terc = None
-
-    if obs_for_terciles is not None:
-        obs_sel = obs_for_terciles.sel(
-            {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
-            method="nearest",
-        )
-        terc = compute_gridpoint_terciles_from_obs(
-            obs_sel, time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim, q=tercile_q
-        )
-    elif clim_terciles is not None:
-        # Accept either ('tercile',Y,X) or ('quantile',Y,X)
-        if "tercile" not in clim_terciles.dims and "quantile" in clim_terciles.dims:
-            clim_terciles = clim_terciles.rename({"quantile": "tercile"})
-        _require_dims(clim_terciles, ["tercile", lat_dim, lon_dim], "clim_terciles")
-        terc = clim_terciles.sel(
-            {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
-            method="nearest",
-        )
-    elif stored_terciles is not None:
-        terc = stored_terciles.sel(
-            {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
-            method="nearest",
-        )
-
-    return terc
-
-
-def _tercile_probs_from_cdf(cdf_fn, low: float, up: float) -> Tuple[float, float, float]:
-    pb = float(cdf_fn(low))
-    pu = float(cdf_fn(up))
-    pn = float(np.clip(pu - pb, 0.0, 1.0))
-    pa = float(np.clip(1.0 - pu, 0.0, 1.0))
-    pb = float(np.clip(pb, 0.0, 1.0))
-    # Renormalize lightly in case of numerical issues
-    s = pb + pn + pa
-    if np.isfinite(s) and s > 0:
-        pb, pn, pa = pb / s, pn / s, pa / s
-    return pb, pn, pa
-
-
-# ============================================================
-# 1) Baseline “mixture BMA-like” class (SLSQP fit), with terciles
-# ============================================================
-
-class WAS_EnsembleBMA:
-    """
-    Baseline mixture postprocessor, with optional terciles.
-
-    model_type:
-      - 'normal' : Gaussian mixture around each member forecast (shared sigma per gridpoint)
-      - 'gamma'  : Gamma mixture; component mean = member forecast; shape is fitted per gridpoint
-      - 'gamma0' : Zero-adjusted gamma (precip): POP via logistic + Gamma mixture for positive part
-
-    fit() can store gridpoint terciles from obs.
-
-    predict_probabilistic() returns:
-      - predictive_mean (T,Y,X)
-      - predictive_quantiles ('quantile',T,Y,X)
-      - tercile_thresholds ('tercile',Y,X)  [if available]
-      - tercile_probability ('category',T,Y,X) with ['PB','PN','PA'] [if available]
-    """
-
-    def __init__(self, model_type: str = "normal", tol: float = 1e-3, compute_terciles: bool = True):
+    def __init__(self, model_type: str = "normal", tol: float = 1e-3):
         if model_type not in {"normal", "gamma", "gamma0"}:
             raise NotImplementedError(f"Model type '{model_type}' not supported.")
         self.model_type = model_type
         self.tol = tol
-        self.compute_terciles = compute_terciles
         self.fitted = False
 
-        self.weights: Optional[xr.DataArray] = None  # (M,Y,X)
-        self.sigma: Optional[xr.DataArray] = None    # (Y,X) if normal
-        self.shape: Optional[xr.DataArray] = None    # (Y,X) if gamma/gamma0
-        self.logistic_params: Optional[xr.DataArray] = None  # (param,Y,X) if gamma0
+        # learned parameters on training grid
+        self.weights: Optional[xr.DataArray] = None              # (M, Y, X)
+        self.sigma: Optional[xr.DataArray] = None                # (Y, X) for normal
+        self.shape: Optional[xr.DataArray] = None                # (Y, X) for gamma/gamma0
+        self.logistic_params: Optional[xr.DataArray] = None      # (param, Y, X) for gamma0
 
-        self.clim_terciles: Optional[xr.DataArray] = None  # ('tercile',Y,X)
+        # remember dims used in fit
+        self._member_dim: Optional[str] = None
+        self._time_dim: Optional[str] = None
+        self._lat_dim: Optional[str] = None
+        self._lon_dim: Optional[str] = None
 
+    # ----------------------------
+    # Utilities
+    # ----------------------------
+    @staticmethod
+    def _require_dims(da: xr.DataArray, dims: Sequence[str], name: str) -> None:
+        missing = [d for d in dims if d not in da.dims]
+        if missing:
+            raise ValueError(f"{name} is missing required dims: {missing}. Found dims={da.dims}")
+
+    @staticmethod
+    def _normalize_weights(w: np.ndarray) -> np.ndarray:
+        w = np.asarray(w, dtype=float)
+        w = np.clip(w, 0.0, np.inf)
+        s = np.sum(w)
+        if not np.isfinite(s) or s <= 0:
+            return np.full_like(w, 1.0 / w.size)
+        return w / s
+
+    @staticmethod
+    def compute_gridpoint_terciles_from_obs(
+        obs: xr.DataArray,
+        *,
+        time_dim: str = "T",
+        lat_dim: str = "Y",
+        lon_dim: str = "X",
+        q: Tuple[float, float] = (1 / 3, 2 / 3),
+    ) -> xr.DataArray:
+        """
+        Compute gridpoint tercile thresholds from observations.
+
+        Parameters
+        ----------
+        obs : xr.DataArray
+            Must include dims (time_dim, lat_dim, lon_dim).
+        Returns
+        -------
+        xr.DataArray
+            dims: ('tercile', lat_dim, lon_dim) with tercile=['lower','upper'].
+        """
+        WAS_EnsembleBMA._require_dims(obs, [time_dim, lat_dim, lon_dim], "obs")
+        qt = obs.quantile(list(q), dim=time_dim, skipna=True).rename({"quantile": "tercile"})
+        qt = qt.assign_coords(tercile=["lower", "upper"])
+        return qt
+
+    def _align_params_to_forecasts(
+        self,
+        new_forecasts: xr.DataArray,
+        *,
+        member_dim: str,
+        time_dim: str,
+        lat_dim: str,
+        lon_dim: str,
+    ):
+        """
+        Align stored parameter grids to the new_forecasts grid using nearest neighbor selection.
+        """
+        self._require_dims(new_forecasts, [member_dim, time_dim, lat_dim, lon_dim], "new_forecasts")
+
+        w_ds = self.weights.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
+
+        if self.model_type == "normal":
+            p1_ds = self.sigma.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
+            p2_ds = None
+        else:
+            p1_ds = self.shape.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
+            p2_ds = None
+            if self.model_type == "gamma0":
+                p2_ds = self.logistic_params.sel(
+                    {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
+                    method="nearest",
+                )
+
+        return w_ds, p1_ds, p2_ds
+
+    # ----------------------------
+    # Fit
+    # ----------------------------
     def fit(
         self,
         hcst_grid: xr.DataArray,
@@ -18463,88 +18391,120 @@ class WAS_EnsembleBMA:
         lat_dim: str = "Y",
         lon_dim: str = "X",
         min_samples: int = 10,
-        tercile_q: Tuple[float, float] = (1 / 3, 2 / 3),
     ):
-        _require_dims(hcst_grid, [member_dim, time_dim, lat_dim, lon_dim], "hcst_grid")
-        _require_dims(obs_grid, [time_dim, lat_dim, lon_dim], "obs_grid")
+        """
+        Fit BMA parameters at each gridpoint.
 
-        if self.compute_terciles:
-            self.clim_terciles = compute_gridpoint_terciles_from_obs(
-                obs_grid, time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim, q=tercile_q
-            )
+        hcst_grid: dims (member_dim, time_dim, lat_dim, lon_dim)
+        obs_grid : dims (time_dim, lat_dim, lon_dim)
+        """
+        self._require_dims(hcst_grid, [member_dim, time_dim, lat_dim, lon_dim], "hcst_grid")
+        self._require_dims(obs_grid, [time_dim, lat_dim, lon_dim], "obs_grid")
+
+        self._member_dim, self._time_dim, self._lat_dim, self._lon_dim = member_dim, time_dim, lat_dim, lon_dim
 
         hcst = hcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim).values
         obs = obs_grid.transpose(time_dim, lat_dim, lon_dim).values
 
-        M, T, Y, X = hcst.shape
+        n_memb, n_time, n_lat, n_lon = hcst.shape
 
-        weights_map = np.full((M, Y, X), 1.0 / M, dtype=float)
-        p1_map = np.full((Y, X), np.nan, dtype=float)         # sigma or shape
-        p2_map = np.full((2, Y, X), np.nan, dtype=float)      # logistic params for gamma0
+        weights_map = np.full((n_memb, n_lat, n_lon), 1.0 / n_memb, dtype=float)
+        param_map_1 = np.full((n_lat, n_lon), np.nan, dtype=float)        # sigma or shape
+        param_map_2 = np.full((2, n_lat, n_lon), np.nan, dtype=float)     # logistic params for gamma0
 
-        print(f"Fitting {self.model_type} baseline mixture...")
+        coords_dict = {
+            member_dim: hcst_grid.coords[member_dim],
+            lat_dim: hcst_grid.coords[lat_dim],
+            lon_dim: hcst_grid.coords[lon_dim],
+        }
 
-        for iy in tqdm(range(Y), desc="Training"):
-            for ix in range(X):
-                f_raw = hcst[:, :, iy, ix]
-                o_raw = obs[:, iy, ix]
+        print(f"Fitting {self.model_type} BMA...")
+
+        for ilat in tqdm(range(n_lat), desc="Training"):
+            for ilon in range(n_lon):
+                f_raw = hcst[:, :, ilat, ilon]          # (M, T)
+                o_raw = obs[:, ilat, ilon]              # (T,)
+
+                # base validity: obs finite AND all members finite at time t
                 valid = np.isfinite(o_raw) & np.isfinite(f_raw).all(axis=0)
                 if int(valid.sum()) < min_samples:
                     continue
 
-                f = f_raw[:, valid]
-                o = o_raw[valid]
+                f_data = f_raw[:, valid]                # (M, N)
+                o_data = o_raw[valid]                   # (N,)
 
+                # -------------------------
+                # NORMAL
+                # -------------------------
                 if self.model_type == "normal":
 
-                    def nll(p):
+                    def nll_normal(p):
                         ws = p[:-1]
                         sigma = p[-1]
                         w_last = 1.0 - np.sum(ws)
                         if (w_last < 0) or (sigma <= 1e-6) or (not np.isfinite(sigma)):
                             return 1e12
-                        w_all = np.append(ws, w_last)
-                        z = (o[None, :] - f) / sigma
-                        pdf = np.dot(w_all, norm.pdf(z) / sigma)
+                        all_ws = np.append(ws, w_last)
+
+                        z = (o_data[None, :] - f_data) / sigma
+                        pdf = np.dot(all_ws, norm.pdf(z) / sigma)
                         return -np.sum(np.log(np.maximum(pdf, 1e-12)))
 
-                    x0 = np.append(np.full(M - 1, 1.0 / M), np.nanstd(o))
-                    bounds = [(0.0, 1.0)] * (M - 1) + [(1e-3, None)]
-                    res = minimize(nll, x0, method="SLSQP", bounds=bounds, tol=self.tol)
-                    if res.success:
-                        w = np.append(res.x[:-1], 1.0 - np.sum(res.x[:-1]))
-                        weights_map[:, iy, ix] = _normalize_weights(w)
-                        p1_map[iy, ix] = float(res.x[-1])
+                    x0 = np.append(np.full(n_memb - 1, 1.0 / n_memb), np.nanstd(o_data))
+                    bounds = [(0.0, 1.0)] * (n_memb - 1) + [(1e-3, None)]
 
+                    try:
+                        res = minimize(nll_normal, x0, method="SLSQP", bounds=bounds, tol=self.tol)
+                        if res.success:
+                            ws = np.append(res.x[:-1], 1.0 - np.sum(res.x[:-1]))
+                            ws = self._normalize_weights(ws)
+                            weights_map[:, ilat, ilon] = ws
+                            param_map_1[ilat, ilon] = float(res.x[-1])
+                    except Exception:
+                        continue
+
+                # -------------------------
+                # GAMMA / GAMMA0
+                # -------------------------
                 else:
+                    # For gamma-family, ensure positivity for likelihood fit
+                    # gamma0: fit POP on all data, then gamma part only on positive obs.
+                    # gamma : fit only on positive obs (and positive forecasts).
                     if self.model_type == "gamma0":
-                        # POP: logistic on cube-root ensemble mean
-                        y_bin = (o > 0).astype(int)
-                        ens_mean = np.mean(f, axis=0)
+                        # logistic POP: y=1 if obs>0 else 0; x=cuberoot(ens_mean)
+                        y_bin = (o_data > 0).astype(int)
+                        ens_mean = np.mean(f_data, axis=0)
                         x_pred = np.cbrt(np.maximum(ens_mean, 0.0))
 
-                        def nll_logit(beta):
-                            p = expit(beta[0] + beta[1] * x_pred)
-                            p = np.clip(p, 1e-8, 1 - 1e-8)
-                            return -np.sum(y_bin * np.log(p) + (1 - y_bin) * np.log(1 - p))
+                        def nll_logistic(beta):
+                            probs = expit(beta[0] + beta[1] * x_pred)
+                            probs = np.clip(probs, 1e-8, 1 - 1e-8)
+                            return -np.sum(y_bin * np.log(probs) + (1 - y_bin) * np.log(1 - probs))
 
-                        res_log = minimize(nll_logit, [0.0, 1.0], method="BFGS")
-                        b0, b1 = (res_log.x if res_log.success else np.array([-5.0, 0.0]))
-                        p2_map[:, iy, ix] = [b0, b1]
+                        try:
+                            res_log = minimize(nll_logistic, [0.0, 1.0], method="BFGS")
+                            param_map_2[:, ilat, ilon] = res_log.x
+                        except Exception:
+                            param_map_2[:, ilat, ilon] = [-5.0, 0.0]
 
-                        mask_pos = (o > 0) & np.isfinite(o) & np.isfinite(f).all(axis=0)
+                        mask_pos = (o_data > 0) & np.isfinite(o_data) & np.isfinite(f_data).all(axis=0)
                         if int(mask_pos.sum()) < max(5, min_samples // 2):
                             continue
-                        o_g = o[mask_pos]
-                        f_g = f[:, mask_pos]
+
+                        o_gamma = o_data[mask_pos]
+                        f_gamma = f_data[:, mask_pos]
+
                     else:
-                        mask_pos = (o > 0) & np.isfinite(o) & np.isfinite(f).all(axis=0)
+                        # gamma: only use positive obs and positive member means
+                        mask_pos = (o_data > 0) & np.isfinite(o_data) & np.isfinite(f_data).all(axis=0)
                         if int(mask_pos.sum()) < min_samples:
                             continue
-                        o_g = o[mask_pos]
-                        f_g = f[:, mask_pos]
+                        o_gamma = o_data[mask_pos]
+                        f_gamma = f_data[:, mask_pos]
 
-                    f_g = np.maximum(f_g, 1e-3)
+                    # Additional safety for forecasts: component means must be >0 to define scales
+                    if np.any(f_gamma <= 0):
+                        f_gamma = np.maximum(f_gamma, 1e-3)
 
                     def nll_gamma(p):
                         ws = p[:-1]
@@ -18552,1025 +18512,1189 @@ class WAS_EnsembleBMA:
                         w_last = 1.0 - np.sum(ws)
                         if (w_last < 0) or (shape_val < 0.1) or (not np.isfinite(shape_val)):
                             return 1e12
-                        w_all = np.append(ws, w_last)
-                        scales = f_g / shape_val
-                        pdfs = gamma.pdf(o_g[None, :], a=shape_val, scale=scales)
-                        mix = np.dot(w_all, pdfs)
-                        return -np.sum(np.log(np.maximum(mix, 1e-12)))
+                        all_ws = np.append(ws, w_last)
 
-                    x0 = np.append(np.full(M - 1, 1.0 / M), 2.0)
-                    bounds = [(0.0, 1.0)] * (M - 1) + [(0.1, 50.0)]
-                    res = minimize(nll_gamma, x0, method="SLSQP", bounds=bounds, tol=self.tol)
-                    if res.success:
-                        w = np.append(res.x[:-1], 1.0 - np.sum(res.x[:-1]))
-                        weights_map[:, iy, ix] = _normalize_weights(w)
-                        p1_map[iy, ix] = float(res.x[-1])
+                        f_safe = np.maximum(f_gamma, 1e-3)
+                        scales = f_safe / shape_val
+                        pdfs = gamma.pdf(o_gamma[None, :], a=shape_val, scale=scales)
+                        mix_pdf = np.dot(all_ws, pdfs)
+                        return -np.sum(np.log(np.maximum(mix_pdf, 1e-12)))
 
-        coords_m = {member_dim: hcst_grid[member_dim], lat_dim: hcst_grid[lat_dim], lon_dim: hcst_grid[lon_dim]}
-        self.weights = xr.DataArray(weights_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_m)
+                    x0 = np.append(np.full(n_memb - 1, 1.0 / n_memb), 2.0)
+                    bounds = [(0.0, 1.0)] * (n_memb - 1) + [(0.1, 50.0)]
+
+                    try:
+                        res = minimize(nll_gamma, x0, method="SLSQP", bounds=bounds, tol=self.tol)
+                        if res.success:
+                            ws = np.append(res.x[:-1], 1.0 - np.sum(res.x[:-1]))
+                            ws = self._normalize_weights(ws)
+                            weights_map[:, ilat, ilon] = ws
+                            param_map_1[ilat, ilon] = float(res.x[-1])
+                    except Exception:
+                        continue
+
+        # save parameters to xarray
+        self.weights = xr.DataArray(weights_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_dict)
 
         if self.model_type == "normal":
-            self.sigma = xr.DataArray(p1_map, dims=(lat_dim, lon_dim), coords={lat_dim: coords_m[lat_dim], lon_dim: coords_m[lon_dim]})
+            self.sigma = xr.DataArray(
+                param_map_1,
+                dims=(lat_dim, lon_dim),
+                coords={lat_dim: coords_dict[lat_dim], lon_dim: coords_dict[lon_dim]},
+            )
         else:
-            self.shape = xr.DataArray(p1_map, dims=(lat_dim, lon_dim), coords={lat_dim: coords_m[lat_dim], lon_dim: coords_m[lon_dim]})
+            self.shape = xr.DataArray(
+                param_map_1,
+                dims=(lat_dim, lon_dim),
+                coords={lat_dim: coords_dict[lat_dim], lon_dim: coords_dict[lon_dim]},
+            )
             if self.model_type == "gamma0":
                 self.logistic_params = xr.DataArray(
-                    p2_map,
+                    param_map_2,
                     dims=("param", lat_dim, lon_dim),
-                    coords={"param": ["b0", "b1"], lat_dim: coords_m[lat_dim], lon_dim: coords_m[lon_dim]},
+                    coords={"param": ["b0", "b1"], lat_dim: coords_dict[lat_dim], lon_dim: coords_dict[lon_dim]},
                 )
 
         self.fitted = True
         return self
 
+    # ----------------------------
+    # Predict
+    # ----------------------------
     def predict_probabilistic(
         self,
         new_forecasts: xr.DataArray,
         *,
+        clim_terciles: Optional[xr.DataArray] = None,
+        obs_for_terciles: Optional[xr.DataArray] = None,
+        tercile_q: Tuple[float, float] = (1 / 3, 2 / 3),
         quantiles: Sequence[float] = (0.1, 0.5, 0.9),
         member_dim: str = "M",
         time_dim: str = "T",
         lat_dim: str = "Y",
         lon_dim: str = "X",
-        # terciles:
-        return_terciles: bool = True,
-        clim_terciles: Optional[xr.DataArray] = None,
-        obs_for_terciles: Optional[xr.DataArray] = None,
-        tercile_q: Tuple[float, float] = (1 / 3, 2 / 3),
     ) -> xr.Dataset:
+        """
+        Probabilistic prediction from BMA mixture.
+
+        If you want tercile probabilities, provide either:
+          - clim_terciles: dims ('tercile', Y, X) with tercile=['lower','upper'], OR
+          - obs_for_terciles: dims (T, Y, X) and terciles are computed per gridpoint.
+
+        Returns xr.Dataset with:
+          - predictive_mean: (T, Y, X)
+          - predictive_quantiles: ('quantile', T, Y, X)
+          - tercile_probability (optional): ('probability', T, Y, X) with ['PB','PN','PA']
+          - tercile_thresholds (optional): ('tercile', Y, X)
+        """
         if not self.fitted:
             raise ValueError("Fit model first.")
-        _require_dims(new_forecasts, [member_dim, time_dim, lat_dim, lon_dim], "new_forecasts")
 
-        w_ds = self.weights.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        if self.model_type == "normal":
-            p1_ds = self.sigma.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-            p2_ds = None
-        else:
-            p1_ds = self.shape.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-            p2_ds = (
-                self.logistic_params.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-                if self.model_type == "gamma0"
-                else None
-            )
+        self._require_dims(new_forecasts, [member_dim, time_dim, lat_dim, lon_dim], "new_forecasts")
 
-        terc_ds = _resolve_terciles_for_prediction(
-            new_forecasts=new_forecasts,
+        w_ds, p1_ds, p2_ds = self._align_params_to_forecasts(
+            new_forecasts,
+            member_dim=member_dim,
+            time_dim=time_dim,
             lat_dim=lat_dim,
             lon_dim=lon_dim,
-            time_dim=time_dim,
-            clim_terciles=clim_terciles,
-            obs_for_terciles=obs_for_terciles,
-            stored_terciles=self.clim_terciles,
-            tercile_q=tercile_q,
         )
 
-        fc = new_forecasts.transpose(member_dim, time_dim, lat_dim, lon_dim).values
-        wv = w_ds.transpose(member_dim, lat_dim, lon_dim).values
+        # --- terciles: gridpoint only ---
+        terciles_da = None
+        if clim_terciles is not None:
+            if "tercile" not in clim_terciles.dims and "quantile" in clim_terciles.dims:
+                clim_terciles = clim_terciles.rename({"quantile": "tercile"})
+            self._require_dims(clim_terciles, ["tercile", lat_dim, lon_dim], "clim_terciles")
+            terciles_da = clim_terciles.sel(
+                {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
+                method="nearest",
+            )
+        elif obs_for_terciles is not None:
+            # align obs to forecast grid then compute per-gridpoint terciles
+            obs_sel = obs_for_terciles.sel(
+                {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
+                method="nearest",
+            )
+            terciles_da = self.compute_gridpoint_terciles_from_obs(
+                obs_sel,
+                time_dim=time_dim,
+                lat_dim=lat_dim,
+                lon_dim=lon_dim,
+                q=tercile_q,
+            )
+
+        terciles_np = None
+        if terciles_da is not None:
+            terciles_np = terciles_da.transpose("tercile", lat_dim, lon_dim).values  # (2, n_lat, n_lon)
+
+        # Extract numpy arrays
+        fcst = new_forecasts.transpose(member_dim, time_dim, lat_dim, lon_dim).values
+        ws = w_ds.transpose(member_dim, lat_dim, lon_dim).values
         p1 = p1_ds.transpose(lat_dim, lon_dim).values
-        p2 = p2_ds.transpose("param", lat_dim, lon_dim).values if p2_ds is not None else None
 
-        M, T, Y, X = fc.shape
-        nq = len(quantiles)
+        p2 = None
+        if self.model_type == "gamma0":
+            p2 = p2_ds.transpose("param", lat_dim, lon_dim).values
 
-        out_mean = np.full((T, Y, X), np.nan, float)
-        out_q = np.full((nq, T, Y, X), np.nan, float)
+        n_memb, n_time, n_lat, n_lon = fcst.shape
+        n_quant = len(quantiles)
 
-        do_terc = return_terciles and (terc_ds is not None)
-        terc_np = terc_ds.transpose("tercile", lat_dim, lon_dim).values if do_terc else None
-        out_probs = np.full((3, T, Y, X), np.nan, float) if do_terc else None
+        out_mean = np.full((n_time, n_lat, n_lon), np.nan, dtype=float)
+        out_quant = np.full((n_quant, n_time, n_lat, n_lon), np.nan, dtype=float)
+        out_probs = np.full((3, n_time, n_lat, n_lon), np.nan, dtype=float) if terciles_np is not None else None
 
-        for iy in tqdm(range(Y), desc="Predict"):
-            for ix in range(X):
-                par = p1[iy, ix]
-                if not np.isfinite(par):
+        print("Predicting...")
+
+        for ilat in tqdm(range(n_lat), desc="Predict"):
+            for ilon in range(n_lon):
+                param_val = p1[ilat, ilon]          # sigma (normal) or shape (gamma*)
+                if not np.isfinite(param_val):
                     continue
-                wk = _normalize_weights(wv[:, iy, ix])
 
-                low_th = up_th = np.nan
-                if do_terc:
-                    low_th, up_th = terc_np[:, iy, ix]
+                w_local = self._normalize_weights(ws[:, ilat, ilon])
+
+                low_th, up_th = (np.nan, np.nan)
+                if terciles_np is not None:
+                    low_th, up_th = terciles_np[:, ilat, ilon]
 
                 if self.model_type == "gamma0":
-                    b0, b1 = p2[:, iy, ix]
+                    b0, b1 = p2[:, ilat, ilon]
                     if not (np.isfinite(b0) and np.isfinite(b1)):
+                        # still allow prediction but POP will be unstable; skip this cell
                         continue
 
-                for t in range(T):
-                    x_m = fc[:, t, iy, ix]
-                    if not np.isfinite(x_m).all():
+                for t in range(n_time):
+                    f_m = fcst[:, t, ilat, ilon]
+                    if not np.isfinite(f_m).all():
                         continue
 
+                    # -------------------------
+                    # NORMAL mixture
+                    # -------------------------
                     if self.model_type == "normal":
-                        mu = float(np.dot(wk, x_m))
-                        out_mean[t, iy, ix] = mu
+                        out_mean[t, ilat, ilon] = float(np.dot(w_local, f_m))
 
-                        def cdf_mix(z):
-                            return float(np.dot(wk, norm.cdf(z, loc=x_m, scale=par)))
+                        def cdf_mix(x):
+                            return float(np.dot(w_local, norm.cdf(x, loc=f_m, scale=param_val)))
 
-                        lo, hi = mu - 8.0 * par, mu + 8.0 * par
+                        mn = out_mean[t, ilat, ilon]
                         for iq, qv in enumerate(quantiles):
                             try:
-                                out_q[iq, t, iy, ix] = _invert_cdf(cdf_mix, float(qv), lo, hi)
+                                out_quant[iq, t, ilat, ilon] = brentq(
+                                    lambda x: cdf_mix(x) - qv,
+                                    mn - 8.0 * param_val,
+                                    mn + 8.0 * param_val,
+                                )
                             except Exception:
                                 pass
 
-                        if do_terc and np.isfinite(low_th) and np.isfinite(up_th):
-                            out_probs[:, t, iy, ix] = _tercile_probs_from_cdf(cdf_mix, float(low_th), float(up_th))
+                        if out_probs is not None:
+                            pb = cdf_mix(low_th)
+                            pa = 1.0 - cdf_mix(up_th)
+                            pn = float(np.clip(1.0 - pb - pa, 0.0, 1.0))
+                            out_probs[:, t, ilat, ilon] = [pb, pn, pa]
 
-                    elif self.model_type == "gamma":
-                        x_safe = np.maximum(x_m, 1e-3)
-                        scales = x_safe / par
-                        out_mean[t, iy, ix] = float(np.dot(wk, x_m))
+                    # -------------------------
+                    # GAMMA0 mixture (precip)
+                    # -------------------------
+                    elif self.model_type == "gamma0":
+                        f_mean_cbrt = np.cbrt(np.maximum(float(np.mean(f_m)), 0.0))
+                        pop = float(expit(b0 + b1 * f_mean_cbrt))
 
-                        def cdf_mix(z):
-                            z = max(float(z), 0.0)
-                            return float(np.dot(wk, gamma.cdf(z, a=par, scale=scales)))
+                        # mean of mixed distribution: POP * E[Gamma-mixture] where component means = f_m
+                        out_mean[t, ilat, ilon] = pop * float(np.dot(w_local, f_m))
 
-                        top = float(np.max(x_safe) * 8.0 + 10.0)
+                        f_safe = np.maximum(f_m, 1e-3)
+                        scales = f_safe / param_val  # component scale = mean/shape
+
+                        def cdf_gamma_part(x):
+                            return float(np.dot(w_local, gamma.cdf(x, a=param_val, scale=scales)))
+
+                        for iq, qv in enumerate(quantiles):
+                            if qv <= (1.0 - pop):
+                                out_quant[iq, t, ilat, ilon] = 0.0
+                            else:
+                                target = (qv - (1.0 - pop)) / max(pop, 1e-12)
+                                try:
+                                    top = float(np.max(f_safe) * 8.0 + 10.0)
+                                    out_quant[iq, t, ilat, ilon] = brentq(
+                                        lambda x: cdf_gamma_part(x) - target,
+                                        1e-6,
+                                        top,
+                                    )
+                                except Exception:
+                                    pass
+
+                        if out_probs is not None:
+                            # Mixed CDF: F(x)= (1-POP) + POP*F_gamma(x) for x>0
+                            cdf_low = (1.0 - pop) + pop * cdf_gamma_part(low_th)
+                            cdf_up = (1.0 - pop) + pop * cdf_gamma_part(up_th)
+                            pb = float(cdf_low)
+                            pa = float(1.0 - cdf_up)
+                            pn = float(np.clip(1.0 - pb - pa, 0.0, 1.0))
+                            out_probs[:, t, ilat, ilon] = [pb, pn, pa]
+
+                    # -------------------------
+                    # GAMMA mixture (wind, etc.)
+                    # -------------------------
+                    else:  # self.model_type == "gamma"
+                        f_safe = np.maximum(f_m, 1e-3)
+                        scales = f_safe / param_val
+
+                        # Mixture mean: sum(w_k * mean_k) with mean_k = f_m[k]
+                        out_mean[t, ilat, ilon] = float(np.dot(w_local, f_m))
+
+                        def cdf_mix_gamma(x):
+                            return float(np.dot(w_local, gamma.cdf(x, a=param_val, scale=scales)))
+
                         for iq, qv in enumerate(quantiles):
                             try:
-                                out_q[iq, t, iy, ix] = _invert_cdf(cdf_mix, float(qv), 1e-6, top)
+                                top = float(np.max(f_safe) * 8.0 + 10.0)
+                                out_quant[iq, t, ilat, ilon] = brentq(
+                                    lambda x: cdf_mix_gamma(x) - qv,
+                                    1e-6,
+                                    top,
+                                )
                             except Exception:
                                 pass
 
-                        if do_terc and np.isfinite(low_th) and np.isfinite(up_th):
-                            out_probs[:, t, iy, ix] = _tercile_probs_from_cdf(cdf_mix, float(low_th), float(up_th))
+                        if out_probs is not None:
+                            pb = cdf_mix_gamma(low_th)
+                            pa = 1.0 - cdf_mix_gamma(up_th)
+                            pn = float(np.clip(1.0 - pb - pa, 0.0, 1.0))
+                            out_probs[:, t, ilat, ilon] = [pb, pn, pa]
 
-                    else:  # gamma0
-                        x_mean_cbrt = np.cbrt(np.maximum(float(np.mean(x_m)), 0.0))
-                        pop = float(expit(b0 + b1 * x_mean_cbrt))  # P(Y>0)
-                        x_safe = np.maximum(x_m, 1e-3)
-                        scales = x_safe / par
+        # Package outputs
+        coords = {
+            time_dim: new_forecasts[time_dim],
+            lat_dim: new_forecasts[lat_dim],
+            lon_dim: new_forecasts[lon_dim],
+        }
 
-                        out_mean[t, iy, ix] = pop * float(np.dot(wk, x_m))
+        ds_out = xr.Dataset()
+        ds_out["predictive_mean"] = xr.DataArray(out_mean, dims=(time_dim, lat_dim, lon_dim), coords=coords)
 
-                        def cdf_pos(z):
-                            z = max(float(z), 0.0)
-                            return float(np.dot(wk, gamma.cdf(z, a=par, scale=scales)))
-
-                        def cdf_mix(z):
-                            z = float(z)
-                            if z <= 0.0:
-                                return float(1.0 - pop)
-                            return float((1.0 - pop) + pop * cdf_pos(z))
-
-                        top = float(np.max(x_safe) * 8.0 + 10.0)
-                        for iq, qv in enumerate(quantiles):
-                            try:
-                                qv = float(qv)
-                                if qv <= (1.0 - pop):
-                                    out_q[iq, t, iy, ix] = 0.0
-                                else:
-                                    target = (qv - (1.0 - pop)) / max(pop, 1e-12)
-                                    out_q[iq, t, iy, ix] = _invert_cdf(cdf_pos, float(target), 1e-6, top)
-                            except Exception:
-                                pass
-
-                        if do_terc and np.isfinite(low_th) and np.isfinite(up_th):
-                            out_probs[:, t, iy, ix] = _tercile_probs_from_cdf(cdf_mix, float(low_th), float(up_th))
-
-        coords = {time_dim: new_forecasts[time_dim], lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}
-        ds = xr.Dataset()
-        ds["predictive_mean"] = xr.DataArray(out_mean, dims=(time_dim, lat_dim, lon_dim), coords=coords)
-        ds["predictive_quantiles"] = xr.DataArray(
-            out_q, dims=("quantile", time_dim, lat_dim, lon_dim), coords={**coords, "quantile": list(quantiles)}
+        ds_out["predictive_quantiles"] = xr.DataArray(
+            out_quant,
+            dims=("quantile", time_dim, lat_dim, lon_dim),
+            coords={**coords, "quantile": list(quantiles)},
         )
 
-        if do_terc:
-            ds["tercile_thresholds"] = terc_ds
-            ds["tercile_probability"] = xr.DataArray(
+        if out_probs is not None:
+            ds_out["tercile_probability"] = xr.DataArray(
                 out_probs,
-                dims=("category", time_dim, lat_dim, lon_dim),
-                coords={**coords, "category": ["PB", "PN", "PA"]},
+                dims=("probability", time_dim, lat_dim, lon_dim),
+                coords={**coords, "probability": ["PB", "PN", "PA"]},
+            )
+            ds_out["tercile_thresholds"] = terciles_da
+
+        return ds_out
+
+class WAS_mme_FullBMA:
+    """
+    Hybrid Bayesian seasonal ensemble postprocessor for seasonal CF.
+
+    Supported families per gridpoint
+    --------------------------------
+    - 1 -> normal
+    - 4 -> gamma
+    - 2 -> lognormal
+
+    Modes
+    -----
+    - mode="full" : full Bayesian MCMC if available
+    - mode="fast" : fast penalized optimization
+    - mode="auto" : try full first, fallback to fast
+
+    Notes
+    -----
+    - dist_map may contain NaN; those gridpoints are skipped.
+    - Positive families (gamma, lognormal) are fitted only on y > 0.
+    - The class returns predictive mean, quantiles, tercile probabilities,
+      family used, fit mode used, and fit status.
+    """
+
+    DIST_CODE_TO_NAME = {1: "normal", 4: "gamma", 2: "lognormal"}
+    DIST_NAME_TO_CODE = {"normal": 1, "gamma": 4, "lognormal": 2}
+    MODE_CODE = {"full": 0, "fast": 1, "failed": -1}
+
+    def __init__(
+        self,
+        mode: str = "auto",
+        eps: float = 1e-6,
+        tol: float = 1e-5,
+        maxiter: int = 300,
+        draws: int = 1000,
+        tune: int = 1000,
+        chains: int = 2,
+        target_accept: float = 0.92,
+        random_seed: int = 42,
+        progressbar: bool = True,
+        verbose: bool = True,
+    ):
+        if mode not in {"full", "fast", "auto"}:
+            raise ValueError("mode must be one of {'full', 'fast', 'auto'}")
+
+        self.mode = mode
+        self.eps = eps
+        self.tol = tol
+        self.maxiter = maxiter
+
+        self.draws = draws
+        self.tune = tune
+        self.chains = chains
+        self.target_accept = target_accept
+        self.random_seed = random_seed
+        self.progressbar = progressbar
+        self.verbose = verbose
+
+        self.fitted = False
+
+        self.weight_map: Optional[xr.DataArray] = None
+        self.intercept_map: Optional[xr.DataArray] = None
+        self.slope_map: Optional[xr.DataArray] = None
+        self.dispersion_map: Optional[xr.DataArray] = None
+        self.family_map_used: Optional[xr.DataArray] = None
+        self.fit_mode_map: Optional[xr.DataArray] = None
+        self.fit_status_map: Optional[xr.DataArray] = None
+
+        self.posterior_: Dict[Tuple[int, int], Dict[str, np.ndarray]] = {}
+
+        self._member_dim = None
+        self._time_dim = None
+        self._lat_dim = None
+        self._lon_dim = None
+        self._member_values = None
+        self._lat_values = None
+        self._lon_values = None
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _require_dims(da: xr.DataArray, dims: Sequence[str], name: str) -> None:
+        missing = [d for d in dims if d not in da.dims]
+        if missing:
+            raise ValueError(f"{name} missing required dims {missing}. Found dims={da.dims}")
+
+    @staticmethod
+    def _safe_scale(x: np.ndarray, default: float = 1.0) -> float:
+        s = np.nanstd(x)
+        if not np.isfinite(s) or s <= 0:
+            s = np.nanmean(np.abs(x))
+        if not np.isfinite(s) or s <= 0:
+            s = default
+        return float(s)
+
+    @staticmethod
+    def _flatten_trace(trace: "az.InferenceData", varname: str) -> np.ndarray:
+        arr = trace.posterior[varname].values
+        return arr.reshape(arr.shape[0] * arr.shape[1], *arr.shape[2:])
+
+    def _parse_family(self, value: Union[str, int, float, None]) -> Optional[str]:
+        """
+        Robust parser for distribution family.
+        Returns None for missing / invalid entries.
+        """
+        if value is None:
+            return None
+
+        try:
+            if np.isnan(value):
+                return None
+        except TypeError:
+            pass
+
+        if isinstance(value, str):
+            fam = value.strip().lower()
+            return fam if fam in self.DIST_NAME_TO_CODE else None
+
+        try:
+            code = int(value)
+        except Exception:
+            return None
+
+        return self.DIST_CODE_TO_NAME.get(code, None)
+
+    @staticmethod
+    def compute_gridpoint_terciles_from_obs(
+        obs: xr.DataArray,
+        *,
+        time_dim: str = "T",
+        lat_dim: str = "Y",
+        lon_dim: str = "X",
+        q: Tuple[float, float] = (1/3, 2/3),
+    ) -> xr.DataArray:
+        qt = obs.quantile(list(q), dim=time_dim, skipna=True).rename({"quantile": "tercile"})
+        qt = qt.assign_coords(tercile=["lower", "upper"])
+        return qt
+
+    def _align_terciles_to_forecast_grid(
+        self,
+        new_forecasts: xr.DataArray,
+        clim_terciles: Optional[xr.DataArray],
+        obs_for_terciles: Optional[xr.DataArray],
+        tercile_q: Tuple[float, float],
+        lat_dim: str,
+        lon_dim: str,
+        time_dim: str,
+    ) -> Optional[xr.DataArray]:
+        if clim_terciles is not None:
+            if "tercile" not in clim_terciles.dims and "quantile" in clim_terciles.dims:
+                clim_terciles = clim_terciles.rename({"quantile": "tercile"})
+            self._require_dims(clim_terciles, ["tercile", lat_dim, lon_dim], "clim_terciles")
+            return clim_terciles.sel(
+                {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
+                method="nearest",
             )
 
-        return ds
+        if obs_for_terciles is not None:
+            obs_sel = obs_for_terciles.sel(
+                {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
+                method="nearest",
+            )
+            return self.compute_gridpoint_terciles_from_obs(
+                obs_sel, time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim, q=tercile_q
+            )
 
+        return None
 
-# ============================================================
-# 2) Gaussian BMA with bias correction + EM, with terciles
-# ============================================================
+    # ------------------------------------------------------------------
+    # FAST backend
+    # ------------------------------------------------------------------
+    def _unpack_fast_params(self, p: np.ndarray, m: int):
+        logits_w = p[:m]
+        a = p[m:2*m]
+        b_raw = p[2*m:3*m]
+        disp_raw = p[3*m]
 
-@dataclass
-class WAS_GaussianBMA_EM:
-    """
-    Gaussian BMA (Raftery/Wilks-style) with optional terciles.
+        w = softmax(logits_w)
+        b = np.exp(b_raw)
+        disp = np.exp(disp_raw)
+        return w, a, b, disp
 
-    Bias correction (Eq. 8.34):
-        m_{t,k} = a_k + b_k x_{t,k}
+    def _nll_fast_normal(self, p, f_data, y_data, lam_w, lam_a, lam_b, lam_disp, y_scale):
+        m, _ = f_data.shape
+        w, a, b, sigma = self._unpack_fast_params(p, m)
 
-    Predictive CDF:
-        F(q) = sum_k w_k Phi((q - m_{t,k}) / sigma_k)
+        mu = a[:, None] + b[:, None] * f_data
+        pdf = norm.pdf(y_data[None, :], loc=mu, scale=max(sigma, self.eps))
+        mix_pdf = np.sum(w[:, None] * pdf, axis=0)
+        nll = -np.sum(np.log(np.maximum(mix_pdf, self.eps)))
 
-    EM estimates weights and sigma_k (optionally constrained equal).
-    """
-    tol: float = 1e-4
-    max_iter: int = 200
-    min_sigma: float = 1e-3
+        pen = (
+            lam_w * np.sum((w - 1.0 / m) ** 2)
+            + lam_a * np.sum((a / max(y_scale, self.eps)) ** 2)
+            + lam_b * np.sum((np.log(b)) ** 2)
+            + lam_disp * (np.log(sigma / max(y_scale, self.eps)) ** 2)
+        )
+        return nll + pen
 
-    bias_mode: str = "memberwise"     # "memberwise" | "exchangeable"
-    equal_sigma: bool = True
-    equal_weights: bool = False
+    def _nll_fast_gamma(self, p, f_data, y_data, lam_w, lam_a, lam_b, lam_disp, y_scale):
+        m, _ = f_data.shape
+        w, a, b, shape = self._unpack_fast_params(p, m)
 
-    compute_terciles: bool = True
-    tercile_q_fit: Tuple[float, float] = (1 / 3, 2 / 3)
+        if np.any(y_data <= 0):
+            return 1e20
 
-    # fitted grids
-    weights: Optional[xr.DataArray] = None  # (M,Y,X)
-    sigma: Optional[xr.DataArray] = None    # (M,Y,X) expanded even if equal_sigma
-    a: Optional[xr.DataArray] = None        # (M,Y,X)
-    b: Optional[xr.DataArray] = None        # (M,Y,X)
-    clim_terciles: Optional[xr.DataArray] = None  # ('tercile',Y,X)
+        mu = np.maximum(a[:, None] + b[:, None] * f_data, self.eps)
+        rate = shape / mu
+        pdf = sp_gamma.pdf(y_data[None, :], a=shape, scale=1.0 / np.maximum(rate, self.eps))
+        mix_pdf = np.sum(w[:, None] * pdf, axis=0)
+        nll = -np.sum(np.log(np.maximum(mix_pdf, self.eps)))
 
-    fitted: bool = False
+        pen = (
+            lam_w * np.sum((w - 1.0 / m) ** 2)
+            + lam_a * np.sum((a / max(y_scale, self.eps)) ** 2)
+            + lam_b * np.sum((np.log(b)) ** 2)
+            + lam_disp * (np.log(shape) ** 2)
+        )
+        return nll + pen
 
-    def _fit_point(self, x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        M, _N = x.shape
+    def _nll_fast_lognormal(self, p, f_data, y_data, lam_w, lam_a, lam_b, lam_disp, y_scale):
+        m, _ = f_data.shape
+        w, a, b, sigma_log = self._unpack_fast_params(p, m)
 
-        # bias correction
-        if self.bias_mode == "exchangeable":
-            a0, b0 = _fit_linear_bias_exchangeable(x, y)
-            a = np.full(M, a0, float)
-            b = np.full(M, b0, float)
+        if np.any(y_data <= 0):
+            return 1e20
+
+        mu_log = a[:, None] + b[:, None] * np.log(np.maximum(f_data, self.eps))
+        pdf = lognorm.pdf(
+            y_data[None, :],
+            s=max(sigma_log, self.eps),
+            scale=np.exp(mu_log),
+        )
+        mix_pdf = np.sum(w[:, None] * pdf, axis=0)
+        nll = -np.sum(np.log(np.maximum(mix_pdf, self.eps)))
+
+        pen = (
+            lam_w * np.sum((w - 1.0 / m) ** 2)
+            + lam_a * np.sum(a ** 2)
+            + lam_b * np.sum((np.log(b)) ** 2)
+            + lam_disp * (np.log(sigma_log) ** 2)
+        )
+        return nll + pen
+
+    def _fit_single_grid_fast(
+        self,
+        f_data: np.ndarray,
+        y_data: np.ndarray,
+        family: str,
+        lam_w: float,
+        lam_a: float,
+        lam_b: float,
+        lam_disp: float,
+    ) -> Dict[str, Any]:
+        m, _ = f_data.shape
+        y_scale = self._safe_scale(y_data, default=1.0)
+
+        if family in {"gamma", "lognormal"}:
+            valid = y_data > 0
+            y_data = y_data[valid]
+            f_data = f_data[:, valid]
+            if y_data.size < 5:
+                raise ValueError(f"Not enough positive samples for {family}")
+
+        p0 = np.concatenate([
+            np.zeros(m),
+            np.zeros(m),
+            np.zeros(m),
+            [np.log(max(y_scale, 1.0))],
+        ])
+
+        if family == "normal":
+            obj = lambda p: self._nll_fast_normal(p, f_data, y_data, lam_w, lam_a, lam_b, lam_disp, y_scale)
+        elif family == "gamma":
+            obj = lambda p: self._nll_fast_gamma(p, f_data, y_data, lam_w, lam_a, lam_b, lam_disp, y_scale)
+        elif family == "lognormal":
+            obj = lambda p: self._nll_fast_lognormal(p, f_data, y_data, lam_w, lam_a, lam_b, lam_disp, y_scale)
         else:
-            a, b = _fit_linear_bias_memberwise(x, y)
+            raise ValueError(f"Unsupported family {family}")
 
-        m = _apply_bias(x, a, b)
+        res = minimize(
+            obj,
+            p0,
+            method="L-BFGS-B",
+            options={"maxiter": self.maxiter, "ftol": self.tol},
+        )
 
-        # init
-        w = np.full(M, 1.0 / M, float)
-        if self.equal_weights:
-            w[:] = 1.0 / M
+        if not res.success:
+            raise RuntimeError(res.message)
 
-        resid = y[None, :] - m
-        sig = np.sqrt(np.nanmean(resid ** 2, axis=1))
-        sig = np.maximum(sig, self.min_sigma)
-        if self.equal_sigma:
-            sig[:] = float(np.maximum(np.sqrt(np.mean(sig ** 2)), self.min_sigma))
+        w, a, b, disp = self._unpack_fast_params(res.x, m)
+        return {
+            "weights": w,
+            "a": a,
+            "b": b,
+            "dispersion": float(disp),
+            "family": family,
+            "backend": "fast",
+        }
 
-        for _ in range(self.max_iter):
-            ll = np.empty((M, y.size), dtype=float)
-            for k in range(M):
-                ll[k, :] = np.log(max(w[k], 1e-12)) + norm.logpdf(y, loc=m[k, :], scale=sig[k])
+    # ------------------------------------------------------------------
+    # FULL backend
+    # ------------------------------------------------------------------
+    def _fit_single_grid_full(
+        self,
+        f_data: np.ndarray,
+        y_data: np.ndarray,
+        family: str,
+        alpha0: float,
+        coef_scale_mult: float,
+        sigma_scale_mult: float,
+        shape_scale: float,
+    ) -> Dict[str, Any]:
+        if not HAS_PYMC:
+            raise RuntimeError("PyMC/ArviZ unavailable")
 
-            ll_max = np.max(ll, axis=0, keepdims=True)
-            r = np.exp(ll - ll_max)
-            r_sum = np.sum(r, axis=0, keepdims=True)
-            r = r / np.maximum(r_sum, 1e-12)
+        m, _ = f_data.shape
+        y_scale = self._safe_scale(y_data, default=1.0)
 
-            w_new = r.mean(axis=1)
-            if self.equal_weights:
-                w_new[:] = 1.0 / M
-            else:
-                w_new = np.clip(w_new, 1e-12, 1.0)
-                w_new /= w_new.sum()
+        if family == "normal":
+            with pm.Model() as model:
+                weights = pm.Dirichlet("weights", a=np.full(m, alpha0))
+                a = pm.Normal("a", mu=0.0, sigma=coef_scale_mult * y_scale, shape=m)
+                b = pm.Normal("b", mu=1.0, sigma=coef_scale_mult, shape=m)
+                sigma = pm.HalfNormal("sigma", sigma=sigma_scale_mult * y_scale)
 
-            sig_new = np.empty_like(sig)
-            for k in range(M):
-                num = np.sum(r[k, :] * (y - m[k, :]) ** 2)
-                den = np.sum(r[k, :])
-                sig_new[k] = np.sqrt(num / np.maximum(den, 1e-12))
-            sig_new = np.maximum(sig_new, self.min_sigma)
+                comp_dists = [pm.Normal.dist(mu=a[k] + b[k] * f_data[k, :], sigma=sigma) for k in range(m)]
+                pm.Mixture("y_like", w=weights, comp_dists=comp_dists, observed=y_data)
 
-            if self.equal_sigma:
-                common = np.sqrt(np.sum(r * (y[None, :] - m) ** 2) / np.maximum(np.sum(r), 1e-12))
-                common = float(np.maximum(common, self.min_sigma))
-                sig_new[:] = common
+                trace = pm.sample(
+                    draws=self.draws,
+                    tune=self.tune,
+                    chains=self.chains,
+                    target_accept=self.target_accept,
+                    random_seed=self.random_seed,
+                    progressbar=self.progressbar,
+                    compute_convergence_checks=False,
+                    return_inferencedata=True,
+                )
 
-            if max(np.max(np.abs(w_new - w)), np.max(np.abs(sig_new - sig))) < self.tol:
-                w, sig = w_new, sig_new
-                break
+            return {
+                "weights": self._flatten_trace(trace, "weights"),
+                "a": self._flatten_trace(trace, "a"),
+                "b": self._flatten_trace(trace, "b"),
+                "dispersion": self._flatten_trace(trace, "sigma"),
+                "family": family,
+                "backend": "full",
+            }
 
-            w, sig = w_new, sig_new
+        elif family == "gamma":
+            valid = y_data > 0
+            y_pos = y_data[valid]
+            f_pos = f_data[:, valid]
 
-        return w, sig, a, b
+            if y_pos.size < 5:
+                raise ValueError("Not enough positive samples for gamma")
 
+            with pm.Model() as model:
+                weights = pm.Dirichlet("weights", a=np.full(m, alpha0))
+                a = pm.Normal("a", mu=0.0, sigma=coef_scale_mult * y_scale, shape=m)
+                b = pm.Normal("b", mu=1.0, sigma=coef_scale_mult, shape=m)
+                shape = pm.HalfNormal("shape", sigma=shape_scale)
+
+                comp_dists = []
+                for k in range(m):
+                    mu_k = pm.math.maximum(a[k] + b[k] * f_pos[k, :], self.eps)
+                    beta_k = shape / mu_k
+                    comp_dists.append(pm.Gamma.dist(alpha=shape, beta=beta_k))
+
+                pm.Mixture("y_like", w=weights, comp_dists=comp_dists, observed=y_pos)
+
+                trace = pm.sample(
+                    draws=self.draws,
+                    tune=self.tune,
+                    chains=self.chains,
+                    target_accept=self.target_accept,
+                    random_seed=self.random_seed,
+                    progressbar=self.progressbar,
+                    compute_convergence_checks=False,
+                    return_inferencedata=True,
+                )
+
+            return {
+                "weights": self._flatten_trace(trace, "weights"),
+                "a": self._flatten_trace(trace, "a"),
+                "b": self._flatten_trace(trace, "b"),
+                "dispersion": self._flatten_trace(trace, "shape"),
+                "family": family,
+                "backend": "full",
+            }
+
+        elif family == "lognormal":
+            valid = y_data > 0
+            y_pos = y_data[valid]
+            f_pos = f_data[:, valid]
+
+            if y_pos.size < 5:
+                raise ValueError("Not enough positive samples for lognormal")
+
+            logy = np.log(np.maximum(y_pos, self.eps))
+            log_scale = self._safe_scale(logy, default=1.0)
+
+            with pm.Model() as model:
+                weights = pm.Dirichlet("weights", a=np.full(m, alpha0))
+                a = pm.Normal("a", mu=0.0, sigma=coef_scale_mult * log_scale, shape=m)
+                b = pm.Normal("b", mu=1.0, sigma=coef_scale_mult, shape=m)
+                sigma_log = pm.HalfNormal("sigma_log", sigma=sigma_scale_mult * log_scale)
+
+                comp_dists = []
+                for k in range(m):
+                    mu_log_k = a[k] + b[k] * pm.math.log(pm.math.maximum(f_pos[k, :], self.eps))
+                    comp_dists.append(pm.LogNormal.dist(mu=mu_log_k, sigma=sigma_log))
+
+                pm.Mixture("y_like", w=weights, comp_dists=comp_dists, observed=y_pos)
+
+                trace = pm.sample(
+                    draws=self.draws,
+                    tune=self.tune,
+                    chains=self.chains,
+                    target_accept=self.target_accept,
+                    random_seed=self.random_seed,
+                    progressbar=self.progressbar,
+                    compute_convergence_checks=False,
+                    return_inferencedata=True,
+                )
+
+            return {
+                "weights": self._flatten_trace(trace, "weights"),
+                "a": self._flatten_trace(trace, "a"),
+                "b": self._flatten_trace(trace, "b"),
+                "dispersion": self._flatten_trace(trace, "sigma_log"),
+                "family": family,
+                "backend": "full",
+            }
+
+        raise ValueError(f"Unsupported family {family}")
+
+    # ------------------------------------------------------------------
+    # Hybrid single-grid fit
+    # ------------------------------------------------------------------
+    def _fit_single_grid_hybrid(
+        self,
+        f_data: np.ndarray,
+        y_data: np.ndarray,
+        family: str,
+        lam_w: float,
+        lam_a: float,
+        lam_b: float,
+        lam_disp: float,
+        alpha0: float,
+        coef_scale_mult: float,
+        sigma_scale_mult: float,
+        shape_scale: float,
+    ) -> Dict[str, Any]:
+        if self.mode == "fast":
+            return self._fit_single_grid_fast(f_data, y_data, family, lam_w, lam_a, lam_b, lam_disp)
+
+        if self.mode == "full":
+            return self._fit_single_grid_full(f_data, y_data, family, alpha0, coef_scale_mult, sigma_scale_mult, shape_scale)
+
+        try:
+            return self._fit_single_grid_full(f_data, y_data, family, alpha0, coef_scale_mult, sigma_scale_mult, shape_scale)
+        except Exception:
+            return self._fit_single_grid_fast(f_data, y_data, family, lam_w, lam_a, lam_b, lam_disp)
+
+    # ------------------------------------------------------------------
+    # Fit
+    # ------------------------------------------------------------------
     def fit(
         self,
         hcst_grid: xr.DataArray,
         obs_grid: xr.DataArray,
+        dist_map: xr.DataArray,
         *,
         member_dim: str = "M",
         time_dim: str = "T",
         lat_dim: str = "Y",
         lon_dim: str = "X",
-        min_samples: int = 20,
+        min_samples: int = 12,
+        lam_w: float = 1.0,
+        lam_a: float = 0.1,
+        lam_b: float = 0.1,
+        lam_disp: float = 0.1,
+        alpha0: float = 1.0,
+        coef_scale_mult: float = 1.0,
+        sigma_scale_mult: float = 1.0,
+        shape_scale: float = 5.0,
     ):
-        _require_dims(hcst_grid, [member_dim, time_dim, lat_dim, lon_dim], "hcst_grid")
-        _require_dims(obs_grid, [time_dim, lat_dim, lon_dim], "obs_grid")
+        self._require_dims(hcst_grid, [member_dim, time_dim, lat_dim, lon_dim], "hcst_grid")
+        self._require_dims(obs_grid, [time_dim, lat_dim, lon_dim], "obs_grid")
+        self._require_dims(dist_map, [lat_dim, lon_dim], "dist_map")
 
-        if self.compute_terciles:
-            self.clim_terciles = compute_gridpoint_terciles_from_obs(
-                obs_grid, time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim, q=self.tercile_q_fit
-            )
+        self._member_dim = member_dim
+        self._time_dim = time_dim
+        self._lat_dim = lat_dim
+        self._lon_dim = lon_dim
+
+        self._member_values = hcst_grid[member_dim].values
+        self._lat_values = hcst_grid[lat_dim].values
+        self._lon_values = hcst_grid[lon_dim].values
 
         hcst = hcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim).values
         obs = obs_grid.transpose(time_dim, lat_dim, lon_dim).values
-        M, _T, Y, X = hcst.shape
+        dist_np = dist_map.transpose(lat_dim, lon_dim).values
 
-        w_map = np.full((M, Y, X), np.nan, float)
-        s_map = np.full((M, Y, X), np.nan, float)
-        a_map = np.full((M, Y, X), np.nan, float)
-        b_map = np.full((M, Y, X), np.nan, float)
+        n_memb, _, n_lat, n_lon = hcst.shape
 
-        print("Fitting Gaussian BMA (EM + bias correction)...")
+        weight_map = np.full((n_memb, n_lat, n_lon), np.nan, dtype=float)
+        intercept_map = np.full((n_memb, n_lat, n_lon), np.nan, dtype=float)
+        slope_map = np.full((n_memb, n_lat, n_lon), np.nan, dtype=float)
+        dispersion_map = np.full((n_lat, n_lon), np.nan, dtype=float)
+        family_code = np.full((n_lat, n_lon), np.nan, dtype=float)
+        fit_mode = np.full((n_lat, n_lon), self.MODE_CODE["failed"], dtype=float)
+        fit_status = np.zeros((n_lat, n_lon), dtype=float)
 
-        for iy in tqdm(range(Y), desc="Training"):
-            for ix in range(X):
-                x_raw = hcst[:, :, iy, ix]
-                y_raw = obs[:, iy, ix]
-                valid = np.isfinite(y_raw) & np.isfinite(x_raw).all(axis=0)
+        self.posterior_.clear()
+
+        if self.verbose:
+            print(f"Fitting hybrid Bayesian seasonal postprocessor [mode={self.mode}]...")
+
+        for ilat in tqdm(range(n_lat), desc="Training", disable=not self.verbose):
+            for ilon in range(n_lon):
+                fam = self._parse_family(dist_np[ilat, ilon])
+                if fam is None:
+                    continue
+
+                f_raw = hcst[:, :, ilat, ilon]
+                y_raw = obs[:, ilat, ilon]
+
+                valid = np.isfinite(y_raw) & np.isfinite(f_raw).all(axis=0)
                 if int(valid.sum()) < min_samples:
                     continue
 
-                w, sig, a, b = self._fit_point(x_raw[:, valid], y_raw[valid])
-                w_map[:, iy, ix] = w
-                s_map[:, iy, ix] = sig
-                a_map[:, iy, ix] = a
-                b_map[:, iy, ix] = b
+                f_data = f_raw[:, valid]
+                y_data = y_raw[valid]
 
-        coords_m = {member_dim: hcst_grid[member_dim], lat_dim: hcst_grid[lat_dim], lon_dim: hcst_grid[lon_dim]}
-        self.weights = xr.DataArray(w_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_m)
-        self.sigma = xr.DataArray(s_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_m)
-        self.a = xr.DataArray(a_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_m)
-        self.b = xr.DataArray(b_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_m)
+                try:
+                    res = self._fit_single_grid_hybrid(
+                        f_data=f_data,
+                        y_data=y_data,
+                        family=fam,
+                        lam_w=lam_w,
+                        lam_a=lam_a,
+                        lam_b=lam_b,
+                        lam_disp=lam_disp,
+                        alpha0=alpha0,
+                        coef_scale_mult=coef_scale_mult,
+                        sigma_scale_mult=sigma_scale_mult,
+                        shape_scale=shape_scale,
+                    )
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Skipping grid ({ilat},{ilon}) [{fam}] due to fit error: {e}")
+                    continue
+
+                family_code[ilat, ilon] = self.DIST_NAME_TO_CODE[fam]
+                fit_status[ilat, ilon] = 1.0
+
+                if res["backend"] == "fast":
+                    fit_mode[ilat, ilon] = self.MODE_CODE["fast"]
+                    weight_map[:, ilat, ilon] = res["weights"]
+                    intercept_map[:, ilat, ilon] = res["a"]
+                    slope_map[:, ilat, ilon] = res["b"]
+                    dispersion_map[ilat, ilon] = float(res["dispersion"])
+
+                elif res["backend"] == "full":
+                    fit_mode[ilat, ilon] = self.MODE_CODE["full"]
+                    self.posterior_[(ilat, ilon)] = res
+                    weight_map[:, ilat, ilon] = res["weights"].mean(axis=0)
+                    intercept_map[:, ilat, ilon] = res["a"].mean(axis=0)
+                    slope_map[:, ilat, ilon] = res["b"].mean(axis=0)
+                    dispersion_map[ilat, ilon] = float(np.mean(res["dispersion"]))
+
+        coords_w = {
+            member_dim: self._member_values,
+            lat_dim: self._lat_values,
+            lon_dim: self._lon_values,
+        }
+        coords_2d = {
+            lat_dim: self._lat_values,
+            lon_dim: self._lon_values,
+        }
+
+        self.weight_map = xr.DataArray(weight_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_w)
+        self.intercept_map = xr.DataArray(intercept_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_w)
+        self.slope_map = xr.DataArray(slope_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_w)
+        self.dispersion_map = xr.DataArray(dispersion_map, dims=(lat_dim, lon_dim), coords=coords_2d)
+        self.family_map_used = xr.DataArray(family_code, dims=(lat_dim, lon_dim), coords=coords_2d)
+        self.fit_mode_map = xr.DataArray(fit_mode, dims=(lat_dim, lon_dim), coords=coords_2d)
+        self.fit_status_map = xr.DataArray(fit_status, dims=(lat_dim, lon_dim), coords=coords_2d)
 
         self.fitted = True
         return self
 
+    # ------------------------------------------------------------------
+    # Predictive helpers
+    # ------------------------------------------------------------------
+    def _mixture_mean_fast(self, f_m, w, a, b, disp, family):
+        if family == "normal":
+            mu = a + b * f_m
+            return float(np.sum(w * mu))
+        if family == "gamma":
+            mu = np.maximum(a + b * f_m, self.eps)
+            return float(np.sum(w * mu))
+        if family == "lognormal":
+            mu_log = a + b * np.log(np.maximum(f_m, self.eps))
+            means = np.exp(mu_log + 0.5 * disp**2)
+            return float(np.sum(w * means))
+        raise ValueError(family)
+
+    def _mixture_cdf_fast(self, x, f_m, w, a, b, disp, family):
+        if family == "normal":
+            mu = a + b * f_m
+            vals = norm.cdf(x, loc=mu, scale=max(disp, self.eps))
+            return float(np.sum(w * vals))
+
+        if family == "gamma":
+            mu = np.maximum(a + b * f_m, self.eps)
+            shape = max(disp, self.eps)
+            rate = shape / mu
+            vals = sp_gamma.cdf(x, a=shape, scale=1.0 / np.maximum(rate, self.eps))
+            return float(np.sum(w * vals))
+
+        if family == "lognormal":
+            mu_log = a + b * np.log(np.maximum(f_m, self.eps))
+            vals = lognorm.cdf(x, s=max(disp, self.eps), scale=np.exp(mu_log))
+            return float(np.sum(w * vals))
+
+        raise ValueError(family)
+
+    def _mixture_quantile_fast(self, q, f_m, w, a, b, disp, family):
+        mean_pred = self._mixture_mean_fast(f_m, w, a, b, disp, family)
+
+        if family == "normal":
+            lo = mean_pred - 8 * max(disp, self.eps)
+            hi = mean_pred + 8 * max(disp, self.eps)
+        elif family == "gamma":
+            lo = 0.0
+            hi = max(mean_pred * 6.0 + 10.0, 1.0)
+        elif family == "lognormal":
+            lo = 0.0
+            hi = max(mean_pred * 8.0 + 10.0, 1.0)
+        else:
+            raise ValueError(family)
+
+        xs = np.linspace(lo, hi, 600)
+        cdfs = np.array([self._mixture_cdf_fast(xx, f_m, w, a, b, disp, family) for xx in xs])
+        idx = np.searchsorted(cdfs, q, side="left")
+        idx = min(max(idx, 0), len(xs) - 1)
+        return float(xs[idx])
+
+    def _sample_pp_full(self, f_m, post, family, rng, n_samples):
+        n_post = post["weights"].shape[0]
+        idx = rng.choice(n_post, size=n_samples, replace=(n_samples > n_post))
+
+        w = post["weights"][idx, :]
+        a = post["a"][idx, :]
+        b = post["b"][idx, :]
+        disp = post["dispersion"][idx]
+
+        u = rng.random(n_samples)
+        cdf = np.cumsum(w, axis=1)
+        comp = (u[:, None] > cdf).sum(axis=1)
+
+        if family == "normal":
+            mu = a + b * f_m[None, :]
+            mu_sel = mu[np.arange(n_samples), comp]
+            return rng.normal(mu_sel, disp)
+
+        if family == "gamma":
+            mu = np.maximum(a + b * f_m[None, :], self.eps)
+            mu_sel = mu[np.arange(n_samples), comp]
+            shape = np.maximum(disp, self.eps)
+            rate = shape / np.maximum(mu_sel, self.eps)
+            return rng.gamma(shape=shape, scale=1.0 / rate)
+
+        if family == "lognormal":
+            mu_log = a + b * np.log(np.maximum(f_m[None, :], self.eps))
+            mu_sel = mu_log[np.arange(n_samples), comp]
+            return rng.lognormal(mean=mu_sel, sigma=np.maximum(disp, self.eps))
+
+        raise ValueError(family)
+
+    # ------------------------------------------------------------------
+    # Predict
+    # ------------------------------------------------------------------
     def predict_probabilistic(
         self,
         new_forecasts: xr.DataArray,
         *,
+        clim_terciles: Optional[xr.DataArray] = None,
+        obs_for_terciles: Optional[xr.DataArray] = None,
+        tercile_q: Tuple[float, float] = (1/3, 2/3),
         quantiles: Sequence[float] = (0.1, 0.5, 0.9),
+        n_pp_samples: int = 2000,
         member_dim: str = "M",
         time_dim: str = "T",
         lat_dim: str = "Y",
         lon_dim: str = "X",
-        # terciles:
-        return_terciles: bool = True,
-        clim_terciles: Optional[xr.DataArray] = None,
-        obs_for_terciles: Optional[xr.DataArray] = None,
-        tercile_q: Tuple[float, float] = (1 / 3, 2 / 3),
     ) -> xr.Dataset:
         if not self.fitted:
-            raise ValueError("Fit model first.")
-        _require_dims(new_forecasts, [member_dim, time_dim, lat_dim, lon_dim], "new_forecasts")
+            raise ValueError("Model must be fitted before prediction.")
 
-        w = self.weights.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        s = self.sigma.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        a = self.a.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        b = self.b.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
+        self._require_dims(new_forecasts, [member_dim, time_dim, lat_dim, lon_dim], "new_forecasts")
 
-        terc_ds = _resolve_terciles_for_prediction(
+        fcst = new_forecasts.transpose(member_dim, time_dim, lat_dim, lon_dim).values
+        _, n_time, n_lat, n_lon = fcst.shape
+
+        w_map = self.weight_map.transpose(member_dim, lat_dim, lon_dim).values
+        a_map = self.intercept_map.transpose(member_dim, lat_dim, lon_dim).values
+        b_map = self.slope_map.transpose(member_dim, lat_dim, lon_dim).values
+        d_map = self.dispersion_map.transpose(lat_dim, lon_dim).values
+        fam_map = self.family_map_used.transpose(lat_dim, lon_dim).values
+        mode_map = self.fit_mode_map.transpose(lat_dim, lon_dim).values
+        status_map = self.fit_status_map.transpose(lat_dim, lon_dim).values
+
+        terciles_da = self._align_terciles_to_forecast_grid(
             new_forecasts=new_forecasts,
+            clim_terciles=clim_terciles,
+            obs_for_terciles=obs_for_terciles,
+            tercile_q=tercile_q,
             lat_dim=lat_dim,
             lon_dim=lon_dim,
             time_dim=time_dim,
-            clim_terciles=clim_terciles,
-            obs_for_terciles=obs_for_terciles,
-            stored_terciles=self.clim_terciles,
-            tercile_q=tercile_q,
         )
 
-        fc = new_forecasts.transpose(member_dim, time_dim, lat_dim, lon_dim).values
-        wv = w.transpose(member_dim, lat_dim, lon_dim).values
-        sv = s.transpose(member_dim, lat_dim, lon_dim).values
-        av = a.transpose(member_dim, lat_dim, lon_dim).values
-        bv = b.transpose(member_dim, lat_dim, lon_dim).values
+        terciles_np = None
+        if terciles_da is not None:
+            terciles_np = terciles_da.transpose("tercile", lat_dim, lon_dim).values
 
-        M, T, Y, X = fc.shape
-        nq = len(quantiles)
+        out_mean = np.full((n_time, n_lat, n_lon), np.nan, dtype=float)
+        out_quant = np.full((len(quantiles), n_time, n_lat, n_lon), np.nan, dtype=float)
+        out_probs = np.full((3, n_time, n_lat, n_lon), np.nan, dtype=float) if terciles_np is not None else None
+        out_family = np.full((n_lat, n_lon), np.nan, dtype=float)
+        out_mode = np.full((n_lat, n_lon), np.nan, dtype=float)
+        out_status = np.full((n_lat, n_lon), np.nan, dtype=float)
 
-        out_mean = np.full((T, Y, X), np.nan, float)
-        out_q = np.full((nq, T, Y, X), np.nan, float)
+        rng = np.random.default_rng(self.random_seed)
 
-        do_terc = return_terciles and (terc_ds is not None)
-        terc_np = terc_ds.transpose("tercile", lat_dim, lon_dim).values if do_terc else None
-        out_probs = np.full((3, T, Y, X), np.nan, float) if do_terc else None
+        if self.verbose:
+            print("Predicting with hybrid Bayesian seasonal postprocessor...")
 
-        for iy in tqdm(range(Y), desc="Predict"):
-            for ix in range(X):
-                wk = _normalize_weights(wv[:, iy, ix])
-                sigk = sv[:, iy, ix]
-                if not np.isfinite(sigk).all():
+        for ilat in tqdm(range(n_lat), desc="Predict", disable=not self.verbose):
+            for ilon in range(n_lon):
+                if not np.isfinite(status_map[ilat, ilon]) or status_map[ilat, ilon] != 1:
                     continue
 
-                low_th = up_th = np.nan
-                if do_terc:
-                    low_th, up_th = terc_np[:, iy, ix]
+                fam_code = fam_map[ilat, ilon]
+                if not np.isfinite(fam_code):
+                    continue
 
-                for t in range(T):
-                    x_m = fc[:, t, iy, ix]
-                    if not np.isfinite(x_m).all():
+                fam = self.DIST_CODE_TO_NAME.get(int(fam_code), None)
+                if fam is None:
+                    continue
+
+                mode_code = int(mode_map[ilat, ilon])
+
+                out_family[ilat, ilon] = int(fam_code)
+                out_mode[ilat, ilon] = mode_code
+                out_status[ilat, ilon] = 1.0
+
+                low_th = up_th = None
+                if terciles_np is not None:
+                    low_th, up_th = terciles_np[:, ilat, ilon]
+
+                for t in range(n_time):
+                    f_m = fcst[:, t, ilat, ilon]
+                    if not np.isfinite(f_m).all():
                         continue
 
-                    mtk = av[:, iy, ix] + bv[:, iy, ix] * x_m
-                    if not np.isfinite(mtk).all():
-                        continue
+                    if mode_code == self.MODE_CODE["full"]:
+                        post = self.posterior_.get((ilat, ilon))
+                        if post is None:
+                            continue
 
-                    out_mean[t, iy, ix] = float(np.sum(wk * mtk))
+                        y_rep = self._sample_pp_full(f_m, post, fam, rng, n_pp_samples)
+                        out_mean[t, ilat, ilon] = np.mean(y_rep)
+                        out_quant[:, t, ilat, ilon] = np.quantile(y_rep, quantiles)
 
-                    def cdf_mix(z):
-                        return float(np.sum(wk * norm.cdf((float(z) - mtk) / sigk)))
+                        if terciles_np is not None:
+                            pb = np.mean(y_rep <= low_th)
+                            pa = np.mean(y_rep > up_th)
+                            pn = np.mean((y_rep > low_th) & (y_rep <= up_th))
+                            out_probs[:, t, ilat, ilon] = [pb, pn, pa]
 
-                    lo = float(np.min(mtk - 8.0 * sigk))
-                    hi = float(np.max(mtk + 8.0 * sigk))
+                    elif mode_code == self.MODE_CODE["fast"]:
+                        w = w_map[:, ilat, ilon]
+                        a = a_map[:, ilat, ilon]
+                        b = b_map[:, ilat, ilon]
+                        disp = float(d_map[ilat, ilon])
 
-                    for iq, qv in enumerate(quantiles):
-                        try:
-                            out_q[iq, t, iy, ix] = _invert_cdf(cdf_mix, float(qv), lo, hi)
-                        except Exception:
-                            pass
+                        out_mean[t, ilat, ilon] = self._mixture_mean_fast(f_m, w, a, b, disp, fam)
+                        for iq, qv in enumerate(quantiles):
+                            out_quant[iq, t, ilat, ilon] = self._mixture_quantile_fast(qv, f_m, w, a, b, disp, fam)
 
-                    if do_terc and np.isfinite(low_th) and np.isfinite(up_th):
-                        out_probs[:, t, iy, ix] = _tercile_probs_from_cdf(cdf_mix, float(low_th), float(up_th))
+                        if terciles_np is not None:
+                            pb = self._mixture_cdf_fast(low_th, f_m, w, a, b, disp, fam)
+                            pa = 1.0 - self._mixture_cdf_fast(up_th, f_m, w, a, b, disp, fam)
+                            pn = max(0.0, 1.0 - pb - pa)
+                            out_probs[:, t, ilat, ilon] = [pb, pn, pa]
 
-        coords = {time_dim: new_forecasts[time_dim], lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}
+        coords = {
+            time_dim: new_forecasts[time_dim],
+            lat_dim: new_forecasts[lat_dim],
+            lon_dim: new_forecasts[lon_dim],
+        }
+
         ds = xr.Dataset()
         ds["predictive_mean"] = xr.DataArray(out_mean, dims=(time_dim, lat_dim, lon_dim), coords=coords)
         ds["predictive_quantiles"] = xr.DataArray(
-            out_q, dims=("quantile", time_dim, lat_dim, lon_dim), coords={**coords, "quantile": list(quantiles)}
+            out_quant,
+            dims=("quantile", time_dim, lat_dim, lon_dim),
+            coords={**coords, "quantile": list(quantiles)},
         )
 
-        if do_terc:
-            ds["tercile_thresholds"] = terc_ds
+        ds["family_used"] = xr.DataArray(
+            out_family,
+            dims=(lat_dim, lon_dim),
+            coords={lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
+            attrs={"1": "normal", "4": "gamma", "2": "lognormal"},
+        )
+
+        ds["fit_mode_used"] = xr.DataArray(
+            out_mode,
+            dims=(lat_dim, lon_dim),
+            coords={lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
+            attrs={"0": "full", "1": "fast", "-1": "failed"},
+        )
+
+        ds["fit_status"] = xr.DataArray(
+            out_status,
+            dims=(lat_dim, lon_dim),
+            coords={lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]},
+            attrs={"1": "success", "0": "failed_or_not_fitted"},
+        )
+
+        if out_probs is not None:
             ds["tercile_probability"] = xr.DataArray(
                 out_probs,
-                dims=("category", time_dim, lat_dim, lon_dim),
-                coords={**coords, "category": ["PB", "PN", "PA"]},
+                dims=("probability", time_dim, lat_dim, lon_dim),
+                coords={**coords, "probability": ["PB", "PN", "PA"]},
             )
+            ds["tercile_thresholds"] = terciles_da
 
         return ds
 
-
-# ============================================================
-# 3) Wang & Bishop (2005) Gaussian dressing, with terciles
-# ============================================================
-
-@dataclass
-class WAS_GaussianDressing_WangBishop:
-    """
-    Gaussian dressing (Wang & Bishop 2005), with optional terciles.
-
-    Uses bias-corrected members m_{t,k} and equal weights 1/M and a common dressing sD.
-    """
-    min_sigma: float = 1e-3
-    clip_negative: bool = True
-    bias_mode: str = "exchangeable"  # typical in MOS
-
-    compute_terciles: bool = True
-    tercile_q_fit: Tuple[float, float] = (1 / 3, 2 / 3)
-
-    # fitted
-    a: Optional[xr.DataArray] = None   # (M,Y,X)
-    b: Optional[xr.DataArray] = None   # (M,Y,X)
-    sD: Optional[xr.DataArray] = None  # (Y,X)
-    clim_terciles: Optional[xr.DataArray] = None
-
-    fitted: bool = False
-
-    def fit(
+    # ------------------------------------------------------------------
+    # WAS-style wrapper
+    # ------------------------------------------------------------------
+    def compute_model(
         self,
-        hcst_grid: xr.DataArray,
-        obs_grid: xr.DataArray,
+        X_train: xr.DataArray,
+        y_train: xr.DataArray,
+        X_test: xr.DataArray,
+        dist_map: xr.DataArray,
         *,
-        member_dim: str = "M",
-        time_dim: str = "T",
-        lat_dim: str = "Y",
-        lon_dim: str = "X",
-        min_samples: int = 20,
-    ):
-        _require_dims(hcst_grid, [member_dim, time_dim, lat_dim, lon_dim], "hcst_grid")
-        _require_dims(obs_grid, [time_dim, lat_dim, lon_dim], "obs_grid")
-
-        if self.compute_terciles:
-            self.clim_terciles = compute_gridpoint_terciles_from_obs(
-                obs_grid, time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim, q=self.tercile_q_fit
-            )
-
-        hcst = hcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim).values
-        obs = obs_grid.transpose(time_dim, lat_dim, lon_dim).values
-        M, _T, Y, X = hcst.shape
-
-        a_map = np.full((M, Y, X), np.nan, float)
-        b_map = np.full((M, Y, X), np.nan, float)
-        sD_map = np.full((Y, X), np.nan, float)
-
-        print("Fitting Wang & Bishop Gaussian dressing...")
-
-        for iy in tqdm(range(Y), desc="Training"):
-            for ix in range(X):
-                x_raw = hcst[:, :, iy, ix]
-                y_raw = obs[:, iy, ix]
-                valid = np.isfinite(y_raw) & np.isfinite(x_raw).all(axis=0)
-                if int(valid.sum()) < min_samples:
-                    continue
-
-                x = x_raw[:, valid]
-                y = y_raw[valid]
-
-                if self.bias_mode == "exchangeable":
-                    a0, b0 = _fit_linear_bias_exchangeable(x, y)
-                    a = np.full(M, a0, float)
-                    b = np.full(M, b0, float)
-                else:
-                    a, b = _fit_linear_bias_memberwise(x, y)
-
-                m = _apply_bias(x, a, b)  # (M,N)
-                mbar = m.mean(axis=0)
-                err = mbar - y
-
-                var_err = np.var(err, ddof=1)
-                var_ens_t = np.var(m, axis=0, ddof=1)
-                mean_var_ens = np.mean(var_ens_t)
-
-                sD2 = var_err - (1.0 + 1.0 / M) * mean_var_ens
-                if sD2 <= 0 and self.clip_negative:
-                    sD2 = self.min_sigma ** 2
-
-                if sD2 > 0:
-                    a_map[:, iy, ix] = a
-                    b_map[:, iy, ix] = b
-                    sD_map[iy, ix] = float(np.sqrt(sD2))
-
-        coords_m = {member_dim: hcst_grid[member_dim], lat_dim: hcst_grid[lat_dim], lon_dim: hcst_grid[lon_dim]}
-        self.a = xr.DataArray(a_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_m)
-        self.b = xr.DataArray(b_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_m)
-        self.sD = xr.DataArray(sD_map, dims=(lat_dim, lon_dim), coords={lat_dim: hcst_grid[lat_dim], lon_dim: hcst_grid[lon_dim]})
-
-        self.fitted = True
-        return self
-
-    def predict_probabilistic(
-        self,
-        new_forecasts: xr.DataArray,
-        *,
-        quantiles: Sequence[float] = (0.1, 0.5, 0.9),
-        member_dim: str = "M",
-        time_dim: str = "T",
-        lat_dim: str = "Y",
-        lon_dim: str = "X",
-        # terciles:
-        return_terciles: bool = True,
         clim_terciles: Optional[xr.DataArray] = None,
         obs_for_terciles: Optional[xr.DataArray] = None,
-        tercile_q: Tuple[float, float] = (1 / 3, 2 / 3),
-    ) -> xr.Dataset:
-        if not self.fitted:
-            raise ValueError("Fit model first.")
-        _require_dims(new_forecasts, [member_dim, time_dim, lat_dim, lon_dim], "new_forecasts")
-
-        a = self.a.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        b = self.b.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        sD = self.sD.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-
-        terc_ds = _resolve_terciles_for_prediction(
-            new_forecasts=new_forecasts,
-            lat_dim=lat_dim,
-            lon_dim=lon_dim,
-            time_dim=time_dim,
-            clim_terciles=clim_terciles,
-            obs_for_terciles=obs_for_terciles,
-            stored_terciles=self.clim_terciles,
-            tercile_q=tercile_q,
-        )
-
-        fc = new_forecasts.transpose(member_dim, time_dim, lat_dim, lon_dim).values
-        av = a.transpose(member_dim, lat_dim, lon_dim).values
-        bv = b.transpose(member_dim, lat_dim, lon_dim).values
-        sv = sD.transpose(lat_dim, lon_dim).values
-
-        M, T, Y, X = fc.shape
-        nq = len(quantiles)
-
-        out_mean = np.full((T, Y, X), np.nan, float)
-        out_q = np.full((nq, T, Y, X), np.nan, float)
-
-        do_terc = return_terciles and (terc_ds is not None)
-        terc_np = terc_ds.transpose("tercile", lat_dim, lon_dim).values if do_terc else None
-        out_probs = np.full((3, T, Y, X), np.nan, float) if do_terc else None
-
-        for iy in tqdm(range(Y), desc="Predict"):
-            for ix in range(X):
-                s = float(sv[iy, ix])
-                if not np.isfinite(s) or s <= 0:
-                    continue
-
-                low_th = up_th = np.nan
-                if do_terc:
-                    low_th, up_th = terc_np[:, iy, ix]
-
-                for t in range(T):
-                    x_m = fc[:, t, iy, ix]
-                    if not np.isfinite(x_m).all():
-                        continue
-
-                    mtk = av[:, iy, ix] + bv[:, iy, ix] * x_m
-                    out_mean[t, iy, ix] = float(np.mean(mtk))
-
-                    def cdf_mix(z):
-                        return float(np.mean(norm.cdf((float(z) - mtk) / s)))
-
-                    lo = float(np.min(mtk - 8.0 * s))
-                    hi = float(np.max(mtk + 8.0 * s))
-
-                    for iq, qv in enumerate(quantiles):
-                        try:
-                            out_q[iq, t, iy, ix] = _invert_cdf(cdf_mix, float(qv), lo, hi)
-                        except Exception:
-                            pass
-
-                    if do_terc and np.isfinite(low_th) and np.isfinite(up_th):
-                        out_probs[:, t, iy, ix] = _tercile_probs_from_cdf(cdf_mix, float(low_th), float(up_th))
-
-        coords = {time_dim: new_forecasts[time_dim], lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}
-        ds = xr.Dataset()
-        ds["predictive_mean"] = xr.DataArray(out_mean, dims=(time_dim, lat_dim, lon_dim), coords=coords)
-        ds["predictive_quantiles"] = xr.DataArray(
-            out_q, dims=("quantile", time_dim, lat_dim, lon_dim), coords={**coords, "quantile": list(quantiles)}
-        )
-
-        if do_terc:
-            ds["tercile_thresholds"] = terc_ds
-            ds["tercile_probability"] = xr.DataArray(
-                out_probs,
-                dims=("category", time_dim, lat_dim, lon_dim),
-                coords={**coords, "category": ["PB", "PN", "PA"]},
-            )
-
-        return ds
-
-
-# ============================================================
-# 4) Precipitation BMA (Sloughter et al. 2007 style), with terciles
-# ============================================================
-
-@dataclass
-class WAS_PrecipBMA_Sloughter2007:
-    """
-    Precipitation BMA with mixed discrete-continuous components.
-
-    - Logistic regression for P(Y=0) per member:
-        p0_{t,k} = logistic(a0_k + a1_k * x_{t,k}^{1/3} + a2_k * I(x_{t,k}=0))
-
-    - Gamma distribution on cube-root transformed positive amounts z=y^(1/3):
-        z ~ Gamma(shape_k, scale_k)
-
-    Predictive CDF for q>=0:
-        F(q) = sum_k w_k [ p0_{t,k} + (1 - p0_{t,k}) * F_gamma(z_q) ]
-      where z_q = q^(1/3)
-
-    Tercile probabilities computed directly from this predictive CDF.
-    """
-    tol: float = 1e-4
-
-    compute_terciles: bool = True
-    tercile_q_fit: Tuple[float, float] = (1 / 3, 2 / 3)
-
-    weights: Optional[xr.DataArray] = None    # (M,Y,X)
-    logit: Optional[xr.DataArray] = None      # (param,M,Y,X) param=['a0','a1','a2']
-    g_shape: Optional[xr.DataArray] = None    # (M,Y,X)
-    g_scale: Optional[xr.DataArray] = None    # (M,Y,X)
-
-    clim_terciles: Optional[xr.DataArray] = None
-
-    fitted: bool = False
-
-    def fit(
-        self,
-        hcst_grid: xr.DataArray,
-        obs_grid: xr.DataArray,
-        *,
-        member_dim: str = "M",
-        time_dim: str = "T",
-        lat_dim: str = "Y",
-        lon_dim: str = "X",
-        min_samples: int = 30,
-    ):
-        _require_dims(hcst_grid, [member_dim, time_dim, lat_dim, lon_dim], "hcst_grid")
-        _require_dims(obs_grid, [time_dim, lat_dim, lon_dim], "obs_grid")
-
-        if self.compute_terciles:
-            self.clim_terciles = compute_gridpoint_terciles_from_obs(
-                obs_grid, time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim, q=self.tercile_q_fit
-            )
-
-        hcst = np.maximum(hcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim).values, 0.0)
-        obs = np.maximum(obs_grid.transpose(time_dim, lat_dim, lon_dim).values, 0.0)
-        M, T, Y, X = hcst.shape
-
-        w_map = np.full((M, Y, X), np.nan, float)
-        log_map = np.full((3, M, Y, X), np.nan, float)
-        sh_map = np.full((M, Y, X), np.nan, float)
-        sc_map = np.full((M, Y, X), np.nan, float)
-
-        print("Fitting precipitation BMA (Sloughter 2007-like)...")
-
-        for iy in tqdm(range(Y), desc="Training"):
-            for ix in range(X):
-                x_raw = hcst[:, :, iy, ix]
-                y_raw = obs[:, iy, ix]
-                valid = np.isfinite(y_raw) & np.isfinite(x_raw).all(axis=0)
-                if int(valid.sum()) < min_samples:
-                    continue
-
-                x = x_raw[:, valid]
-                y = y_raw[valid]
-                z = np.cbrt(y)
-
-                # weights: keep equal by default (can be extended to MLE if desired)
-                w_map[:, iy, ix] = np.full(M, 1.0 / M, float)
-
-                for k in range(M):
-                    xk = x[k, :]
-                    xk_c = np.cbrt(xk)
-                    ind0 = (xk == 0.0).astype(float)
-                    ybin = (y == 0.0).astype(int)
-
-                    def nll_logit(beta):
-                        p0 = expit(beta[0] + beta[1] * xk_c + beta[2] * ind0)
-                        p0 = np.clip(p0, 1e-8, 1 - 1e-8)
-                        return -np.sum(ybin * np.log(p0) + (1 - ybin) * np.log(1 - p0))
-
-                    res = minimize(nll_logit, [0.0, 1.0, 0.0], method="BFGS")
-                    log_map[:, k, iy, ix] = res.x if res.success else np.array([0.0, 0.0, 0.0])
-
-                    pos = y > 0
-                    zk = z[pos]
-                    if zk.size >= 10:
-                        m1 = float(np.mean(zk))
-                        v1 = float(np.var(zk, ddof=1))
-                        if (m1 > 0) and (v1 > 0) and np.isfinite(m1) and np.isfinite(v1):
-                            sh_map[k, iy, ix] = (m1 ** 2) / v1
-                            sc_map[k, iy, ix] = v1 / m1
-
-        coords_m = {member_dim: hcst_grid[member_dim], lat_dim: hcst_grid[lat_dim], lon_dim: hcst_grid[lon_dim]}
-        self.weights = xr.DataArray(w_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_m)
-        self.logit = xr.DataArray(
-            log_map,
-            dims=("param", member_dim, lat_dim, lon_dim),
-            coords={"param": ["a0", "a1", "a2"], **coords_m},
-        )
-        self.g_shape = xr.DataArray(sh_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_m)
-        self.g_scale = xr.DataArray(sc_map, dims=(member_dim, lat_dim, lon_dim), coords=coords_m)
-
-        self.fitted = True
-        return self
-
-    def predict_probabilistic(
-        self,
-        new_forecasts: xr.DataArray,
-        *,
+        tercile_q: Tuple[float, float] = (1/3, 2/3),
         quantiles: Sequence[float] = (0.1, 0.5, 0.9),
+        n_pp_samples: int = 2000,
         member_dim: str = "M",
         time_dim: str = "T",
         lat_dim: str = "Y",
         lon_dim: str = "X",
-        # terciles:
-        return_terciles: bool = True,
-        clim_terciles: Optional[xr.DataArray] = None,
-        obs_for_terciles: Optional[xr.DataArray] = None,
-        tercile_q: Tuple[float, float] = (1 / 3, 2 / 3),
+        min_samples: int = 12,
+        lam_w: float = 1.0,
+        lam_a: float = 0.1,
+        lam_b: float = 0.1,
+        lam_disp: float = 0.1,
+        alpha0: float = 1.0,
+        coef_scale_mult: float = 1.0,
+        sigma_scale_mult: float = 1.0,
+        shape_scale: float = 5.0,
     ) -> xr.Dataset:
-        if not self.fitted:
-            raise ValueError("Fit model first.")
-        _require_dims(new_forecasts, [member_dim, time_dim, lat_dim, lon_dim], "new_forecasts")
-
-        w = self.weights.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        logit = self.logit.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        sh = self.g_shape.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        sc = self.g_scale.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-
-        terc_ds = _resolve_terciles_for_prediction(
-            new_forecasts=new_forecasts,
+        self.fit(
+            hcst_grid=X_train,
+            obs_grid=y_train,
+            dist_map=dist_map,
+            member_dim=member_dim,
+            time_dim=time_dim,
             lat_dim=lat_dim,
             lon_dim=lon_dim,
-            time_dim=time_dim,
+            min_samples=min_samples,
+            lam_w=lam_w,
+            lam_a=lam_a,
+            lam_b=lam_b,
+            lam_disp=lam_disp,
+            alpha0=alpha0,
+            coef_scale_mult=coef_scale_mult,
+            sigma_scale_mult=sigma_scale_mult,
+            shape_scale=shape_scale,
+        )
+
+        return self.predict_probabilistic(
+            new_forecasts=X_test,
             clim_terciles=clim_terciles,
             obs_for_terciles=obs_for_terciles,
-            stored_terciles=self.clim_terciles,
             tercile_q=tercile_q,
-        )
-
-        fc = np.maximum(new_forecasts.transpose(member_dim, time_dim, lat_dim, lon_dim).values, 0.0)
-
-        wv = w.transpose(member_dim, lat_dim, lon_dim).values
-        lv = logit.transpose("param", member_dim, lat_dim, lon_dim).values
-        shv = sh.transpose(member_dim, lat_dim, lon_dim).values
-        scv = sc.transpose(member_dim, lat_dim, lon_dim).values
-
-        M, T, Y, X = fc.shape
-        nq = len(quantiles)
-
-        out_mean = np.full((T, Y, X), np.nan, float)
-        out_q = np.full((nq, T, Y, X), np.nan, float)
-
-        do_terc = return_terciles and (terc_ds is not None)
-        terc_np = terc_ds.transpose("tercile", lat_dim, lon_dim).values if do_terc else None
-        out_probs = np.full((3, T, Y, X), np.nan, float) if do_terc else None
-
-        for iy in tqdm(range(Y), desc="Predict"):
-            for ix in range(X):
-                wk = _normalize_weights(wv[:, iy, ix])
-                a0 = lv[0, :, iy, ix]
-                a1 = lv[1, :, iy, ix]
-                a2 = lv[2, :, iy, ix]
-                shape_k = shv[:, iy, ix]
-                scale_k = scv[:, iy, ix]
-
-                if not (np.isfinite(a0).all() and np.isfinite(a1).all() and np.isfinite(a2).all()):
-                    continue
-                if not (np.isfinite(shape_k).any() and np.isfinite(scale_k).any()):
-                    continue
-
-                low_th = up_th = np.nan
-                if do_terc:
-                    low_th, up_th = terc_np[:, iy, ix]
-
-                for t in range(T):
-                    x_m = fc[:, t, iy, ix]
-                    if not np.isfinite(x_m).all():
-                        continue
-
-                    x_c = np.cbrt(x_m)
-                    ind0 = (x_m == 0.0).astype(float)
-                    p0 = expit(a0 + a1 * x_c + a2 * ind0)   # P(Y=0)
-                    p0 = np.clip(p0, 1e-8, 1 - 1e-8)
-
-                    # pragmatic mean proxy (consistent with many operational pipelines):
-                    out_mean[t, iy, ix] = float(np.sum(wk * (1.0 - p0) * x_m))
-
-                    def cdf_mix(q):
-                        q = max(float(q), 0.0)
-                        zq = q ** (1.0 / 3.0)
-                        cdfz = gamma.cdf(zq, a=shape_k, scale=scale_k)
-                        cdfz = np.nan_to_num(cdfz, nan=0.0)
-                        return float(np.sum(wk * (p0 + (1.0 - p0) * cdfz)))
-
-                    # quantiles by inversion on y-scale
-                    hi = float(np.max(x_m) * 12.0 + 50.0)
-                    for iq, qv in enumerate(quantiles):
-                        qv = float(qv)
-                        try:
-                            # mass at zero: F(0) = sum w_k p0_k
-                            p_at_0 = float(np.sum(wk * p0))
-                            if qv <= p_at_0:
-                                out_q[iq, t, iy, ix] = 0.0
-                            else:
-                                out_q[iq, t, iy, ix] = _invert_cdf(cdf_mix, qv, 0.0, hi)
-                        except Exception:
-                            pass
-
-                    if do_terc and np.isfinite(low_th) and np.isfinite(up_th):
-                        out_probs[:, t, iy, ix] = _tercile_probs_from_cdf(cdf_mix, float(low_th), float(up_th))
-
-        coords = {time_dim: new_forecasts[time_dim], lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}
-        ds = xr.Dataset()
-        ds["predictive_mean"] = xr.DataArray(out_mean, dims=(time_dim, lat_dim, lon_dim), coords=coords)
-        ds["predictive_quantiles"] = xr.DataArray(
-            out_q, dims=("quantile", time_dim, lat_dim, lon_dim), coords={**coords, "quantile": list(quantiles)}
-        )
-
-        if do_terc:
-            ds["tercile_thresholds"] = terc_ds
-            ds["tercile_probability"] = xr.DataArray(
-                out_probs,
-                dims=("category", time_dim, lat_dim, lon_dim),
-                coords={**coords, "category": ["PB", "PN", "PA"]},
-            )
-
-        return ds
-
-
-# ============================================================
-# 5) Schmeits & Kok (2010) precip variant, with terciles
-# ============================================================
-
-@dataclass
-class WAS_PrecipBMA_SchmeitsKok2010(WAS_PrecipBMA_Sloughter2007):
-    """
-    Variant where P(Y=0) uses a shared logistic based on ensemble-mean cube-root:
-        p0_t = logistic(a0 + a1 * mean_k x_{t,k}^{1/3})
-    applied to all members.
-    """
-
-    def predict_probabilistic(
-        self,
-        new_forecasts: xr.DataArray,
-        *,
-        quantiles: Sequence[float] = (0.1, 0.5, 0.9),
-        member_dim: str = "M",
-        time_dim: str = "T",
-        lat_dim: str = "Y",
-        lon_dim: str = "X",
-        # terciles:
-        return_terciles: bool = True,
-        clim_terciles: Optional[xr.DataArray] = None,
-        obs_for_terciles: Optional[xr.DataArray] = None,
-        tercile_q: Tuple[float, float] = (1 / 3, 2 / 3),
-    ) -> xr.Dataset:
-        if not self.fitted:
-            raise ValueError("Fit model first.")
-        _require_dims(new_forecasts, [member_dim, time_dim, lat_dim, lon_dim], "new_forecasts")
-
-        w = self.weights.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        logit = self.logit.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        sh = self.g_shape.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-        sc = self.g_scale.sel({lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}, method="nearest")
-
-        terc_ds = _resolve_terciles_for_prediction(
-            new_forecasts=new_forecasts,
+            quantiles=quantiles,
+            n_pp_samples=n_pp_samples,
+            member_dim=member_dim,
+            time_dim=time_dim,
             lat_dim=lat_dim,
             lon_dim=lon_dim,
-            time_dim=time_dim,
-            clim_terciles=clim_terciles,
-            obs_for_terciles=obs_for_terciles,
-            stored_terciles=self.clim_terciles,
-            tercile_q=tercile_q,
         )
-
-        fc = np.maximum(new_forecasts.transpose(member_dim, time_dim, lat_dim, lon_dim).values, 0.0)
-        wv = w.transpose(member_dim, lat_dim, lon_dim).values
-        lv = logit.transpose("param", member_dim, lat_dim, lon_dim).values
-        shv = sh.transpose(member_dim, lat_dim, lon_dim).values
-        scv = sc.transpose(member_dim, lat_dim, lon_dim).values
-
-        M, T, Y, X = fc.shape
-        nq = len(quantiles)
-
-        out_mean = np.full((T, Y, X), np.nan, float)
-        out_q = np.full((nq, T, Y, X), np.nan, float)
-
-        do_terc = return_terciles and (terc_ds is not None)
-        terc_np = terc_ds.transpose("tercile", lat_dim, lon_dim).values if do_terc else None
-        out_probs = np.full((3, T, Y, X), np.nan, float) if do_terc else None
-
-        for iy in tqdm(range(Y), desc="Predict"):
-            for ix in range(X):
-                wk = _normalize_weights(wv[:, iy, ix])
-
-                # use first member's (a0,a1) as shared (you may also refit shared parameters explicitly)
-                a0 = float(lv[0, 0, iy, ix])
-                a1 = float(lv[1, 0, iy, ix])
-
-                shape_k = shv[:, iy, ix]
-                scale_k = scv[:, iy, ix]
-                if not (np.isfinite(shape_k).any() and np.isfinite(scale_k).any()):
-                    continue
-
-                low_th = up_th = np.nan
-                if do_terc:
-                    low_th, up_th = terc_np[:, iy, ix]
-
-                for t in range(T):
-                    x_m = fc[:, t, iy, ix]
-                    if not np.isfinite(x_m).all():
-                        continue
-
-                    x_c_mean = float(np.mean(np.cbrt(x_m)))
-                    p0 = float(expit(a0 + a1 * x_c_mean))
-                    p0 = float(np.clip(p0, 1e-8, 1 - 1e-8))
-
-                    out_mean[t, iy, ix] = float((1.0 - p0) * np.sum(wk * x_m))
-
-                    def cdf_mix(q):
-                        q = max(float(q), 0.0)
-                        zq = q ** (1.0 / 3.0)
-                        cdfz = gamma.cdf(zq, a=shape_k, scale=scale_k)
-                        cdfz = np.nan_to_num(cdfz, nan=0.0)
-                        return float(p0 + (1.0 - p0) * np.sum(wk * cdfz))
-
-                    hi = float(np.max(x_m) * 12.0 + 50.0)
-                    for iq, qv in enumerate(quantiles):
-                        qv = float(qv)
-                        try:
-                            if qv <= p0:
-                                out_q[iq, t, iy, ix] = 0.0
-                            else:
-                                out_q[iq, t, iy, ix] = _invert_cdf(cdf_mix, qv, 0.0, hi)
-                        except Exception:
-                            pass
-
-                    if do_terc and np.isfinite(low_th) and np.isfinite(up_th):
-                        out_probs[:, t, iy, ix] = _tercile_probs_from_cdf(cdf_mix, float(low_th), float(up_th))
-
-        coords = {time_dim: new_forecasts[time_dim], lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}
-        ds = xr.Dataset()
-        ds["predictive_mean"] = xr.DataArray(out_mean, dims=(time_dim, lat_dim, lon_dim), coords=coords)
-        ds["predictive_quantiles"] = xr.DataArray(
-            out_q, dims=("quantile", time_dim, lat_dim, lon_dim), coords={**coords, "quantile": list(quantiles)}
-        )
-
-        if do_terc:
-            ds["tercile_thresholds"] = terc_ds
-            ds["tercile_probability"] = xr.DataArray(
-                out_probs,
-                dims=("category", time_dim, lat_dim, lon_dim),
-                coords={**coords, "category": ["PB", "PN", "PA"]},
-            )
-
-        return ds
-
-

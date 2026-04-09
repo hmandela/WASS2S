@@ -752,7 +752,7 @@ class WAS_Download:
                                 "product_type": ["monthly_mean"],
                                 "year": years,
                                 "month": month_of_initialization,
-                                "leadtime_month": lead_time,
+                                "leadtime_month": [i.lstrip('0') for i in lead_time],
                                 "data_format": "netcdf",
                                 "area": area,
                             }
@@ -765,7 +765,7 @@ class WAS_Download:
                                 "product_type": ["monthly_mean"],
                                 "year": years,
                                 "month": month_of_initialization,
-                                "leadtime_month": lead_time,
+                                "leadtime_month": [i.lstrip('0') for i in lead_time],
                                 "data_format": "netcdf",
                                 "area": area,
                             }
@@ -1700,6 +1700,7 @@ class WAS_Download:
             force_download=False,
             run_avg=3
         ):
+        
             """
             Download reanalysis data for specified center-variable combinations, years, and months,
             handling cross-year seasons (e.g., NDJ).
@@ -1738,9 +1739,11 @@ class WAS_Download:
                 "UGRD_1000": "u_component_of_wind",
                 "UGRD_925": "u_component_of_wind",
                 "UGRD_850": "u_component_of_wind",
+                "UGRD_200": "u_component_of_wind",
                 "VGRD_1000": "v_component_of_wind",
                 "VGRD_925": "v_component_of_wind",
                 "VGRD_850": "v_component_of_wind",
+                "VGRD_200": "v_component_of_wind",
             }
             
             # Helper for zero-padded month strings
@@ -1755,16 +1758,20 @@ class WAS_Download:
 
             now = datetime.datetime.now()
             curr_yr, curr_mon = now.year, now.month
-    
+
+            file_path = []
             for c, v in zip(centers, vars_):
+                
                 # =================================================================
                 # Special Case: NOAA ERSST from NCEI (Direct Download) 
                 # https://www.ncei.noaa.gov/data/sea-surface-temperature-extended-reconstructed/v6/access/
                 # =================================================================
+
                 if c == "NOAA" and v == "SST":
                     out_file = dir_to_save / f"{c}_{v}_{year_start}_{year_end}_{season_str}.nc"
                     if not force_download and out_file.exists():
                         print(f"{out_file} exists. Skipping.")
+                        file_path.append(out_file)
                         continue
                     
                     print(f"Starting download for NOAA ERSST (v6) for {year_start}-{year_end}")
@@ -1876,6 +1883,7 @@ class WAS_Download:
     
                         # 7. Save
                         ds_agg.to_netcdf(out_file)
+                        file_path.append(out_file)
                         print(f"Saved NOAA ERSST data to {out_file}")
     
                     except Exception as e:
@@ -1896,6 +1904,7 @@ class WAS_Download:
                 rean = centre_dict[c]
                 out_file = dir_to_save / f"{c}_{v}_{year_start}_{year_end}_{season_str}.nc"
                 if (not force_download) and out_file.exists():
+                    file_path.append(out_file)
                     print(f"{out_file} already exists. Skipping.")
                     continue
     
@@ -2044,9 +2053,12 @@ class WAS_Download:
                     
                     # Save final
                     dsC.to_netcdf(out_file)
+                    file_path.append(out_file)
                     print(f"Saved final reanalysis file: {out_file}")
                 else:
                     print(f"No data found for {c}/{v}.")
+                
+            return file_path
 
 
     
@@ -2749,7 +2761,7 @@ class WAS_Download:
             if combined_datasets:
                 try:
                     combined_ds = xr.concat(combined_datasets, dim="time").to_dataset(name="precip")
-                    combined_ds = combined_ds.rename({"x": "X", "y": "Y", "time": "T"})
+                    combined_ds = combined_ds.rename({"x": "X", "y": "Y", "time": "T"}).drop_vars('band')
                     combined_ds = combined_ds.isel(Y=slice(None, None, -1))
                     combined_ds.to_netcdf(output_path)
                     combined_ds.close()
@@ -2768,8 +2780,10 @@ class WAS_Download:
            
             File format is: chirps-v3.0.YYYY.MM.DD.tif
             """
-            base_url = f"https://data.chc.ucsb.edu/products/CHIRPS/v3.0/daily/final/{blend_type}/{year}"
-            fname = f"chirps-v3.0.{year}.{month:02d}.{day:02d}.tif"
+            _type = "rnl" if blend_type == "ERA5" else "sat"
+                
+            base_url = f"https://data.chc.ucsb.edu/products/CHIRPS/v3.0/daily/final/{_type}/{year}"
+            fname = f"chirps-v3.0.{_type}.{year}.{month:02d}.{day:02d}.tif"
             url = f"{base_url}/{fname}"
             local_path = Path(dir_to_save) / fname
             if not local_path.exists() or force_download:
@@ -3162,14 +3176,15 @@ class WAS_Download:
                 # harmonize dims if needed
                 rename_dict = {k: v for k, v in {"lon": "X", "lat": "Y", "time": "T"}.items() if k in ds_out.dims}
                 ds_out = ds_out.rename(rename_dict)
-                if len(season_months)==1:
-                    ds_out["T"] = [f"{year}-{season_months[0]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
-                elif len(season_months) in [2,3]:
-                    ds_out["T"] = [f"{year}-{season_months[1]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
-                elif len(season_months) in [4,5]:
-                    ds_out["T"] = [f"{year}-{season_months[2]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
+                season_months_ = [int(m) for m in season_months]
+                if len(season_months_)==1:
+                    ds_out["T"] = [f"{year}-{season_months_[0]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
+                elif len(season_months_) in [2,3]:
+                    ds_out["T"] = [f"{year}-{ season_months_[1]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
+                elif len(season_months_) in [4,5]:
+                    ds_out["T"] = [f"{year}-{season_months_[2]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]
                 else:
-                    ds_out["T"] = [f"{year}-{season_months[3]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]                    
+                    ds_out["T"] = [f"{year}-{season_months_[3]:02d}-01" for year in ds_out["T"].dt.year.astype(str).values]                    
                 ds_out["T"] = ds_out["T"].astype("datetime64[ns]")
                 ds_out.to_netcdf(out_nc)
                 print(f"[INFO] Saved seasonal {product.upper()} data → {out_nc}")
@@ -3294,7 +3309,9 @@ class WAS_Download:
             dir_to_save = Path(dir_to_save)
             dir_to_save.mkdir(parents=True, exist_ok=True)
             start_date = f"{year_start}-01-01"
-            end_date = f"{year_end}-12-31"
+            end_date = f"{year_end}-12-31" if len(str(year_end)) == 4 else f"{year_end.year:04d}-{year_end.month:02d}-{year_end.day:02d}"
+            yr_end = year_end if len(str(year_end)) == 4 else year_end.year
+        
             # ---- sensible defaults by product ----
             if product == "rfe":
                 variables = variables or ("rfe",)
@@ -3320,7 +3337,7 @@ class WAS_Download:
             # ---- output filename ----
             sdate_str = start_date.replace("-", "")
             edate_str = end_date.replace("-", "")
-            out_nc = dir_to_save / f"Obs_{product.upper()}_daily_{sdate_str}_{edate_str}.nc"
+            out_nc = dir_to_save /  f"Daily_PRCP_{year_start}_{yr_end}.nc" # f"Obs_{product.upper()}_daily_{sdate_str}_{edate_str}.nc"
             if out_nc.exists() and not force_download:
                 print(f"[INFO] {out_nc} already exists – skip download.")
                 return out_nc

@@ -388,6 +388,78 @@ class WAS_Cross_Validator:
 
             return hindcast_det, hindcast_prob
 
+        elif isinstance(model, WAS_mme_NGR_Gaussian):
+            all_params = {**model_params}
+            
+            params_prob = {
+                key: value for key, value in all_params.items() 
+                if key in model.compute_model.__code__.co_varnames
+            }
+            
+            mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+            Predictor['T'] = Predictant['T']
+            if "M" in Predictant.coords:
+                Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+            else:
+                Predictant = Predictant
+
+            obs_for_terciles = params_prob.get('obs_for_terciles')
+            quantiles = params_prob.get('quantiles')
+            return_synthetic_ensemble = params_prob.get('return_synthetic_ensemble')            
+            member_dim = params_prob.get('member_dim')
+            time_dim = params_prob.get('time_dim')
+            lat_dim = params_prob.get('lat_dim') 
+            lon_dim = params_prob.get('lon_dim')
+
+            print("Cross-validation ongoing")
+            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
+                X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
+                y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
+                pred_prob = model.compute_model(X_train, y_train, X_test, obs_for_terciles=obs_for_terciles, quantiles=quantiles, clim_terciles=clim_terciles, return_synthetic_ensemble=return_synthetic_ensemble, member_dim=member_dim, time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim,)['tercile_probability']
+                hindcast_prob.append(pred_prob)
+
+            hindcast_prob = xr.concat(hindcast_prob, dim="T")
+            hindcast_prob['T'] = Predictant['T']
+
+            return _, hindcast_prob
+
+        elif isinstance(model, WAS_mme_FullBMA):
+            all_params = {**model_params}
+            
+            params_prob = {
+                key: value for key, value in all_params.items() 
+                if key in model.compute_model.__code__.co_varnames
+            }
+            
+            mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+            Predictor['T'] = Predictant['T']
+            if "M" in Predictant.coords:
+                Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+            else:
+                Predictant = Predictant
+
+            dist_map = params_prob.get('dist_map')
+            obs_for_terciles = params_prob.get('obs_for_terciles')
+            quantiles = params_prob.get('quantiles')           
+            member_dim = params_prob.get('member_dim')
+            time_dim = params_prob.get('time_dim')
+            lat_dim = params_prob.get('lat_dim') 
+            lon_dim = params_prob.get('lon_dim')
+            n_pp_samples = params_prob.get('n_pp_samples')
+
+            print("Cross-validation ongoing")
+            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
+                X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
+                y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
+                pred_prob = model.compute_model(X_train, y_train, X_test, dist_map=dist_map, obs_for_terciles=obs_for_terciles, quantiles=quantiles, clim_terciles=clim_terciles, n_pp_samples=n_pp_samples, member_dim=member_dim, time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim,)['tercile_probability']
+                hindcast_prob.append(pred_prob)
+
+            hindcast_prob = xr.concat(hindcast_prob, dim="T")
+            hindcast_prob['T'] = Predictant['T']
+
+            return _, hindcast_prob
+
+        
         elif isinstance(model, WAS_mme_gaussian_process):
             
             if "M" in Predictant.coords:
@@ -438,34 +510,29 @@ class WAS_Cross_Validator:
             
             params_prob = {
                 key: value for key, value in all_params.items() 
-                if key not in model.compute_model.__code__.co_varnames
+                if key in model.compute_pmme_probabilities.__code__.co_varnames
             }
 
-            params_models = {
-                key: value for key, value in all_params.items() 
-                if key not in params_prob
-            } 
+            masks = params_prob.get('masks')
+            ensemble_sizes = params_prob.get('ensemble_sizes')
+            climatology = params_prob.get('climatology')
             
-            mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+            # mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
             Predictor['T'] = Predictant['T']
-            verify = WAS_Verification()
-            Predictant_class = verify.compute_class(Predictant, clim_year_start, clim_year_end)
-            Predictor_st = standardize_timeseries(Predictor, clim_year_start, clim_year_end)
 
             print("Cross-validation ongoing")
             for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
-                X_train, X_test = Predictor_st.isel(T=train_index), Predictor_st.isel(T=test_index)
-                y_train, y_test = Predictant_class.isel(T=train_index), Predictant.isel(T=test_index)
-                pred_det, pred_prob = model.compute_model(X_train, y_train, X_test, y_test, clim_year_start, clim_year_end, **model_params)
-                hindcast_det.append(pred_det)
+                X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
+                forecasts = {k: X_test.sel(M=v) for k, v in masks.items()}
+                hindcasts = {k: X_train.sel(M=v) for k, v in masks.items()}
+                pred_prob = model.compute_pmme_probabilities(forecasts, hindcasts, climatology, ensemble_sizes)
+                pred_prob  = xr.concat([pred_prob["PB"], pred_prob["PN"], pred_prob["PA"]], dim=xr.DataArray(["PB", "PN", "PA"], dims="probability", name="probability"),)
                 hindcast_prob.append(pred_prob)
 
-            hindcast_det = xr.concat(hindcast_det, dim="T")
-            hindcast_det['T'] = Predictant['T']
             hindcast_prob = xr.concat(hindcast_prob, dim="T")
             hindcast_prob['T'] = Predictant['T']
 
-            return hindcast_det, hindcast_prob
+            return hindcast_prob, _
         
         # reorganisez après ceci
         elif isinstance(model, WAS_LogisticRegression_Model) or (

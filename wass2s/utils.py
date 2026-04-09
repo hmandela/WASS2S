@@ -4549,7 +4549,7 @@ cessation_dryspell_criteria = {
 ########################## Extended seasonal forecast ##########################################
 qmap = WAS_Qmap()
 qmap_ = WAS_bias_correction()
-def proceed_seasonal_daily_bias_correction(dir_to_save_model, observation, hindcast_files, forecast_files, varname="PRCP", wet_day=0.1):
+def proceed_seasonal_daily_bias_correction(dir_to_save_model, observation, hindcast_files, forecast_files, varname="PRCP", method='QUANT', wet_day=True, qstep=0.01, distr=None, transfun=None):
     hindcast_files_={}
     forecast_files_={}
     os.makedirs(f"{dir_to_save_model}/corrected", exist_ok=True)
@@ -4569,13 +4569,39 @@ def proceed_seasonal_daily_bias_correction(dir_to_save_model, observation, hindc
                 # obs_month, hcst_month = xr.align(obs_month, hcst_month, join='inner')
                 fcst_month = fcst.sel(T=fcst['T'].dt.month == month)
                 if varname == "PRCP":
-                    fobj_quant = qmap.fitQmap(obs_month, hcst_month, method='QUANT', wet_day=0.1,  qstep=0.0001)
-                    hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant, type='linear')
-                    fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant, type='linear')
+                    if method in ['QUANT','RQUANT']:
+                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep)
+                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant, type='linear')
+                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant, type='linear')
+                    elif method == 'SSPLIN':
+                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep)
+                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant)
+                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant)
+                    elif method == 'PTF':
+                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep, transfun=transfun)
+                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant)
+                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant)
+                    elif method == 'DIST':                   
+                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep, distr=distr)
+                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant)
+                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant)  
+                    else:
+                        print('please choose method between QUANT','RQUANT','SSPLIN','DIST','PTF')
                 else:
-                    fobj_quant = qmap_.fitBC(obs_month, hcst_month, method='QUANT', qstep=0.0001, nboot=5)
-                    hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant, type='linear')
-                    fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant, type='linear')         
+                    if method=='QUANT':
+                        fobj_quant = qmap_.fitBC(obs_month, hcst_month, method=method, qstep=qstep, nboot=20)
+                        hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant, type='linear')
+                        fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant, type='linear')
+                    elif method in ['MEAN','VARSCALE']:
+                        fobj_quant = qmap_.fitBC(obs_month, hcst_month, method=method)
+                        hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant)
+                        fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant)
+                    elif method=='DIST':
+                        fobj_quant = qmap_.fitBC(obs_month, hcst_month, method=method, qstep=qstep, distr=distr)
+                        hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant)
+                        fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant)
+                    else:
+                        print('please choose method between QUANT','MEAN','VARSCALE','DIST')
                 corrected_hcst.append(hcst_month_corr)
                 corrected_fcst.append(fcst_month_corr)
             corrected_hcst_ = xr.concat(corrected_hcst, dim='T').sortby('T').fillna(0) * mask
