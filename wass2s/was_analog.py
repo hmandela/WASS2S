@@ -656,7 +656,7 @@ class WAS_Analog:
         months = [f"{m:02d}" for m in range(1, 13)]
         season = "".join([calendar.month_abbr[int(m)] for m in months])
         now = datetime.datetime.now()
-        curr_yr, curr_mon = now.year, now.month
+        curr_yr, curr_mon = year_end, self.month_of_initialization#now.year, now.month - 1
         store_file_path = {}
 
         for center, var, area in zip(centers, variables, areas):
@@ -682,18 +682,17 @@ class WAS_Analog:
                 # Loop through the "Seasonal Years"
                 for s_year in range(self.year_start, year_end + 1):
                     for month in season_months:
-                        # Calculate actual calendar year for this month
-                        # If month is >= pivot, it belongs to s_year (e.g. Nov 2000)
-                        # If month is < pivot, it belongs to s_year + 1 (e.g. Jan 2001)
-                        if month >= pivot:
-                            cal_year = s_year
-                        else:
-                            cal_year = s_year + 1
+                        cal_year = s_year
 
-                        if cal_year == year_end and month >= pivot:
-                            continue
-                        if cal_year > year_end:
-                            continue
+                        # if month >= pivot:
+                        #     cal_year = s_year
+                        # else:
+                        #     cal_year = s_year + 1
+
+                        # if cal_year == year_end and month >= pivot:
+                        #     continue
+                        # if cal_year > year_end:
+                        #     continue
                         if (cal_year > curr_yr) or (cal_year == curr_yr and month > curr_mon):
                             continue
                         
