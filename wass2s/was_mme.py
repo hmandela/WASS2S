@@ -312,8 +312,11 @@ def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None,
               .transpose('probability', 'T', 'M', 'Y', 'X')
         ) * mask
         all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
-        obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
-        obs = obs.fillna(obs.mean(dim="T", skipna=True))
+        if "M" in rainfall.coords:
+            obs = rainfall.fillna(rainfall.mean(dim="T", skipna=True))
+        else:
+            obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
+            obs = obs.fillna(obs.mean(dim="T", skipna=True))
 
     else:
         all_model_hdcst = (
@@ -1249,7 +1252,9 @@ class WAS_ProbWeighted:
         hdcst['T'] = rainfall['T'].astype('datetime64[ns]')
         
         # Create a spatial mask from rainfall (using first time and model)
-        mask = xr.where(~np.isnan(rainfall.isel(T=0, M=0)), 1, np.nan).drop_vars('T').squeeze().to_numpy()
+        if "M" in rainfall.coords:
+            rainfall = rainfall.isel(M=0).drop_vars("M").squeeze()
+        mask = xr.where(~np.isnan(rainfall.isel(T=0)), 1, np.nan).drop_vars('T').squeeze().to_numpy()
 
         # --- Initialize accumulators for weighted and unweighted sums ---
         weighted_hindcast_sum = None
@@ -1343,7 +1348,7 @@ class WAS_ProbWeighted:
         if "M" in forecast_weighted.coords:
             forecast_weighted = forecast_weighted.drop_vars('M')
         
-        return hindcast_weighted * mask, forecast_weighted * mask
+        return (hindcast_weighted * mask).transpose("probability", "T", "Y", "X"), (forecast_weighted * mask).transpose("probability", "T", "Y", "X")
 
 
 

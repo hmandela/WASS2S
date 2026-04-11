@@ -405,7 +405,8 @@ class WAS_Cross_Validator:
 
             obs_for_terciles = params_prob.get('obs_for_terciles')
             quantiles = params_prob.get('quantiles')
-            return_synthetic_ensemble = params_prob.get('return_synthetic_ensemble')            
+            return_synthetic_ensemble = params_prob.get('return_synthetic_ensemble')                
+            clim_terciles = params_prob.get('clim_terciles')
             member_dim = params_prob.get('member_dim')
             time_dim = params_prob.get('time_dim')
             lat_dim = params_prob.get('lat_dim') 
@@ -421,7 +422,7 @@ class WAS_Cross_Validator:
             hindcast_prob = xr.concat(hindcast_prob, dim="T")
             hindcast_prob['T'] = Predictant['T']
 
-            return _, hindcast_prob
+            return hindcast_prob, hindcast_prob
 
         elif isinstance(model, WAS_mme_FullBMA):
             all_params = {**model_params}
@@ -457,7 +458,7 @@ class WAS_Cross_Validator:
             hindcast_prob = xr.concat(hindcast_prob, dim="T")
             hindcast_prob['T'] = Predictant['T']
 
-            return _, hindcast_prob
+            return hindcast_prob, hindcast_prob
 
         
         elif isinstance(model, WAS_mme_gaussian_process):
@@ -512,8 +513,13 @@ class WAS_Cross_Validator:
                 key: value for key, value in all_params.items() 
                 if key in model.compute_pmme_probabilities.__code__.co_varnames
             }
-
-            masks = params_prob.get('masks')
+            
+            params_models = {
+                key: value for key, value in all_params.items() 
+                if key not in params_prob
+            }
+            
+            masks = params_models.get('masks')
             ensemble_sizes = params_prob.get('ensemble_sizes')
             climatology = params_prob.get('climatology')
             
@@ -532,7 +538,7 @@ class WAS_Cross_Validator:
             hindcast_prob = xr.concat(hindcast_prob, dim="T")
             hindcast_prob['T'] = Predictant['T']
 
-            return hindcast_prob, _
+            return hindcast_prob, hindcast_prob
         
         # reorganisez après ceci
         elif isinstance(model, WAS_LogisticRegression_Model) or (
