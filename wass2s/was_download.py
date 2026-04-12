@@ -48,14 +48,17 @@ class WAS_Download:
             "ECMWF_51": "ecmwf",
             "UKMO_604": "ukmo",
             "UKMO_603": "ukmo",
+            "UKMO_605": "ukmo",
+            "UKMO_610": "ukmo",
             "METEOFRANCE_8": "meteo_france",
             "METEOFRANCE_9": "meteo_france",
             "DWD_21": "dwd", # month of initialization available for forecast are Jan to Mar
             "DWD_22": "dwd", # month of initialization available for forecast are Apr to __ 
             "CMCC_35": "cmcc",
-            # "CMCC_3": "cmcc",
+            "CMCC_4": "cmcc",
             "NCEP_2": "ncep",
             "JMA_3": "jma",
+            "JMA_4": "jma",
             "ECCC_4": "eccc",
             "ECCC_5": "eccc",
             # "CFSV2": "CFS",
@@ -393,14 +396,17 @@ class WAS_Download:
             "ECMWF_51": "ecmwf",
             "UKMO_604": "ukmo", # month of initialization available for forecast are Apr to __
             "UKMO_603": "ukmo", # month of initialization available for forecast are Jan to Mar
+            "UKMO_605": "ukmo",
+            "UKMO_610": "ukmo",
             "METEOFRANCE_8": "meteo_france",
             "METEOFRANCE_9": "meteo_france", 
             "DWD_21": "dwd", # month of initialization available for forecast are Jan to Mar
             "DWD_22": "dwd", # month of initialization available for forecast are Apr to __ 
             "CMCC_35": "cmcc",
-            # "CMCC_3": "cmcc",
+            "CMCC_4": "cmcc",
             "NCEP_2": "ncep",
             "JMA_3": "jma",
+            "JMA_4": "jma",
             "ECCC_4": "eccc",
             "ECCC_5": "eccc",
             # "CFSV2": "cfsv2",
@@ -461,15 +467,18 @@ class WAS_Download:
             "ECMWF_51": "51",
             "UKMO_604": "604",
             "UKMO_603": "603",
+            "UKMO_605": "605",
+            "UKMO_610": "610",
             "METEOFRANCE_8": "8",
             "METEOFRANCE_9": "9",
             "DWD_21": "21",
             "DWD_22": "22",
             # "DWD_2": "2",
             "CMCC_35": "35",
-            # "CMCC_3": "3",
+            "CMCC_4": "4",
             "NCEP_2": "2",
             "JMA_3": "3",
+            "JMA_4": "4",
             "ECCC_4": "4",
             "ECCC_5": "5",
             # "CFSV2": "1",
@@ -1087,15 +1096,18 @@ class WAS_Download:
             "ECMWF_51": "ecmwf",
             "UKMO_604": "ukmo", # month of initialization available for forecast are Apr to __
             "UKMO_603": "ukmo", # month of initialization available for forecast are Jan to Mar
+            "UKMO_605": "ukmo",
+            "UKMO_610": "ukmo",
             "METEOFRANCE_8": "meteo_france",
             "METEOFRANCE_9": "meteo_france",
             "DWD_21": "dwd",
             "DWD_22": "dwd",
             # "DWD_2": "dwd",
             "CMCC_35": "cmcc",
-            # "CMCC_3": "cmcc",
+            "CMCC_4": "cmcc",
             "NCEP_2": "ncep",
             "JMA_3": "jma",
+            "JMA_4": "jma",
             "ECCC_4": "eccc",
             "ECCC_5": "eccc",
         }
@@ -1105,15 +1117,18 @@ class WAS_Download:
             "ECMWF_51": "51",
             "UKMO_604": "604",
             "UKMO_603": "603",
+            "UKMO_605": "605",
+            "UKMO_610": "610",
             "METEOFRANCE_8": "8",
             "METEOFRANCE_9": "9",
             "DWD_21": "21",
             "DWD_22": "22",
             # "DWD_2": "2",
             "CMCC_35": "35",
-            # "CMCC_3": "3",
+            "CMCC_4": "4",
             "NCEP_2": "2",
             "JMA_3": "3",
+            "JMA_4": "4",
             "ECCC_4": "4",
             "ECCC_5": "5",
         }
@@ -1172,14 +1187,8 @@ class WAS_Download:
             # Map to the Copernicus naming
             cent = centre[c]
             syst = system[c]
-            # if v in variables_1:
-            #     var_cds = variables_1[v]
-            # elif v in variables_2:
-            #     var_cds = variables_2[v]
-            # else:
-            #     print(f"Unknown variable code: {v}, skipping.")
-            #     continue
 
+            ### Particularity for day of initialization NCEP and JMA
             if cent == "jma" and year_forecast is None:
                 day_of_initialization = init_day_dict_jma[month_of_initialization]
             if cent == "ncep" and year_forecast is None:

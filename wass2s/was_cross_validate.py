@@ -440,6 +440,7 @@ class WAS_Cross_Validator:
                 Predictant = Predictant
 
             dist_map = params_prob.get('dist_map')
+            clim_terciles = params_prob.get('clim_terciles')
             obs_for_terciles = params_prob.get('obs_for_terciles')
             quantiles = params_prob.get('quantiles')           
             member_dim = params_prob.get('member_dim')
