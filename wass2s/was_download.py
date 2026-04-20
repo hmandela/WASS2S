@@ -457,9 +457,13 @@ class WAS_Download:
             "UGRD_1000": "u_component_of_wind",
             "UGRD_925": "u_component_of_wind",
             "UGRD_850": "u_component_of_wind",
+            "UGRD_700": "u_component_of_wind",
+            "UGRD_200": "u_component_of_wind",
             "VGRD_1000": "v_component_of_wind",
             "VGRD_925": "v_component_of_wind",
             "VGRD_850": "v_component_of_wind",
+            "VGRD_700": "v_component_of_wind",
+            "VGRD_200": "v_component_of_wind",
         }
 
         system = {
@@ -1151,14 +1155,18 @@ class WAS_Download:
         }
         variables_2 = {
             "HUSS_1000": "specific_humidity",
-            "HUSS_925":  "specific_humidity",
-            "HUSS_850":  "specific_humidity",
+            "HUSS_925": "specific_humidity",
+            "HUSS_850": "specific_humidity",
             "UGRD_1000": "u_component_of_wind",
-            "UGRD_925":  "u_component_of_wind",
-            "UGRD_850":  "u_component_of_wind",
+            "UGRD_925": "u_component_of_wind",
+            "UGRD_850": "u_component_of_wind",
+            "UGRD_700": "u_component_of_wind",
+            "UGRD_200": "u_component_of_wind",
             "VGRD_1000": "v_component_of_wind",
-            "VGRD_925":  "v_component_of_wind",
-            "VGRD_850":  "v_component_of_wind",
+            "VGRD_925": "v_component_of_wind",
+            "VGRD_850": "v_component_of_wind",
+            "VGRD_700": "v_component_of_wind",
+            "VGRD_200": "v_component_of_wind",
         }
 
         ### Particularity for day of initialization NCEP and JMA
@@ -1707,7 +1715,7 @@ class WAS_Download:
             area,
             seas=["01", "02", "03"],  # e.g. NDJ = ["11","12","01"]
             force_download=False,
-            run_avg=3
+            run_avg=1
         ):
         
             """
@@ -1748,10 +1756,14 @@ class WAS_Download:
                 "UGRD_1000": "u_component_of_wind",
                 "UGRD_925": "u_component_of_wind",
                 "UGRD_850": "u_component_of_wind",
+                "UGRD_700": "u_component_of_wind",
+                "UGRD_600": "u_component_of_wind",
                 "UGRD_200": "u_component_of_wind",
                 "VGRD_1000": "v_component_of_wind",
                 "VGRD_925": "v_component_of_wind",
                 "VGRD_850": "v_component_of_wind",
+                "VGRD_700": "v_component_of_wind",
+                "VGRD_600": "v_component_of_wind",
                 "VGRD_200": "v_component_of_wind",
             }
             
@@ -1797,15 +1809,16 @@ class WAS_Download:
                     for s_year in range(year_start, year_end + 1):
                         
                         for month in season_months:
-                            if month >= pivot:
-                                cal_year = s_year
-                            else:
-                                cal_year = s_year + 1
+                            cal_year = s_year
+                            # if month >= pivot:
+                            #     cal_year = s_year
+                            # else:
+                            #     cal_year = s_year + 1
 
-                            if cal_year == year_end + 1 and month >= pivot:
-                                continue
-                            if cal_year > year_end + 1:
-                                continue
+                            # if cal_year == year_end + 1 and month >= pivot:
+                            #     continue
+                            # if cal_year > year_end + 1:
+                            #     continue
                             if (cal_year > curr_yr) or (cal_year == curr_yr and month > curr_mon):
                                 continue
                                 
@@ -1813,7 +1826,7 @@ class WAS_Download:
                             fname = f"ersst.v6.{cal_year}{month:02d}.nc"
                             required_files.append((cal_year, month, fname))
     
-                    # Download Loop
+                    # Download 
                     # Base URL for ERSST 'v6'.
                     base_url = "https://www.ncei.noaa.gov/data/sea-surface-temperature-extended-reconstructed/v6/access/"
                     
@@ -2071,7 +2084,6 @@ class WAS_Download:
 
 
     
-
     def WAS_Download_Reanalysis_(
         self,
         dir_to_save,
