@@ -1389,7 +1389,7 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, title = "Seasona
     nn_colors = ["#ffeda0", "#f7fcb9"]
     
     if reverse_cmap:
-        an_colors, bn_colors, nn_colors  = bn_colors, an_colors, colors_nn[::-1]
+        an_colors, bn_colors, nn_colors  = bn_colors, an_colors, nn_colors[::-1]
 
     # Build discrete colormaps matching the exact number of required bins
     cmaps = [
