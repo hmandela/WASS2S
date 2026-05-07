@@ -44,7 +44,7 @@ VAR_CONFIG = {
         "levels_contour": np.arange(990, 1038, 2),
         "highlight_black": [1015],
         "highlight_green": [1012],
-        "extent": [45, -60, -45, 120]
+        "extent": [50, -60, -45, 130]
     },
 
     # --- OLR ---
@@ -72,7 +72,7 @@ VAR_CONFIG = {
         "plot_type": "ratio",
         "cmap": "BrBG",
         "levels": [0, 25, 50, 75, 90, 110, 125, 150, 200, 300],
-        "extent": [35, -25, -5, 55]
+        "extent": [35, -25, -15, 55]
     },
 
     # --- WIND 850 ---
@@ -97,7 +97,7 @@ VAR_CONFIG = {
         "plot_type": "streamlines",
         "cmap": "YlOrRd",
         "levels": np.arange(0, 15, 1),
-        "extent": [35, -30, -5, 50],
+        "extent": [35, -30, -15, 50],
     }
 }
 

@@ -4351,6 +4351,7 @@ def plot_date(A):
     -----
     Converts colorbar ticks to calendar dates (e.g., '01-Jan') for readability.
     """
+    A = xr.where(A > 366, A - 366, A)
     fig, ax = plt.subplots(figsize=(8, 6), subplot_kw=dict(projection=ccrs.PlateCarree()))
     plt_obj = A.plot(
         ax=ax,
