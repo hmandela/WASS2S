@@ -128,7 +128,7 @@ class WAS_Download:
 
     def ReanalysisName(
         self,
-        centre={"ERA5": "reanalysis ERA5", "NOAA": "NOAA ERSST"},
+        centre={"ERA5": "reanalysis ERA5", "NOAA": "NOAA ERSST", "ERA5Land": "reanalysis ERA5Land"},
         variables_1={
             "PRCP": "total_precipitation",
             "TEMP": "2m_temperature",
@@ -139,6 +139,7 @@ class WAS_Download:
             "DSWR": "surface_solar_radiation_downwards",
             "DLWR": "surface_thermal_radiation_downwards",
             "NOLR": "top_thermal_radiation",
+            "RUNOFF": "surface_runoff"
             
         },
         variables_2={

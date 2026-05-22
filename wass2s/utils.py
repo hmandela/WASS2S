@@ -437,9 +437,9 @@ def predictant_mask(data):
     mask = mask.where(abs(mask.Y) <= 19.5, np.nan)
     return mask
 
-def trend_data(data):
+def extract_leading_eeof_component(data):
     """
-    Compute trends in data using ExtendedEOF.
+    extract leading eeof component using ExtendedEOF.
 
     Parameters
     ----------

@@ -193,7 +193,7 @@ class WAS_Cross_Validator:
         
 
 
-        if isinstance(model, WAS_CCA):
+        if isinstance(model, WAS_CCA_op):
             all_params = {**model_params}
             params_prob = {
                 k: v for k, v in all_params.items()
@@ -249,8 +249,113 @@ class WAS_Cross_Validator:
             hindcast_prob = (hindcast_prob * mask).clip(min=0, max=1)
             # print(np.unique(hindcast_prob))
             return hindcast_det, hindcast_prob
+
+        if isinstance(model, WAS_CCA_):
         
-        if isinstance(model, WAS_CCA_old):
+            all_params = {**model_params}
+        
+            compute_model_args = model.compute_model.__code__.co_varnames
+        
+            params_models = {
+                key: value
+                for key, value in all_params.items()
+                if key in compute_model_args
+            }
+        
+            params_prob = {
+                key: value
+                for key, value in all_params.items()
+                if key not in compute_model_args
+            }
+        
+            # Remove member dimension if needed.
+            if "M" in Predictant.dims:
+                Predictant_obs = Predictant.isel(M=0, drop=True)
+            else:
+                Predictant_obs = Predictant
+        
+            if "M" in Predictor.dims:
+                Predictor_cv = Predictor.isel(M=0, drop=True)
+            else:
+                Predictor_cv = Predictor
+        
+            Predictant_obs = Predictant_obs.transpose("T", "Y", "X")
+            Predictor_cv = Predictor_cv.transpose("T", "Y", "X")
+        
+            # Spatial mask based on observed predictand.
+            mask = xr.where(
+                np.isfinite(Predictant_obs.isel(T=0)),
+                1.0,
+                np.nan,
+            )
+        
+            # Standardize predictand only.
+            # No trend_data.
+            Predictant_st = standardize_timeseries(
+                Predictant_obs,
+                clim_year_start,
+                clim_year_end,
+            )
+        
+            hindcast_det = []
+        
+            print("Cross-validation ongoing")
+        
+            for i, (train_index, test_index) in enumerate(
+                tqdm(
+                    self.custom_cv.split(Predictor_cv["T"], self.nb_omit),
+                    total=n_splits,
+                ),
+                start=1,
+            ):
+        
+                X_train = Predictor_cv.isel(T=train_index)
+                X_test = Predictor_cv.isel(T=test_index)
+        
+                y_train = Predictant_st.isel(T=train_index)
+                y_test = Predictant_st.isel(T=test_index)
+        
+                pred_det = model.compute_model(
+                    X_train,
+                    y_train,
+                    X_test,
+                    y_test,
+                    **params_models,
+                )
+        
+                hindcast_det.append(pred_det)
+        
+            hindcast_det = xr.concat(hindcast_det, dim="T")
+            hindcast_det = hindcast_det.sortby("T")
+        
+            # Reindex to original predictand time axis.
+            hindcast_det = hindcast_det.reindex(T=Predictant_obs["T"])
+        
+            # Back-transform from standardized predictand space to original rainfall scale.
+            hindcast_det = reverse_standardize(
+                hindcast_det,
+                Predictant_obs,
+                clim_year_start,
+                clim_year_end,
+            )
+        
+            hindcast_det = xr.where(hindcast_det < 0, 0, hindcast_det)
+            hindcast_det = hindcast_det * mask
+        
+            hindcast_prob = model.compute_prob(
+                Predictant=Predictant_obs,
+                clim_year_start=clim_year_start,
+                clim_year_end=clim_year_end,
+                hindcast_det=hindcast_det,
+                **params_prob,
+            )
+        
+            hindcast_prob = xr.where(hindcast_prob < 0, 0, hindcast_prob)
+            hindcast_prob = hindcast_prob.clip(min=0, max=1)
+        
+            return hindcast_det, hindcast_prob
+        
+        if isinstance(model, WAS_CCA):
 
             all_params = {**model_params}
             params_prob = {
@@ -265,9 +370,9 @@ class WAS_Cross_Validator:
 
             
             mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-            Predictor_ = (Predictor - trend_data(Predictor).fillna(trend_data(Predictor)[-3])).fillna(0)
+            Predictor_ = (Predictor - extract_leading_eeof_component(Predictor).fillna(extract_leading_eeof_component(Predictor)[-3])).fillna(0)
             Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-            Predictant_ = (Predictant_st - trend_data(Predictant_st).fillna(trend_data(Predictant_st)[-3])).fillna(0)
+            Predictant_ = (Predictant_st - extract_leading_eeof_component(Predictant_st).fillna(extract_leading_eeof_component(Predictant_st)[-3])).fillna(0)
 
             print("Cross-validation ongoing")
             for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor_['T'], self.nb_omit), total=n_splits), start=1):
@@ -275,6 +380,7 @@ class WAS_Cross_Validator:
                 X_train_, X_test_ = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
                 y_train, y_test = Predictant_.isel(T=train_index), Predictant_.isel(T=test_index)
                 pred_det = model.compute_model(X_train, y_train, X_test_, y_test, **params_models)
+                # pred_det = model.compute_model(X_train, y_train, X_test, y_test, **params_models)
                 hindcast_det.append(pred_det)
 
             hindcast_det = xr.concat(hindcast_det, dim="T")
@@ -283,6 +389,178 @@ class WAS_Cross_Validator:
             hindcast_prob = model.compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det, **params_prob)
 
             return xr.where(hindcast_det<0, 0, hindcast_det)*mask, xr.where(hindcast_prob<0, 0, hindcast_prob)*mask
+
+        if isinstance(model, WAS_CCA_strict):
+            import inspect
+        
+            all_params = {**model_params}
+        
+            # Split parameters safely between compute_model() and compute_prob()
+            compute_model_args = set(inspect.signature(model.compute_model).parameters.keys())
+        
+            params_models = {
+                k: v for k, v in all_params.items()
+                if k in compute_model_args
+            }
+        
+            params_prob = {
+                k: v for k, v in all_params.items()
+                if k not in compute_model_args
+            }
+        
+            # ------------------------------------------------------------------
+            # 1. Prepare predictand and mask
+            # ------------------------------------------------------------------
+            Predictant_safe = Predictant.copy(deep=True)
+        
+            if "M" in Predictant_safe.dims:
+                Predictant_safe = Predictant_safe.isel(M=0).squeeze()
+                if "M" in Predictant_safe.coords:
+                    Predictant_safe = Predictant_safe.drop_vars("M")
+        
+            Predictant_safe = Predictant_safe.transpose("T", "Y", "X")
+        
+            mask = model._spatial_mask(Predictant_safe)
+        
+            n_splits = len(Predictant_safe.get_index("T"))
+        
+            print("Cross-validation ongoing")
+        
+            hindcast_list = []
+        
+            # ------------------------------------------------------------------
+            # 2. Strict fold-safe cross-validation
+            #    All preprocessing is fitted only on the training fold.
+            # ------------------------------------------------------------------
+            for train_index, test_index in tqdm(
+                self.custom_cv.split(Predictor["T"], self.nb_omit),
+                total=n_splits,
+            ):
+                X_train_raw = Predictor.isel(T=train_index)
+                X_test_raw = Predictor.isel(T=test_index)
+        
+                y_train_raw = Predictant_safe.isel(T=train_index)
+                y_test_raw = Predictant_safe.isel(T=test_index)
+        
+                # --------------------------------------------------------------
+                # 2.1 Fill predictor using training information only
+                # --------------------------------------------------------------
+                X_train_filled = model._fill_spatial_gaps(X_train_raw)
+                X_test_filled = model._fill_spatial_gaps(
+                    X_test_raw,
+                    ref=X_train_filled,
+                )
+        
+                # --------------------------------------------------------------
+                # 2.2 Detrend predictor using training fold only
+                # --------------------------------------------------------------
+                X_train_detr, coeffs_X, meta_X = detrended_data(
+                    X_train_filled,
+                    dim="T",
+                )
+        
+                X_test_detr = X_test_filled - apply_detrend_data(
+                    X_test_filled,
+                    coeffs_X,
+                    meta_X,
+                )
+        
+                X_train_ready = X_train_detr.fillna(0.0)
+                X_test_ready = X_test_detr.fillna(0.0)
+        
+                # --------------------------------------------------------------
+                # 2.3 Standardize predictand using training fold only
+                # --------------------------------------------------------------
+                y_train_st = standardize_timeseries(
+                    y_train_raw,
+                    clim_year_start,
+                    clim_year_end,
+                )
+        
+                y_train_st = y_train_st.where(np.isfinite(y_train_st))
+        
+                # --------------------------------------------------------------
+                # 2.4 Detrend standardized predictand using training fold only
+                # --------------------------------------------------------------
+                y_train_st_detr, coeffs_Y, meta_Y = detrended_data(
+                    y_train_st,
+                    dim="T",
+                )
+        
+                y_train_ready = y_train_st_detr.fillna(0.0)
+        
+                # y_test is only used to preserve the validation T coordinate
+                y_test_placeholder = xr.zeros_like(y_test_raw)
+        
+                # --------------------------------------------------------------
+                # 2.5 CCA prediction in transformed space
+                # --------------------------------------------------------------
+                pred_st_detr = model.compute_model(
+                    X_train_ready,
+                    y_train_ready,
+                    X_test_ready,
+                    y_test_placeholder,
+                    **params_models,
+                )
+        
+                pred_st_detr = pred_st_detr.transpose("T", "Y", "X")
+        
+                # --------------------------------------------------------------
+                # 2.6 Add predictand trend back at validation-year T
+                # --------------------------------------------------------------
+                pred_st = pred_st_detr + apply_detrend_data(
+                    pred_st_detr,
+                    coeffs_Y,
+                    meta_Y,
+                )
+        
+                # --------------------------------------------------------------
+                # 2.7 Reverse standardization using training fold reference only
+                # --------------------------------------------------------------
+                pred_det = reverse_standardize(
+                    pred_st,
+                    y_train_raw,
+                    clim_year_start,
+                    clim_year_end,
+                )
+        
+                pred_det = pred_det.transpose("T", "Y", "X") * mask
+                pred_det = pred_det.clip(min=0.0)
+        
+                hindcast_list.append(pred_det)
+        
+            # ------------------------------------------------------------------
+            # 3. Concatenate strict hindcasts
+            # ------------------------------------------------------------------
+            hindcast_det = xr.concat(hindcast_list, dim="T")
+            hindcast_det = hindcast_det.sortby("T")
+            hindcast_det = hindcast_det.transpose("T", "Y", "X") * mask
+            hindcast_det = hindcast_det.clip(min=0.0)
+        
+            # Keep exact temporal coordinate order from Predictant
+            hindcast_det = hindcast_det.reindex(T=Predictant_safe["T"])
+        
+            # ------------------------------------------------------------------
+            # 4. Compute probabilities from strict deterministic hindcasts
+            # ------------------------------------------------------------------
+            hindcast_prob = model.compute_prob(
+                Predictant_safe,
+                clim_year_start,
+                clim_year_end,
+                hindcast_det,
+                **params_prob,
+            )
+        
+            hindcast_prob = hindcast_prob.transpose("probability", "T", "Y", "X")
+            hindcast_prob = hindcast_prob * mask
+            hindcast_prob = hindcast_prob.clip(min=0.0, max=1.0)
+        
+            # Normalize PB + PN + PA = 1
+            prob_sum = hindcast_prob.sum(dim="probability")
+            hindcast_prob = xr.where(prob_sum > 0, hindcast_prob / prob_sum, np.nan)
+            hindcast_prob = hindcast_prob * mask
+        
+            return hindcast_det, hindcast_prob
 
         elif isinstance(model, WAS_Analog):
 
