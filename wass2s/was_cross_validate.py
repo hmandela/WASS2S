@@ -250,7 +250,7 @@ class WAS_Cross_Validator:
             # print(np.unique(hindcast_prob))
             return hindcast_det, hindcast_prob
 
-        if isinstance(model, WAS_CCA_):
+        if isinstance(model, WAS_CCA_base):
         
             all_params = {**model_params}
         
