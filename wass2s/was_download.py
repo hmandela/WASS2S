@@ -1,3 +1,31 @@
+"""Data download utilities for ERA5, CHIRPS, TAMSAT, and NMME.
+
+Provides a unified interface for downloading and pre-processing gridded
+seasonal hindcast and reanalysis datasets.
+
+Class
+-----
+WAS_Download
+    Central download manager.  Key methods:
+
+    ``WAS_Download_Models``
+        NMME and C3S seasonal forecast / hindcast data.
+    ``WAS_Download_Reanalysis`` / ``WAS_Download_Reanalysis_``
+        ERA5 single-level and pressure-level reanalysis (via CDS).
+    ``WAS_Download_ERA5Land`` / ``WAS_Download_ERA5Land_daily``
+        ERA5-Land daily and monthly data.
+    ``WAS_Download_CHIRPSv3_Seasonal`` / ``WAS_Download_CHIRPSv3_Daily``
+        CHIRPS v3 precipitation (seasonal aggregates and daily fields).
+    ``WAS_Download_TAMSAT_Seasonal`` / ``WAS_Download_TAMSAT_Daily``
+        TAMSAT African rainfall estimates.
+    ``WAS_Download_AgroIndicators`` / ``WAS_Download_AgroIndicators_daily``
+        NMME-derived agroclimatic indicator downloads.
+
+Standalone function
+-------------------
+plot_map
+    Quick Cartopy map of a geographic extent.
+"""
 from __future__ import annotations
 import logging
 import os
@@ -200,19 +228,6 @@ class WAS_Download:
             dict: A dictionary mapping agro variables to their corresponding full names.
         """
         return variables
-
-    # def download_nmme_txt_with_progress(self, url, file_path, chunk_size=1024):
-    #     file_path = Path(file_path)
-    #     response = requests.get(url, stream=True)
-    #     total_size = int(response.headers.get('content-length', 0))
-        
-    #     with open(file_path, "wb") as f, tqdm(
-    #         total=total_size, unit="B", unit_scale=True, desc=file_path.name
-    #     ) as progress:
-    #         for data in response.iter_content(chunk_size):
-    #             progress.update(len(data))
-    #             f.write(data)
-
     def download_nmme_txt_with_progress(self, url, file_path, chunk_size=1024):   
         # Check if the URL exists using a HEAD request
         try:
@@ -352,7 +367,6 @@ class WAS_Download:
         return da, days_in_month_da, times_start
     
 
-    
     def WAS_Download_Models(
         self,
         dir_to_save,
@@ -877,7 +891,6 @@ class WAS_Download:
         return store_file_path
 
 
-        
     def WAS_Download_AgroIndicators_daily(
             self,
             dir_to_save,
@@ -2084,7 +2097,6 @@ class WAS_Download:
             return file_path
 
 
-    
     def WAS_Download_Reanalysis_(
         self,
         dir_to_save,
@@ -2965,7 +2977,6 @@ class WAS_Download:
             return out_nc
 
 
-
     def _fetch_chirps_monthly(self, year, month, dir_to_save, region, force_download, area):
         """
         Construct the CHIRPS v3.0 monthly TIF URL for (year, month), 
@@ -2979,23 +2990,6 @@ class WAS_Download:
 
         local_path = Path(dir_to_save) / fname
         download_file(url, local_path, force_download=force_download, chunk_size=8192, timeout=120)
-        
-        # # Download if needed
-        # if (not local_path.exists()) or force_download:
-        #     print(f"[DOWNLOAD] {url}")
-        #     try:
-        #         with requests.get(url, stream=True, timeout=120) as r:
-        #             r.raise_for_status()
-        #             with open(local_path, "wb") as f:
-        #                 for chunk in r.iter_content(chunk_size=8192):
-        #                     f.write(chunk)
-        #     except Exception as e:
-        #         print(f"[ERROR] Could not download {url}: {e}")
-        #         return None
-        # else:
-        #     print(f"[SKIP] {fname} is already present. (Use force_download=True to overwrite)")
-
-        # Open as xarray via rioxarray
         try:
             da = rioxr.open_rasterio(local_path, masked=True).squeeze()
             time_coord = pd.to_datetime(f"{year}-{month:02d}-01")
@@ -3468,8 +3462,6 @@ class WAS_Download:
             return None
 
 
-
-
 #####
 
 def plot_map(extent, title="Map"): # [west, east, south, north]
@@ -3498,6 +3490,5 @@ def plot_map(extent, title="Map"): # [west, east, south, north]
     # Show plot
     plt.tight_layout()
     plt.show()
-
 
 

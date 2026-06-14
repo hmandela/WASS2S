@@ -1,3 +1,19 @@
+"""Canonical Correlation Analysis (CCA) for seasonal forecasting.
+
+Two implementations are provided:
+
+``WAS_CCA``
+    Legacy CCA built on xeofs EOF analysis and numpy CCA.  Suitable for
+    quick exploratory use.
+
+``WAS_CCA_base``
+    Leakage-free CCA that fits all preprocessing (NaN fill, standardization,
+    EOF decomposition) strictly on the training fold and applies the fitted
+    transforms to the test fold.  Recommended for cross-validation.
+
+Both classes expose ``compute_model``, ``compute_prob``, ``forecast``, and
+``plot_cca_results`` methods.
+"""
 from scipy import stats
 from scipy import signal as sig
 import numpy as np
@@ -53,59 +69,6 @@ class WAS_CCA:
         X_train_final, y_train_final = self.preprocess_data(X_train, y_train)
         # Fit the CCA model
         self.cca_model = self.cca.fit(X_train_final, y_train_final, dim="T")
-
-    # def detrend_data(self, data): ### Replace detrend by extendedEOF after
-    #     """
-    #     Detrend the data along the 'T' dimension if detrending is enabled.
-
-    #     Parameters:
-    #     - data: xarray DataArray to be detrended.
-
-    #     Returns:
-    #     - data_detrended: Detrended xarray DataArray.
-    #     """
-    #     if self.detrend:
-    #         # Create mask for missing data
-    #         mask = xr.where(np.isnan(data), np.nan, 1)
-    #         # mask = np.where(np.isnan(data.isel(T=0)), np.nan, 1)
-    #         # Fill missing values with zero before detrending
-    #         data_filled = data.fillna(0)
-    #         # Detrend data along 'T' axis (axis=0)
-    #         data_detrended = sig.detrend(data_filled, axis=0)
-    #         data_detrended = xr.DataArray(data_detrended, dims=data.dims, coords=data.coords)
-    #         # Apply mask after detrending
-    #         # data_detrended = data_detrended * mask
-    #         return data_detrended
-    #     else:
-    #         return data
-
-    # def preprocess_data(self, X, Y):
-    #     """
-    #     Preprocess the data by detrending, masking, and filling missing values.
-
-    #     Parameters:
-    #     - X: xarray DataArray for predictors.
-    #     - Y: xarray DataArray for predictands.
-
-    #     Returns:
-    #     - X_final: Preprocessed X data.
-    #     - Y_final: Preprocessed Y data.
-    #     """
-    #     # Apply detrending and masking (masking is now inside detrend_data)
-    #     X_processed = self.detrend_data(X)
-    #     # Fill missing values with mean along 'T'
-    #     X_final = X_processed.fillna(X_processed.mean(dim="T", skipna=True))
-
-    #     # Process Y data (assuming we do not detrend Y)
-    #     Y_final = Y.fillna(Y.mean(dim="T", skipna=True))
-
-    #     # Rename dimensions and transpose
-    #     dims_rename = {"X": "lon", "Y": "lat"}
-    #     X_final = X_final.rename(dims_rename).transpose('T', 'lat', 'lon')
-    #     Y_final = Y_final.rename(dims_rename).transpose('T', 'lat', 'lon')
-
-    #     return X_final, Y_final
-
     def preprocess_data(self, X, Y):
         """
         Preprocess the data by detrending, masking, and filling missing values.
@@ -524,7 +487,6 @@ class WAS_CCA:
         return pred_prob
 
 
-
     def compute_prob(
         self,
         Predictant: xr.DataArray,
@@ -659,7 +621,6 @@ class WAS_CCA:
             probability=("probability", ["PB", "PN", "PA"])
         )
         return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
-
 
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
@@ -855,8 +816,6 @@ class WAS_CCA:
             
         plt.tight_layout()
         plt.show()
-
-
 
 
 class WAS_CCA_base:
@@ -1716,8 +1675,19 @@ class WAS_CCA_base:
     ):
         """
         Plot CCA spatial modes and canonical scores.
-
         """
+
+        def _spatial_to_was(da):
+            """Rename xeofs lat/lon -> WAS Y/X for a spatial mode (no T axis)."""
+            rename = {}
+            if "lat" in da.dims:
+                rename["lat"] = "Y"
+            if "lon" in da.dims:
+                rename["lon"] = "X"
+            da = da.rename(rename)
+            order = [d for d in ("T", "Y", "X") if d in da.dims]
+            return da.transpose(*order)
+
         if X is not None and Y is not None:
             X = self._drop_member_dim(X)
             Y = self._drop_member_dim(Y)
@@ -1741,6 +1711,8 @@ class WAS_CCA_base:
                 "The CCA model has not been fitted yet. "
                 "Provide X and Y or call fit_cca first."
             )
+        else:
+            mask = None
 
         X_modes, Y_modes = self.cca_model.components()
         X_scores, Y_scores = self.cca_model.scores()
@@ -1780,7 +1752,9 @@ class WAS_CCA_base:
             ax.set_ylabel("Canonical variate")
 
             ax = axes[i, 2]
-            Y_mode = self._from_xeofs_dims(Y_modes.sel(mode=mode)) * mask
+            Y_mode = _spatial_to_was(Y_modes.sel(mode=mode))
+            if mask is not None:
+                Y_mode = Y_mode * mask
             Y_mode.plot(ax=ax, cmap="RdBu_r")
             var_Y = float(var_explained_Y.sel(mode=mode).values) * 100
             ax.set_title(f"Y Mode {mode} ({var_Y:.2f}% variance)")
@@ -1856,101 +1830,6 @@ class WAS_CCA_op:
         hindcast = y_pred_phys.rename({"lon": "X", "lat": "Y"})
 
         return hindcast
-
-    # def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
-    #     mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze()
-        
-    #     # 1. Prepare Historical Data
-    #     Predictor_detrend, coeffss, metas = detrended_data(Predictor, dim="T")
-        
-    #     Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-    #     Predictant_st_detrend, coeffs, meta = detrended_data(Predictant_st, dim="T")
-
-    #     # 2. Prepare Forecast Year Predictor
-    #     Predictor_for_year_filled = Predictor_for_year.fillna(Predictor.mean(dim="T", skipna=True))
-    #     Predictor_for_year_filled = Predictor_for_year_filled.ffill(dim="Y").bfill(dim="Y").ffill(dim="X").bfill(dim="X").fillna(0)
-        
-    #     Predictor_for_year_detrended = Predictor_for_year_filled - apply_detrend_data(Predictor_for_year_filled, coeffss, metas)
-
-    #     # 3. Fit and Predict
-    #     self.fit_cca(Predictor_detrend, Predictant_st_detrend)
-            
-    #     X_forecast_prepared = Predictor_for_year_detrended.rename({"X": "lon", "Y": "lat"}).transpose('T', 'lat', 'lon')
-        
-    #     y_pred = self.cca_model.predict(X_forecast_prepared)
-    #     y_pred_phys = self.cca_model.inverse_transform(self.cca_model.transform(X_forecast_prepared), y_pred)[1] 
-    #     result_ = y_pred_phys.rename({"lon": "X", "lat": "Y"})
-        
-    #     # 4. Assign Future Time Coordinate
-    #     try:
-    #         year = int(Predictor_for_year.coords['T'].dt.year[0])
-    #     except:
-    #          year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
-        
-    #     T_value_1 = Predictant.isel(T=0).coords['T'].values
-    #     month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
-    #     new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
-        
-    #     result_ = result_.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        
-    #     # 5. Add Trend Back & Reverse Standardize
-    #     result_ = result_ + apply_detrend_data(result_, coeffs, meta)
-    #     result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end) 
-        
-    #     forecast_expanded = result_
-    #     forecast_expanded['T'] = forecast_expanded['T'].astype('datetime64[ns]')
-
-    #     # 6. Probabilities
-    #     index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-    #     index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-    #     rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        
-    #     terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-    #     T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-    #     T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        
-    #     error_variance = (Predictant - hindcast_det).var(dim='T')
-    #     dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
-
-    #     dm = self.dist_method
-
-    #     if dm == "bestfit":
-    #         if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-    #             raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
-            
-    #         T1, T2 = xr.apply_ufunc(
-    #             self._ppf_terciles_from_code,
-    #             best_code_da, best_shape_da, best_loc_da, best_scale_da,
-    #             input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-    #             vectorize=True, dask="parallelized", output_dtypes=[float, float],
-    #         )
-
-    #         forecast_prob = xr.apply_ufunc(
-    #             self.calculate_tercile_probabilities_bestfit,
-    #             forecast_expanded, error_variance, T1, T2, best_code_da,
-    #             input_core_dims=[("T",), (), (), (), ()], output_core_dims=[("probability", "T")],
-    #             vectorize=True, dask="parallelized", kwargs={"dof": dof},
-    #             output_dtypes=[float],
-    #             dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-    #         )
-
-    #     elif dm == "nonparam":
-    #         error_samples = Predictant - hindcast_det
-    #         forecast_prob = xr.apply_ufunc(
-    #             self.calculate_tercile_probabilities_nonparametric,
-    #             forecast_expanded, error_samples, T1_emp, T2_emp,
-    #             input_core_dims=[("T",), ("T",), (), ()], output_core_dims=[("probability", "T")],
-    #             vectorize=True, dask="parallelized", output_dtypes=[float],
-    #             dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-    #         )
-    #     else:
-    #         raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-    #     forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        
-    #     return forecast_expanded * mask, (forecast_prob * mask).transpose('probability', 'T', 'Y', 'X')
-
-
     def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
         # Predictor_ = (Predictor - extract_leading_eeof_component(Predictor).fillna(extract_leading_eeof_component(Predictor)[-3])).fillna(0)
@@ -2093,7 +1972,6 @@ class WAS_CCA_op:
             mask = xr.where(~np.isnan(Y.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
             # mask.name = None
             
-
 
             X, coeffss, metas = detrended_data(X, dim="T")
         
@@ -2471,7 +2349,6 @@ class WAS_CCA_op:
         return pred_prob
 
 
-
     def compute_prob(
         self,
         Predictant: xr.DataArray,
@@ -2639,7 +2516,7 @@ class WAS_CCA_strict:
         Do not convert to NumPy, because xarray broadcasting is safer.
         """
         mask = xr.where(~np.isnan(da.isel(T=0)), 1.0, np.nan)
-        mask = WAS_CCA_._safe_drop_vars(mask, ["T"])
+        mask = WAS_CCA_strict._safe_drop_vars(mask, ["T"])
         return mask.squeeze()
     
     
@@ -3495,7 +3372,6 @@ class WAS_CCA_strict:
             pred_prob[1, t] = p_between
             pred_prob[2, t] = p_above
         return pred_prob
-
 
 
     def compute_prob(

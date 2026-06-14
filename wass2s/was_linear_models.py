@@ -1,3 +1,25 @@
+"""Linear regression models for spatial seasonal forecasting.
+
+Each class implements a ``compute_model`` / ``compute_prob`` / ``forecast``
+interface compatible with :class:`~wass2s.was_cross_validate.WAS_Cross_Validator`
+and :class:`~wass2s.was_pcr.WAS_PCR`.
+
+Classes
+-------
+WAS_LinearRegression_Model
+    Pixel-wise ordinary least-squares regression with parametric or
+    non-parametric tercile probabilities.
+WAS_Ridge_Model
+    Ridge (L2-regularised) regression with Optuna / randomized
+    hyperparameter search.
+WAS_Lasso_Model
+    Lasso (L1-regularised) regression with Optuna / randomized
+    hyperparameter search.
+WAS_LassoLars_Model
+    LassoLars regression.
+WAS_ElasticNet_Model
+    Elastic-Net (L1+L2) regression.
+"""
 ################################### Modules ###################################
 from sklearn import linear_model
 from sklearn.linear_model import LinearRegression
@@ -557,7 +579,6 @@ class WAS_LinearRegression_Model:
         return pred_prob
 
 
-
     def compute_prob(
         self,
         Predictant: xr.DataArray,
@@ -841,6 +862,7 @@ class WAS_LinearRegression_Model:
                 input_core_dims=[("T",), ("T",), (), ()],
                 output_core_dims=[("probability", "T")],
                 vectorize=True,
+                exclude_dims=set(("T",)),
                 dask="parallelized",
                 output_dtypes=[float],
                 dask_gufunc_kwargs={
@@ -2443,7 +2465,6 @@ class WAS_Lasso_Model:
         return pred_prob
 
 
-
     def compute_prob(
         self,
         Predictant: xr.DataArray,
@@ -2744,7 +2765,6 @@ class WAS_Lasso_Model:
             raise ValueError(f"Invalid dist_method: {self.dist_method}")
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return forecast_expanded, forecast_prob.transpose('probability', 'T', 'Y', 'X')
-
 
 
 class WAS_ElasticNet_Model:
@@ -3468,7 +3488,6 @@ class WAS_ElasticNet_Model:
         return pred_prob
 
 
-
     def compute_prob(
         self,
         Predictant: xr.DataArray,
@@ -3778,7 +3797,6 @@ class WAS_ElasticNet_Model:
             raise ValueError(f"Invalid dist_method: {self.dist_method}")
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return forecast_expanded, forecast_prob.transpose('probability', 'T', 'Y', 'X')
-
 
 
 class WAS_LassoLars_Model:
@@ -4507,7 +4525,6 @@ class WAS_LassoLars_Model:
             pred_prob[1, t] = p_between
             pred_prob[2, t] = p_above
         return pred_prob
-
 
 
     def compute_prob(

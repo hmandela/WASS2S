@@ -1,3 +1,28 @@
+"""Analog-ensemble seasonal forecasting.
+
+Identifies historically similar years (analogs) by comparing climate
+indices or EOF scores for the target period and composites their observed
+rainfall to produce a forecast.
+
+Classes
+-------
+WAS_Analog
+    Full analog toolkit: downloads ERA5 reanalysis and NMME model data,
+    computes SST/OLR/wind indices, performs dimensionality reduction, and
+    applies one of several analog selection strategies.
+
+    Analog methods available via ``compute_model``:
+
+    - ``SOM`` — Self-Organising Maps (minisom).
+    - ``Bias_Based`` — mean-bias distance in index space.
+    - ``Corr_Based`` — Pearson correlation distance.
+    - ``Pca_Based`` — PCA followed by Euclidean distance.
+    - ``KMeans_Based`` — K-Means clustering in index space.
+    - ``Agglomerative_Based`` — Agglomerative (Ward) clustering.
+
+WAS_Analog__
+    Archived predecessor of ``WAS_Analog``; kept for backward compatibility.
+"""
 # Core Python Libraries
 import os
 from pathlib import Path
@@ -228,199 +253,6 @@ class WAS_Analog:
         keep_vars = [var_name, 'T', 'X', 'Y']
         drop_vars = [v for v in ds.variables if v not in keep_vars]
         return ds.drop_vars(drop_vars, errors="ignore")
-
-    # def download_reanalysis_(self, force_download=False):
-    #         """
-    #         Download reanalysis data (ERA5 and NOAA ERSST).
-    #         Saves raw MONTHLY data (1-12) without aggregation, preserving seasonality.
-    #         """
-    #         year_end = self.year_forecast
-            
-    #         # We download ALL months to preserve the full seasonal cycle for the analog search
-    #         months_int = list(range(1, 13))
-    #         # Naming convention: usually we just denote this as the full year range
-    #         # If you want to put "JanDec" in the filename, you can, or just leave it generic.
-    #         season_str = "JanDec" 
-            
-    #         variables = [item['variable'] for item in self.predictor_vars]
-    #         centers = [item['reanalysis_name'] for item in self.predictor_vars]
-    #         areas = [item['area'] for item in self.predictor_vars]
-            
-    #         # Variable Mappings
-    #         variables_1 = {
-    #             "PRCP": "total_precipitation", "TEMP": "2m_temperature",
-    #             "TMAX": "maximum_2m_temperature_in_the_last_24_hours",
-    #             "TMIN": "minimum_2m_temperature_in_the_last_24_hours",
-    #             "UGRD10": "10m_u_component_of_wind", "VGRD10": "10m_v_component_of_wind",
-    #             "SST": "sea_surface_temperature", "SLP": "mean_sea_level_pressure",
-    #             "DSWR": "surface_solar_radiation_downwards", "DLWR": "surface_thermal_radiation_downwards",
-    #             "NOLR": "top_net_thermal_radiation",
-    #         }
-    #         variables_2 = {
-    #             "HUSS_1000": "specific_humidity", "HUSS_925": "specific_humidity", "HUSS_850": "specific_humidity",
-    #             "UGRD_1000": "u_component_of_wind", "UGRD_925": "u_component_of_wind", "UGRD_850": "u_component_of_wind",
-    #             "VGRD_1000": "v_component_of_wind", "VGRD_925": "v_component_of_wind", "VGRD_850": "v_component_of_wind",
-    #         }
-    
-    #         dir_to_save = Path(self.dir_to_save)
-    #         dir_to_save.mkdir(parents=True, exist_ok=True)
-    #         store_file_path = {}
-    
-    #         for center, var, area in zip(centers, variables, areas):
-    #             # Filename includes "JanDec" or similar to indicate full monthly data
-    #             combined_output_path = dir_to_save / f"{center}_{var}_{self.year_start}_{year_end}_{season_str}_{area[0]}{area[1]}{area[2]}{area[3]}.nc" 
-    
-    #             if not force_download and combined_output_path.exists():
-    #                 print(f"{combined_output_path} exists. Skipping download.")
-    #                 store_file_path[var] = xr.open_dataset(combined_output_path)
-    #                 continue
-    
-    #             # =================================================================
-    #             # CASE 1: NOAA ERSST (Direct NCEI Download)
-    #             # =================================================================
-    #             if f"{center}.{var}" == "NOAA.SST":
-    #                 try:
-    #                     print(f"Starting NCEI Direct Download for NOAA ERSST: {self.year_start}-{year_end}")
-    #                     cache_dir = dir_to_save / "ersst_cache"
-    #                     cache_dir.mkdir(exist_ok=True)
-                        
-    #                     downloaded_paths = []
-    #                     # v5 is standard, check if v6 is required/available
-    #                     base_url = "https://www.ncei.noaa.gov/data/sea-surface-temperature-extended-reconstructed/v6/access/" 
-    
-    #                     for s_year in range(self.year_start, year_end + 1):
-    #                         for month in months_int:
-    #                             fname = f"ersst.v6.{s_year}{month:02d}.nc"
-    #                             local_path = cache_dir / fname
-                                
-    #                             if not local_path.exists():
-    #                                 url = f"{base_url}/{fname}"
-    #                                 # print(f"Downloading {fname}...") # reduced verbosity
-    #                                 r = requests.get(url, timeout=30)
-    #                                 r.raise_for_status()
-    #                                 with open(local_path, 'wb') as f:
-    #                                     f.write(r.content)
-    #                             downloaded_paths.append(local_path)
-    
-    #                     # Process ERSST
-    #                     ds = xr.open_mfdataset(downloaded_paths, combine='by_coords')
-    #                     ds = ds[["sst"]].drop_vars("lev", errors="ignore").squeeze()
-    
-    #                     # Standardize Coordinates (0-360 -> -180/180)
-    #                     if 'lon' in ds.coords:
-    #                         ds = ds.assign_coords(lon=(((ds.lon + 180) % 360) - 180))
-    #                         ds = ds.sortby('lon')
-                        
-    #                     # Rename to standard (X, Y, T, SST)
-    #                     rename_dict = {}
-    #                     if 'lat' in ds.coords: rename_dict['lat'] = 'Y'
-    #                     if 'lon' in ds.coords: rename_dict['lon'] = 'X'
-    #                     if 'time' in ds.coords: rename_dict['time'] = 'T'
-    #                     if 'sst' in ds.variables: rename_dict['sst'] = 'SST'
-    #                     ds = ds.rename(rename_dict)
-                        
-    #                     # Slice Area [N, W, S, E]
-    #                     ds = ds.sortby(['X', 'Y'])
-    #                     ds = ds.sel(X=slice(area[1], area[3]), Y=slice(area[2], area[0]))
-    
-    #                     # NO AGGREGATION: Just ensure time is sorted
-    #                     ds = ds.sortby('T')
-                        
-    #                     # Final Cleanup
-    #                     ds = ds.rename({"SST": "sst"}) 
-    #                     ds.to_netcdf(combined_output_path)
-    #                     store_file_path[var] = ds
-    #                     print(f"Saved NOAA ERSST data to {combined_output_path}")
-    #                     continue
-    #                 except Exception as e:
-    #                     print(f"Failed to download NOAA.SST via NCEI: {e}")
-    #                     import traceback
-    #                     traceback.print_exc()
-    #                     continue
-    
-    #             # =================================================================
-    #             # CASE 2: ERA5 / CDSAPI
-    #             # =================================================================
-    #             combined_datasets = []
-    #             client = cdsapi.Client()
-                
-    #             is_pressure = var in variables_2
-    #             dataset_name = "reanalysis-era5-pressure-levels-monthly-means" if is_pressure else "reanalysis-era5-single-levels-monthly-means"
-    #             api_var = variables_2[var] if is_pressure else variables_1.get(var, var)
-    #             press_level = var.split("_")[1] if is_pressure else None
-    
-    #             for year in range(self.year_start, year_end + 1):
-    #                 yearly_file_path = dir_to_save / f"{center}_{var}_{year}.nc"
-                
-    #                 if not force_download and yearly_file_path.exists():
-    #                     try:
-    #                         ds = xr.open_dataset(yearly_file_path).load()
-    #                         if 'latitude' in ds.coords: ds = ds.rename({"latitude": "Y", "longitude": "X", "valid_time": "T"})
-    #                         combined_datasets.append(ds)
-    #                         continue
-    #                     except Exception as e:
-    #                         print(f"Failed to load {yearly_file_path}: {e}")
-                
-    #                 try:
-    #                     request = {
-    #                         "product_type": "monthly_averaged_reanalysis",
-    #                         "variable": api_var,
-    #                         "year": str(year),
-    #                         "month": [f"{m:02d}" for m in months_int],
-    #                         "time": "00:00",
-    #                         "area": area,
-    #                         "format": "netcdf",
-    #                     }
-    #                     if is_pressure:
-    #                         request["pressure_level"] = press_level
-    
-    #                     print(f"Downloading {var} for {year} from {center}...")
-    #                     client.retrieve(dataset_name, request).download(str(yearly_file_path))
-                    
-    #                     with xr.open_dataset(yearly_file_path) as ds:
-    #                         if 'latitude' in ds.coords: ds = ds.rename({"latitude": "Y", "longitude": "X", "valid_time": "T"})
-    #                         ds = ds.load()
-    #                         combined_datasets.append(ds)
-    #                 except Exception as e:
-    #                     print(f"Failed to download/process {var} for {year}: {e}")
-    #                     continue
-            
-    #             if combined_datasets:
-    #                 print(f"Concatenating {var} datasets...")
-    #                 combined_ds = xr.concat(combined_datasets, dim="T")
-    #                 combined_ds = combined_ds.drop_vars(["number", "expver"], errors="ignore").squeeze()
-                    
-    #                 # Unit Conversions
-    #                 if var in ["TMIN", "TEMP", "TMAX", "SST"]:
-    #                     combined_ds = combined_ds - 273.15
-    #                 elif var == "PRCP":
-    #                     combined_ds = combined_ds * 1000 
-    #                 elif var in ["DSWR", "DLWR", "NOLR"]:
-    #                     combined_ds = combined_ds / 86400
-    #                 elif var == "SLP":
-    #                     combined_ds = combined_ds / 100
-                    
-    #                 combined_ds = combined_ds.isel(Y=slice(None, None, -1))
-                    
-    #                 # NO AGGREGATION HERE either
-    #                 combined_ds = combined_ds.sortby('T')
-    
-    #                 store_file_path[var] = combined_ds
-    #                 combined_ds.to_netcdf(combined_output_path)
-    #                 print(f"Saved combined dataset to {combined_output_path}")
-                    
-    #                 # Cleanup yearly files
-    #                 for year in range(self.year_start, year_end + 1):
-    #                     single_file_path = dir_to_save / f"{center}_{var}_{year}.nc"
-    #                     if single_file_path.exists():
-    #                         try: os.remove(single_file_path)
-    #                         except: pass
-    #             else:
-    #                 print(f"No data combined for {var}. Check download success.")
-    
-    #         return store_file_path
-
-    
     def download_reanalysis_(self, force_download=False):
             """
             Download reanalysis data (ERA5 and NOAA ERSST).
@@ -770,35 +602,6 @@ class WAS_Analog:
                     import traceback
                     traceback.print_exc()
                 continue 
-
-
-            # if f"{center}.{var}" == "NOAA.SST":
-            #     try:
-            #         url = build_iridl_url_ersst(
-            #             year_start=self.year_start,
-            #             year_end=year_end,
-            #             bbox=area,
-            #             run_avg=None,
-            #             month_start="Jan",
-            #             month_end="Dec"
-            #         )
-            #         print(f"Using IRIDL URL: {url}")
-        
-            #         ds = xr.open_dataset(url, decode_times=False)
-            #         ds = decode_cf(ds, "T").rename({"T": "time"}).convert_calendar("proleptic_gregorian", align_on="year").rename({"time": "T"})
-            #         ds = ds.assign_coords(T=ds.T - pd.Timedelta(days=15))
-            #         ds = ds.rename({'sst': 'SST'})
-            #         ds = self._postprocess_ersst(ds, var)
-            #         ds['T'] = ds['T'].astype('datetime64[ns]')
-            #         ds = ds.rename({'SST': 'sst'})
-            #         store_file_path[var] = ds
-            #         ds.to_netcdf(combined_output_path)
-            #         print(f"Saved NOAA ERSST data to {combined_output_path}")
-            #         return store_file_path
-            #     except Exception as e:
-            #         print(f"Failed to download NOAA.SST: {e}")
-            #         continue
-
             combined_datasets = []
             client = cdsapi.Client()
         
@@ -1136,16 +939,6 @@ class WAS_Analog:
         n_modes = np.where(cumulative_var >= self.eof_explained_var)[0][0] + 1
         print(f"Selected {n_modes} modes explaining {cumulative_var[n_modes-1].values*100:.2f}% variance")
         return model.scores().isel(mode=slice(0, n_modes))
-
-    # def _detrended_da(self, da):
-    #     """Detrend a DataArray by removing the linear trend."""
-    #     if 'T' not in da.dims:
-    #         raise ValueError("DataArray must have a time dimension 'T' for detrending.")
-    #     trend = da.polyfit(dim='T', deg=1)
-    #     da_detrended = da - (trend.polyval(da['T']) if 'polyval' in dir(trend) else trend)
-    #     return da_detrended.isel(degree=0, drop=True).to_array().drop_vars('variable').squeeze(),\
-    #          trend.isel(degree=0, drop=True).to_array().drop_vars('variable').squeeze()
-
     def _detrended_da(self, da, dim='T'):
             """
             Detrend a DataArray by removing the linear trend.
@@ -1369,53 +1162,6 @@ class WAS_Analog:
         similar_years = top_2['T'].to_numpy()
         print(f"Similar years for {reference_year}: {similar_years}")
         return similar_years
-
-
-    # def Pca_Based(self, predictant, itrain, ireference_year):
-    #     """Identify similar years using PCA-based analog method."""
-    #     _, ddd = self.download_and_process()
-    #     ddd = ddd.get(self.predictor_vars[0]['variable'])
-    #     if ddd is None:
-    #         raise ValueError(f"Variable {self.predictor_vars[0]['variable']} not found in downloaded data.")
-        
-    #     # predictor_ = ddd.fillna(ddd.groupby("T.month").mean("T", skipna=True))
-    #     # predictor_detrend = sig.detrend(predictor_, axis=0)
-    #     # ddd = xr.DataArray(predictor_detrend, dims=predictor_.dims, coords=predictor_.coords)
-
-    #     if self.detrend:
-    #         ddd, _ = self._detrended_da(ddd)
-    #     # ddd = ddd.rename({"X": "lon", "Y": "lat"})
-    #     # eof = xe.single.EOF(n_modes=50, use_coslat=True, center=False)
-    #     # eof.fit(ddd.fillna(ddd.mean(dim="T", skipna=True)), dim="T")
-    #     # scores = eof.scores()
-    #     scores = self.compute_eofs(ddd)
-        
-    #     predictant = predictant.copy()
-    #     predictant['T'] = predictant['T'].astype('datetime64[ns]')
-
-    #     if ireference_year==2100:
-    #         reference_year = self.year_forecast
-    #         predictant_ = xr.concat([predictant.isel(T=itrain)], dim="T")
-    #     else:
-    #         reference_year = int(np.unique(predictant.isel(T=ireference_year)['T'].dt.year))
-    #         predictant_ = xr.concat([predictant.isel(T=itrain)], dim="T")
-
-    #     sst_ref = scores.sel(T=str(reference_year)).stack(score=('mode', 'T'))       
-    #     unique_years = np.append(np.unique(predictant_['T'].dt.year),reference_year)
-
-    #     correlations = []
-    #     for year in unique_years:
-    #         tmp = scores.sel(T=str(year)).stack(score=('mode', 'T'))
-    #         correlation = xr.corr(tmp, sst_ref, dim="score").compute()
-    #         correlations.append(correlation)
-        
-    #     similar = xr.concat(correlations, dim='T').assign_coords(T=unique_years)
-    #     similar = similar.sortby(similar, ascending=False)
-    #     top_2 = similar.isel(T=slice(1,3))
-    #     similar_years = top_2['T'].to_numpy()
-    #     print(f"Similar years for {reference_year}: {similar_years}")
-    #     return similar_years
-
     def Pca_Based(self, predictant, itrain, ireference_year):
             """Identify similar years using PCA-based analog method."""
             _, ddd = self.download_and_process()
@@ -1524,135 +1270,6 @@ class WAS_Analog:
 
         print(f"Similar years for {reference_year} (Agglomerative): {similar_years}")
         return np.array(similar_years)
-
-    # def download_and_process(self):
-    #     """Download and process reanalysis and forecast data.
-
-    #     Combines reanalysis and forecast data, applies standardization or anomaly calculation,
-    #     and optionally applies a rolling mean.
-
-    #     Returns
-    #     -------
-    #     data_var_concatenated : dict
-    #         Dictionary of concatenated, processed datasets.
-    #     data_var_shifted : dict
-    #         Dictionary of time-shifted, processed datasets.
-    #     """
-    #     lead_time = [1, 2, 3, 4, 5] if self.lead_time is None else self.lead_time
-    #     month_of_initialization = (datetime.now() - relativedelta(months=1)).month if self.month_of_initialization is None else self.month_of_initialization
-        
-    #     sst_hist = self.download_reanalysis(force_download=False)
-    #     sst_hdcst, sst_for = self.download_models(force_download=False)
-
-    #     variables = [item['variable'] for item in self.predictor_vars]
-    #     print(f"Processing variables: {variables}")
-    #     data_var_concatenated = {}
-    #     data_var_shifted = {}
-
-    #     for var in variables:
-    #         if var not in sst_hist or var not in sst_for:
-    #             print(f"Skipping {var}: data not available.")
-    #             continue  
-
-    #         sst_hist_ = sst_hist[var]
-    #         sst_hdcst_ = sst_hdcst[var]
-    #         sst_for_ = sst_for[var]
-
-    #         # process hindcast data
-    #         hindcast = []
-    #         for i in sst_hdcst_['T']:
-    #             sst_hdcst_i = sst_hdcst_.sel(T=i)
-    #             base_times = pd.Timestamp(sst_hdcst_i['T'].values)
-    #             new_times = [base_times + pd.DateOffset(months=int(m)) for m in sst_hdcst_i['forecastMonth'].values]
-    #             sst_hdcst_i = sst_hdcst_i.assign_coords(forecastMonth=("forecastMonth", new_times))
-    #             sst_hdcst_i = sst_hdcst_i.drop_vars('T', errors='ignore').squeeze().rename({'forecastMonth': 'T'})
-    #             hindcast.append(sst_hdcst_i)
-    #         sst_hdcst_ = xr.concat(hindcast, dim='T')          
-    #         sst_hdcst_ = sst_hdcst_.interp(Y=sst_hist_.Y, X=sst_hist_.X, method="linear", kwargs={"fill_value": "extrapolate"})
-
-            
-    #         # process forecast data
-    #         sst_for_ = sst_for_.interp(Y=sst_hist_.Y, X=sst_hist_.X, method="linear", kwargs={"fill_value": "extrapolate"})
-    #         if (isinstance(sst_for_['T'].values, np.ndarray)):
-    #             base_time = pd.Timestamp(sst_for_['T'].values[-1])
-    #         else:
-    #             base_time = pd.Timestamp(sst_for_['T'].values)
-    #         new_times = [base_time + pd.DateOffset(months=int(m)) for m in sst_for_['forecastMonth'].values]
-    #         sst_for_ = sst_for_.assign_coords(forecastMonth=("forecastMonth", new_times))
-    #         sst_for_ = sst_for_.drop_vars('T', errors='ignore').squeeze().rename({'forecastMonth': 'T'})
-
-    #         # Correct forecast systematic bias
-    #         biasr = WAS_bias_correction()
-
-    #         sst_for_bias_corrected = []
-    #         for m in lead_time:
-    #             target_time = base_time + pd.DateOffset(months=m)
-    #             current_target_month = target_time.month
-
-    #             sst_hist_mean = sst_hist_.where(sst_hist_['T'].dt.month.isin(current_target_month), drop=True)
-    #             sst_hist_mean = sst_hist_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze()
-
-    #             sst_hdcst_mean = sst_hdcst_.where(sst_hdcst_['T'].dt.month.isin(current_target_month), drop=True)
-    #             sst_hdcst_mean = sst_hdcst_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze()
-    #             sst_hist_mean, sst_hdcst_mean  = xr.align(sst_hist_mean, sst_hdcst_mean, join="inner")
-    #             sst_for_mean = sst_for_.where(sst_for_['T'].dt.month.isin(current_target_month), drop=True)
-    #             sst_for_mean = sst_for_mean.to_array().drop_vars(['variable'], errors='ignore').squeeze('variable', drop=True)
-                
-    #             if var in ["TMIN", "TEMP", "TMAX", "SST", "HUSS_1000", "HUSS_925", "HUSS_850", "SLP", "UGRD10", "VGRD10", "UGRD_1000", "UGRD_925", "UGRD_850", "VGRD_1000", "VGRD_925", "VGRD_850"]:
-    #                 fobj_quant_da = biasr.fitBC(sst_hist_mean, sst_hdcst_mean, method='QUANT', qstep=0.01, nboot=10)
-    #                 sst_for_bias_corrected.append(biasr.doBC(sst_for_mean, fobj_quant_da, type='linear'))
-    #                 # sst_for_bias_corrected.append(sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True) - sst_hdcst_mean + sst_hist_mean)
-    #             # if var in ["PRCP", "DSWR", "DLWR", "N.OLR"]:
-    #                 # fobj_quant = qmap.fitQmap(sst_hist_mean, sst_hdcst_mean, method='QUANT', wet_day=0.1,  qstep=0.001)
-    #                 # sst_for_bias_corrected.append(sst_for_.where(sst_for_['T'].dt.month.isin(m), drop=True) * sst_hist_mean / sst_hdcst_mean)
-    #         sst_for_ = xr.concat(sst_for_bias_corrected, dim='T').sortby("T")
-
-    #         # Concatenate hist and forecast data
-    #         sst_hist_ = sst_hist_.sel(T=slice(f"{self.year_start}-01", f"{base_time.year}-{base_time.month:02d}"))
-    #         sst_hist_ = sst_hist_.to_array().drop_vars(['variable'], errors='ignore').squeeze()
-    #         concatenated_ds = xr.concat([sst_hist_, sst_for_], dim='T')
-    #         concatenated_ds = concatenated_ds.sortby("T")
-    #         concatenated_ds = concatenated_ds.to_dataset(name=var)
-
-    #         if isinstance(self.rolling, int) and self.rolling > 1:
-    #            print(f"Applied rolling mean with window size {self.rolling} for {var}.")
-    #            concatenated_ds = concatenated_ds.rolling(T=self.rolling, center=False, min_periods=self.rolling).mean()
-
-    #         if self.standardize:
-    #             print(f"Standardizing timeseries for {var}.")
-    #             concatenated_ds_st = self.standardize_timeseries(concatenated_ds)
-    #         else:
-    #             print(f"Computing anomalies for {var}.")
-    #             concatenated_ds_st = self.anomaly_timeseries(concatenated_ds)
-
-    #         # first_year = concatenated_ds_st.isel(T=0).T.dt.year.item()
-    #         # last_month = concatenated_ds_st.isel(T=-1).T.dt.month.item()
-
-    #         select_parts = concatenated_ds_st['T'].size - (self.year_forecast - self.year_start) * 12 
-
-    #         # if last_month == 12:
-    #         #     start_month = 1
-    #         #     first_year += 1
-    #         # else:
-    #         #     start_month = last_month + 1
-            
-    #         concatenated_ds_st = concatenated_ds_st.isel(T=slice(select_parts, None))
-            
-    #         # concatenated_ds_st = concatenated_ds_st.sel(T=slice(f"{first_year}-{start_month:02d}", f"{self.year_forecast}-{last_month:02d}"))
-    #         # if last_month == 12:
-    #         #     new_time = pd.DatetimeIndex([pd.to_datetime(f"{first_year}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))])
-    #         # else:
-    #         #     new_time = pd.DatetimeIndex([pd.to_datetime(f"{first_year+1}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))])    
-
-    #         new_time = pd.DatetimeIndex([pd.to_datetime(f"{self.year_start+1}-01-01") + pd.DateOffset(months=t) for t in range(len(concatenated_ds_st['T']))]) 
-
-    #         ds_shifted = concatenated_ds_st.assign_coords(T=new_time)
-    
-    #         data_var_shifted[var] = ds_shifted.to_array().drop_vars(['variable'], errors='ignore').squeeze()
-    #         data_var_concatenated[var] = concatenated_ds_st.to_array().drop_vars(['variable'], errors='ignore').squeeze()
-    #     return data_var_concatenated, data_var_shifted
-
-
     def download_and_process(self):
             """Download and process reanalysis and forecast data."""
             
@@ -2112,7 +1729,6 @@ class WAS_Analog:
             pred_prob[1, t] = p_between
             pred_prob[2, t] = p_above
         return pred_prob
-
 
 
     def compute_prob(
@@ -3860,7 +3476,6 @@ class WAS_Analog__:
             pred_prob[1, t] = p_between
             pred_prob[2, t] = p_above
         return pred_prob
-
 
 
     def compute_prob(

@@ -1,3 +1,26 @@
+"""Machine-learning regression models for seasonal forecasting.
+
+All classes expose the standard
+``compute_model`` / ``compute_prob`` / ``forecast`` interface and are
+compatible with :class:`~wass2s.was_cross_validate.WAS_Cross_Validator`.
+
+Classes
+-------
+BaseOptimizer
+    Unified hyperparameter optimizer supporting grid search, random search,
+    and Optuna Bayesian optimization.
+WAS_PolynomialRegression
+    Polynomial feature expansion followed by ridge regression.
+WAS_MARS_Model
+    Multivariate Adaptive Regression Splines (py-earth).
+WAS_LogisticRegression_Model
+    Pixel-wise multinomial logistic regression for direct tercile
+    classification.
+WAS_PoissonRegression
+    Pixel-wise Poisson GLM for count / precipitation data.
+WAS_NonNeural_Base
+    Encompassing others non_neural regression : WAS_RandomForest_Model ...
+"""
 # Machine Learning and Statistical Modeling
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor, StackingRegressor
@@ -52,12 +75,22 @@ from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
-# import numpy as np
-# import optuna
-# from sklearn.base import clone
-# from sklearn.model_selection import cross_val_score, GridSearchCV, RandomizedSearchCV
-# from scipy.stats import randint, uniform, loguniform
+import numpy as np
+import pandas as pd
+import xarray as xr
 
+from dask.distributed import Client
+from sklearn.cluster import KMeans
+from sklearn.model_selection import cross_val_score
+
+from scipy.stats import (norm, lognorm, expon, gamma, weibull_min, t,
+                         poisson, nbinom, randint, uniform, loguniform)
+from scipy.special import gamma as gamma_function
+from scipy.optimize import fsolve
+
+import optuna
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 class BaseOptimizer:
     """
     Unified Optimizer. Supports SVR (multi-grid), MLP, and Stacking architectures.
@@ -182,5286 +215,6 @@ class BaseOptimizer:
             
             study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
             return study.best_params
-
-
-# class BaseOptimizer__:
-#     """
-#     Base class for hyperparameter optimization with support for:
-#     - GridSearchCV (exhaustive)a
-#     - RandomizedSearchCV (random)
-#     - Optuna (Bayesian/Bayesian)
-#     """
-    
-#     def __init__(self, optimization_method="grid", n_trials=20, cv=3, random_state=42):
-#         self.optimization_method = optimization_method
-#         self.n_trials = n_trials
-#         self.cv = cv
-#         self.random_state = random_state
-        
-#     def optimize(self, model, param_space, X, y, scoring='neg_mean_squared_error'):
-#         if self.optimization_method == "grid":
-#             return self._grid_search(model, param_space, X, y, scoring)
-#         elif self.optimization_method == "random":
-#             return self._random_search(model, param_space, X, y, scoring)
-#         elif self.optimization_method == "bayesian":
-#             return self._optuna_search(model, param_space, X, y, scoring)
-#         else:
-#             raise ValueError(f"Unknown optimization method: {self.optimization_method}")
-
-#     def _apply_params(self, model_instance, params):
-#         """
-#         Helper to apply parameters to a model, handling TransformedTargetRegressor 
-#         or Pipelines by adding the appropriate prefix.
-#         """
-#         if hasattr(model_instance, 'regressor'):
-#             # It's a TransformedTargetRegressor
-#             keyed_params = {f"regressor__{k}": v for k, v in params.items()}
-#             model_instance.set_params(**keyed_params)
-#         elif hasattr(model_instance, 'steps'):
-#             # It's a Pipeline (assuming 'mlp' is the final step name)
-#             # You might need to adjust 'mlp' if your pipeline step name differs
-#             keyed_params = {f"mlp__{k}": v for k, v in params.items()}
-#             model_instance.set_params(**keyed_params)
-#         else:
-#             # Standard model
-#             model_instance.set_params(**params)
-#         return model_instance
-
-#     def _optuna_search(self, model, param_space, X, y, scoring):
-#         def objective(trial):
-#             params = {}
-#             for param_name, param_values in param_space.items():
-#                 if isinstance(param_values, list):
-#                     params[param_name] = trial.suggest_categorical(param_name, param_values)
-#                 elif isinstance(param_values, tuple) and len(param_values) >= 2:
-#                     low, high = param_values[0], param_values[1]
-#                     is_log = len(param_values) == 3 and param_values[2] == 'log'
-#                     params[param_name] = trial.suggest_float(param_name, low, high, log=is_log)
-            
-#             # FIX: Clone the original model (wrapper and all)
-#             model_instance = clone(model)
-#             # FIX: Route the suggested params to the internal regressor
-#             model_instance = self._apply_params(model_instance, params)
-            
-#             scores = cross_val_score(model_instance, X, y, cv=self.cv, scoring=scoring, n_jobs=1)
-#             return scores.mean()
-
-#         study = optuna.create_study(direction="maximize", 
-#                                     sampler=optuna.samplers.TPESampler(seed=self.random_state))
-#         study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
-#         return study.best_params
-
-#     def _grid_search(self, model, param_space, X, y, scoring):
-#         from sklearn.model_selection import GridSearchCV
-#         # Prefix keys for the grid search if model is wrapped
-#         if hasattr(model, 'regressor'):
-#             param_space = {f"regressor__{k}": v for k, v in param_space.items()}
-        
-#         gs = GridSearchCV(model, param_space, cv=self.cv, scoring=scoring, n_jobs=-1)
-#         gs.fit(X, y)
-        
-#         # Clean the double underscores from keys before returning
-#         best_params = {k.split('__')[-1]: v for k, v in gs.best_params_.items()}
-#         return best_params
-
-#     def _random_search(self, model, param_space, X, y, scoring):
-#         from sklearn.model_selection import RandomizedSearchCV
-#         param_dist = self._convert_to_distributions(param_space)
-        
-#         if hasattr(model, 'regressor'):
-#             param_dist = {f"regressor__{k}": v for k, v in param_dist.items()}
-            
-#         rs = RandomizedSearchCV(model, param_dist, n_iter=self.n_trials, 
-#                                 cv=self.cv, scoring=scoring, random_state=self.random_state, n_jobs=-1)
-#         rs.fit(X, y)
-        
-#         best_params = {k.split('__')[-1]: v for k, v in rs.best_params_.items()}
-#         return best_params
-
-#     def _convert_to_distributions(self, param_space):
-#         """Convert parameter space to distributions for random search."""
-#         param_distributions = {}
-#         for param_name, param_values in param_space.items():
-#             if isinstance(param_values, list):
-#                 if all(isinstance(v, int) for v in param_values):
-#                     param_distributions[param_name] = randint(min(param_values), max(param_values) + 1)
-#                 elif all(isinstance(v, float) for v in param_values):
-#                     param_distributions[param_name] = uniform(min(param_values), max(param_values) - min(param_values))
-#                 else:
-#                     param_distributions[param_name] = param_values
-#             elif isinstance(param_values, tuple):
-#                 if len(param_values) == 2:
-#                     if all(isinstance(v, int) for v in param_values):
-#                         param_distributions[param_name] = randint(param_values[0], param_values[1] + 1)
-#                     else:
-#                         param_distributions[param_name] = uniform(param_values[0], param_values[1] - param_values[0])
-#                 elif len(param_values) == 3 and param_values[2] == 'log':
-#                     param_distributions[param_name] = loguniform(param_values[0], param_values[1])
-#         return param_distributions
-
-
-
-
-# class BaseOptimizer_:
-#     """
-#     Base class for hyperparameter optimization with support for:
-#     - GridSearchCV (exhaustive)
-#     - RandomizedSearchCV (random)
-#     - Optuna (Bayesian)
-#     """
-    
-#     def __init__(self, optimization_method="grid", n_trials=20, cv=3, random_state=42):
-#         """
-#         Parameters
-#         ----------
-#         optimization_method : str
-#             One of: "grid", "random", "optuna"
-#         n_trials : int
-#             Number of trials for random/optuna optimization
-#         cv : int
-#             Cross-validation folds
-#         random_state : int
-#             Random seed for reproducibility
-#         """
-#         self.optimization_method = optimization_method
-#         self.n_trials = n_trials
-#         self.cv = cv
-#         self.random_state = random_state
-        
-#     def optimize(self, model, param_space, X, y, scoring='neg_mean_squared_error'):
-#         """
-#         Optimize hyperparameters using specified method.
-        
-#         Parameters
-#         ----------
-#         model : sklearn estimator
-#             Model to optimize
-#         param_space : dict
-#             Parameter space for optimization
-#         X : array-like
-#             Features
-#         y : array-like
-#             Target
-#         scoring : str
-#             Scoring metric
-            
-#         Returns
-#         -------
-#         dict
-#             Best parameters
-#         """
-#         if self.optimization_method == "grid":
-#             return self._grid_search(model, param_space, X, y, scoring)
-#         elif self.optimization_method == "random":
-#             return self._random_search(model, param_space, X, y, scoring)
-#         elif self.optimization_method == "bayesian":
-#             return self._optuna_search(model, param_space, X, y, scoring)
-#         else:
-#             raise ValueError(f"Unknown optimization method: {self.optimization_method}")
-    
-#     def _grid_search(self, model, param_space, X, y, scoring):
-#         """Grid search optimization."""
-#         from sklearn.model_selection import GridSearchCV
-#         grid_search = GridSearchCV(
-#             estimator=model,
-#             param_grid=param_space,
-#             cv=self.cv,
-#             scoring=scoring,
-#             n_jobs=-1
-#         )
-#         grid_search.fit(X, y)
-#         return grid_search.best_params_
-    
-#     def _random_search(self, model, param_space, X, y, scoring):
-#         """Random search optimization."""
-#         from sklearn.model_selection import RandomizedSearchCV
-#         # Convert lists to distributions for random search
-#         param_distributions = self._convert_to_distributions(param_space)
-        
-#         random_search = RandomizedSearchCV(
-#             estimator=model,
-#             param_distributions=param_distributions,
-#             n_iter=self.n_trials,
-#             cv=self.cv,
-#             scoring=scoring,
-#             random_state=self.random_state,
-#             n_jobs=-1
-#         )
-#         random_search.fit(X, y)
-#         return random_search.best_params_
-    
-#     def _optuna_search(self, model, param_space, X, y, scoring):
-#         """Optuna Bayesian optimization."""
-#         # Define objective function for Optuna
-#         def objective(trial):
-#             # Suggest parameters based on param_space
-#             params = {}
-#             for param_name, param_values in param_space.items():
-#                 if isinstance(param_values, list):
-#                     if all(isinstance(v, int) for v in param_values):
-#                         params[param_name] = trial.suggest_categorical(param_name, param_values)
-#                     elif all(isinstance(v, float) for v in param_values):
-#                         params[param_name] = trial.suggest_float(param_name, min(param_values), max(param_values))
-#                     else:
-#                         params[param_name] = trial.suggest_categorical(param_name, param_values)
-#                 elif isinstance(param_values, tuple) and len(param_values) == 2:
-#                     # Assume (low, high) for continuous or (low, high, 'log') for log scale
-#                     if len(param_values) == 3 and param_values[2] == 'log':
-#                         params[param_name] = trial.suggest_float(param_name, param_values[0], param_values[1], log=True)
-#                     else:
-#                         params[param_name] = trial.suggest_float(param_name, param_values[0], param_values[1])
-            
-#             # Create and cross-validate model
-#             model_instance = model.__class__(**params)
-#             from sklearn.model_selection import cross_val_score
-#             scores = cross_val_score(model_instance, X, y, cv=self.cv, scoring=scoring)
-#             return scores.mean()
-        
-#         # Create study and optimize
-#         study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=self.random_state))
-#         study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
-        
-#         return study.best_params
-    
-#     def _convert_to_distributions(self, param_space):
-#         """Convert parameter space to distributions for random search."""
-#         param_distributions = {}
-#         for param_name, param_values in param_space.items():
-#             if isinstance(param_values, list):
-#                 if all(isinstance(v, int) for v in param_values):
-#                     param_distributions[param_name] = randint(min(param_values), max(param_values) + 1)
-#                 elif all(isinstance(v, float) for v in param_values):
-#                     param_distributions[param_name] = uniform(min(param_values), max(param_values) - min(param_values))
-#                 else:
-#                     param_distributions[param_name] = param_values
-#             elif isinstance(param_values, tuple):
-#                 if len(param_values) == 2:
-#                     if all(isinstance(v, int) for v in param_values):
-#                         param_distributions[param_name] = randint(param_values[0], param_values[1] + 1)
-#                     else:
-#                         param_distributions[param_name] = uniform(param_values[0], param_values[1] - param_values[0])
-#                 elif len(param_values) == 3 and param_values[2] == 'log':
-#                     param_distributions[param_name] = loguniform(param_values[0], param_values[1])
-#         return param_distributions
-
-
-class WAS_SVR:
-    """
-    Support Vector Regression (SVR) based model with spatial clustering, hyperparameter optimization,
-    and probabilistic tercile forecasting for geospatial time-series data (typically seasonal rainfall).
-
-    This class implements a spatially-aware SVR workflow:
-    1. Clusters the predictand field using KMeans (spatial homogeneity zones).
-    2. Optimizes SVR hyperparameters independently per cluster using grid/random/Bayesian search.
-    3. Fits SVR models per grid cell with the best-found parameters.
-    4. Generates deterministic predictions and computes tercile probabilities (Below/Normal/Above)
-       using either best-fit parametric distributions or non-parametric error sampling.
-
-    Main use case: Seasonal climate forecasting (e.g. rainfall) with deterministic hindcasts
-    and probabilistic outputs in tercile format (PB = Below, PN = Normal, PA = Above).
-
-    Parameters
-    ----------
-    nb_cores : int, default=1
-        Number of CPU cores for parallel processing (dask + joblib).
-
-    n_clusters : int, default=5
-        Number of spatial clusters (KMeans) to group similar predictand regimes.
-
-    kernel : {'linear', 'poly', 'rbf', 'all'}, default='linear'
-        SVR kernel type. 'all' = search over linear + poly + rbf.
-
-    gamma : list of str or None, default=["auto", "scale"]
-        Gamma values for 'rbf' kernel (only used when kernel='rbf' or 'all').
-
-    C_range : list of float, default=[0.1, 1, 10, 100]
-        Regularization parameter values to search.
-
-    epsilon_range : list of float, default=[0.01, 0.1, 0.5, 1]
-        Epsilon-tube values to search.
-
-    degree_range : list of int, default=[2, 3, 4]
-        Polynomial degrees to search (only for 'poly' kernel).
-
-    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
-        Method to compute tercile probabilities:
-        - 'bestfit': use best-fit distribution per cluster/grid cell
-        - 'nonparam': empirical sampling of historical errors
-
-    optimization_method : {'grid', 'random', 'bayesian'}, default='grid'
-        Hyperparameter search strategy.
-
-    n_trials : int, default=20
-        Number of trials for 'random' or 'bayesian' optimization.
-
-    cv : int, default=5
-        Number of cross-validation folds for hyperparameter tuning.
-
-    random_state : int, default=42
-        Random seed for reproducibility (KMeans, CV splits, etc.).
-
-    Attributes
-    ----------
-    optimizer : BaseOptimizer
-        Internal hyperparameter optimization object.
-
-    Methods
-    -------
-    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
-        Cluster predictand → optimize SVR hyperparameters per cluster → return parameter maps.
-
-    fit_predict(x, y, x_test, y_test, epsilon, C, degree=None)
-        Fit SVR on one grid cell and predict (used internally in parallel apply_ufunc).
-
-    compute_model(X_train, y_train, X_test, y_test, epsilon, C, degree_array=None)
-        Spatially parallel SVR prediction across entire grid.
-
-    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
-                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
-        Compute tercile probabilities from deterministic hindcast.
-
-    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
-             Predictor_for_year, epsilon, C, kernel_array, degree_array, gamma_array,
-             best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
-        Full forecast pipeline for one target year → deterministic prediction + probabilities.
-
-    Notes
-    -----
-    - All input DataArrays must share compatible coordinates (T=time, Y=lat, X=lon).
-    - Hyperparameter optimization is performed per cluster, then broadcast to all grid cells.
-    - For 'bestfit' probability method, requires distribution fit results from WAS_TransformData.
-    - Negative predictions are clipped to zero (useful for rainfall).
-    - Large domains benefit greatly from higher `nb_cores` (uses dask parallel apply_ufunc).
-    """
-    def __init__(
-        self, 
-        nb_cores=1, 
-        n_clusters=5, 
-        kernel='linear',
-        gamma=None,
-        C_range=[0.1, 1, 10, 100], 
-        epsilon_range=[0.01, 0.1, 0.5, 1], 
-        degree_range=[2, 3, 4],
-        dist_method="nonparam",
-        optimization_method="grid",  # optimization method "grid", "random", "bayesian" 
-        n_trials=20,   # number of trials for random/optuna
-        cv=5,  
-        random_state=42  # random seed
-    ):
-        self.nb_cores = nb_cores
-        self.n_clusters = n_clusters
-        self.kernel = kernel
-        self.gamma = gamma if gamma is not None else ["auto", "scale"]
-        self.C_range = C_range
-        self.epsilon_range = epsilon_range
-        self.degree_range = degree_range
-        self.dist_method = dist_method
-        self.optimization_method = optimization_method
-        self.n_trials = n_trials
-        self.cv = cv
-        self.random_state = random_state
-        
-        # Initialize optimizer
-        self.optimizer = BaseOptimizer(
-            optimization_method=optimization_method,
-            n_trials=n_trials,
-            cv=cv,
-            random_state=random_state
-        )
-
-    def compute_hyperparameters(self, predictand, predictor, clim_year_start, clim_year_end):
-        predictor['T'] = predictand['T']
-        """Optimized version with Bayesian optimization."""
-        # Step 1: Perform KMeans clustering
-        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        
-        predictand_dropna = predictand.to_dataframe().reset_index().dropna().drop(columns=['T'])
-        variable_column = predictand_dropna.columns[2]
-        predictand_dropna['cluster'] = kmeans.fit_predict(
-            predictand_dropna[[variable_column]]
-        )
-        
-        df_unique = predictand_dropna.drop_duplicates(subset=['Y', 'X'])
-        dataset = df_unique.set_index(['Y', 'X']).to_xarray()
-        mask = xr.where(~np.isnan(predictand.isel(T=0)), 1, np.nan)
-        Cluster = (dataset['cluster'] * mask)
-        
-        xarray1, xarray2 = xr.align(predictand, Cluster, join="outer")
-        clusters = np.unique(xarray2)
-        clusters = clusters[~np.isnan(clusters)]
-        
-        cluster_means = {
-            int(cluster): xarray1.where(xarray2 == cluster).mean(dim=['Y', 'X'], skipna=True)
-            for cluster in clusters
-        }
-
-        # Step 2: Prepare parameter space based on kernel
-        param_space = []
-        
-        if self.kernel in ['linear', 'all']:
-            param_space.append({
-                'kernel': ['linear'], 
-                'C': self.C_range, 
-                'epsilon': self.epsilon_range
-            })
-        if self.kernel in ['poly', 'all']:
-            param_space.append({
-                'kernel': ['poly'], 
-                'degree': self.degree_range, 
-                'C': self.C_range, 
-                'epsilon': self.epsilon_range
-            })
-        if self.kernel in ['rbf', 'all']:
-            param_space.append({
-                'kernel': ['rbf'], 
-                'C': self.C_range, 
-                'epsilon': self.epsilon_range, 
-                'gamma': self.gamma
-            })
-
-        hyperparams_cluster = {}
-        
-        # Step 3: Optimize for each cluster
-        for cluster_label in clusters:
-            cluster_mean = cluster_means[int(cluster_label)].dropna('T')
-            predictor['T'] = cluster_mean['T']
-            common_times = np.intersect1d(cluster_mean['T'].values, predictor['T'].values)
-            
-            if len(common_times) == 0:
-                continue
-
-            cluster_mean_common = cluster_mean.sel(T=common_times)
-            predictor_common = predictor.sel(T=common_times)
-
-            y_cluster = cluster_mean_common.values
-            if y_cluster.size > 0:
-                # Use optimizer to find best parameters
-                svr = SVR()
-                model = TransformedTargetRegressor(regressor=svr,
-                                                          transformer=StandardScaler()
-                                                         )
-                best_params = self.optimizer.optimize(
-                    model, 
-                    param_space, 
-                    predictor_common, 
-                    y_cluster
-                )
-                
-                hyperparams_cluster[int(cluster_label)] = {
-                    'C': best_params['C'],
-                    'epsilon': best_params['epsilon'],
-                    'kernel': best_params['kernel'],
-                    'degree': best_params.get('degree', None),
-                    'gamma': best_params.get('gamma', None)
-                }
-    
-        # Step 4: Create DataArrays for best parameters
-        C_array = xr.full_like(Cluster, np.nan, dtype=float)
-        epsilon_array = xr.full_like(Cluster, np.nan, dtype=float)
-        degree_array = xr.full_like(Cluster, np.nan, dtype=int)
-        kernel_array = xr.full_like(Cluster, "", dtype=object)
-        gamma_array = xr.full_like(Cluster, "", dtype=object)
-
-        for cluster_label, params in hyperparams_cluster.items():
-            mask = Cluster == cluster_label
-            C_array = C_array.where(~mask, other=params['C'])
-            epsilon_array = epsilon_array.where(~mask, other=params['epsilon'])
-            degree_array = degree_array.where(~mask, other=params.get('degree', np.nan))
-            kernel_array = kernel_array.where(~mask, other=params['kernel'])
-            gamma_array = gamma_array.where(~mask, other=params.get('gamma', ""))
-    
-        C_array, epsilon_array, degree_array, Cluster, _ = xr.align(
-            C_array, epsilon_array, degree_array, Cluster, 
-            predictand.isel(T=0).drop_vars('T').squeeze(), 
-            join="outer"
-        )
-        
-        # Align kernel and gamma arrays
-        kernel_array, _ = xr.align(kernel_array, Cluster, join="outer")
-        gamma_array, _ = xr.align(gamma_array, Cluster, join="outer")
-        
-        return C_array, epsilon_array, degree_array, Cluster, kernel_array, gamma_array
-
-    def fit_predict(self, x, y, x_test, y_test, epsilon, C, degree=None):
-        """
-        Fits an SVR model to the provided training data, makes predictions on the test data, 
-        and calculates the prediction error.
-
-        We handle data-type issues (e.g., bytes input), set up the SVR with the requested
-        parameters, fit it, and return both the error and the prediction.
-
-        Parameters
-        ----------
-        x : array-like, shape (n_samples, n_features)
-            Training predictors.
-        y : array-like, shape (n_samples,)
-            Training targets.
-        x_test : array-like, shape (n_features,)
-            Test predictors.
-        y_test : float or None
-            Test target value. Used to calculate error if available.
-        epsilon : float
-            Epsilon parameter for SVR (defines epsilon-tube).
-        C : float
-            Regularization parameter for SVR.
-        degree : int, optional
-            Degree for 'poly' kernel. Ignored if kernel != 'poly'.
-
-        Returns
-        -------
-        np.ndarray
-            A 2-element array containing [error, prediction].
-        """
-        # Convert any byte-string parameters to standard Python strings/integers
-        if isinstance(self.kernel, bytes):
-            kernel = self.kernel.decode('utf-8')
-        if isinstance(degree, bytes) and degree is not None and not np.isnan(degree):
-            degree = int(degree)
-        if isinstance(self.gamma, bytes) and self.gamma is not None:
-            gamma = self.gamma.decode('utf-8')
-        
-        # Ensure 'degree' has a valid numeric default if not properly set
-        if degree is None or degree == 'nan' or (isinstance(degree, float) and np.isnan(degree)):
-            degree = 1
-        else:
-            degree = int(float(degree))
-
-        # Prepare model parameters based on kernel type
-        model_params = {'kernel': self.kernel, 'C': C, 'epsilon': epsilon}
-        if self.kernel == 'poly' and degree is not None:
-            model_params['degree'] = int(degree)
-        if self.kernel == 'rbf' and self.gamma[0] is not None:
-            model_params['gamma'] = self.gamma[0]
-
-        # Instantiate the SVR model with chosen parameters
-        svr = SVR(**model_params)
-        
-        model = TransformedTargetRegressor(
-            regressor=svr,
-            transformer=StandardScaler()
-)
-
-        # Check for valid (finite) training data
-        mask = np.isfinite(y) & np.all(np.isfinite(x), axis=-1)
-
-        # Train only if there's valid data
-        if np.any(mask):
-            y_clean = y[mask]
-            x_clean = x[mask, :]
-
-            model.fit(x_clean, y_clean)
-
-            # If x_test is 1-D, reshape into 2-D for prediction
-            if x_test.ndim == 1:
-                x_test = x_test.reshape(1, -1)
-
-            # Make predictions
-            preds = model.predict(x_test)
-
-            # Ensuring no negative predictions (if that applies to your data domain, e.g., rainfall)
-            preds[preds < 0] = 0
-
-            # Calculate error, if y_test is valid
-            if y_test is not None and not np.isnan(y_test):
-                error_ = y_test - preds
-            else:
-                error_ = np.nan
-
-            # Return [error, prediction] as a flattened array
-            return np.array([error_, preds]).squeeze()
-        else:
-            # If there's no valid training data, return NaNs
-            return np.array([np.nan, np.nan]).squeeze()
-
-    
-    def compute_model(self, X_train, y_train, X_test, y_test, epsilon, C, degree_array=None):
-        """
-        Computes predictions for spatiotemporal data using SVR with parallel processing via Dask.
-
-        We break the data into chunks, apply the `fit_predict` function in parallel,
-        and combine the results into an output DataArray.
-
-        Parameters
-        ----------
-        X_train : xarray.DataArray
-            Training predictors with dimensions ('T', 'features').
-        y_train : xarray.DataArray
-            Training targets with dimensions ('T', 'Y', 'X').
-        X_test : xarray.DataArray
-            Test predictors with dimensions ('features',).
-        y_test : xarray.DataArray
-            Test target values with dimensions ('Y', 'X').
-        epsilon : xarray.DataArray
-            Epsilon hyperparameters per grid point.
-        C : xarray.DataArray
-            C hyperparameters per grid point.
-        degree_array : xarray.DataArray, optional
-            Polynomial degrees per grid point (only used if kernel='poly').
-
-        Returns
-        -------
-        xarray.DataArray
-            Predictions & errors, stacked along a new 'output' dimension (size=2).
-        """
-        # Determine chunk sizes so each worker handles a portion of the spatial domain
-        chunksize_x = int(np.round(len(y_train.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(y_train.get_index("Y")) / self.nb_cores))
-
-        # Align time dimension in X_train with y_train
-        X_train['T'] = y_train['T']
-        y_train = y_train.transpose('T', 'Y', 'X')
-        
-        # Squeeze out any singleton dimension in X_test / y_test
-        X_test = X_test.squeeze()
-        y_test = y_test.squeeze().transpose('Y', 'X')
-
-        # Create a Dask client for parallel processing
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
-
-        # Apply `fit_predict` across each (Y,X) grid cell in parallel
-        result = xr.apply_ufunc(
-            self.fit_predict,
-            X_train,
-            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            X_test,
-            y_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            epsilon.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            C.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            degree_array.chunk({'Y': chunksize_y, 'X': chunksize_x}) if degree_array is not None else xr.full_like(epsilon, None),
-            input_core_dims=[
-                ('T', 'features'),  # x
-                ('T',),             # y
-                ('features',),      # x_test
-                (),                 # y_test
-                (),                 # epsilon
-                (),                 # C
-                ()                  # degree
-            ],
-            vectorize=True,
-            output_core_dims=[('output',)],
-            dask='parallelized',
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-
-        # Trigger actual computation
-        result_ = result.compute()
-
-        # Close the Dask client
-        client.close()
-
-        # Return the results, containing both errors and predictions
-        return result_.isel(output=1)
-
-    @staticmethod
-    # ------------------ Probability Calculation Methods ------------------
-
-    @staticmethod
-    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
-        """
-        Return tercile thresholds (T1, T2) from best-fit distribution parameters.
-    
-        dist_code:
-            1: norm
-            2: lognorm
-            3: expon
-            4: gamma
-            5: weibull_min
-            6: t
-            7: poisson
-            8: nbinom
-        """
-        if np.isnan(dist_code):
-            return np.nan, np.nan
-    
-        code = int(dist_code)
-        try:
-            if code == 1:
-                return (
-                    norm.ppf(0.32, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 2:
-                return (
-                    lognorm.ppf(0.32, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
-                )
-            elif code == 3:
-                return (
-                    expon.ppf(0.32, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 4:
-                return (
-                    gamma.ppf(0.32, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
-                )
-            elif code == 5:
-                return (
-                    weibull_min.ppf(0.32, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
-                )
-            elif code == 6:
-                # Note: Renamed 't_dist' to 't' for standard scipy.stats
-                return (
-                    t.ppf(0.32, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
-                )
-            elif code == 7:
-                # Poisson: poisson.ppf(q, mu, loc=0)
-                # ASSUMPTION: 'mu' (mean) is passed as 'shape'
-                #             'loc' is passed as 'loc'
-                #             'scale' is unused
-                return (
-                    poisson.ppf(0.32, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
-                )
-            elif code == 8:
-                # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
-                # ASSUMPTION: 'n' (successes) is passed as 'shape'
-                #             'p' (probability) is passed as 'scale'
-                #             'loc' is passed as 'loc'
-                return (
-                    nbinom.ppf(0.32, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
-                )
-        except Exception:
-            return np.nan, np.nan
-    
-        # Fallback if code is not 1-8
-        return np.nan, np.nan
-        
-    @staticmethod
-    def weibull_shape_solver(k, M, V):
-        """
-        Function to find the root of the Weibull shape parameter 'k'.
-        We find 'k' such that the theoretical variance/mean^2 ratio
-        matches the observed V/M^2 ratio.
-        """
-        # Guard against invalid 'k' values during solving
-        if k <= 0:
-            return -np.inf
-        try:
-            g1 = gamma_function(1 + 1/k)
-            g2 = gamma_function(1 + 2/k)
-            
-            # This is the V/M^2 ratio *implied by k*
-            implied_v_over_m_sq = (g2 / (g1**2)) - 1
-            
-            # This is the *observed* ratio
-            observed_v_over_m_sq = V / (M**2)
-            
-            # Return the difference (we want this to be 0)
-            return observed_v_over_m_sq - implied_v_over_m_sq
-        except ValueError:
-            return -np.inf # Handle math errors
-
-    @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
-    ):
-        """
-        Generic tercile probabilities using best-fit family per grid cell.
-    
-        Inputs (per grid cell):
-        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
-        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
-        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
-        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
-    
-        Strategy:
-        - For each time step, build a predictive distribution of the same family:
-            * Use ``best_guess[t]`` to adjust mean / location;
-            * Keep shape parameters from climatology.
-        - Then compute probabilities:
-            * P(B) = F(T1)
-            * P(N) = F(T2) - F(T1)
-            * P(A) = 1 - F(T2)
-    
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast/hindcast best estimates.
-        error_variance : float
-            Variance of prediction errors.
-        T1 : float
-            Lower tercile threshold.
-        T2 : float
-            Upper tercile threshold.
-        dist_code : int
-            Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
-    
-        Returns
-        -------
-        array-like
-            Probabilities [P(B), P(N), P(A)].
-    
-        Notes
-        -----
-        - Uses :math:`F` as the CDF of the predictive distribution.
-        """
-        
-        best_guess = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        # T1 = np.asarray(T1, dtype=float)
-        # T2 = np.asarray(T2, dtype=float)
-        n_time = best_guess.size
-        out = np.full((3, n_time), np.nan, float)
-
-        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
-            return out
-
-        code = int(dist_code)
-
-        # Normal: loc = forecast; scale from clim
-        if code == 1:
-            error_std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
-
-        # Lognormal: shape = sigma from clim; enforce mean = best_guess
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-            mu = np.log(best_guess) - sigma**2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
-
-
-        # Exponential: keep scale from clim; shift loc so mean = best_guess
-        elif code == 3:
-            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
-            c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        # Gamma: use shape from clim; set scale so mean = best_guess
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5: # Assuming 5 is for Weibull   
-        
-            for i in range(n_time):
-                # Get the scalar values for this specific element (e.g., grid cell)
-                M = best_guess[i]
-                print(M)
-                V = error_variance
-                print(V)
-                
-                # Handle cases with no variance to avoid division by zero
-                if V <= 0 or M <= 0:
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue # Skip to the next element
-        
-                # --- 1. Numerically solve for shape 'k' ---
-                # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
-                initial_guess = 2.0
-                
-                # fsolve finds the root of our helper function
-                k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
-        
-                # --- 2. Check for bad solution and calculate scale 'lambda' ---
-                if k <= 0:
-                    # Solver failed
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue
-                
-                # With 'k' found, we can now algebraically find scale 'lambda'
-                # In scipy.stats, scale is 'scale'
-                lambda_scale = M / gamma_function(1 + 1/k)
-        
-                # --- 3. Calculate Probabilities ---
-                # In scipy.stats, shape 'k' is 'c'
-                # Use the T1 and T2 values for this specific element
-                
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-        
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
-
-        # Student-t: df from clim; scale from clim; loc = best_guess
-        elif code == 6:       
-            # Check if df is valid for variance calculation
-            if dof <= 2:
-                # Cannot calculate scale, fill with NaNs
-                out[0, :] = np.nan
-                out[1, :] = np.nan
-                out[2, :] = np.nan
-            else:
-                # 1. Calculate t-distribution parameters
-                # 'loc' (mean) is just the best_guess
-                loc = best_guess
-                # 'scale' is calculated from the variance and df
-                # Variance = scale**2 * (df / (df - 2))
-                scale = np.sqrt(error_variance * (dof - 2) / dof)
-                
-                # 2. Calculate probabilities
-                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
-                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
-
-                out[0, :] = c1
-                out[1, :] = c2 - c1
-                out[2, :] = 1.0 - c2
-
-        elif code == 7: # Assuming 7 is for Poisson
-            
-            # --- 1. Set the Poisson parameter 'mu' ---
-            # The 'mu' parameter is the mean.
-            
-            # A warning is strongly recommended if error_variance is different from best_guess
-            if not np.allclose(best_guess, error_variance, atol=0.5):
-                print("Warning: 'error_variance' is not equal to 'best_guess'.")
-                print("Poisson model assumes mean=variance and is likely inappropriate.")
-                print("Consider using Negative Binomial.")
-            
-            mu = best_guess
-        
-            # --- 2. Calculate Probabilities ---
-            # poisson.cdf(k, mu) calculates P(X <= k)
-            
-            c1 = poisson.cdf(T1, mu=mu)
-            c2 = poisson.cdf(T2, mu=mu)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8: # Assuming 8 is for Negative Binomial
-            
-            # --- 1. Calculate Negative Binomial Parameters ---
-            # This model is ONLY valid for overdispersion (Variance > Mean).
-            # We will use np.where to set parameters to NaN if V <= M.
-            
-            # p = Mean / Variance
-            p = np.where(error_variance > best_guess, 
-                         best_guess / error_variance, 
-                         np.nan)
-            
-            # n = Mean^2 / (Variance - Mean)
-            n = np.where(error_variance > best_guess, 
-                         (best_guess**2) / (error_variance - best_guess), 
-                         np.nan)
-            
-            # --- 2. Calculate Probabilities ---
-            # The nbinom.cdf function will propagate NaNs, correctly
-            # handling the cases where the model was invalid.
-            
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-            
-        else:
-            raise ValueError(f"Invalid distribution")
-
-        return out
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-
-
-    def compute_prob(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det: xr.DataArray,
-        best_code_da: xr.DataArray = None,
-        best_shape_da: xr.DataArray = None,
-        best_loc_da: xr.DataArray = None,
-        best_scale_da: xr.DataArray = None
-    ) -> xr.DataArray:
-        """
-        Compute tercile probabilities for deterministic hindcasts.
-
-        If dist_method == 'bestfit':
-            - Use cluster-based best-fit distributions to:
-                * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
-                * compute predictive probabilities using the same family.
-
-        Otherwise:
-            - Use empirical terciles from Predictant climatology and the selected
-              parametric / nonparametric method.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data (T, Y, X) or (T, Y, X, M).
-        clim_year_start, clim_year_end : int or str
-            Climatology period (inclusive) for thresholds.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast (T, Y, X).
-        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
-            Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
-
-        Returns
-        -------
-        hindcast_prob : xarray.DataArray
-            Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
-        """
-        # Handle member dimension if present
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
-
-        # Ensure dimension order
-        Predictant = Predictant.transpose("T", "Y", "X")
-
-        # Spatial mask
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-
-        # Climatology subset
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        # Error variance for predictive distributions
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
-
-        # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.32, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-        
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT: zone-wise optimal distributions ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
-                )
-
-            # T1, T2 from best-fit distributions (per grid)
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            # Predictive probabilities using same family
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
-
-        
-    def forecast(
-        self, 
-        Predictant, 
-        clim_year_start, 
-        clim_year_end, 
-        Predictor, 
-        hindcast_det, 
-        Predictor_for_year, 
-        epsilon, 
-        C, 
-        kernel_array, 
-        degree_array, 
-        gamma_array, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None
-    ):
-        """
-        Generates forecasts and computes probabilities for a specific year.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Target variable (T, Y, X).
-        clim_year_start : int
-            Start year for climatology.
-        clim_year_end : int
-            End year for climatology.
-        Predictor : xarray.DataArray
-            Historical predictor data (T, features).
-        hindcast_det : xarray.DataArray
-            Deterministic hindcasts (includes 'prediction' and 'error' outputs).
-        Predictor_for_year : xarray.DataArray
-            Predictor data for the target forecast year (features).
-        epsilon, C, kernel_array, degree_array, gamma_array : xarray.DataArray
-            Hyperparameter grids for the model.
-
-        Returns
-        -------
-        tuple
-            1) The forecast results (error, prediction) for that year.
-            2) The corresponding tercile probabilities (PB, PN, PA).
-        """
-        # Divide the spatial domain into chunks for parallel computation
-        chunksize_x = int(np.round(len(Predictant.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(Predictant.get_index("Y")) / self.nb_cores))
-
-        # Ensure time dimension alignment
-        Predictor['T'] = Predictant['T']
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        Predictor_for_year_ = Predictor_for_year.squeeze()
-
-        # We don't have an actual observed y_test for the forecast year, so fill with NaNs
-        y_test = xr.full_like(epsilon, np.nan)
-
-        # Create a Dask client for parallelization
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
-
-        # Apply `fit_predict` in parallel across the grid, using the forecast year's predictors
-        result = xr.apply_ufunc(
-            self.fit_predict,
-            Predictor,
-            Predictant.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            Predictor_for_year_,
-            y_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            epsilon.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            C.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            kernel_array.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            degree_array.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            gamma_array.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[
-                ('T', 'features'),  # x (training)
-                ('T',),             # y (training target)
-                ('features',),      # x_test (forecast-year predictors)
-                (),                 # y_test (unknown, hence NaN)
-                (),                 # epsilon
-                (),                 # C
-                (),                 # kernel
-                (),                 # degree
-                ()                  # gamma
-            ],
-            vectorize=True,
-            output_core_dims=[('output',)],
-            dask='parallelized',
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-        result_ = result.compute()
-        client.close()
-        result_ = result_.isel(output=1)
-
-        # result_ => dims (output=2, Y, X). 
-        # For a real future forecast, "error" is NaN, "prediction" is the forecast.
-
-        # 2) Compute thresholds T1, T2 from climatology
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.32, 0.67], dim='T')
-        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        
-        # Expand single prediction to T=1 so probability methods can handle it
-        forecast_expanded = result_.expand_dims(
-            T=[pd.Timestamp(Predictor_for_year.coords['T'].values[0]).to_pydatetime()]
-        )
-        year = Predictor_for_year.coords['T'].values[0].astype('datetime64[Y]').astype(int) + 1970
-        # year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        
-        forecast_expanded = forecast_expanded.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        forecast_expanded['T'] = forecast_expanded['T'].astype('datetime64[ns]')
-
-        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
-                )
-            
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                forecast_expanded,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                kwargs={"dof": dof},
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                forecast_expanded,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-        forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return result_da, forecast_prob.transpose('probability', 'T', 'Y', 'X')
-
-
-
-
-
-
-class WAS_MLP:
-    
-    """
-    Multi-Layer Perceptron (MLP) regression model for spatiotemporal climate prediction
-    with spatial clustering, per-cluster hyperparameter optimization, and probabilistic
-    tercile forecasting.
-
-    This class implements a complete workflow for seasonal climate forecasting (typically
-    rainfall or temperature anomalies):
-
-    1. **Spatial clustering** (KMeans) to identify homogeneous predictand regimes.
-    2. **Per-cluster hyperparameter tuning** of MLPRegressor using grid, random, or
-       Bayesian optimization.
-    3. **Spatially-varying model training & prediction** using the best local hyperparameters.
-    4. **Deterministic forecast generation** with parallel computation across the grid.
-    5. **Tercile probability computation** (Below/Normal/Above) using either:
-       - Parametric distributions fitted per grid cell/cluster (bestfit mode),
-       - or non-parametric historical error sampling (nonparam mode).
-
-    Main intended use case: Statistical downscaling or seasonal forecasting with neural
-    networks, combining deterministic predictions with calibrated probabilistic outputs.
-
-    Parameters
-    ----------
-    nb_cores : int, default=1
-        Number of CPU cores for parallel processing (dask + joblib).
-
-    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
-        Method for calculating tercile probabilities:
-        - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs)
-        - 'nonparam' → empirical sampling of historical forecast errors
-
-    n_clusters : int, default=5
-        Number of spatial clusters for KMeans grouping of the predictand field.
-
-    param_grid : dict or None, default=None
-        Hyperparameter search space for MLPRegressor.
-        If None, a reasonable default grid is used:
-            - hidden_layer_sizes: [(10,5), (10,), (20,10), (50,)]
-            - activation: ['relu', 'tanh', 'logistic']
-            - solver: ['adam', 'lbfgs']
-            - alpha: [0.0001, 0.001, 0.01]
-            - learning_rate_init: [0.001, 0.01, 0.1]
-            - max_iter: [200, 500, 1000]
-
-    optimization_method : {'grid', 'random', 'bayesian'}, default='grid'
-        Strategy for hyperparameter search.
-
-    n_trials : int, default=20
-        Number of trials for random or Bayesian optimization.
-
-    cv : int, default=5
-        Number of cross-validation folds during hyperparameter tuning.
-
-    random_state : int, default=42
-        Random seed for reproducibility (KMeans, CV splits, optimizer).
-
-    Attributes
-    ----------
-    nb_cores, dist_method, n_clusters, param_grid, optimization_method, n_trials, cv, random_state
-        Stored initialization parameters.
-
-    optimizer : BaseOptimizer
-        Internal hyperparameter optimization object.
-
-    Methods
-    -------
-    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
-        Performs spatial clustering and optimizes MLP hyperparameters per cluster.
-        Returns spatial maps of the best hyperparameters.
-
-    fit_predict(X_train, y_train, X_test, y_test, hl_sizes, activation, lr_init, maxiter)
-        Fits MLP on a single grid cell using local hyperparameters and predicts.
-        Returns [error, prediction].
-
-    compute_model(X_train, y_train, X_test, y_test, hl_array, act_array, lr_array, maxiter_array)
-        Parallelized prediction across the entire spatial domain using dask.
-
-    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
-                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
-        Computes deterministic hindcast tercile probabilities.
-
-    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
-             Predictor_for_year, hl_array, act_array, lr_array,
-             best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
-        Full forecast pipeline for one target year: deterministic prediction + probabilities.
-
-    Notes
-    -----
-    - All input DataArrays must share compatible coordinates: T (time), Y (latitude), X (longitude).
-    - Negative predictions are automatically clipped to zero (useful for precipitation).
-    - Large domains benefit significantly from higher `nb_cores`.
-    - For `dist_method='bestfit'`, you must provide distribution fit results from `WAS_TransformData`.
-    - The model internally uses `TransformedTargetRegressor` with `StandardScaler` on the target
-      (y) to improve training stability, especially for skewed variables like rainfall.
-        """      
-
-    def __init__(
-        self,
-        nb_cores=1,
-        dist_method="nonparam",
-        n_clusters=5,
-        param_grid=None,
-        optimization_method="grid",  # New parameter
-        n_trials=20,  # New parameter
-        cv=5,  # New parameter
-        random_state=42  # New parameter
-    ):
-
-        self.nb_cores = nb_cores
-        self.dist_method = dist_method
-        self.n_clusters = n_clusters
-        
-        # Define default parameter grid if none provided
-        if param_grid is None:
-            self.param_grid = {
-                'hidden_layer_sizes': [(10,5), (10,), (20,10), (50,)],
-                'activation': ['relu', 'tanh', 'logistic'],
-                'solver': ['adam', 'lbfgs'],
-                'alpha': [0.0001, 0.001, 0.01],
-                'learning_rate_init': [0.001, 0.01, 0.1],
-                'max_iter': [200, 500, 1000]
-            }
-        else:
-            self.param_grid = param_grid
-            
-        self.optimization_method = optimization_method
-        self.n_trials = n_trials
-        self.cv = cv
-        self.random_state = random_state
-        
-        # Initialize optimizer
-        self.optimizer = BaseOptimizer(
-            optimization_method=optimization_method,
-            n_trials=n_trials,
-            cv=cv,
-            random_state=random_state
-        )
-
-    def compute_hyperparameters(self, predictand, predictor, clim_year_start, clim_year_end):
-        """Optimized version with Bayesian optimization."""
-        predictor['T'] = predictand['T']
-        predictand_ = standardize_timeseries(predictand)
-
-        # (a) KMeans clustering
-        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        predictand_dropna = (
-            predictand.to_dataframe()
-                      .reset_index()
-                      .dropna()
-                      .drop(columns=['T'])
-        )
-        
-        col_name = predictand_dropna.columns[2]
-        predictand_dropna['cluster'] = kmeans.fit_predict(
-            predictand_dropna[[col_name]]
-        )
-        
-        df_unique = predictand_dropna.drop_duplicates(subset=['Y', 'X'])
-        dataset = df_unique.set_index(['Y', 'X']).to_xarray()
-        
-        cluster_da = (dataset['cluster'] *
-                      xr.where(~np.isnan(predictand.isel(T=0)), 1, np.nan)
-                     ).drop_vars("T", errors='ignore')
-        
-        _, cluster_da = xr.align(predictand, cluster_da, join="outer")
-        clusters = np.unique(cluster_da)
-        clusters = clusters[~np.isnan(clusters)]
-    
-        hyperparams_cluster = {}
-    
-        # (b) Optimize for each cluster
-        for c in clusters:
-            mask_c = (cluster_da == c)
-            y_cluster = (
-                predictand_.where(mask_c)
-                          .mean(dim=["Y", "X"], skipna=True)
-                          .dropna(dim="T")
-            )
-            if len(y_cluster["T"]) == 0:
-                continue
-    
-            predictor_cluster = predictor.sel(T=y_cluster["T"])
-            X_mat = predictor_cluster.values
-            y_vec = y_cluster.values
-            
-            # # Wrap MLP in a pipeline with scaling
-            # mlp_pipeline = Pipeline([
-            #     ('scaler', StandardScaler()),  # Scales features to mean=0, std=1
-            #     ('mlp', MLPRegressor(random_state=42))
-            # ])
-
-            # MLP with NO X scaling
-            mlp = MLPRegressor(random_state=42, max_iter=1000)
-            
-            # Scale ONLY y for the MLP
-            mlp_y_scaled = TransformedTargetRegressor(
-                regressor=mlp,
-                transformer=StandardScaler()
-            )
-            
-            # # Use optimizer to find best parameters
-            # model = MLPRegressor(random_state=42)
-            best_params = self.optimizer.optimize(
-                mlp_y_scaled,
-                self.param_grid,
-                X_mat,
-                y_vec,
-                scoring='neg_mean_squared_error'
-            )
-            
-            hyperparams_cluster[int(c)] = best_params
-    
-        # (c) Broadcast best hyperparameters to each grid cell
-        hl_array = xr.full_like(cluster_da, np.nan, dtype=object)
-        act_array = xr.full_like(cluster_da, np.nan, dtype=object)
-        solver_array = xr.full_like(cluster_da, np.nan, dtype=object)
-        alpha_array = xr.full_like(cluster_da, np.nan, dtype=float)
-        lr_array = xr.full_like(cluster_da, np.nan, dtype=float)
-        maxiter_array = xr.full_like(cluster_da, np.nan, dtype=float)
-        
-        for c, bp in hyperparams_cluster.items():
-            c_mask = (cluster_da == c)
-            hl_str = str(bp.get('hidden_layer_sizes', (10,5)))
-            act_str = bp.get('activation', 'relu')
-            solver_str = bp.get('solver', 'adam')
-            alpha_val = bp.get('alpha', 0.0001)
-            lr_val = bp.get('learning_rate_init', 0.001)
-            maxiter_val = bp.get('max_iter', 200)
-            
-            hl_array = hl_array.where(~c_mask, other=hl_str)
-            act_array = act_array.where(~c_mask, other=act_str)
-            solver_array = solver_array.where(~c_mask, other=solver_str)
-            alpha_array = alpha_array.where(~c_mask, other=alpha_val)
-            lr_array = lr_array.where(~c_mask, other=lr_val)
-            maxiter_array = maxiter_array.where(~c_mask, other=maxiter_val)
-
-        return hl_array, act_array, solver_array, alpha_array, lr_array, maxiter_array, cluster_da
-
-    # ------------------------------------------------------------------
-    # 2) FIT + PREDICT ON A SINGLE GRID CELL
-    # ------------------------------------------------------------------
-    def fit_predict(self, X_train, y_train, X_test, y_test,
-                    hl_sizes, activation, lr_init, maxiter):
-        """
-        Trains an MLP (with local hyperparams) on the provided training data, then predicts on X_test.
-        Returns [error, prediction].
-
-        Parameters
-        ----------
-        X_train : np.ndarray, shape (n_samples, n_features)
-        y_train : np.ndarray, shape (n_samples,)
-        X_test  : np.ndarray, shape (n_features,) or (1, n_features)
-        y_test  : float or np.nan
-        hl_sizes : str (stored as string in xarray) or None
-        activation : str
-        lr_init : float
-
-        Returns
-        -------
-        np.ndarray of shape (2,)
-            [error, predicted_value]
-        """
-        # Convert hidden_layer_sizes from string if needed
-        if hl_sizes is not None and isinstance(hl_sizes, str):
-            hl_sizes = eval(hl_sizes)  # parse string into tuple
-
-        mask = np.isfinite(y_train) & np.all(np.isfinite(X_train), axis=-1)
-
-        # mlp_model = Pipeline([
-        #     ('scaler', StandardScaler()),
-        #     ('mlp', MLPRegressor(
-        #     hidden_layer_sizes=hl_sizes if hl_sizes else (10,5),
-        #     activation=activation if activation else 'relu',
-        #     solver='adam',
-        #     max_iter=int(maxiter) if not np.isnan(maxiter) else 1000,
-        #     learning_rate_init=lr_init if not np.isnan(lr_init) else 0.001
-        #     # learning_rate_init=lr_init if lr_init else 0.001
-        # ))
-        # ])
-        
-        # MLP with NO X scaling
-        mlp = MLPRegressor(
-        hidden_layer_sizes=hl_sizes if hl_sizes else (10,5),
-        activation=activation if activation else 'relu',
-        solver='adam',
-        max_iter=int(maxiter) if not np.isnan(maxiter) else 1000,
-        learning_rate_init=lr_init if not np.isnan(lr_init) else 0.001
-        # learning_rate_init=lr_init if lr_init else 0.001
-        )
-            
-        # Scale ONLY y for the MLP
-        mlp_model = TransformedTargetRegressor(
-            regressor=mlp,
-            transformer=StandardScaler()
-        )
-        
-        if np.any(mask):
-            X_c = X_train[mask, :]
-            y_c = y_train[mask]
-            mlp_model.fit(X_c, y_c)
-
-            if X_test.ndim == 1:
-                X_test = X_test.reshape(1, -1)
-            mlp_preds = mlp_model.predict(X_test)
-            mlp_preds[mlp_preds < 0] = 0  # clip negative if it's precipitation
-
-            err = np.nan if (y_test is None or np.isnan(y_test)) else (y_test - mlp_preds)
-            return np.array([err, mlp_preds]).squeeze()
-        else:
-            return np.array([np.nan, np.nan]).squeeze()
-
-    # ------------------------------------------------------------------
-    # 3) PARALLELIZED MODEL PREDICTION OVER SPACE
-    # ------------------------------------------------------------------
-    def compute_model(
-        self, 
-        X_train, y_train, 
-        X_test, y_test,
-        hl_array, act_array, lr_array, maxiter_array
-    ):
-        """
-        Runs MLP fit/predict for each (Y,X) cell in parallel, using cluster-based hyperparams.
-        
-        Parameters
-        ----------
-        X_train : xarray.DataArray
-            Training predictors with dims ('T','features').
-        y_train : xarray.DataArray
-            Training target with dims ('T','Y','X').
-        X_test : xarray.DataArray
-            Test predictors, shape ('features',) or broadcastable.
-        y_test : xarray.DataArray
-            Test target with dims ('Y','X').
-        hl_array, act_array, lr_array : xarray.DataArray
-            Local best hyperparameters from compute_hyperparameters.
-
-        Returns
-        -------
-        xarray.DataArray
-            dims ('output', 'Y', 'X'), where 'output' = [error, prediction].
-        """
-        chunksize_x = int(np.round(len(y_train.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(y_train.get_index("Y")) / self.nb_cores))
-
-        # Align time
-        X_train['T'] = y_train['T']
-        y_train = y_train.transpose('T', 'Y', 'X')
-
-        X_test = X_test.squeeze()
-        y_test = y_test.squeeze().transpose('Y', 'X')
-
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            X_train,                           
-            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            X_test,
-            y_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            hl_array.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            act_array.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            lr_array.chunk({'Y': chunksize_y,  'X': chunksize_x}),
-            maxiter_array.chunk({'Y': chunksize_y,  'X': chunksize_x}),
-            
-            input_core_dims=[
-                ('T','features'),  # X_train
-                ('T',),           # y_train
-                ('features',),    # X_test
-                (),               # y_test
-                (),               # hidden_layer_sizes
-                (),               # activation
-                (),                # learning_rate_init
-                ()                # max_iter                
-            ],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('output',)],
-            output_dtypes=[float],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-        result_ = result_da.compute()
-        client.close()
-
-        # Return DataArray with dims ('output','Y','X') => [error, prediction]
-        return result_.isel(output=1)
-
-    # ------------------ Probability Calculation Methods ------------------
-
-    @staticmethod
-    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
-        """
-        Return tercile thresholds (T1, T2) from best-fit distribution parameters.
-    
-        dist_code:
-            1: norm
-            2: lognorm
-            3: expon
-            4: gamma
-            5: weibull_min
-            6: t
-            7: poisson
-            8: nbinom
-        """
-        if np.isnan(dist_code):
-            return np.nan, np.nan
-    
-        code = int(dist_code)
-        try:
-            if code == 1:
-                return (
-                    norm.ppf(0.32, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 2:
-                return (
-                    lognorm.ppf(0.32, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
-                )
-            elif code == 3:
-                return (
-                    expon.ppf(0.32, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 4:
-                return (
-                    gamma.ppf(0.32, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
-                )
-            elif code == 5:
-                return (
-                    weibull_min.ppf(0.32, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
-                )
-            elif code == 6:
-                # Note: Renamed 't_dist' to 't' for standard scipy.stats
-                return (
-                    t.ppf(0.32, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
-                )
-            elif code == 7:
-                # Poisson: poisson.ppf(q, mu, loc=0)
-                # ASSUMPTION: 'mu' (mean) is passed as 'shape'
-                #             'loc' is passed as 'loc'
-                #             'scale' is unused
-                return (
-                    poisson.ppf(0.32, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
-                )
-            elif code == 8:
-                # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
-                # ASSUMPTION: 'n' (successes) is passed as 'shape'
-                #             'p' (probability) is passed as 'scale'
-                #             'loc' is passed as 'loc'
-                return (
-                    nbinom.ppf(0.32, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
-                )
-        except Exception:
-            return np.nan, np.nan
-    
-        # Fallback if code is not 1-8
-        return np.nan, np.nan
-        
-    @staticmethod
-    def weibull_shape_solver(k, M, V):
-        """
-        Function to find the root of the Weibull shape parameter 'k'.
-        We find 'k' such that the theoretical variance/mean^2 ratio
-        matches the observed V/M^2 ratio.
-        """
-        # Guard against invalid 'k' values during solving
-        if k <= 0:
-            return -np.inf
-        try:
-            g1 = gamma_function(1 + 1/k)
-            g2 = gamma_function(1 + 2/k)
-            
-            # This is the V/M^2 ratio *implied by k*
-            implied_v_over_m_sq = (g2 / (g1**2)) - 1
-            
-            # This is the *observed* ratio
-            observed_v_over_m_sq = V / (M**2)
-            
-            # Return the difference (we want this to be 0)
-            return observed_v_over_m_sq - implied_v_over_m_sq
-        except ValueError:
-            return -np.inf # Handle math errors
-
-    @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
-    ):
-        """
-        Generic tercile probabilities using best-fit family per grid cell.
-    
-        Inputs (per grid cell):
-        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
-        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
-        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
-        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
-    
-        Strategy:
-        - For each time step, build a predictive distribution of the same family:
-            * Use ``best_guess[t]`` to adjust mean / location;
-            * Keep shape parameters from climatology.
-        - Then compute probabilities:
-            * P(B) = F(T1)
-            * P(N) = F(T2) - F(T1)
-            * P(A) = 1 - F(T2)
-    
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast/hindcast best estimates.
-        error_variance : float
-            Variance of prediction errors.
-        T1 : float
-            Lower tercile threshold.
-        T2 : float
-            Upper tercile threshold.
-        dist_code : int
-            Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
-    
-        Returns
-        -------
-        array-like
-            Probabilities [P(B), P(N), P(A)].
-    
-        Notes
-        -----
-        - Uses :math:`F` as the CDF of the predictive distribution.
-        """
-        
-        best_guess = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        # T1 = np.asarray(T1, dtype=float)
-        # T2 = np.asarray(T2, dtype=float)
-        n_time = best_guess.size
-        out = np.full((3, n_time), np.nan, float)
-
-        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
-            return out
-
-        code = int(dist_code)
-
-        # Normal: loc = forecast; scale from clim
-        if code == 1:
-            error_std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
-
-        # Lognormal: shape = sigma from clim; enforce mean = best_guess
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-            mu = np.log(best_guess) - sigma**2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
-
-
-        # Exponential: keep scale from clim; shift loc so mean = best_guess
-        elif code == 3:
-            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
-            c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        # Gamma: use shape from clim; set scale so mean = best_guess
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5: # Assuming 5 is for Weibull   
-        
-            for i in range(n_time):
-                # Get the scalar values for this specific element (e.g., grid cell)
-                M = best_guess[i]
-                print(M)
-                V = error_variance
-                print(V)
-                
-                # Handle cases with no variance to avoid division by zero
-                if V <= 0 or M <= 0:
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue # Skip to the next element
-        
-                # --- 1. Numerically solve for shape 'k' ---
-                # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
-                initial_guess = 2.0
-                
-                # fsolve finds the root of our helper function
-                k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
-        
-                # --- 2. Check for bad solution and calculate scale 'lambda' ---
-                if k <= 0:
-                    # Solver failed
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue
-                
-                # With 'k' found, we can now algebraically find scale 'lambda'
-                # In scipy.stats, scale is 'scale'
-                lambda_scale = M / gamma_function(1 + 1/k)
-        
-                # --- 3. Calculate Probabilities ---
-                # In scipy.stats, shape 'k' is 'c'
-                # Use the T1 and T2 values for this specific element
-                
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-        
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
-
-        # Student-t: df from clim; scale from clim; loc = best_guess
-        elif code == 6:       
-            # Check if df is valid for variance calculation
-            if dof <= 2:
-                # Cannot calculate scale, fill with NaNs
-                out[0, :] = np.nan
-                out[1, :] = np.nan
-                out[2, :] = np.nan
-            else:
-                # 1. Calculate t-distribution parameters
-                # 'loc' (mean) is just the best_guess
-                loc = best_guess
-                # 'scale' is calculated from the variance and df
-                # Variance = scale**2 * (df / (df - 2))
-                scale = np.sqrt(error_variance * (dof - 2) / dof)
-                
-                # 2. Calculate probabilities
-                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
-                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
-
-                out[0, :] = c1
-                out[1, :] = c2 - c1
-                out[2, :] = 1.0 - c2
-
-        elif code == 7: # Assuming 7 is for Poisson
-            
-            # --- 1. Set the Poisson parameter 'mu' ---
-            # The 'mu' parameter is the mean.
-            
-            # A warning is strongly recommended if error_variance is different from best_guess
-            if not np.allclose(best_guess, error_variance, atol=0.5):
-                print("Warning: 'error_variance' is not equal to 'best_guess'.")
-                print("Poisson model assumes mean=variance and is likely inappropriate.")
-                print("Consider using Negative Binomial.")
-            
-            mu = best_guess
-        
-            # --- 2. Calculate Probabilities ---
-            # poisson.cdf(k, mu) calculates P(X <= k)
-            
-            c1 = poisson.cdf(T1, mu=mu)
-            c2 = poisson.cdf(T2, mu=mu)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8: # Assuming 8 is for Negative Binomial
-            
-            # --- 1. Calculate Negative Binomial Parameters ---
-            # This model is ONLY valid for overdispersion (Variance > Mean).
-            # We will use np.where to set parameters to NaN if V <= M.
-            
-            # p = Mean / Variance
-            p = np.where(error_variance > best_guess, 
-                         best_guess / error_variance, 
-                         np.nan)
-            
-            # n = Mean^2 / (Variance - Mean)
-            n = np.where(error_variance > best_guess, 
-                         (best_guess**2) / (error_variance - best_guess), 
-                         np.nan)
-            
-            # --- 2. Calculate Probabilities ---
-            # The nbinom.cdf function will propagate NaNs, correctly
-            # handling the cases where the model was invalid.
-            
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-            
-        else:
-            raise ValueError(f"Invalid distribution")
-
-        return out
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-
-
-    def compute_prob(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det: xr.DataArray,
-        best_code_da: xr.DataArray = None,
-        best_shape_da: xr.DataArray = None,
-        best_loc_da: xr.DataArray = None,
-        best_scale_da: xr.DataArray = None
-    ) -> xr.DataArray:
-        """
-        Compute tercile probabilities for deterministic hindcasts.
-
-        If dist_method == 'bestfit':
-            - Use cluster-based best-fit distributions to:
-                * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
-                * compute predictive probabilities using the same family.
-
-        Otherwise:
-            - Use empirical terciles from Predictant climatology and the selected
-              parametric / nonparametric method.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data (T, Y, X) or (T, Y, X, M).
-        clim_year_start, clim_year_end : int or str
-            Climatology period (inclusive) for thresholds.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast (T, Y, X).
-        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
-            Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
-
-        Returns
-        -------
-        hindcast_prob : xarray.DataArray
-            Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
-        """
-        # Handle member dimension if present
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
-
-        # Ensure dimension order
-        Predictant = Predictant.transpose("T", "Y", "X")
-
-        # Spatial mask
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-
-        # Climatology subset
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        # Error variance for predictive distributions
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
-
-        # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.32, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-        
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT: zone-wise optimal distributions ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
-                )
-
-            # T1, T2 from best-fit distributions (per grid)
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            # Predictive probabilities using same family
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
-
-        
-    # ------------------------------------------------------------------
-    # 6) FORECAST METHOD
-    # ------------------------------------------------------------------
-    def forecast(
-        self, 
-        Predictant, 
-        clim_year_start, 
-        clim_year_end, 
-        Predictor, 
-        hindcast_det, 
-        Predictor_for_year, 
-        hl_array, act_array, lr_array, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None
-    ):
-        """
-        Generate a forecast for a single future time (e.g., future year), 
-        then compute tercile probabilities using the chosen distribution method.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data with dims (T, Y, X), used for computing climatological terciles.
-        clim_year_start : int
-            Start year of the climatology period.
-        clim_year_end : int
-            End year of the climatology period.
-        Predictor : xarray.DataArray
-            Historical predictor data with dims (T, features).
-        hindcast_det : xarray.DataArray
-            Historical deterministic forecast with dims (output=[error,prediction], T, Y, X).
-            Used to compute error variance or error samples.
-        Predictor_for_year : xarray.DataArray
-            Predictor data for the forecast year, shape (features,) or (1, features).
-        hl_array, act_array, lr_array : xarray.DataArray
-            Hyperparameters from `compute_hyperparameters`, 
-            each with dims (Y, X) specifying local MLP settings.
-
-        Returns
-        -------
-        result_ : xarray.DataArray
-            dims ('output','Y','X'), containing [error, prediction]. 
-            For a forecast, the "error" is generally NaN.
-        hindcast_prob : xarray.DataArray
-            dims (probability=3, Y, X) => PB, PN, PA tercile probabilities.
-        """
-        # Provide a dummy y_test of NaNs (since we don't have future obs)
-        y_test_dummy = xr.full_like(Predictant.isel(T=0), np.nan)  # shape (Y, X)
-
-        # Prepare chunk sizes
-        chunksize_x = int(np.round(len(Predictant.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(Predictant.get_index("Y")) / self.nb_cores))
-
-        # Align times
-        Predictor['T'] = Predictant['T']
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        Predictor_for_year_ = Predictor_for_year.squeeze()
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        
-        # 1) Fit+predict in parallel for each grid cell
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            Predictor,                              # X_train
-            Predictant.chunk({'Y': chunksize_y, 'X': chunksize_x}),  # y_train
-            Predictor_for_year_,                   # X_test
-            y_test_dummy.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            hl_array.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            act_array.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            lr_array.chunk({'Y': chunksize_y,  'X': chunksize_x}),
-
-            input_core_dims=[
-                ('T','features'),  # X_train
-                ('T',),           # y_train
-                ('features',),    # X_test
-                (),               # y_test
-                (),               # hidden_layer_sizes
-                (),               # activation
-                ()                # learning_rate_init
-            ],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('output',)],
-            output_dtypes=[float],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-        result_ = result_da.compute()
-        client.close()
-        result_ = result_.isel(output=1)
-        
-        result_ = reverse_standardize(result_, Predictant,
-                                        clim_year_start, clim_year_end)
-        # result_ => dims (output=2, Y, X). 
-        # For a real future forecast, "error" is NaN, "prediction" is the forecast.
-
-        # 2) Compute thresholds T1, T2 from climatology
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.32, 0.67], dim='T')
-        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        
-        # Expand single prediction to T=1 so probability methods can handle it
-        forecast_expanded = result_.expand_dims(
-            T=[pd.Timestamp(Predictor_for_year.coords['T'].values[0]).to_pydatetime()]
-        )
-        year = Predictor_for_year.coords['T'].values[0].astype('datetime64[Y]').astype(int) + 1970
-        # year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        
-        forecast_expanded = forecast_expanded.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        forecast_expanded['T'] = forecast_expanded['T'].astype('datetime64[ns]')
-
-        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
-                )
-            
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                forecast_expanded,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                kwargs={"dof": dof},
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                forecast_expanded,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-        forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return forecast_expanded, forecast_prob.transpose('probability', 'T', 'Y', 'X')
-
-
-                  
-class WAS_RandomForest_XGBoost_ML_Stacking:
-    def __init__(
-        self,
-        nb_cores=1,
-        dist_method="nonparam",
-        n_clusters=5,
-        param_grid=None,
-        optimization_method="grid",  # New parameter
-        n_trials=20,  # New parameter
-        cv=5,  # New parameter
-        random_state=42  # New parameter
-    ):
-        self.nb_cores = nb_cores
-        self.dist_method = dist_method
-        self.n_clusters = n_clusters
-        self.optimization_method = optimization_method
-        self.n_trials = n_trials
-        self.cv = cv
-        self.random_state = random_state
-
-        # Define minimal default param_grid if none is provided
-        if param_grid is None:
-            self.param_grid = {
-                "rf__n_estimators": [50, 100, 200],
-                "rf__max_depth": [None, 10, 20],
-                "xgb__n_estimators": [50, 100],
-                "xgb__max_depth": [3, 6, 9],
-                "xgb__learning_rate": [0.01, 0.1, 0.3],
-                "xgb__subsample": [0.8, 1.0],
-                "final_estimator__fit_intercept": [True, False]
-            }
-        else:
-            self.param_grid = param_grid
-            
-        # Initialize optimizer
-        self.optimizer = BaseOptimizer(
-            optimization_method=optimization_method,
-            n_trials=n_trials,
-            cv=cv,
-            random_state=random_state
-        )
-
-    def compute_hyperparameters(self, predictand, predictor, clim_year_start, clim_year_end):
-        """Optimized version with Bayesian optimization."""
-        predictor['T'] = predictand['T']
-        df = (
-            predictand.to_dataframe()
-                      .reset_index()
-                      .dropna()
-                      .drop(columns=['T'])
-        )
-        col_name = df.columns[2]
-        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        df["cluster"] = kmeans.fit_predict(df[[col_name]])
-    
-        df_unique = df.drop_duplicates(subset=["Y", "X"])
-        dataset = df_unique.set_index(["Y", "X"]).to_xarray()
-    
-        cluster_da = (dataset["cluster"] *
-                      xr.where(~np.isnan(predictand.isel(T=0)), 1, np.nan)
-                     ).drop_vars("T", errors="ignore")
-    
-        _, cluster_da = xr.align(predictand, cluster_da, join="outer")
-    
-        # Build the stacking model
-        base_rf = RandomForestRegressor(n_jobs=-1, random_state=42)
-        base_xgb = xgb.XGBRegressor(n_jobs=-1, random_state=42)
-        
-        meta_pipeline = Pipeline([
-            ('scaler', StandardScaler()),
-            ('meta_lin', LinearRegression())
-        ])
-        
-        
-        stacking_core = StackingRegressor(
-            estimators=[
-                ("rf", base_rf), 
-                ("xgb", base_xgb)
-            ],
-            final_estimator=meta_pipeline,
-            cv=3,
-            n_jobs=-1
-        )
-        
-        stacking_model = TransformedTargetRegressor(
-            regressor=stacking_core,
-            transformer=StandardScaler()
-        )
-    
-        unique_clusters = np.unique(cluster_da)
-        unique_clusters = unique_clusters[np.isfinite(unique_clusters)]
-        best_params_for_cluster = {}
-    
-        for c in unique_clusters:
-            mask_c = (cluster_da == c)
-            y_cluster = (
-                predictand.where(mask_c)
-                          .mean(dim=["Y", "X"], skipna=True)
-                          .dropna(dim="T")
-            )
-            if len(y_cluster["T"]) == 0:
-                continue
-    
-            predictor_cluster = predictor.sel(T=y_cluster["T"])
-            X_mat = predictor_cluster.values
-            y_vec = y_cluster.values
-    
-            # Use optimizer to find best parameters
-            best_params = self.optimizer.optimize(
-                stacking_model,
-                self.param_grid,
-                X_mat,
-                y_vec,
-                scoring='neg_mean_squared_error'
-            )
-            best_params_for_cluster[int(c)] = best_params
-    
-        # Broadcast best hyperparameter sets back to each grid cell
-        best_param_da = xr.full_like(cluster_da, np.nan, dtype=object)
-        for c, bp in best_params_for_cluster.items():
-            c_mask = (cluster_da == c)
-            best_param_da = best_param_da.where(~c_mask, other=str(bp))
-    
-        best_param_da, _ = xr.align(best_param_da, predictand, join="outer")
-
-        return best_param_da, cluster_da
-
-    # ----------------------------------------------------------------------
-    # 2) FIT + PREDICT FOR A SINGLE GRID CELL
-    # ----------------------------------------------------------------------
-    def fit_predict(self, X_train, y_train, X_test, y_test, best_params_str):
-        """
-        Fit a local StackingRegressor with the best hyperparams (parsed from best_params_str),
-        then predict on X_test, returning [error, prediction].
-
-        Parameters
-        ----------
-        X_train : np.ndarray, shape (n_samples, n_features)
-        y_train : np.ndarray, shape (n_samples,)
-        X_test :  np.ndarray, shape (n_features,) or (1, n_features)
-        y_test :  float or np.nan
-        best_params_str : str
-            String of best_params (e.g. "{'estimators__rf__n_estimators':100, ...}")
-
-        Returns
-        -------
-        np.ndarray of shape (2,)
-            [error, predicted_value]
-        """
-        mask = np.isfinite(y_train) & np.all(np.isfinite(X_train), axis=-1)
-        if not isinstance(best_params_str, str) or len(best_params_str.strip()) == 0:
-            return np.array([np.nan, np.nan])
-
-        # Parse param dictionary
-        best_params = eval(best_params_str)  # or safer parse, e.g. json.loads
-
-        # Build fresh model
-        base_rf = RandomForestRegressor(n_jobs=-1, random_state=42)
-        base_xgb = xgb.XGBRegressor(n_jobs=-1, random_state=42)
-        
-        meta_pipeline = Pipeline([
-            ('scaler', StandardScaler()),
-            ('meta_lin', LinearRegression())
-        ])
-        
-        
-        stacking_core = StackingRegressor(
-            estimators=[
-                ("rf", base_rf), 
-                ("xgb", base_xgb)
-            ],
-            final_estimator=meta_pipeline,
-            cv=3,
-            n_jobs=-1
-        )
-        
-        stacking_model = TransformedTargetRegressor(
-            regressor=stacking_core,
-            transformer=StandardScaler()
-        )
-
-        # Set best_params
-        # Call set_params on the internal stacking core
-        stacking_model.regressor.set_params(**best_params)
-
-        if np.any(mask):
-            X_c = X_train[mask, :]
-            y_c = y_train[mask]
-            stacking_model.fit(X_c, y_c)
-
-            if X_test.ndim == 1:
-                X_test = X_test.reshape(1, -1)
-
-            preds = stacking_model.predict(X_test)
-            # e.g., clamp negative if precipitation
-            preds[preds < 0] = 0
-
-            err = np.nan if np.isnan(y_test) else (y_test - preds)
-            return np.array([err, preds]).squeeze()
-        else:
-            return np.array([np.nan, np.nan]).squeeze()
-
-    # ----------------------------------------------------------------------
-    # 3) PARALLELIZED MODEL TRAINING & PREDICTION OVER SPACE
-    # ----------------------------------------------------------------------
-    def compute_model(self, X_train, y_train, X_test, y_test, best_param_da):
-        """
-        Parallel fit/predict across the entire spatial domain, using cluster-based hyperparams.
-
-        Parameters
-        ----------
-        X_train : xarray.DataArray
-            Training data (predictors) with dims ('T','features').
-        y_train : xarray.DataArray
-            Training target with dims ('T','Y','X').
-        X_test : xarray.DataArray
-            Test data (predictors), shape (features,) or broadcastable across (Y, X).
-        y_test : xarray.DataArray
-            Test target with dims ('Y','X').
-        best_param_da : xarray.DataArray
-            The per-grid best_params from compute_hyperparameters (as strings).
-
-        Returns
-        -------
-        xarray.DataArray
-            dims ('output','Y','X'), where 'output' = [error, prediction].
-        """
-        chunksize_x = int(np.round(len(y_train.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(y_train.get_index("Y")) / self.nb_cores))
-
-        # Align time
-        X_train['T'] = y_train['T']
-        y_train = y_train.transpose('T', 'Y', 'X')
-
-        # Squeeze test data
-        X_test = X_test.squeeze()
-        y_test = y_test.squeeze().transpose('Y','X')
-
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            X_train,
-            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            X_test,
-            y_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            best_param_da.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[
-                ('T','features'),  # X_train
-                ('T',),           # y_train
-                ('features',),    # X_test
-                (),               # y_test
-                ()                # best_params_str
-            ],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('output',)],
-            output_dtypes=[float],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-        result_ = result_da.compute()
-        client.close()
-        return result_.isel(output=1)
-
-    # ------------------ Probability Calculation Methods ------------------
-
-    @staticmethod
-    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
-        """
-        Return tercile thresholds (T1, T2) from best-fit distribution parameters.
-    
-        dist_code:
-            1: norm
-            2: lognorm
-            3: expon
-            4: gamma
-            5: weibull_min
-            6: t
-            7: poisson
-            8: nbinom
-        """
-        if np.isnan(dist_code):
-            return np.nan, np.nan
-    
-        code = int(dist_code)
-        try:
-            if code == 1:
-                return (
-                    norm.ppf(0.32, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 2:
-                return (
-                    lognorm.ppf(0.32, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
-                )
-            elif code == 3:
-                return (
-                    expon.ppf(0.32, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 4:
-                return (
-                    gamma.ppf(0.32, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
-                )
-            elif code == 5:
-                return (
-                    weibull_min.ppf(0.32, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
-                )
-            elif code == 6:
-                # Note: Renamed 't_dist' to 't' for standard scipy.stats
-                return (
-                    t.ppf(0.32, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
-                )
-            elif code == 7:
-                # Poisson: poisson.ppf(q, mu, loc=0)
-                # ASSUMPTION: 'mu' (mean) is passed as 'shape'
-                #             'loc' is passed as 'loc'
-                #             'scale' is unused
-                return (
-                    poisson.ppf(0.32, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
-                )
-            elif code == 8:
-                # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
-                # ASSUMPTION: 'n' (successes) is passed as 'shape'
-                #             'p' (probability) is passed as 'scale'
-                #             'loc' is passed as 'loc'
-                return (
-                    nbinom.ppf(0.32, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
-                )
-        except Exception:
-            return np.nan, np.nan
-    
-        # Fallback if code is not 1-8
-        return np.nan, np.nan
-        
-    @staticmethod
-    def weibull_shape_solver(k, M, V):
-        """
-        Function to find the root of the Weibull shape parameter 'k'.
-        We find 'k' such that the theoretical variance/mean^2 ratio
-        matches the observed V/M^2 ratio.
-        """
-        # Guard against invalid 'k' values during solving
-        if k <= 0:
-            return -np.inf
-        try:
-            g1 = gamma_function(1 + 1/k)
-            g2 = gamma_function(1 + 2/k)
-            
-            # This is the V/M^2 ratio *implied by k*
-            implied_v_over_m_sq = (g2 / (g1**2)) - 1
-            
-            # This is the *observed* ratio
-            observed_v_over_m_sq = V / (M**2)
-            
-            # Return the difference (we want this to be 0)
-            return observed_v_over_m_sq - implied_v_over_m_sq
-        except ValueError:
-            return -np.inf # Handle math errors
-
-    @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
-    ):
-        """
-        Generic tercile probabilities using best-fit family per grid cell.
-    
-        Inputs (per grid cell):
-        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
-        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
-        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
-        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
-    
-        Strategy:
-        - For each time step, build a predictive distribution of the same family:
-            * Use ``best_guess[t]`` to adjust mean / location;
-            * Keep shape parameters from climatology.
-        - Then compute probabilities:
-            * P(B) = F(T1)
-            * P(N) = F(T2) - F(T1)
-            * P(A) = 1 - F(T2)
-    
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast/hindcast best estimates.
-        error_variance : float
-            Variance of prediction errors.
-        T1 : float
-            Lower tercile threshold.
-        T2 : float
-            Upper tercile threshold.
-        dist_code : int
-            Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
-    
-        Returns
-        -------
-        array-like
-            Probabilities [P(B), P(N), P(A)].
-    
-        Notes
-        -----
-        - Uses :math:`F` as the CDF of the predictive distribution.
-        """
-        
-        best_guess = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        # T1 = np.asarray(T1, dtype=float)
-        # T2 = np.asarray(T2, dtype=float)
-        n_time = best_guess.size
-        out = np.full((3, n_time), np.nan, float)
-
-        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
-            return out
-
-        code = int(dist_code)
-
-        # Normal: loc = forecast; scale from clim
-        if code == 1:
-            error_std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
-
-        # Lognormal: shape = sigma from clim; enforce mean = best_guess
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-            mu = np.log(best_guess) - sigma**2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
-
-
-        # Exponential: keep scale from clim; shift loc so mean = best_guess
-        elif code == 3:
-            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
-            c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        # Gamma: use shape from clim; set scale so mean = best_guess
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5: # Assuming 5 is for Weibull   
-        
-            for i in range(n_time):
-                # Get the scalar values for this specific element (e.g., grid cell)
-                M = best_guess[i]
-                print(M)
-                V = error_variance
-                print(V)
-                
-                # Handle cases with no variance to avoid division by zero
-                if V <= 0 or M <= 0:
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue # Skip to the next element
-        
-                # --- 1. Numerically solve for shape 'k' ---
-                # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
-                initial_guess = 2.0
-                
-                # fsolve finds the root of our helper function
-                k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
-        
-                # --- 2. Check for bad solution and calculate scale 'lambda' ---
-                if k <= 0:
-                    # Solver failed
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue
-                
-                # With 'k' found, we can now algebraically find scale 'lambda'
-                # In scipy.stats, scale is 'scale'
-                lambda_scale = M / gamma_function(1 + 1/k)
-        
-                # --- 3. Calculate Probabilities ---
-                # In scipy.stats, shape 'k' is 'c'
-                # Use the T1 and T2 values for this specific element
-                
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-        
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
-
-        # Student-t: df from clim; scale from clim; loc = best_guess
-        elif code == 6:       
-            # Check if df is valid for variance calculation
-            if dof <= 2:
-                # Cannot calculate scale, fill with NaNs
-                out[0, :] = np.nan
-                out[1, :] = np.nan
-                out[2, :] = np.nan
-            else:
-                # 1. Calculate t-distribution parameters
-                # 'loc' (mean) is just the best_guess
-                loc = best_guess
-                # 'scale' is calculated from the variance and df
-                # Variance = scale**2 * (df / (df - 2))
-                scale = np.sqrt(error_variance * (dof - 2) / dof)
-                
-                # 2. Calculate probabilities
-                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
-                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
-
-                out[0, :] = c1
-                out[1, :] = c2 - c1
-                out[2, :] = 1.0 - c2
-
-        elif code == 7: # Assuming 7 is for Poisson
-            
-            # --- 1. Set the Poisson parameter 'mu' ---
-            # The 'mu' parameter is the mean.
-            
-            # A warning is strongly recommended if error_variance is different from best_guess
-            if not np.allclose(best_guess, error_variance, atol=0.5):
-                print("Warning: 'error_variance' is not equal to 'best_guess'.")
-                print("Poisson model assumes mean=variance and is likely inappropriate.")
-                print("Consider using Negative Binomial.")
-            
-            mu = best_guess
-        
-            # --- 2. Calculate Probabilities ---
-            # poisson.cdf(k, mu) calculates P(X <= k)
-            
-            c1 = poisson.cdf(T1, mu=mu)
-            c2 = poisson.cdf(T2, mu=mu)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8: # Assuming 8 is for Negative Binomial
-            
-            # --- 1. Calculate Negative Binomial Parameters ---
-            # This model is ONLY valid for overdispersion (Variance > Mean).
-            # We will use np.where to set parameters to NaN if V <= M.
-            
-            # p = Mean / Variance
-            p = np.where(error_variance > best_guess, 
-                         best_guess / error_variance, 
-                         np.nan)
-            
-            # n = Mean^2 / (Variance - Mean)
-            n = np.where(error_variance > best_guess, 
-                         (best_guess**2) / (error_variance - best_guess), 
-                         np.nan)
-            
-            # --- 2. Calculate Probabilities ---
-            # The nbinom.cdf function will propagate NaNs, correctly
-            # handling the cases where the model was invalid.
-            
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-            
-        else:
-            raise ValueError(f"Invalid distribution")
-
-        return out
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-
-
-    def compute_prob(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det: xr.DataArray,
-        best_code_da: xr.DataArray = None,
-        best_shape_da: xr.DataArray = None,
-        best_loc_da: xr.DataArray = None,
-        best_scale_da: xr.DataArray = None
-    ) -> xr.DataArray:
-        """
-        Compute tercile probabilities for deterministic hindcasts.
-
-        If dist_method == 'bestfit':
-            - Use cluster-based best-fit distributions to:
-                * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
-                * compute predictive probabilities using the same family.
-
-        Otherwise:
-            - Use empirical terciles from Predictant climatology and the selected
-              parametric / nonparametric method.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data (T, Y, X) or (T, Y, X, M).
-        clim_year_start, clim_year_end : int or str
-            Climatology period (inclusive) for thresholds.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast (T, Y, X).
-        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
-            Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
-
-        Returns
-        -------
-        hindcast_prob : xarray.DataArray
-            Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
-        """
-        # Handle member dimension if present
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
-
-        # Ensure dimension order
-        Predictant = Predictant.transpose("T", "Y", "X")
-
-        # Spatial mask
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-
-        # Climatology subset
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        # Error variance for predictive distributions
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
-
-        # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.32, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-        
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT: zone-wise optimal distributions ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
-                )
-
-            # T1, T2 from best-fit distributions (per grid)
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            # Predictive probabilities using same family
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
-
-    # ----------------------------------------------------------------------
-    # 6) FORECAST METHOD
-    # ----------------------------------------------------------------------
-    def forecast(
-        self, 
-        Predictant, 
-        clim_year_start, 
-        clim_year_end, 
-        Predictor, 
-        hindcast_det, 
-        Predictor_for_year, 
-        best_param_da, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None
-    ):
-        """
-        Generate a forecast for a single time (e.g., future year), then compute 
-        tercile probabilities from the chosen distribution method.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data with dims (T, Y, X), used for climatological terciles.
-        clim_year_start : int
-            Start year of the climatology.
-        clim_year_end : int
-            End year of the climatology.
-        Predictor : xarray.DataArray
-            Historical predictor data, dims (T, features).
-        hindcast_det : xarray.DataArray
-            Historical deterministic forecast, dims (output=[error,prediction], T, Y, X).
-            Used to compute error variance or error samples.
-        Predictor_for_year : xarray.DataArray
-            Predictor data for the forecast year, shape (features,) or (1, features).
-        best_param_da : xarray.DataArray
-            Grid-based hyperparameters from compute_hyperparameters.
-
-        Returns
-        -------
-        result_ : xarray.DataArray
-            dims ('output','Y','X') => [error, prediction].
-            For a forecast, the 'error' will generally be NaN.
-        hindcast_prob : xarray.DataArray
-            dims (probability=3, Y, X) => tercile probabilities PB, PN, PA.
-        """
-        # We need a dummy y_test array, because fit_predict expects y_test
-        # but we don't have actual future obs.
-        y_test_dummy = xr.full_like(Predictant.isel(T=0), np.nan)  # shape (Y, X)
-
-        # Prepare chunk sizes for parallel
-        chunksize_x = int(np.round(len(Predictant.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(Predictant.get_index("Y")) / self.nb_cores))
-
-        # Align times, typically we set Predictor['T'] = Predictant['T']
-        Predictor['T'] = Predictant['T']
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        
-        # Squeeze the forecast predictor
-        Predictor_for_year_ = Predictor_for_year.squeeze()
-
-        # 1) Fit+predict with the stacked model in parallel, returning [error, pred]
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            Predictor,                          # X_train
-            Predictant_st.chunk({'Y': chunksize_y, 'X': chunksize_x}),  # y_train
-            Predictor_for_year_,               # X_test
-            y_test_dummy.chunk({'Y': chunksize_y, 'X': chunksize_x}), # y_test (dummy)
-            best_param_da.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[
-                ('T','features'),  # X_train
-                ('T',),           # y_train
-                ('features',),    # X_test
-                (),               # y_test
-                ()                # best_params_str
-            ],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('output',)],  # We'll get shape (2,) => [err, pred]
-            output_dtypes=[float],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-        result_ = result_da.compute()
-        client.close()
-        result_ = result_.isel(output=1)
-        
-        result_ = reverse_standardize(result_, Predictant,
-                                        clim_year_start, clim_year_end)
-        # result_ => dims (output=2, Y, X). 
-        # For a real future forecast, "error" is NaN, "prediction" is the forecast.
-
-        # 2) Compute thresholds T1, T2 from climatology
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.32, 0.67], dim='T')
-        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        
-        # Expand single prediction to T=1 so probability methods can handle it
-        forecast_expanded = result_.expand_dims(
-            T=[pd.Timestamp(Predictor_for_year.coords['T'].values[0]).to_pydatetime()]
-        )
-        year = Predictor_for_year.coords['T'].values[0].astype('datetime64[Y]').astype(int) + 1970
-        # year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        
-        forecast_expanded = forecast_expanded.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        forecast_expanded['T'] = forecast_expanded['T'].astype('datetime64[ns]')
-
-        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
-                )
-            
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                forecast_expanded,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                kwargs={"dof": dof},
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                forecast_expanded,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-        forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return forecast_expanded, forecast_prob.transpose('probability', 'T', 'Y', 'X')
-
-
-class WAS_RandomForest_XGBoost_Stacking_MLP:
-    """
-    Ensemble stacking regression model that combines **Random Forest (RF)** and **XGBoost (XGB)**
-    as base learners with a **Linear Regression** meta-learner, optimized for spatiotemporal
-    climate prediction (typically seasonal rainfall totals, anomalies, or other continuous
-    predictands).
-
-    Workflow summary:
-    1. **Spatial clustering** (KMeans) on a summary statistic of the predictand (default: mean over time)
-       to identify homogeneous climate regimes.
-    2. **Per-cluster hyperparameter optimization** of the full stacking pipeline using grid, random,
-       or Bayesian search.
-    3. **Broadcast best hyperparameters** to every grid cell (Y, X).
-    4. **Spatially parallel training & prediction** using local best hyperparameters.
-    5. **Deterministic forecast generation** (point prediction + optional error).
-    6. **Tercile probability computation** (Below/Normal/Above = PB/PN/PA) using either:
-       - Parametric best-fit distributions per grid cell/cluster ('bestfit')
-       - Non-parametric sampling of historical forecast errors ('nonparam')
-
-    This model leverages the complementary strengths of tree-based methods (RF + XGB) for robust
-    non-linear modeling and a simple linear meta-learner for final calibration.
-
-    Parameters
-    ----------
-    nb_cores : int, default=1
-        Number of CPU cores for parallel processing (dask + joblib).
-
-    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
-        Method for computing tercile probabilities:
-        - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs)
-        - 'nonparam' → empirical sampling of historical forecast errors
-
-    n_clusters : int, default=5
-        Number of spatial clusters for KMeans grouping of the predictand field.
-
-    param_grid : dict or None, default=None
-        Hyperparameter search space for the stacking regressor.
-        If None, a minimal default grid is used:
-            - rf__n_estimators: [50, 100, 200]
-            - rf__max_depth: [None, 10, 20]
-            - xgb__n_estimators: [50, 100]
-            - xgb__max_depth: [3, 6, 9]
-            - xgb__learning_rate: [0.01, 0.1, 0.3]
-            - xgb__subsample: [0.8, 1.0]
-            - final_estimator__fit_intercept: [True, False]
-
-    optimization_method : {'grid', 'random', 'bayesian'}, default='grid'
-        Strategy for hyperparameter search.
-
-    n_trials : int, default=20
-        Number of trials for 'random' or 'bayesian' optimization.
-
-    cv : int, default=5
-        Number of cross-validation folds during tuning.
-
-    random_state : int, default=42
-        Random seed for reproducibility (KMeans, CV, models, optimizer).
-
-    Attributes
-    ----------
-    nb_cores, dist_method, n_clusters, param_grid, optimization_method, n_trials, cv, random_state
-        Stored initialization parameters.
-
-    optimizer : BaseOptimizer
-        Internal hyperparameter optimization object.
-
-    Methods
-    -------
-    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
-        Clusters predictand → optimizes stacking hyperparameters per cluster →
-        returns spatial map of best parameter sets (as stringified dictionaries).
-
-    fit_predict(X_train, y_train, X_test, y_test, best_params_str)
-        Fits stacking model on one grid cell using local hyperparameters and predicts.
-        Returns [error, prediction].
-
-    compute_model(X_train, y_train, X_test, y_test, best_param_da)
-        Parallelized prediction across entire spatial domain using local best params.
-
-    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
-                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
-        Computes deterministic hindcast tercile probabilities.
-
-    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
-             Predictor_for_year, best_param_da, best_code_da=None, best_shape_da=None,
-             best_loc_da=None, best_scale_da=None)
-        Full forecast pipeline for one target year: deterministic prediction + probabilities.
-
-    Notes
-    -----
-    - All input DataArrays must share compatible coordinates: T (time), Y (latitude), X (longitude).
-    - Negative predictions are automatically clipped to zero (useful for precipitation).
-    - The stacking model uses `TransformedTargetRegressor` with `StandardScaler` on the target (y)
-      for improved training stability, especially for skewed variables.
-    - Hyperparameters are stored as stringified dictionaries in xarray due to nested/complex structure.
-    - Large spatial domains benefit greatly from higher `nb_cores`.
-    - For `dist_method='bestfit'`, distribution fit results from `WAS_TransformData` must be provided.
-    """
-    def __init__(
-        self,
-        nb_cores=1,
-        dist_method="nonparam",
-        n_clusters=5,
-        param_grid=None,
-        optimization_method="grid",  # New parameter
-        n_trials=20,  # New parameter
-        cv=5,  # New parameter
-        random_state=42  # New parameter
-    ):
-        self.nb_cores = nb_cores
-        self.dist_method = dist_method
-        self.n_clusters = n_clusters
-        self.optimization_method = optimization_method
-        self.n_trials = n_trials
-        self.cv = cv
-        self.random_state = random_state
-
-        # Define minimal param_grid if none is provided
-        if param_grid is None:
-            self.param_grid = {
-                "rf__n_estimators": [50, 100],
-                "xgb__max_depth": [3, 6],
-                "xgb__learning_rate": [0.01, 0.1],
-                "final_estimator__hidden_layer_sizes": [(50,), (30,10)],
-                "final_estimator__activation": ["relu", "tanh"],
-                "final_estimator__alpha": [0.0001, 0.001],
-                "final_estimator__learning_rate_init": [0.001, 0.01]
-            }
-        else:
-            self.param_grid = param_grid
-            
-        # Initialize optimizer
-        self.optimizer = BaseOptimizer(
-            optimization_method=optimization_method,
-            n_trials=n_trials,
-            cv=cv,
-            random_state=random_state
-        )
-
-    def compute_hyperparameters(self, predictand, predictor, clim_year_start, clim_year_end):
-        predictor['T'] = predictand['T']
-        """Optimized version with Bayesian optimization."""
-        df = (
-            predictand.to_dataframe()
-                      .reset_index()
-                      .dropna()
-                      .drop(columns=['T'])
-        )
-        col_name = df.columns[2]
-        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        df["cluster"] = kmeans.fit_predict(df[[col_name]])
-    
-        df_unique = df.drop_duplicates(subset=["Y", "X"])
-        dataset = df_unique.set_index(["Y", "X"]).to_xarray()
-        
-        cluster_da = (dataset["cluster"] *
-                      xr.where(~np.isnan(predictand.isel(T=0)), 1, np.nan)
-                     ).drop_vars("T", errors="ignore")
-        _, cluster_da = xr.align(predictand, cluster_da, join="outer")
-    
-        # Build stacking model
-        base_rf = RandomForestRegressor(n_jobs=-1, random_state=42)
-        base_xgb = xgb.XGBRegressor(n_jobs=-1, random_state=42)
-        
-        # Wrap MLP (meta) in a pipeline with scaling
-        meta_pipeline = Pipeline([
-            ('scaler', StandardScaler()),  
-            ('meta_mlp', MLPRegressor(random_state=42, max_iter=1000))
-        ])
-        
-        stacking = StackingRegressor(
-            estimators=[('rf', base_rf), ('xgb', base_xgb)],
-            final_estimator=meta_pipeline,  
-            n_jobs=-1
-        )
-        # Scale ONLY y, and automatically inverse-transform predictions back to original y units
-        stacking_model = TransformedTargetRegressor(
-            regressor=stacking,
-            transformer=StandardScaler()   
-        )    
-        unique_clusters = np.unique(cluster_da)
-        unique_clusters = unique_clusters[np.isfinite(unique_clusters)]
-        best_params_for_cluster = {}
-    
-        for c in unique_clusters:
-            mask_c = (cluster_da == c)
-            y_cluster = (
-                predictand.where(mask_c)
-                          .mean(dim=["Y", "X"], skipna=True)
-                          .dropna(dim="T")
-            )
-            if len(y_cluster["T"]) == 0:
-                continue
-    
-            predictor_cluster = predictor.sel(T=y_cluster["T"])
-            X_mat = predictor_cluster.values
-            y_vec = y_cluster.values
-    
-            # Use optimizer to find best parameters
-            best_params = self.optimizer.optimize(
-                stacking_model,
-                self.param_grid,
-                X_mat,
-                y_vec,
-                scoring='neg_mean_squared_error'
-            )
-            best_params_for_cluster[int(c)] = best_params
-    
-        # Broadcast best hyperparameters
-        best_param_da = xr.full_like(cluster_da, np.nan, dtype=object)
-        for c, bp in best_params_for_cluster.items():
-            c_mask = (cluster_da == c)
-            best_param_da = best_param_da.where(~c_mask, other=str(bp))
-
-        return best_param_da, cluster_da
-
-    # -----------------------------------------------------------------
-    # 2) FIT + PREDICT FOR A SINGLE GRID CELL
-    # -----------------------------------------------------------------
-    def fit_predict(self, X_train, y_train, X_test, y_test, best_params_str):
-        """
-        For a single grid cell, parse the local best_params dict, set them on the 
-        StackingRegressor (with RF + XGB base, MLP meta), train and predict.
-        
-        Returns [error, prediction].
-        
-        Parameters
-        ----------
-        X_train : np.ndarray, shape (n_samples, n_features)
-        y_train : np.ndarray, shape (n_samples,)
-        X_test :  np.ndarray, shape (n_features,) or (1, n_features)
-        y_test :  float or np.nan
-        best_params_str : str
-            Local best hyperparams as a stringified dict.
-
-        Returns
-        -------
-        np.ndarray of shape (2,)
-            [error, prediction]
-        """
-        mask = np.isfinite(y_train) & np.all(np.isfinite(X_train), axis=-1)
-
-        # If there's no valid best_params or no data, return NaNs
-        if not isinstance(best_params_str, str) or len(best_params_str.strip()) == 0:
-            return np.array([np.nan, np.nan])
-
-        # Parse the params
-        best_params = eval(best_params_str)  
-        
-        # Build stacking model
-        base_rf = RandomForestRegressor(n_jobs=-1, random_state=42)
-        base_xgb = xgb.XGBRegressor(n_jobs=-1, random_state=42)
-        
-        # Wrap MLP (meta) in a pipeline with scaling
-        meta_pipeline = Pipeline([
-            ('scaler', StandardScaler()),  
-            ('meta_mlp', MLPRegressor(random_state=42, max_iter=1000))
-        ])
-        
-        stacking = StackingRegressor(
-            estimators=[('rf', base_rf), ('xgb', base_xgb)],
-            final_estimator=meta_pipeline,  
-            n_jobs=-1
-        )
-        # Scale ONLY y, and automatically inverse-transform predictions back to original y units
-        stacking_model = TransformedTargetRegressor(
-            regressor=stacking,
-            transformer=StandardScaler()   
-        ) 
-        # Apply local best params
-        stacking_model.regressor.set_params(**best_params)
-
-        if np.any(mask):
-            X_c = X_train[mask, :]
-            y_c = y_train[mask]
-
-            stacking_model.fit(X_c, y_c)
-
-            if X_test.ndim == 1:
-                X_test = X_test.reshape(1, -1)
-
-            preds = stacking_model.predict(X_test)
-            preds[preds < 0] = 0  # clip negatives if it's precipitation
-            err = np.nan if (np.isnan(y_test)) else (y_test - preds)
-            return np.array([err, preds]).squeeze()
-        else:
-            return np.array([np.nan, np.nan]).squeeze()
-
-    # -----------------------------------------------------------------
-    # 3) PARALLELIZED COMPUTE_MODEL
-    # -----------------------------------------------------------------
-    def compute_model(self, X_train, y_train, X_test, y_test, best_param_da):
-        """
-        Parallel training + prediction across the entire spatial domain,
-        referencing local best_params for each grid cell.
-
-        Returns an xarray.DataArray with dim 'output' = [error, prediction].
-        """
-        # chunk sizes for parallel
-        chunksize_x = int(np.round(len(y_train.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(y_train.get_index("Y")) / self.nb_cores))
-
-        # Align time
-        X_train['T'] = y_train['T']
-        y_train = y_train.transpose('T','Y','X')
-
-        X_test = X_test.squeeze()
-        y_test = y_test.squeeze().transpose('Y','X')
-
-        # Parallel execution with Dask
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            X_train,
-            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            X_test,
-            y_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            best_param_da.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[
-                ('T','features'),
-                ('T',),
-                ('features',),
-                (),
-                ()
-            ],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('output',)],
-            output_dtypes=[float],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-        result_ = result_da.compute()
-        client.close()
-        return result_.isel(output=1)
-
-    # ------------------ Probability Calculation Methods ------------------
-
-    @staticmethod
-    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
-        """
-        Return tercile thresholds (T1, T2) from best-fit distribution parameters.
-    
-        dist_code:
-            1: norm
-            2: lognorm
-            3: expon
-            4: gamma
-            5: weibull_min
-            6: t
-            7: poisson
-            8: nbinom
-        """
-        if np.isnan(dist_code):
-            return np.nan, np.nan
-    
-        code = int(dist_code)
-        try:
-            if code == 1:
-                return (
-                    norm.ppf(0.32, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 2:
-                return (
-                    lognorm.ppf(0.32, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
-                )
-            elif code == 3:
-                return (
-                    expon.ppf(0.32, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 4:
-                return (
-                    gamma.ppf(0.32, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
-                )
-            elif code == 5:
-                return (
-                    weibull_min.ppf(0.32, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
-                )
-            elif code == 6:
-                # Note: Renamed 't_dist' to 't' for standard scipy.stats
-                return (
-                    t.ppf(0.32, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
-                )
-            elif code == 7:
-                # Poisson: poisson.ppf(q, mu, loc=0)
-                # ASSUMPTION: 'mu' (mean) is passed as 'shape'
-                #             'loc' is passed as 'loc'
-                #             'scale' is unused
-                return (
-                    poisson.ppf(0.32, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
-                )
-            elif code == 8:
-                # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
-                # ASSUMPTION: 'n' (successes) is passed as 'shape'
-                #             'p' (probability) is passed as 'scale'
-                #             'loc' is passed as 'loc'
-                return (
-                    nbinom.ppf(0.32, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
-                )
-        except Exception:
-            return np.nan, np.nan
-    
-        # Fallback if code is not 1-8
-        return np.nan, np.nan
-        
-    @staticmethod
-    def weibull_shape_solver(k, M, V):
-        """
-        Function to find the root of the Weibull shape parameter 'k'.
-        We find 'k' such that the theoretical variance/mean^2 ratio
-        matches the observed V/M^2 ratio.
-        """
-        # Guard against invalid 'k' values during solving
-        if k <= 0:
-            return -np.inf
-        try:
-            g1 = gamma_function(1 + 1/k)
-            g2 = gamma_function(1 + 2/k)
-            
-            # This is the V/M^2 ratio *implied by k*
-            implied_v_over_m_sq = (g2 / (g1**2)) - 1
-            
-            # This is the *observed* ratio
-            observed_v_over_m_sq = V / (M**2)
-            
-            # Return the difference (we want this to be 0)
-            return observed_v_over_m_sq - implied_v_over_m_sq
-        except ValueError:
-            return -np.inf # Handle math errors
-
-    @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
-    ):
-        """
-        Generic tercile probabilities using best-fit family per grid cell.
-
-        Inputs (per grid cell):
-        - best_guess : 1D array over T (hindcast_det or forecast_det)
-        - T1, T2     : scalar terciles from climatological best-fit distribution
-        - dist_code  : int, as in _ppf_terciles_from_code
-        - shape, loc, scale : scalars from climatology fit
-
-        Strategy:
-        - For each time step, build a predictive distribution of the same family:
-            * Use best_guess[t] to adjust mean / location;
-            * Keep shape parameters from climatology.
-        - Then compute probabilities:
-            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
-        """
-        
-        best_guess = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        # T1 = np.asarray(T1, dtype=float)
-        # T2 = np.asarray(T2, dtype=float)
-        n_time = best_guess.size
-        out = np.full((3, n_time), np.nan, float)
-
-        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
-            return out
-
-        code = int(dist_code)
-
-        # Normal: loc = forecast; scale from clim
-        if code == 1:
-            error_std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
-
-        # Lognormal: shape = sigma from clim; enforce mean = best_guess
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-            mu = np.log(best_guess) - sigma**2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
-
-
-        # Exponential: keep scale from clim; shift loc so mean = best_guess
-        elif code == 3:
-            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
-            c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        # Gamma: use shape from clim; set scale so mean = best_guess
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5: # Assuming 5 is for Weibull   
-        
-            for i in range(n_time):
-                # Get the scalar values for this specific element (e.g., grid cell)
-                M = best_guess[i]
-                print(M)
-                V = error_variance
-                print(V)
-                
-                # Handle cases with no variance to avoid division by zero
-                if V <= 0 or M <= 0:
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue # Skip to the next element
-        
-                # --- 1. Numerically solve for shape 'k' ---
-                # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
-                initial_guess = 2.0
-                
-                # fsolve finds the root of our helper function
-                k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
-        
-                # --- 2. Check for bad solution and calculate scale 'lambda' ---
-                if k <= 0:
-                    # Solver failed
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue
-                
-                # With 'k' found, we can now algebraically find scale 'lambda'
-                # In scipy.stats, scale is 'scale'
-                lambda_scale = M / gamma_function(1 + 1/k)
-        
-                # --- 3. Calculate Probabilities ---
-                # In scipy.stats, shape 'k' is 'c'
-                # Use the T1 and T2 values for this specific element
-                
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-        
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
-
-        # Student-t: df from clim; scale from clim; loc = best_guess
-        elif code == 6:       
-            # Check if df is valid for variance calculation
-            if dof <= 2:
-                # Cannot calculate scale, fill with NaNs
-                out[0, :] = np.nan
-                out[1, :] = np.nan
-                out[2, :] = np.nan
-            else:
-                # 1. Calculate t-distribution parameters
-                # 'loc' (mean) is just the best_guess
-                loc = best_guess
-                # 'scale' is calculated from the variance and df
-                # Variance = scale**2 * (df / (df - 2))
-                scale = np.sqrt(error_variance * (dof - 2) / dof)
-                
-                # 2. Calculate probabilities
-                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
-                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
-
-                out[0, :] = c1
-                out[1, :] = c2 - c1
-                out[2, :] = 1.0 - c2
-
-        elif code == 7: # Assuming 7 is for Poisson
-            
-            # --- 1. Set the Poisson parameter 'mu' ---
-            # The 'mu' parameter is the mean.
-            
-            # A warning is strongly recommended if error_variance is different from best_guess
-            if not np.allclose(best_guess, error_variance, atol=0.5):
-                print("Warning: 'error_variance' is not equal to 'best_guess'.")
-                print("Poisson model assumes mean=variance and is likely inappropriate.")
-                print("Consider using Negative Binomial.")
-            
-            mu = best_guess
-        
-            # --- 2. Calculate Probabilities ---
-            # poisson.cdf(k, mu) calculates P(X <= k)
-            
-            c1 = poisson.cdf(T1, mu=mu)
-            c2 = poisson.cdf(T2, mu=mu)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8: # Assuming 8 is for Negative Binomial
-            
-            # --- 1. Calculate Negative Binomial Parameters ---
-            # This model is ONLY valid for overdispersion (Variance > Mean).
-            # We will use np.where to set parameters to NaN if V <= M.
-            
-            # p = Mean / Variance
-            p = np.where(error_variance > best_guess, 
-                         best_guess / error_variance, 
-                         np.nan)
-            
-            # n = Mean^2 / (Variance - Mean)
-            n = np.where(error_variance > best_guess, 
-                         (best_guess**2) / (error_variance - best_guess), 
-                         np.nan)
-            
-            # --- 2. Calculate Probabilities ---
-            # The nbinom.cdf function will propagate NaNs, correctly
-            # handling the cases where the model was invalid.
-            
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-            
-        else:
-            raise ValueError(f"Invalid distribution")
-
-        return out
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-
-
-    def compute_prob(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det: xr.DataArray,
-        best_code_da: xr.DataArray = None,
-        best_shape_da: xr.DataArray = None,
-        best_loc_da: xr.DataArray = None,
-        best_scale_da: xr.DataArray = None
-    ) -> xr.DataArray:
-        """
-        Compute tercile probabilities for deterministic hindcasts.
-
-        If dist_method == 'bestfit':
-            - Use cluster-based best-fit distributions to:
-                * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
-                * compute predictive probabilities using the same family.
-
-        Otherwise:
-            - Use empirical terciles from Predictant climatology and the selected
-              parametric / nonparametric method.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data (T, Y, X) or (T, Y, X, M).
-        clim_year_start, clim_year_end : int or str
-            Climatology period (inclusive) for thresholds.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast (T, Y, X).
-        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
-            Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
-
-        Returns
-        -------
-        hindcast_prob : xarray.DataArray
-            Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
-        """
-        # Handle member dimension if present
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
-
-        # Ensure dimension order
-        Predictant = Predictant.transpose("T", "Y", "X")
-
-        # Spatial mask
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-
-        # Climatology subset
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        # Error variance for predictive distributions
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
-
-        # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.32, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-        
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT: zone-wise optimal distributions ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
-                )
-
-            # T1, T2 from best-fit distributions (per grid)
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            # Predictive probabilities using same family
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
-
-
-    # -----------------------------------------------------------------
-    # 6) FORECAST METHOD
-    # -----------------------------------------------------------------
-    def forecast(
-        self, 
-        Predictant, 
-        clim_year_start, 
-        clim_year_end, 
-        Predictor, 
-        hindcast_det, 
-        Predictor_for_year, 
-        best_param_da, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None
-    ):
-        """
-        Generate a forecast for a single future time (e.g., future year),
-        then compute tercile probabilities from the chosen distribution method.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data with dims (T, Y, X) used for computing climatological terciles.
-        clim_year_start : int
-            Start year of the climatology period.
-        clim_year_end : int
-            End year of the climatology period.
-        Predictor : xarray.DataArray
-            Historical predictor data, shape (T, features).
-        hindcast_det : xarray.DataArray
-            Historical deterministic forecast with dims (output=[error,prediction], T, Y, X).
-            Used to estimate error variance or error samples.
-        Predictor_for_year : xarray.DataArray
-            Predictor data for the forecast year, shape (features,) or (1, features).
-        best_param_da : xarray.DataArray
-            Grid-based best hyperparams from `compute_hyperparameters`.
-
-        Returns
-        -------
-        result_ : xarray.DataArray
-            dims ('output','Y','X') => [error, prediction].
-            For a true forecast, the 'error' is typically NaN.
-        hindcast_prob : xarray.DataArray
-            dims (probability=3, Y, X) => PB, PN, PA tercile probabilities.
-        """
-        # 1) Provide a dummy y_test => shape (Y, X), all NaN
-        y_test_dummy = xr.full_like(Predictant.isel(T=0), np.nan)
-
-        # Prepare chunk sizes
-        chunksize_x = int(np.round(len(Predictant.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(Predictant.get_index("Y")) / self.nb_cores))
-
-        # Align time
-        Predictor['T'] = Predictant['T']
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        Predictor_for_year_ = Predictor_for_year.squeeze()
-        # Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        
-        # 2) Fit+predict in parallel => produce shape (2, Y, X) => [error, prediction]
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            Predictor,
-            Predictant.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            Predictor_for_year_,
-            y_test_dummy.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            best_param_da.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[
-                ('T','features'),  # X_train
-                ('T',),           # y_train
-                ('features',),    # X_test
-                (),               # y_test (dummy)
-                ()                # best_params_str
-            ],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('output',)],
-            output_dtypes=[float],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-        result_ = result_da.compute()
-        client.close()
-        result_ = result_.isel(output=1)
-        # result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end)
-        # result_ => dims (output=2, Y, X). 
-        # For a real future forecast, "error" is NaN, "prediction" is the forecast.
-
-        # 2) Compute thresholds T1, T2 from climatology
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.32, 0.67], dim='T')
-        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        
-        # Expand single prediction to T=1 so probability methods can handle it
-        forecast_expanded = result_.expand_dims(
-            T=[pd.Timestamp(Predictor_for_year.coords['T'].values[0]).to_pydatetime()]
-        )
-        year = Predictor_for_year.coords['T'].values[0].astype('datetime64[Y]').astype(int) + 1970
-        # year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        
-        forecast_expanded = forecast_expanded.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        forecast_expanded['T'] = forecast_expanded['T'].astype('datetime64[ns]')
-
-        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
-                )
-            
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                forecast_expanded,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                kwargs={"dof": dof},
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                forecast_expanded,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-        forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return forecast_expanded, forecast_prob.transpose('probability', 'T', 'Y', 'X')
-
-
-
-class WAS_Stacking_Ridge:
-    """
-    Advanced ensemble stacking regression model combining **Random Forest (RF)**,
-    **XGBoost (XGB)**, and **MLP** base learners with a **Ridge regression** meta-learner,
-    specifically designed for high-accuracy spatiotemporal climate prediction
-    (e.g., seasonal rainfall, temperature anomalies, agro-climatic indices).
-
-    Workflow overview:
-    1. **Spatial clustering** (KMeans) on a summary statistic of the predictand
-       (default: climatological mean over time) to identify homogeneous zones.
-    2. **Per-cluster hyperparameter optimization** of the full stacking pipeline
-       using grid, random, or Bayesian search.
-    3. **Broadcast best hyperparameters** to every grid cell (Y, X) as stringified dicts.
-    4. **Spatially parallel training & prediction** using local best hyperparameters.
-    5. **Deterministic forecast generation** (point prediction + optional error term).
-    6. **Tercile probability computation** (Below/Normal/Above = PB/PN/PA) using either:
-       - Parametric best-fit distributions per grid cell/cluster ('bestfit')
-       - Non-parametric sampling of historical forecast errors ('nonparam')
-
-    This model exploits the complementary strengths of:
-    - Tree-based methods (RF + XGB): robust non-linear modeling, handling interactions
-    - MLP base learner: captures complex patterns (with feature scaling)
-    - Ridge meta-learner: stable linear combination with L2 regularization
-
-    Parameters
-    ----------
-    nb_cores : int, default=1
-        Number of CPU cores for parallel processing (dask + joblib).
-
-    dist_method : {'bestfit', 'nonparam'}, default='nonparam'
-        Method for computing tercile probabilities:
-        - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs)
-        - 'nonparam' → empirical sampling of historical forecast errors
-
-    n_clusters : int, default=5
-        Number of spatial clusters for KMeans grouping of the predictand field.
-
-    param_grid : dict or None, default=None
-        Hyperparameter search space for the stacking regressor.
-        If None, a minimal default grid is used:
-            - rf__n_estimators: [50, 100]
-            - xgb__max_depth: [3, 6]
-            - mlp_base__hidden_layer_sizes: [(20,), (50, 10)]
-            - mlp_base__activation: ["relu", "tanh"]
-            - mlp_base__alpha: [0.0001, 0.001]
-            - final_estimator__alpha: [0.1, 0.9, 5.0]   # Ridge regularization
-
-    optimization_method : {'grid', 'random', 'bayesian'}, default='grid'
-        Strategy for hyperparameter search.
-
-    n_trials : int, default=20
-        Number of trials for 'random' or 'bayesian' optimization.
-
-    cv : int, default=5
-        Number of cross-validation folds during tuning.
-
-    random_state : int, default=42
-        Random seed for reproducibility (KMeans, CV, models, optimizer).
-
-    Attributes
-    ----------
-    nb_cores, dist_method, n_clusters, param_grid, optimization_method, n_trials, cv, random_state
-        Stored initialization parameters.
-
-    optimizer : BaseOptimizer
-        Internal hyperparameter optimization object.
-
-    Methods
-    -------
-    compute_hyperparameters(predictand, predictor, clim_year_start, clim_year_end)
-        Clusters predictand → optimizes stacking hyperparameters per cluster →
-        returns spatial map of best parameter sets (as stringified dictionaries).
-
-    fit_predict(X_train, y_train, X_test, y_test, best_params_str)
-        Fits stacking model on one grid cell using local hyperparameters and predicts.
-        Returns [error, prediction].
-
-    compute_model(X_train, y_train, X_test, y_test, best_param_da)
-        Parallelized prediction across entire spatial domain using local best params.
-
-    compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det,
-                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
-        Computes deterministic hindcast tercile probabilities.
-
-    forecast(Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det,
-             Predictor_for_year, best_param_da, best_code_da=None, best_shape_da=None,
-             best_loc_da=None, best_scale_da=None)
-        Full forecast pipeline for one target year: deterministic prediction + probabilities.
-
-    Notes
-    -----
-    - All input DataArrays must share compatible coordinates: T (time), Y (latitude), X (longitude).
-    - Negative predictions are automatically clipped to zero (useful for precipitation).
-    - The stacking model uses `TransformedTargetRegressor` with `StandardScaler` on the target (y)
-      for improved training stability, especially for skewed variables like rainfall.
-    - MLP base learner includes internal feature scaling via Pipeline.
-    - Hyperparameters are stored as stringified dictionaries in xarray due to nested/complex structure.
-    - Large spatial domains benefit greatly from higher `nb_cores`.
-    - For `dist_method='bestfit'`, distribution fit results from `WAS_TransformData` must be provided.
-    
-    """
-    def __init__(
-        self,
-        nb_cores=1,
-        dist_method="nonparam",
-        n_clusters=5,
-        param_grid=None,
-        optimization_method="grid",  # New parameter
-        n_trials=20,  # New parameter
-        cv=5,  # New parameter
-        random_state=42  # New parameter
-    ):
-        self.nb_cores = nb_cores
-        self.dist_method = dist_method
-        self.n_clusters = n_clusters
-        self.optimization_method = optimization_method
-        self.n_trials = n_trials
-        self.cv = cv
-        self.random_state = random_state
-
-        # Minimal default grid if none is provided
-        if param_grid is None:
-            self.param_grid = {
-                "rf__n_estimators": [50, 100],
-                "xgb__max_depth": [3, 6],
-                "mlp_base__hidden_layer_sizes": [(20,), (50, 10)],
-                "mlp_base__activation": ["relu", "tanh"],
-                "mlp_base__alpha": [0.0001, 0.001],
-                "final_estimator__alpha": [0.1, 0.9, 5.0]
-            }
-        else:
-            self.param_grid = param_grid
-            
-        # Initialize optimizer
-        self.optimizer = BaseOptimizer(
-            optimization_method=optimization_method,
-            n_trials=n_trials,
-            cv=cv,
-            random_state=random_state
-        )
-
-    def compute_hyperparameters(self, predictand, predictor, clim_year_start, clim_year_end):
-        """Optimized version with Bayesian optimization."""
-        predictor['T'] = predictand['T']
-        df = (
-            predictand.to_dataframe()
-                      .reset_index()
-                      .dropna()
-                      .drop(columns=['T'])
-        )
-        col_name = df.columns[2]
-        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        df["cluster"] = kmeans.fit_predict(df[[col_name]])
-    
-        df_unique = df.drop_duplicates(subset=["Y", "X"])
-        dataset = df_unique.set_index(["Y", "X"]).to_xarray()
-    
-        cluster_da = (dataset["cluster"] *
-                      xr.where(~np.isnan(predictand.isel(T=0)), 1, np.nan)
-                     ).drop_vars("T", errors="ignore")
-        _, cluster_da = xr.align(predictand, cluster_da, join="outer")
-    
-        # Build stacking model
-        rf_model = RandomForestRegressor(n_jobs=-1, random_state=42)
-        xgb_model = xgb.XGBRegressor(n_jobs=-1, random_state=42)
-        
-        # # # Wrap MLP (base) in a pipeline with scaling
-        # # mlp_pipeline = Pipeline([
-        # #     ('scaler', StandardScaler()),  
-        # #     ('mlp_base', MLPRegressor(random_state=42, max_iter=1000))
-        # # ])
-        # mlp_pipeline = TransformedTargetRegressor(
-        #     regressor=MLPRegressor(random_state=42, max_iter=1000),
-        #     transformer=StandardScaler()
-        # )  
-        # meta_pipeline = Pipeline([
-        #     ('scaler', StandardScaler()),  
-        #     ('ridge_meta', Ridge(alpha=0.8))
-        # ])
-
-        # stacking_ridge = StackingRegressor(
-        #     estimators=[("rf", rf_model), ("xgb", xgb_model), ("mlp", mlp_pipeline)],
-        #     final_estimator=meta_pipeline,
-        #     n_jobs=-1
-        # )
-        
-        mlp_base = Pipeline([
-            ('scaler', StandardScaler()), 
-            ('mlp', MLPRegressor(random_state=42, max_iter=1000))
-        ])
-        
-        meta_pipeline = Pipeline([
-            ('scaler', StandardScaler()),  
-            ('ridge_meta', Ridge(alpha=0.8))
-        ])
-        
-        stacking_core = StackingRegressor(
-            estimators=[
-                ("rf", rf_model),   # RF/XGB are scale-invariant but will target anomalies
-                ("xgb", xgb_model), 
-                ("mlp", mlp_base)
-            ],
-            final_estimator=meta_pipeline,
-            cv=3,
-            n_jobs=-1
-        )
-        
-        stacking_ridge = TransformedTargetRegressor(
-            regressor=stacking_core,
-            transformer=StandardScaler()
-        )
-        unique_clusters = np.unique(cluster_da)
-        unique_clusters = unique_clusters[np.isfinite(unique_clusters)]
-        best_params_for_cluster = {}
-    
-        for c in unique_clusters:
-            mask_c = (cluster_da == c)
-            y_cluster = (
-                predictand.where(mask_c)
-                          .mean(dim=["Y", "X"], skipna=True)
-                          .dropna(dim="T")
-            )
-            if len(y_cluster["T"]) == 0:
-                continue
-    
-            predictor_cluster = predictor.sel(T=y_cluster["T"])
-            X_mat = predictor_cluster.values
-            y_vec = y_cluster.values
-    
-            # Use optimizer to find best parameters
-            best_params = self.optimizer.optimize(
-                stacking_ridge,
-                self.param_grid,
-                X_mat,
-                y_vec,
-                scoring='neg_mean_squared_error'
-            )
-            best_params_for_cluster[int(c)] = best_params
-    
-        # Broadcast best hyperparameters
-        best_param_da = xr.full_like(cluster_da, np.nan, dtype=object)
-        for c, bp in best_params_for_cluster.items():
-            c_mask = (cluster_da == c)
-            best_param_da = best_param_da.where(~c_mask, other=str(bp))
-
-        return best_param_da, cluster_da
-
-    # ------------------------------------------------------------------
-    # 2) FIT + PREDICT FOR A SINGLE GRID CELL
-    # ------------------------------------------------------------------
-    def fit_predict(self, X_train, y_train, X_test, y_test, best_params_str):
-        """
-        For a single grid cell, parse the best params, instantiate the stacking regressor,
-        fit to local data, and predict.
-
-        Returns [error, prediction].
-        """
-        mask = np.isfinite(y_train) & np.all(np.isfinite(X_train), axis=-1)
-
-        if not isinstance(best_params_str, str) or len(best_params_str.strip()) == 0:
-            # No valid hyperparams => return NaN
-            return np.array([np.nan, np.nan])
-
-        # Parse param dict from string
-        best_params = eval(best_params_str)  # or use a safer parser if you prefer
-
-        mlp_base = Pipeline([
-            ('scaler', StandardScaler()), 
-            ('mlp', MLPRegressor(random_state=42, max_iter=1000))
-        ])
-        
-        meta_pipeline = Pipeline([
-            ('scaler', StandardScaler()),  
-            ('ridge_meta', Ridge(alpha=0.8))
-        ])
-        
-        stacking_core = StackingRegressor(
-            estimators=[
-                ("rf", rf_model),   # RF/XGB are scale-invariant but will target anomalies
-                ("xgb", xgb_model), 
-                ("mlp", mlp_base)
-            ],
-            final_estimator=meta_pipeline,
-            cv=3,
-            n_jobs=-1
-        )
-        
-        stacking_ridge = TransformedTargetRegressor(
-            regressor=stacking_core,
-            transformer=StandardScaler()
-        )
-
-        # Apply local best params
-        stacking_ridge.regressor.set_params(**best_params)
-
-        if np.any(mask):
-            X_c = X_train[mask, :]
-            y_c = y_train[mask]
-            stacking_ridge.fit(X_c, y_c)
-
-            if X_test.ndim == 1:
-                X_test = X_test.reshape(1, -1)
-
-            preds = stacking_ridge.predict(X_test)
-            preds[preds < 0] = 0  # clip negative if modeling precip
-            err = np.nan if np.isnan(y_test) else (y_test - preds)
-            return np.array([err, preds]).squeeze()
-        else:
-            return np.array([np.nan, np.nan])
-
-    # ------------------------------------------------------------------
-    # 3) PARALLEL MODELING ACROSS SPACE
-    # ------------------------------------------------------------------
-    def compute_model(self, X_train, y_train, X_test, y_test, best_param_da):
-        """
-        Parallel training + prediction across all spatial grid points.
-        Uses local best hyperparams from best_param_da for each pixel.
-
-        Returns an xarray.DataArray with dim ('output','Y','X') => [error, prediction].
-        """
-        chunksize_x = int(np.round(len(y_train.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(y_train.get_index("Y")) / self.nb_cores))
-
-        X_train['T'] = y_train['T']
-        y_train = y_train.transpose('T','Y','X')
-        X_test = X_test.squeeze()
-        y_test = y_test.squeeze().transpose('Y','X')
-
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            X_train,
-            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            X_test,
-            y_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            best_param_da.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[
-                ('T','features'),  # X_train
-                ('T',),           # y_train
-                ('features',),    # X_test
-                (),
-                ()
-            ],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('output',)],
-            output_dtypes=[float],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-        result_ = result_da.compute()
-        client.close()
-        return result_.isel(output=1)
-
-    # ------------------ Probability Calculation Methods ------------------
-
-    @staticmethod
-    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
-        """
-        Return tercile thresholds (T1, T2) from best-fit distribution parameters.
-    
-        dist_code:
-            1: norm
-            2: lognorm
-            3: expon
-            4: gamma
-            5: weibull_min
-            6: t
-            7: poisson
-            8: nbinom
-        """
-        if np.isnan(dist_code):
-            return np.nan, np.nan
-    
-        code = int(dist_code)
-        try:
-            if code == 1:
-                return (
-                    norm.ppf(0.32, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 2:
-                return (
-                    lognorm.ppf(0.32, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
-                )
-            elif code == 3:
-                return (
-                    expon.ppf(0.32, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 4:
-                return (
-                    gamma.ppf(0.32, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
-                )
-            elif code == 5:
-                return (
-                    weibull_min.ppf(0.32, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
-                )
-            elif code == 6:
-                # Note: Renamed 't_dist' to 't' for standard scipy.stats
-                return (
-                    t.ppf(0.32, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
-                )
-            elif code == 7:
-                # Poisson: poisson.ppf(q, mu, loc=0)
-                # ASSUMPTION: 'mu' (mean) is passed as 'shape'
-                #             'loc' is passed as 'loc'
-                #             'scale' is unused
-                return (
-                    poisson.ppf(0.32, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
-                )
-            elif code == 8:
-                # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
-                # ASSUMPTION: 'n' (successes) is passed as 'shape'
-                #             'p' (probability) is passed as 'scale'
-                #             'loc' is passed as 'loc'
-                return (
-                    nbinom.ppf(0.32, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
-                )
-        except Exception:
-            return np.nan, np.nan
-    
-        # Fallback if code is not 1-8
-        return np.nan, np.nan
-        
-    @staticmethod
-    def weibull_shape_solver(k, M, V):
-        """
-        Function to find the root of the Weibull shape parameter 'k'.
-        We find 'k' such that the theoretical variance/mean^2 ratio
-        matches the observed V/M^2 ratio.
-        """
-        # Guard against invalid 'k' values during solving
-        if k <= 0:
-            return -np.inf
-        try:
-            g1 = gamma_function(1 + 1/k)
-            g2 = gamma_function(1 + 2/k)
-            
-            # This is the V/M^2 ratio *implied by k*
-            implied_v_over_m_sq = (g2 / (g1**2)) - 1
-            
-            # This is the *observed* ratio
-            observed_v_over_m_sq = V / (M**2)
-            
-            # Return the difference (we want this to be 0)
-            return observed_v_over_m_sq - implied_v_over_m_sq
-        except ValueError:
-            return -np.inf # Handle math errors
-
-    @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
-    ):
-        """
-        Generic tercile probabilities using best-fit family per grid cell.
-    
-        Inputs (per grid cell):
-        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
-        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
-        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
-        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
-    
-        Strategy:
-        - For each time step, build a predictive distribution of the same family:
-            * Use ``best_guess[t]`` to adjust mean / location;
-            * Keep shape parameters from climatology.
-        - Then compute probabilities:
-            * P(B) = F(T1)
-            * P(N) = F(T2) - F(T1)
-            * P(A) = 1 - F(T2)
-    
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast/hindcast best estimates.
-        error_variance : float
-            Variance of prediction errors.
-        T1 : float
-            Lower tercile threshold.
-        T2 : float
-            Upper tercile threshold.
-        dist_code : int
-            Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
-    
-        Returns
-        -------
-        array-like
-            Probabilities [P(B), P(N), P(A)].
-    
-        Notes
-        -----
-        - Uses :math:`F` as the CDF of the predictive distribution.
-        """
-        
-        best_guess = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        # T1 = np.asarray(T1, dtype=float)
-        # T2 = np.asarray(T2, dtype=float)
-        n_time = best_guess.size
-        out = np.full((3, n_time), np.nan, float)
-
-        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
-            return out
-
-        code = int(dist_code)
-
-        # Normal: loc = forecast; scale from clim
-        if code == 1:
-            error_std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
-
-        # Lognormal: shape = sigma from clim; enforce mean = best_guess
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-            mu = np.log(best_guess) - sigma**2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
-
-
-        # Exponential: keep scale from clim; shift loc so mean = best_guess
-        elif code == 3:
-            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
-            c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        # Gamma: use shape from clim; set scale so mean = best_guess
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5: # Assuming 5 is for Weibull   
-        
-            for i in range(n_time):
-                # Get the scalar values for this specific element (e.g., grid cell)
-                M = best_guess[i]
-                print(M)
-                V = error_variance
-                print(V)
-                
-                # Handle cases with no variance to avoid division by zero
-                if V <= 0 or M <= 0:
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue # Skip to the next element
-        
-                # --- 1. Numerically solve for shape 'k' ---
-                # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
-                initial_guess = 2.0
-                
-                # fsolve finds the root of our helper function
-                k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
-        
-                # --- 2. Check for bad solution and calculate scale 'lambda' ---
-                if k <= 0:
-                    # Solver failed
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue
-                
-                # With 'k' found, we can now algebraically find scale 'lambda'
-                # In scipy.stats, scale is 'scale'
-                lambda_scale = M / gamma_function(1 + 1/k)
-        
-                # --- 3. Calculate Probabilities ---
-                # In scipy.stats, shape 'k' is 'c'
-                # Use the T1 and T2 values for this specific element
-                
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-        
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
-
-        # Student-t: df from clim; scale from clim; loc = best_guess
-        elif code == 6:       
-            # Check if df is valid for variance calculation
-            if dof <= 2:
-                # Cannot calculate scale, fill with NaNs
-                out[0, :] = np.nan
-                out[1, :] = np.nan
-                out[2, :] = np.nan
-            else:
-                # 1. Calculate t-distribution parameters
-                # 'loc' (mean) is just the best_guess
-                loc = best_guess
-                # 'scale' is calculated from the variance and df
-                # Variance = scale**2 * (df / (df - 2))
-                scale = np.sqrt(error_variance * (dof - 2) / dof)
-                
-                # 2. Calculate probabilities
-                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
-                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
-
-                out[0, :] = c1
-                out[1, :] = c2 - c1
-                out[2, :] = 1.0 - c2
-
-        elif code == 7: # Assuming 7 is for Poisson
-            
-            # --- 1. Set the Poisson parameter 'mu' ---
-            # The 'mu' parameter is the mean.
-            
-            # A warning is strongly recommended if error_variance is different from best_guess
-            if not np.allclose(best_guess, error_variance, atol=0.5):
-                print("Warning: 'error_variance' is not equal to 'best_guess'.")
-                print("Poisson model assumes mean=variance and is likely inappropriate.")
-                print("Consider using Negative Binomial.")
-            
-            mu = best_guess
-        
-            # --- 2. Calculate Probabilities ---
-            # poisson.cdf(k, mu) calculates P(X <= k)
-            
-            c1 = poisson.cdf(T1, mu=mu)
-            c2 = poisson.cdf(T2, mu=mu)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8: # Assuming 8 is for Negative Binomial
-            
-            # --- 1. Calculate Negative Binomial Parameters ---
-            # This model is ONLY valid for overdispersion (Variance > Mean).
-            # We will use np.where to set parameters to NaN if V <= M.
-            
-            # p = Mean / Variance
-            p = np.where(error_variance > best_guess, 
-                         best_guess / error_variance, 
-                         np.nan)
-            
-            # n = Mean^2 / (Variance - Mean)
-            n = np.where(error_variance > best_guess, 
-                         (best_guess**2) / (error_variance - best_guess), 
-                         np.nan)
-            
-            # --- 2. Calculate Probabilities ---
-            # The nbinom.cdf function will propagate NaNs, correctly
-            # handling the cases where the model was invalid.
-            
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-            
-        else:
-            raise ValueError(f"Invalid distribution")
-
-        return out
-
-    @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
-
-
-
-    def compute_prob(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det: xr.DataArray,
-        best_code_da: xr.DataArray = None,
-        best_shape_da: xr.DataArray = None,
-        best_loc_da: xr.DataArray = None,
-        best_scale_da: xr.DataArray = None
-    ) -> xr.DataArray:
-        """
-        Compute tercile probabilities for deterministic hindcasts.
-
-        If dist_method == 'bestfit':
-            - Use cluster-based best-fit distributions to:
-                * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
-                * compute predictive probabilities using the same family.
-
-        Otherwise:
-            - Use empirical terciles from Predictant climatology and the selected
-              parametric / nonparametric method.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data (T, Y, X) or (T, Y, X, M).
-        clim_year_start, clim_year_end : int or str
-            Climatology period (inclusive) for thresholds.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast (T, Y, X).
-        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
-            Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
-
-        Returns
-        -------
-        hindcast_prob : xarray.DataArray
-            Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
-        """
-        # Handle member dimension if present
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
-
-        # Ensure dimension order
-        Predictant = Predictant.transpose("T", "Y", "X")
-
-        # Spatial mask
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-
-        # Climatology subset
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        # Error variance for predictive distributions
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
-
-        # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.32, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-        
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT: zone-wise optimal distributions ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
-                )
-
-            # T1, T2 from best-fit distributions (per grid)
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            # Predictive probabilities using same family
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
-
-
-    # ------------------------------------------------------------------
-    # 6) FORECAST METHOD
-    # ------------------------------------------------------------------
-    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year, best_param_da, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
-        """
-        Forecast for a single future year (or time) and compute tercile probabilities.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data with dims (T, Y, X), used for computing climatology thresholds.
-        clim_year_start : int
-            Start of climatology period.
-        clim_year_end : int
-            End of climatology period.
-        Predictor : xarray.DataArray
-            Historical predictor data, shape (T, features).
-        hindcast_det : xarray.DataArray
-            Historical deterministic forecast with dims (output=[error,prediction], T, Y, X) 
-            for computing error variance or samples.
-        Predictor_for_year : xarray.DataArray
-            Predictor data for the forecast year, shape (features,) or (1, features).
-        best_param_da : xarray.DataArray
-            Local best hyperparams from compute_hyperparameters, shape (Y, X).
-
-        Returns
-        -------
-        result_ : xarray.DataArray
-            dims (output=2, Y, X) => [error, prediction].
-            In a real forecast, "error" is typically NaN since we have no future observation.
-        hindcast_prob : xarray.DataArray
-            dims (probability=3, Y, X) => [PB, PN, PA].
-        """
-        # Create a dummy y_test (NaN) for the forecast
-        y_test_dummy = xr.full_like(Predictant.isel(T=0), np.nan)  # shape (Y, X)
-
-        # Chunk sizes for parallel
-        chunksize_x = int(np.round(len(Predictant.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(Predictant.get_index("Y")) / self.nb_cores))
-
-        # Align times
-        Predictor['T'] = Predictant['T']
-        Predictant = Predictant.transpose('T', 'Y', 'X')
-        Predictor_for_year_ = Predictor_for_year.squeeze()
-        # Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        
-        # 1) Fit+predict in parallel => shape (2, Y, X)
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            Predictor,
-            Predictant.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            Predictor_for_year_,
-            y_test_dummy.chunk({'Y': chunksize_y, 'X': chunksize_x}),     # dummy y_test
-            best_param_da.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[
-                ('T','features'),  # X_train
-                ('T',),           # y_train
-                ('features',),    # X_test
-                (),               # y_test
-                ()                # best_params_str
-            ],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('output',)],
-            output_dtypes=[float],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-        result_ = result_da.compute()
-        client.close()
-        result_ = result_.isel(output=1)
-        # result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end)
-        
-        # result_ => dims (output=2, Y, X). 
-        # For a real future forecast, "error" is NaN, "prediction" is the forecast.
-
-        # 2) Compute thresholds T1, T2 from climatology
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.32, 0.67], dim='T')
-        T1 = terciles.isel(quantile=0).drop_vars('quantile')
-        T2 = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        
-        # Expand single prediction to T=1 so probability methods can handle it
-        forecast_expanded = result_.expand_dims(
-            T=[pd.Timestamp(Predictor_for_year.coords['T'].values[0]).to_pydatetime()]
-        )
-        year = Predictor_for_year.coords['T'].values[0].astype('datetime64[Y]').astype(int) + 1970
-        # year = Predictor_for_year.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        
-        forecast_expanded = forecast_expanded.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        forecast_expanded['T'] = forecast_expanded['T'].astype('datetime64[ns]')
-
-        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
-                )
-            
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                forecast_expanded,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                kwargs={"dof": dof},
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                forecast_expanded,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-        forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return forecast_expanded, forecast_prob.transpose('probability', 'T', 'Y', 'X')
-
-
-
 class WAS_LogisticRegression_Model:
     """
     Logistic Regression model for **tercile classification** (Below/Normal/Above = 0/1/2)
@@ -6517,7 +1270,6 @@ class WAS_PolynomialRegression:
         return pred_prob
 
 
-
     def compute_prob(
         self,
         Predictant: xr.DataArray,
@@ -7340,7 +2092,6 @@ class WAS_PoissonRegression:
         return pred_prob
 
 
-
     def compute_prob(
         self,
         Predictant: xr.DataArray,
@@ -7633,7 +2384,6 @@ class WAS_PoissonRegression:
             raise ValueError(f"Invalid dist_method: {self.dist_method}")
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return forecast_expanded,forecast_prob.transpose('probability', 'T', 'Y', 'X')
-
 
 
 class MARS:
@@ -8496,7 +3246,6 @@ class WAS_MARS_Model:
         return pred_prob
 
 
-
     def compute_prob(
         self,
         Predictant: xr.DataArray,
@@ -8818,30 +3567,6 @@ class WAS_MARS_Model:
             raise ValueError(f"Invalid dist_method: {self.dist_method}")
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return forecast_expanded, forecast_prob.transpose('probability', 'T', 'Y', 'X')
-
-
-
-# import numpy as np
-# import pandas as pd
-# import xarray as xr
-
-# try:
-#     from dask.distributed import Client
-# except Exception:
-#     Client = None
-
-# from scipy import stats
-# from scipy.stats import (
-#     norm, lognorm, expon, gamma, weibull_min, t, poisson, nbinom
-# )
-# from scipy.special import gamma as gamma_function
-# from scipy.optimize import fsolve
-
-
-# # =============================================================================
-# # Low-level, Dask-safe (NumPy-only) solvers
-# # =============================================================================
-
 def _add_intercept(X: np.ndarray) -> np.ndarray:
     return np.column_stack([np.ones(X.shape[0], dtype=float), X])
 
@@ -8956,7 +3681,6 @@ def _logit_irls_coef(
 def _safe_mask_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     m = np.all(np.isfinite(x), axis=1) & np.isfinite(y)
     return x[m], y[m]
-
 
 
 class _WAS_CountProbMixin:
@@ -9117,7 +3841,6 @@ class _WAS_CountProbMixin:
             pred_prob[1, t_] = p_between
             pred_prob[2, t_] = p_above
         return pred_prob
-
 
 
 class WAS_NegativeBinomial_Model(_WAS_CountProbMixin):
@@ -9548,3 +4271,831 @@ class WAS_HurdleNB_Model(WAS_NegativeBinomial_Model):
 # fcst_det, fcst_prob = model_nb.forecast(Predictant, clim_year_start, clim_year_end,
 #                                        Predictor, hind_det, Predictor_for_year, ...)
 
+
+"""
+WAS non-neural machine-learning models for spatial seasonal forecasting.
+
+
+Available estimators
+--------------------
+    WAS_RandomForest_Model      WAS_ExtraTrees_Model
+    WAS_GradientBoosting_Model  WAS_AdaBoost_Model
+    WAS_XGBoost_Model           WAS_LightGBM_Model      (xgboost / lightgbm optional)
+    WAS_SVR_Model               WAS_KNN_Model           (auto-scaled)
+"""
+
+
+# =====================================================================
+#  Base class: everything shared by every non-neural estimator
+# =====================================================================
+class _WAS_NonNeural_Base:
+    """
+    Base class implementing the full spatial forecasting pipeline for any
+    scikit-learn-compatible regressor. Subclasses only need to define
+    ``_default_param_space`` and ``_make_estimator``.
+
+    Parameters
+    ----------
+    param_space : dict, optional
+        Search space, mapping ``name -> (low, high, is_int, is_log)``.
+        Defaults to the subclass' ``_default_param_space()``.
+    n_clusters : int, default=5
+        Number of spatial clusters (mode='cluster').
+    nb_cores : int, default=1
+        Dask workers for spatial parallelism. Estimators run single-threaded
+        (n_jobs=1) so the parallelism stays at the spatial level only.
+    dist_method : {'nonparam', 'bestfit'}, default='nonparam'
+        Tercile-probability strategy (identical to WAS_Ridge_Model).
+    hyperparam_optimizer : {'bayesian', 'random'}, default='bayesian'
+        'bayesian' -> Optuna; 'random' -> manual randomised search (both route
+        every candidate through ``_make_estimator`` + 3-fold CV neg-MSE, so they
+        work uniformly even for pipeline-wrapped estimators like SVR/KNN).
+    n_trials : int, default=50
+        Optuna trials.
+    n_iter : int, default=50
+        Randomised-search samples.
+    mode : {'cluster', 'grid'}, default='cluster'
+        'cluster' -> one hyperparameter set per spatial cluster (recommended).
+        'grid'    -> independent optimisation per grid cell (very slow).
+    """
+
+    def __init__(self, param_space=None, n_clusters=5, nb_cores=1,
+                 dist_method="nonparam", hyperparam_optimizer="bayesian",
+                 n_trials=50, n_iter=50, mode="cluster"):
+        self.param_space = param_space or self._default_param_space()
+        self._param_names = list(self.param_space.keys())
+        self._int_params = {
+            name for name, (lo, hi, is_int, is_log) in self.param_space.items() if is_int
+        }
+        self.n_clusters = n_clusters
+        self.nb_cores = nb_cores
+        self.dist_method = dist_method
+        self.hyperparam_optimizer = hyperparam_optimizer
+        self.n_trials = n_trials
+        self.n_iter = n_iter
+        self.mode = mode
+
+    # ----- to be provided by subclasses ------------------------------
+    def _default_param_space(self):
+        raise NotImplementedError
+
+    def _make_estimator(self, **params):
+        raise NotImplementedError
+
+    # ----- hyperparameter helpers ------------------------------------
+    def _cast_params(self, params):
+        """Cast integer hyperparameters to int, the rest to float."""
+        out = {}
+        for name, val in params.items():
+            out[name] = int(round(val)) if name in self._int_params else float(val)
+        return out
+
+    def _suggest_params(self, trial):
+        params = {}
+        for name, (lo, hi, is_int, is_log) in self.param_space.items():
+            if is_int:
+                params[name] = trial.suggest_int(name, int(lo), int(hi))
+            else:
+                params[name] = trial.suggest_float(name, lo, hi, log=is_log)
+        return params
+
+    def _param_distributions(self):
+        dists = {}
+        for name, (lo, hi, is_int, is_log) in self.param_space.items():
+            if is_int:
+                dists[name] = randint(int(lo), int(hi) + 1)
+            elif is_log:
+                dists[name] = loguniform(lo, hi)
+            else:
+                dists[name] = uniform(lo, hi - lo)
+        return dists
+
+    def _optimize_optuna(self, X, y):
+        def objective(trial):
+            params = self._cast_params(self._suggest_params(trial))
+            model = self._make_estimator(**params)
+            scores = cross_val_score(model, X, y, cv=3,
+                                     scoring="neg_mean_squared_error")
+            return scores.mean()
+
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
+        return study.best_params
+
+    def _optimize_random(self, X, y):
+        rng = np.random.RandomState(42)
+        dists = self._param_distributions()
+        best_score, best = -np.inf, None
+        for _ in range(self.n_iter):
+            params = {n: d.rvs(random_state=rng) for n, d in dists.items()}
+            try:
+                model = self._make_estimator(**self._cast_params(params))
+                score = cross_val_score(model, X, y, cv=3,
+                                        scoring="neg_mean_squared_error").mean()
+            except Exception:
+                continue
+            if score > best_score:
+                best_score, best = score, params
+        return best
+
+    def _optimize_single_cell(self, y_vec, X_mat):
+        """
+        Optimise hyperparameters for one pixel / cluster mean.
+
+        Returns a 1D array of best hyperparameter values, ordered by
+        ``self._param_names`` (or an all-NaN array if it cannot be optimised).
+        """
+        n = len(self._param_names)
+        nan_out = np.full(n, np.nan)
+        mask = np.isfinite(y_vec) & np.all(np.isfinite(X_mat), axis=-1)
+        if np.sum(mask) < 10:  # need >= 10 valid time steps
+            return nan_out
+
+        X_clean, y_clean = X_mat[mask], y_vec[mask]
+        try:
+            if self.hyperparam_optimizer == "random":
+                best = self._optimize_random(X_clean, y_clean)
+            else:
+                best = self._optimize_optuna(X_clean, y_clean)
+            if best is None:
+                return nan_out
+            return np.array([float(best[name]) for name in self._param_names])
+        except Exception:
+            return nan_out
+
+    # ----- core logic ------------------------------------------------
+    def compute_hyperparameters(self, predictand, predictor,
+                                clim_year_start, clim_year_end):
+        """
+        Compute spatially varying hyperparameters.
+
+        Returns
+        -------
+        hyper_ds : xarray.Dataset
+            One (Y, X) field per hyperparameter (named after the search space
+            keys). Constant per cluster in 'cluster' mode. Feed this back into
+            ``compute_model`` / ``forecast`` (replaces Ridge's ``alpha``).
+        cluster_da : xarray.DataArray
+            Cluster labels (cluster mode) or a 1/NaN validity mask (grid mode).
+        """
+        predictor["T"] = predictand["T"]
+        predictand_st = standardize_timeseries(predictand, clim_year_start, clim_year_end)
+        names = self._param_names
+
+        if self.mode == "grid":
+            chunk_y = int(np.ceil(len(predictand_st.Y) / self.nb_cores))
+            chunk_x = int(np.ceil(len(predictand_st.X) / self.nb_cores))
+            p_st_chunked = predictand_st.chunk({"Y": chunk_y, "X": chunk_x})
+
+            client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+            hp_array = xr.apply_ufunc(
+                self._optimize_single_cell,
+                p_st_chunked,
+                predictor,
+                input_core_dims=[("T",), ("T", "features")],
+                output_core_dims=[("param",)],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"param": len(names)}},
+            )
+            hp_array = hp_array.compute()
+            client.close()
+
+            hyper_ds = xr.Dataset(
+                {n: hp_array.isel(param=i, drop=True) for i, n in enumerate(names)}
+            )
+            cluster_da = xr.where(~np.isnan(hyper_ds[names[0]]), 1, np.nan)
+            return hyper_ds, cluster_da
+
+        # ---- cluster mode ----
+        print(f"{self.__class__.__name__}: cluster-wise optimization "
+              f"({self.n_clusters} clusters)...")
+        kmeans = KMeans(n_clusters=self.n_clusters)
+        predictand_dropna = (
+            predictand.to_dataframe().reset_index().dropna().drop(columns=["T"])
+        )
+        variable_column = predictand_dropna.columns[2]
+        predictand_dropna["cluster"] = kmeans.fit_predict(
+            predictand_dropna[[variable_column]]
+        )
+
+        df_unique = predictand_dropna.drop_duplicates(subset=["Y", "X"])
+        dataset = df_unique.set_index(["Y", "X"]).to_xarray()
+        mask = xr.where(~np.isnan(predictand.isel(T=0)), 1, np.nan)
+        cluster_da = dataset["cluster"] * mask
+
+        x1, x2 = xr.align(predictand_st, cluster_da, join="outer")
+        clusters = np.unique(x2)
+        clusters = clusters[~np.isnan(clusters)]
+        cluster_da = x2
+
+        hyper_maps = {n: xr.full_like(cluster_da, np.nan, dtype=float) for n in names}
+        for clus in clusters:
+            y_cluster = (
+                x1.where(x2 == clus).mean(dim=["Y", "X"], skipna=True).dropna(dim="T")
+            )
+            if len(y_cluster["T"]) > 0:
+                best = self._optimize_single_cell(
+                    y_cluster.values, predictor.sel(T=y_cluster["T"]).values
+                )
+                for i, n in enumerate(names):
+                    hyper_maps[n] = hyper_maps[n].where(cluster_da != clus, best[i])
+
+        hyper_ds = xr.Dataset(hyper_maps)
+        return hyper_ds, cluster_da
+
+    def fit_predict(self, x, y, x_test, y_test, *param_values):
+        """
+        Fit the estimator on one grid cell and predict.
+
+        ``param_values`` are the per-cell hyperparameters, in the order of
+        ``self._param_names``. Returns ``[error, prediction]``.
+        """
+        params = dict(zip(self._param_names, param_values))
+        if any(not np.isfinite(v) for v in params.values()):
+            return np.array([np.nan, np.nan]).squeeze()
+
+        model = self._make_estimator(**self._cast_params(params))
+        mask = np.isfinite(y) & np.all(np.isfinite(x), axis=-1)
+
+        if np.any(mask):
+            model.fit(x[mask, :], y[mask])
+            if x_test.ndim == 1:
+                x_test = x_test.reshape(1, -1)
+            preds = model.predict(x_test)
+            preds[preds < 0] = 0
+            error_ = y_test - preds
+            return np.array([error_, preds]).squeeze()
+        return np.array([np.nan, np.nan]).squeeze()
+
+    def compute_model(self, X_train, y_train, X_test, y_test, hyperparams):
+        """
+        Fit & predict over the whole spatial domain, parallelised with Dask.
+
+        ``hyperparams`` is the Dataset returned by ``compute_hyperparameters``
+        (replaces Ridge's ``alpha`` map). Returns the prediction field
+        (dims Y, X).
+        """
+        chunksize_x = int(np.round(len(y_train.get_index("X")) / self.nb_cores))
+        chunksize_y = int(np.round(len(y_train.get_index("Y")) / self.nb_cores))
+
+        X_train["T"] = y_train["T"]
+        y_train = y_train.transpose("T", "Y", "X")
+        X_test = X_test.squeeze()
+        y_test = y_test.drop_vars("T").squeeze().transpose("Y", "X")
+
+        y_train, hyperparams = xr.align(y_train, hyperparams, join="outer")
+        y_test, hyperparams = xr.align(y_test, hyperparams, join="outer")
+
+        names = self._param_names
+        hp_chunked = [
+            hyperparams[n].chunk({"Y": chunksize_y, "X": chunksize_x}) for n in names
+        ]
+        core_dims = [("T", "features"), ("T",), ("features",), ()] + [() for _ in names]
+
+        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        result_da = xr.apply_ufunc(
+            self.fit_predict,
+            X_train,
+            y_train.chunk({"Y": chunksize_y, "X": chunksize_x}),
+            X_test,
+            y_test.chunk({"Y": chunksize_y, "X": chunksize_x}),
+            *hp_chunked,
+            input_core_dims=core_dims,
+            vectorize=True,
+            dask="parallelized",
+            output_core_dims=[("output",)],
+            output_dtypes=["float"],
+            dask_gufunc_kwargs={"output_sizes": {"output": 2}},
+        )
+        result_ = result_da.compute()
+        client.close()
+        return result_.isel(output=1)
+
+    # ----- probability calculation (identical to WAS_Ridge_Model) ----
+    @staticmethod
+    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
+        """Tercile thresholds (T1, T2) from best-fit distribution parameters."""
+        if np.isnan(dist_code):
+            return np.nan, np.nan
+        code = int(dist_code)
+        try:
+            if code == 1:
+                return (norm.ppf(0.33, loc=loc, scale=scale),
+                        norm.ppf(0.67, loc=loc, scale=scale))
+            elif code == 2:
+                return (lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
+                        lognorm.ppf(0.67, s=shape, loc=loc, scale=scale))
+            elif code == 3:
+                return (expon.ppf(0.33, loc=loc, scale=scale),
+                        expon.ppf(0.67, loc=loc, scale=scale))
+            elif code == 4:
+                return (gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
+                        gamma.ppf(0.67, a=shape, loc=loc, scale=scale))
+            elif code == 5:
+                return (weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
+                        weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale))
+            elif code == 6:
+                return (t.ppf(0.33, df=shape, loc=loc, scale=scale),
+                        t.ppf(0.67, df=shape, loc=loc, scale=scale))
+            elif code == 7:
+                return (poisson.ppf(0.33, mu=shape, loc=loc),
+                        poisson.ppf(0.67, mu=shape, loc=loc))
+            elif code == 8:
+                return (nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
+                        nbinom.ppf(0.67, n=shape, p=scale, loc=loc))
+        except Exception:
+            return np.nan, np.nan
+        return np.nan, np.nan
+
+    @staticmethod
+    def weibull_shape_solver(k, M, V):
+        """Solver for Weibull shape parameter."""
+        if k <= 0:
+            return -np.inf
+        try:
+            g1 = gamma_function(1 + 1 / k)
+            g2 = gamma_function(1 + 2 / k)
+            implied_v_over_m_sq = (g2 / (g1 ** 2)) - 1
+            observed_v_over_m_sq = V / (M ** 2)
+            return observed_v_over_m_sq - implied_v_over_m_sq
+        except ValueError:
+            return -np.inf
+
+    @staticmethod
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance,
+                                                T1, T2, dist_code, dof):
+        """Tercile probabilities using the climatological best-fit family."""
+        best_guess = np.asarray(best_guess, float)
+        error_variance = np.asarray(error_variance, dtype=float)
+        n_time = best_guess.size
+        out = np.full((3, n_time), np.nan, float)
+
+        if (np.all(np.isnan(best_guess)) or np.isnan(dist_code)
+                or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance)):
+            return out
+
+        code = int(dist_code)
+
+        if code == 1:
+            error_std = np.sqrt(error_variance)
+            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[1, :] = (norm.cdf(T2, loc=best_guess, scale=error_std)
+                         - norm.cdf(T1, loc=best_guess, scale=error_std))
+            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
+
+        elif code == 2:
+            sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
+            mu = np.log(best_guess) - sigma ** 2 / 2
+            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[1, :] = (lognorm.cdf(T2, s=sigma, scale=np.exp(mu))
+                         - lognorm.cdf(T1, s=sigma, scale=np.exp(mu)))
+            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))
+
+        elif code == 3:
+            scale = np.sqrt(error_variance)
+            c1 = expon.cdf(T1, loc=best_guess, scale=scale)
+            c2 = expon.cdf(T2, loc=best_guess, scale=scale)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 4:
+            alpha = (best_guess ** 2) / error_variance
+            theta = error_variance / best_guess
+            c1 = gamma.cdf(T1, a=alpha, scale=theta)
+            c2 = gamma.cdf(T2, a=alpha, scale=theta)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 5:
+            for i in range(n_time):
+                M = best_guess[i]
+                V = error_variance
+                if V <= 0 or M <= 0:
+                    out[:, i] = np.nan
+                    continue
+                k = fsolve(_WAS_NonNeural_Base.weibull_shape_solver, 2.0, args=(M, V))[0]
+                if k <= 0:
+                    out[:, i] = np.nan
+                    continue
+                lambda_scale = M / gamma_function(1 + 1 / k)
+                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
+                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
+                out[0, i] = c1
+                out[1, i] = c2 - c1
+                out[2, i] = 1.0 - c2
+
+        elif code == 6:
+            if dof <= 2:
+                out[:, :] = np.nan
+            else:
+                loc = best_guess
+                scale = np.sqrt(error_variance * (dof - 2) / dof)
+                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
+                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
+                out[0, :] = c1
+                out[1, :] = c2 - c1
+                out[2, :] = 1.0 - c2
+
+        elif code == 7:
+            mu = best_guess
+            c1 = poisson.cdf(T1, mu=mu)
+            c2 = poisson.cdf(T2, mu=mu)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 8:
+            p = np.where(error_variance > best_guess,
+                         best_guess / error_variance, np.nan)
+            n = np.where(error_variance > best_guess,
+                         (best_guess ** 2) / (error_variance - best_guess), np.nan)
+            c1 = nbinom.cdf(T1, n=n, p=p)
+            c2 = nbinom.cdf(T2, n=n, p=p)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        else:
+            raise ValueError(f"Invalid distribution code: {dist_code}")
+
+        return out
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples,
+                                                      first_tercile, second_tercile):
+        """Non-parametric method using historical error samples."""
+        n_time = len(best_guess)
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+        for tt in range(n_time):
+            if np.isnan(best_guess[tt]):
+                continue
+            dist = best_guess[tt] + error_samples
+            dist = dist[np.isfinite(dist)]
+            if len(dist) == 0:
+                continue
+            p_below = np.mean(dist < first_tercile)
+            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+            p_above = 1.0 - (p_below + p_between)
+            pred_prob[0, tt] = p_below
+            pred_prob[1, tt] = p_between
+            pred_prob[2, tt] = p_above
+        return pred_prob
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                     best_code_da=None, best_shape_da=None,
+                     best_loc_da=None, best_scale_da=None):
+        """Tercile probabilities for deterministic hindcasts (identical to Ridge)."""
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+
+        Predictant = Predictant.transpose("T", "Y", "X")
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+
+        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+        if clim.sizes.get("T", 0) < 3:
+            raise ValueError("Not enough years in climatology period for terciles.")
+
+        error_variance = (Predictant - hindcast_det).var(dim="T")
+        dof = max(int(clim.sizes["T"]) - 1, 2)
+
+        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
+        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
+
+        dm = self.dist_method
+        if dm == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da,
+                                       best_loc_da, best_scale_da)):
+                raise ValueError("dist_method='bestfit' requires best_code_da, "
+                                 "best_shape_da, best_loc_da, best_scale_da.")
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code,
+                best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                input_core_dims=[(), (), (), ()],
+                output_core_dims=[(), ()],
+                vectorize=True, dask="parallelized",
+                output_dtypes=[float, float],
+            )
+            hindcast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_bestfit,
+                hindcast_det, error_variance, T1, T2, best_code_da,
+                input_core_dims=[("T",), (), (), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True, kwargs={"dof": dof}, dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3},
+                                    "allow_rechunk": True},
+            )
+        elif dm == "nonparam":
+            error_samples = Predictant - hindcast_det
+            hindcast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_nonparametric,
+                hindcast_det, error_samples, T1_emp, T2_emp,
+                input_core_dims=[("T",), ("T",), (), ()],
+                output_core_dims=[("probability", "T")],
+                exclude_dims=set(("T",)),
+                vectorize=True, dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3},
+                                    "allow_rechunk": True},
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
+
+        hindcast_prob = hindcast_prob.assign_coords(
+            probability=("probability", ["PB", "PN", "PA"])
+        )
+        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
+
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                 hindcast_det, Predictor_for_year, hyperparams,
+                 best_code_da=None, best_shape_da=None,
+                 best_loc_da=None, best_scale_da=None):
+        """End-to-end forecast for a single target year (deterministic + terciles)."""
+        y_test_dummy = xr.full_like(Predictant.isel(T=0), np.nan)
+
+        chunksize_x = int(np.round(len(Predictant.get_index("X")) / self.nb_cores))
+        chunksize_y = int(np.round(len(Predictant.get_index("Y")) / self.nb_cores))
+
+        Predictor["T"] = Predictant["T"]
+        Predictant = Predictant.transpose("T", "Y", "X")
+        Predictor_for_year_ = Predictor_for_year.squeeze()
+        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
+        Predictant_st, hyperparams = xr.align(Predictant_st, hyperparams, join="outer")
+
+        names = self._param_names
+        hp_chunked = [
+            hyperparams[n].chunk({"Y": chunksize_y, "X": chunksize_x}) for n in names
+        ]
+        core_dims = [("T", "features"), ("T",), ("features",), ()] + [() for _ in names]
+
+        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        result_da = xr.apply_ufunc(
+            self.fit_predict,
+            Predictor,
+            Predictant_st.chunk({"Y": chunksize_y, "X": chunksize_x}),
+            Predictor_for_year_,
+            y_test_dummy.chunk({"Y": chunksize_y, "X": chunksize_x}),
+            *hp_chunked,
+            input_core_dims=core_dims,
+            vectorize=True,
+            dask="parallelized",
+            output_core_dims=[("output",)],
+            output_dtypes=["float"],
+            dask_gufunc_kwargs={"output_sizes": {"output": 2}},
+        )
+        result_ = result_da.compute()
+        client.close()
+        result_ = result_.isel(output=1)
+        result_ = reverse_standardize(result_, Predictant,
+                                      clim_year_start, clim_year_end)
+
+        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim="T")
+        T1_emp = terciles.isel(quantile=0).drop_vars("quantile")
+        T2_emp = terciles.isel(quantile=1).drop_vars("quantile")
+        error_variance = (Predictant - hindcast_det).var(dim="T")
+
+        forecast_expanded = result_.expand_dims(
+            T=[pd.Timestamp(Predictor_for_year.coords["T"].values[0]).to_pydatetime()]
+        )
+        year = Predictor_for_year.coords["T"].values[0].astype("datetime64[Y]").astype(int) + 1970
+        T_value_1 = Predictant.isel(T=0).coords["T"].values
+        month_1 = T_value_1.astype("datetime64[M]").astype(int) % 12 + 1
+        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
+
+        forecast_expanded = forecast_expanded.assign_coords(
+            T=xr.DataArray([new_T_value], dims=["T"])
+        )
+        forecast_expanded["T"] = forecast_expanded["T"].astype("datetime64[ns]")
+
+        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
+        dm = self.dist_method
+
+        if dm == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da,
+                                       best_loc_da, best_scale_da)):
+                raise ValueError("dist_method='bestfit' requires best_code_da, "
+                                 "best_shape_da, best_loc_da, best_scale_da.")
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code,
+                best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                input_core_dims=[(), (), (), ()],
+                output_core_dims=[(), ()],
+                vectorize=True, dask="parallelized",
+                output_dtypes=[float, float],
+            )
+            forecast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_bestfit,
+                forecast_expanded, error_variance, T1, T2, best_code_da,
+                input_core_dims=[("T",), (), (), (), ()],
+                output_core_dims=[("probability", "T")],
+                vectorize=True, dask="parallelized", kwargs={"dof": dof},
+                output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3},
+                                    "allow_rechunk": True},
+            )
+        elif dm == "nonparam":
+            error_samples = Predictant - hindcast_det
+            forecast_prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_nonparametric,
+                forecast_expanded, error_samples, T1_emp, T2_emp,
+                input_core_dims=[("T",), ("T",), (), ()],
+                output_core_dims=[("probability", "T")],
+                exclude_dims=set(("T",)),
+                vectorize=True, dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3},
+                                    "allow_rechunk": True},
+            )
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
+
+        forecast_prob = forecast_prob.assign_coords(
+            probability=("probability", ["PB", "PN", "PA"])
+        )
+        return forecast_expanded, forecast_prob.transpose("probability", "T", "Y", "X")
+
+
+# =====================================================================
+#  Concrete estimators
+# =====================================================================
+class WAS_RandomForest_Model(_WAS_NonNeural_Base):
+    """Random Forest regressor (sklearn). ``max_features`` is a fraction in (0, 1]."""
+
+    def _default_param_space(self):
+        return {
+            "n_estimators":      (50, 500, True, False),
+            "max_depth":         (2, 30, True, False),
+            "min_samples_split": (2, 20, True, False),
+            "min_samples_leaf":  (1, 20, True, False),
+            "max_features":      (0.1, 1.0, False, False),
+        }
+
+    def _make_estimator(self, **params):
+        from sklearn.ensemble import RandomForestRegressor
+        return RandomForestRegressor(random_state=42, n_jobs=1, **params)
+
+
+class WAS_ExtraTrees_Model(_WAS_NonNeural_Base):
+    """Extremely Randomized Trees regressor (sklearn)."""
+
+    def _default_param_space(self):
+        return {
+            "n_estimators":      (50, 500, True, False),
+            "max_depth":         (2, 30, True, False),
+            "min_samples_split": (2, 20, True, False),
+            "min_samples_leaf":  (1, 20, True, False),
+            "max_features":      (0.1, 1.0, False, False),
+        }
+
+    def _make_estimator(self, **params):
+        from sklearn.ensemble import ExtraTreesRegressor
+        return ExtraTreesRegressor(random_state=42, n_jobs=1, **params)
+
+
+class WAS_GradientBoosting_Model(_WAS_NonNeural_Base):
+    """Gradient Boosting regressor (sklearn)."""
+
+    def _default_param_space(self):
+        return {
+            "n_estimators":     (50, 500, True, False),
+            "learning_rate":    (1e-3, 0.3, False, True),
+            "max_depth":        (2, 8, True, False),
+            "subsample":        (0.5, 1.0, False, False),
+            "min_samples_leaf": (1, 20, True, False),
+        }
+
+    def _make_estimator(self, **params):
+        from sklearn.ensemble import GradientBoostingRegressor
+        return GradientBoostingRegressor(random_state=42, **params)
+
+
+class WAS_AdaBoost_Model(_WAS_NonNeural_Base):
+    """AdaBoost regressor (sklearn)."""
+
+    def _default_param_space(self):
+        return {
+            "n_estimators":  (50, 500, True, False),
+            "learning_rate": (1e-3, 1.0, False, True),
+        }
+
+    def _make_estimator(self, **params):
+        from sklearn.ensemble import AdaBoostRegressor
+        return AdaBoostRegressor(random_state=42, **params)
+
+
+class WAS_XGBoost_Model(_WAS_NonNeural_Base):
+    """XGBoost regressor. Requires the ``xgboost`` package."""
+
+    def _default_param_space(self):
+        return {
+            "n_estimators":     (50, 600, True, False),
+            "max_depth":        (2, 12, True, False),
+            "learning_rate":    (1e-3, 0.3, False, True),
+            "subsample":        (0.5, 1.0, False, False),
+            "colsample_bytree": (0.5, 1.0, False, False),
+            "min_child_weight": (1, 10, True, False),
+            "reg_alpha":        (1e-8, 10.0, False, True),
+            "reg_lambda":       (1e-8, 10.0, False, True),
+            "gamma":            (1e-8, 5.0, False, True),
+        }
+
+    def _make_estimator(self, **params):
+        from xgboost import XGBRegressor
+        return XGBRegressor(
+            random_state=42, n_jobs=1, verbosity=0,
+            objective="reg:squarederror", tree_method="hist", **params
+        )
+
+
+class WAS_LightGBM_Model(_WAS_NonNeural_Base):
+    """LightGBM regressor. Requires the ``lightgbm`` package."""
+
+    def _default_param_space(self):
+        return {
+            "n_estimators":      (50, 600, True, False),
+            "num_leaves":        (15, 255, True, False),
+            "max_depth":         (3, 12, True, False),
+            "learning_rate":     (1e-3, 0.3, False, True),
+            "subsample":         (0.5, 1.0, False, False),
+            "colsample_bytree":  (0.5, 1.0, False, False),
+            "reg_alpha":         (1e-8, 10.0, False, True),
+            "reg_lambda":        (1e-8, 10.0, False, True),
+            "min_child_samples": (5, 50, True, False),
+        }
+
+    def _make_estimator(self, **params):
+        from lightgbm import LGBMRegressor
+        return LGBMRegressor(random_state=42, n_jobs=1, verbosity=-1, **params)
+
+
+class WAS_SVR_Model(_WAS_NonNeural_Base):
+    """Support Vector Regression (RBF kernel), auto-scaled with StandardScaler."""
+
+    def _default_param_space(self):
+        return {
+            "C":       (1e-2, 1e3, False, True),
+            "epsilon": (1e-3, 1.0, False, True),
+            "gamma":   (1e-4, 1e1, False, True),
+        }
+
+    def _make_estimator(self, **params):
+        from sklearn.svm import SVR
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.pipeline import make_pipeline
+        return make_pipeline(StandardScaler(), SVR(kernel="rbf", **params))
+
+
+class WAS_KNN_Model(_WAS_NonNeural_Base):
+    """K-Nearest-Neighbours regressor, auto-scaled with StandardScaler."""
+
+    def _default_param_space(self):
+        return {
+            "n_neighbors": (2, 30, True, False),
+            "p":           (1, 2, True, False),
+        }
+
+    def _make_estimator(self, **params):
+        from sklearn.neighbors import KNeighborsRegressor
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.pipeline import make_pipeline
+        return make_pipeline(
+            StandardScaler(),
+            KNeighborsRegressor(weights="distance", n_jobs=1, **params),
+        )
+
+
+# # Convenience registry: name -> class
+# WAS_NONNEURAL_MODELS = {
+#     "rf":        WAS_RandomForest_Model,
+#     "extratrees": WAS_ExtraTrees_Model,
+#     "gbr":       WAS_GradientBoosting_Model,
+#     "adaboost":  WAS_AdaBoost_Model,
+#     "xgboost":   WAS_XGBoost_Model,
+#     "lightgbm":  WAS_LightGBM_Model,
+#     "svr":       WAS_SVR_Model,
+#     "knn":       WAS_KNN_Model,
+# }
+
+
+# ---------------------------------------------------------------------
+# Example 
+#
+#   model = WAS_XGBoost_Model(mode="cluster", n_clusters=8,
+#                             hyperparam_optimizer="bayesian",
+#                             n_trials=80, nb_cores=12)
+#   hp_ds, cluster_map = model.compute_hyperparameters(
+#       seasonal_rainfall, predictors, 1991, 2020)        # -> xr.Dataset
+#   hindcast = model.compute_model(predictors, seasonal_rainfall,
+#                                  predictors_hc, seasonal_rainfall, hp_ds)
+#   hc_prob  = model.compute_prob(seasonal_rainfall, 1991, 2020, hindcast)
+#   fc_det, fc_prob = model.forecast(seasonal_rainfall, 1991, 2020,
+#                                    predictors, hindcast, predictor_2025, hp_ds)
+# ---------------------------------------------------------------------

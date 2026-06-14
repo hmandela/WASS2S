@@ -1,3 +1,37 @@
+"""Station–gridded merging methods for observed rainfall.
+
+Combines sparse station observations with a gridded first-guess field
+(e.g. CHIRPS, TAMSAT, or a model hindcast) using a suite of spatial
+interpolation and machine-learning techniques.
+
+Classes
+-------
+WAS_Merging
+    First-generation merging class (legacy interface).  Implements simple
+    bias adjustment, regression kriging, and neural-network kriging.
+WAS_Merging_Extended
+    Refactored merging class with a richer method suite, DEM support,
+    leave-one-out cross-validation, and a unified comparison plot.
+
+    Available methods:
+
+    ``simple_bias_adjustment``
+        Additive or multiplicative mean-bias correction at station points.
+    ``regression_kriging``
+        OLS regression on the gridded field + kriging of residuals.
+    ``conditional_merging``
+        Preserve gridded spatial structure while matching station totals.
+    ``kriging_with_external_drift``
+        Kriging with the gridded field as an external drift variable.
+    ``optimal_interpolation``
+        Gaussian-covariance optimal interpolation (Gandin 1963).
+    ``barnes_interpolation``
+        Multi-pass Barnes successive correction.
+    ``random_forest_merging`` / ``xgboost_merging``
+        Machine-learning regression with k-NN neighbourhood features.
+    ``validate_merging_methods``
+        Leave-one-out cross-validation across all methods.
+"""
 import warnings
 import pandas as pd
 import xarray as xr
@@ -513,7 +547,6 @@ class WAS_Merging:
         mask = estim.mean(dim="T").squeeze()
         mask = xr.where(np.isnan(mask), np.nan, 1)
 
-        
         
         gridx, gridy = np.meshgrid(estim.X.values, estim.Y.values)
 
@@ -1038,7 +1071,6 @@ class WAS_Merging:
         plt.show()
 
         
-
 import warnings
 import numpy as np
 import pandas as pd
@@ -1061,7 +1093,7 @@ from pykrige.uk import UniversalKriging
 warnings.filterwarnings("ignore")
 
 
-class WAS_Merging_:
+class WAS_Merging_Extended:
     """
     Merging class for station observations with gridded estimates,
     using geostatistical and machine learning methods.

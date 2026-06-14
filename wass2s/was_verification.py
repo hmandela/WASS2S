@@ -1,3 +1,32 @@
+"""Deterministic and probabilistic forecast verification.
+
+Provides pixel-wise and domain-averaged scores compatible with the
+WASS2S xarray data model (dimensions T, Y, X).
+
+Class
+-----
+WAS_Verification
+    Container for all verification methods.  Scores are applied
+    grid-point by grid-point via ``compute_deterministic_score``, or
+    computed directly over spatial maps.
+
+Deterministic scores
+    Pearson correlation, Spearman correlation, Index of Agreement,
+    Nash–Sutcliffe Efficiency, Kling–Gupta Efficiency, MAE, RMSE,
+    Taylor diagram.
+
+Probabilistic scores
+    GROC (Generalized ROC), RPSS, Ignorance Score, Brier Score,
+    Brier Skill Score, Resolution Score.
+
+Tercile utilities
+    ``classify`` — assign observations to below / near / above-normal
+    tercile classes.
+    ``compute_class`` — classify a full DataArray over a climatological
+    reference period.
+    ``classify_data_into_terciles`` — binary classification with
+    pre-computed thresholds.
+"""
 import numpy as np
 import xarray as xr
 from scipy.stats import pearsonr, norm, linregress
@@ -398,156 +427,6 @@ class WAS_Verification:
         if savepath:
             fig.savefig(savepath, dpi=300, bbox_inches="tight")
         return fig, ax
-
-    # def taylor_diagram_(
-    #     self,
-    #     obs,
-    #     models,
-    #     *,
-    #     normalize: bool = True,
-    #     correlation: str = "pearson",   # "pearson" or "spearman"
-    #     labels: dict | None = None,     # optional pretty labels per model key
-    #     title: str | None = "Taylor diagram",
-    #     figsize=(7, 6),
-    #     savepath: str | None = None,
-    # ):
-    #     """
-    #     Plot a Taylor diagram comparing one or more model series against observations.
-    
-    #     Parameters
-    #     ----------
-    #     obs : xarray.DataArray or np.ndarray
-    #         Observations. If xarray, can be (T), (T,Y,X), etc.
-    #     models : dict[str, xarray.DataArray | np.ndarray]
-    #         Mapping of model name -> forecast array (same shape as obs or broadcastable).
-    #     normalize : bool, optional
-    #         If True (default), normalize std and CRMSD by std(obs).
-    #     correlation : {"pearson","spearman"}, optional
-    #         Correlation metric used on paired, finite values.
-    #     labels : dict[str,str], optional
-    #         Custom display labels for model markers. Defaults to model keys.
-    #     title : str or None, optional
-    #         Figure title.
-    #     figsize : tuple, optional
-    #         Matplotlib figure size.
-    #     savepath : str or None, optional
-    #         If provided, save figure to this path.
-    
-    #     Returns
-    #     -------
-    #     (fig, ax) : matplotlib Figure and Axes
-    #     """
-    #     try:
-    #         import skill_metrics as sm
-    #     except Exception as e:
-    #         raise ImportError(
-    #             "SkillMetrics is required. Install with: pip install SkillMetrics"
-    #         ) from e
-    
-    #     def _to_aligned_1d(o, f):
-    #         # Align xarray objects on shared coords; otherwise just np.asarray.
-    #         if hasattr(o, "dims") or hasattr(f, "dims"):
-    #             o_al, f_al = xr.align(o, f, join="inner")
-    #             o_vals = np.asarray(o_al).ravel()
-    #             f_vals = np.asarray(f_al).ravel()
-    #         else:
-    #             o_vals = np.asarray(o).ravel()
-    #             f_vals = np.asarray(f).ravel()
-    #         m = np.isfinite(o_vals) & np.isfinite(f_vals)
-    #         return o_vals[m], f_vals[m]
-    
-    #     # Prepare labels
-    #     model_names = list(models.keys())
-    #     if labels is None:
-    #         labels = {k: k for k in model_names}
-    
-    #     # Compute stats for each model
-    #     sdev_list, crmsd_list, corr_list, used_names = [], [], [], []
-    #     std_obs_plot = None  # will hold reference STD on diagram scale
-    
-    #     # We compute obs std using the first model's mask (pairwise); then re-compute per model.
-    #     # For normalization, each model uses its *own* paired-data obs std to be consistent.
-    #     for name in model_names:
-    #         o, f = _to_aligned_1d(obs, models[name])
-    #         if o.size < 3:
-    #             continue
-    
-    #         # correlation
-    #         if correlation.lower() == "spearman":
-    #             r = stats.spearmanr(o, f).correlation
-    #         else:
-    #             r = np.corrcoef(o, f)[0, 1]
-    
-    #         # standard deviations (population)
-    #         std_o = np.std(o, ddof=0)
-    #         std_f = np.std(f, ddof=0)
-    
-    #         # centered RMS difference
-    #         cr = np.sqrt(std_o**2 + std_f**2 - 2.0 * std_o * std_f * r)
-    
-    #         # normalize if requested
-    #         if normalize and std_o > 0:
-    #             std_o_plot = 1.0
-    #             std_f_plot = std_f / std_o
-    #             cr_plot = cr / std_o
-    #         else:
-    #             std_o_plot = std_o
-    #             std_f_plot = std_f
-    #             cr_plot = cr
-    
-    #         if std_obs_plot is None:
-    #             std_obs_plot = std_o_plot
-    
-    #         sdev_list.append(std_f_plot)
-    #         crmsd_list.append(cr_plot)
-    #         corr_list.append(r)
-    #         used_names.append(name)
-    
-    #     if not used_names:
-    #         raise ValueError("No model had ≥3 paired finite values w.r.t. observations.")
-    
-    #     # Build inputs for SkillMetrics (first entry is OBS reference)
-    #     sdev  = np.concatenate(([std_obs_plot], np.asarray(sdev_list)))
-    #     crmsd = np.concatenate(([0.0],        np.asarray(crmsd_list)))
-    #     ccoef = np.concatenate(([1.0],        np.asarray(corr_list)))
-    #     marker_labels = ["OBS"] + [labels[n] for n in used_names]
-    
-    #     # Axis extent
-    #     axis_max = 1.25 * max(sdev.max(), crmsd.max(), 1.0)
-    
-    #     # Plot
-    #     fig, ax = plt.subplots(figsize=figsize)
-    #     sm.taylor_diagram(
-    #         sdev,
-    #         crmsd,
-    #         ccoef,
-    #         numberPanels=1,
-    #         axisMax=axis_max,
-    #         markerDisplayed="marker",
-    #         markerLabel=marker_labels,
-    #         markerLegend="on",
-    #         styleOBS="-",
-    #         colOBS="k",
-    #         markerObs="*",
-    #         titleOBS="obs",
-    #         labelRMS="CRMSD" if not normalize else "CRMSD (norm.)",
-    #         # Note: SkillMetrics has no 'labelSTD' option; showing default titles:
-    #         titleSTD="on",
-    #         titleCOR="on",
-    #         colCOR="tab:blue",
-    #         colSTD="black",
-    #         colRMS="tab:green",
-    #     )
-    
-    #     if title:
-    #         ax.set_title(title)
-    
-    #     if savepath:
-    #         fig.savefig(savepath, dpi=300, bbox_inches="tight")
-    
-    #     return fig, ax
-
-
     def compute_deterministic_score(self, score_func, obs, pred):
         """
         Apply a deterministic scoring function over xarray DataArrays.
@@ -615,63 +494,6 @@ class WAS_Verification:
             return y_class, terciles[0], terciles[1]
         else:
             return np.full(y.shape[0], np.nan), np.nan, np.nan
-
-    # def classify(self, y, index_start, index_end):
-    #     """
-    #     Classify data into terciles based on climatological thresholds.
-    
-    #     Parameters
-    #     ----------
-    #     y : array-like
-    #         Input data to classify.
-    #     index_start : int
-    #         Start index of the climatology period.
-    #     index_end : int
-    #         End index of the climatology period.
-    
-    #     Returns
-    #     -------
-    #     tuple
-    #         - y_class : array-like
-    #             Classified data (0: below-normal, 1: near-normal, 2: above-normal).
-    #         - tercile_33 : float
-    #             33rd percentile threshold.
-    #         - tercile_67 : float
-    #             67th percentile threshold.
-    #     """
-    #     # Check if climatology period has enough valid data
-    #     clim_data = y[index_start:index_end]
-    #     clim_mask = np.isfinite(clim_data)
-        
-    #     if np.sum(clim_mask) < 5:  # Need minimum data points
-    #         return np.full(y.shape, np.nan), np.nan, np.nan
-        
-    #     # Calculate terciles from climatology period
-    #     terciles = np.nanpercentile(clim_data, [33.33, 66.67])
-        
-    #     # Classify all data using these terciles
-    #     y_class = np.full(y.shape, np.nan)  # Initialize with NaN
-    #     valid_mask = np.isfinite(y)
-        
-    #     if np.any(valid_mask):
-    #         # Standard tercile classification
-    #         # Below normal: y < terciles[0]
-    #         y_class[valid_mask & (y < terciles[0])] = 0
-    #         # Above normal: y > terciles[1]
-    #         y_class[valid_mask & (y > terciles[1])] = 2
-    #         # Near normal: terciles[0] <= y <= terciles[1]
-    #         near_normal_mask = valid_mask & (y >= terciles[0]) & (y <= terciles[1])
-    #         y_class[near_normal_mask] = 1
-            
-    #         # Alternative: Handle exactly equal to boundaries consistently
-    #         # Values exactly equal to lower tercile go to near-normal
-    #         y_class[valid_mask & (y == terciles[0])] = 1
-    #         # Values exactly equal to upper tercile go to above-normal
-    #         y_class[valid_mask & (y == terciles[1])] = 2
-        
-    #     return y_class, terciles[0], terciles[1]
-
-    
     def compute_class(self, Predictant, clim_year_start, clim_year_end):
         """
         Compute tercile class labels for observed data.
@@ -880,7 +702,6 @@ class WAS_Verification:
         return groc_score
 
 
-
     def calculate_groc_weighted(self, y_true, y_probs, index_start, index_end, n_classes=3):
         """
         Compute Generalized Discrimination (GROC) score with category weighting.
@@ -966,7 +787,6 @@ class WAS_Verification:
                 weighted_sum += base_rates[i] * roc_auc
         
         return weighted_sum
-
 
 
     def calculate_groc_fixed(self, y_true, y_probs, index_start, index_end, n_classes=3):
@@ -1211,61 +1031,6 @@ class WAS_Verification:
     
         bs_ref = float(np.mean((p_ref - o_all) ** 2))
         return np.nan if bs_ref == 0 else float(1.0 - bs / bs_ref)
-
-
-
-    # def resolution_score_grid_(self, y_true, y_probs, index_start, index_end,
-    #                          bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
-    #                                         0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-    #                                         0.550, 0.600, 0.650, 0.6700, 0.6750, 0.800,
-    #                                         0.850, 0.900, 0.950, 0.975, 1.000])):
-    #     """
-    #     Compute Resolution Score on a grid based on Weijs (2010).
-
-    #     Measures the ability of the forecast to distinguish between different outcomes.
-
-    #     Parameters
-    #     ----------
-    #     y_true : array-like
-    #         Observed values.
-    #     y_probs : array-like
-    #         Forecast probabilities with shape (n_classes, n_samples).
-    #     index_start : int
-    #         Start index of the climatology period.
-    #     index_end : int
-    #         End index of the climatology period.
-    #     bins : array-like, optional
-    #         Probability bins for discretizing forecast probabilities.
-
-    #     Returns
-    #     -------
-    #     float
-    #         Resolution score, non-negative. Returns np.nan if insufficient valid data.
-    #     """
-    #     mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
-    #     if not np.any(mask):
-    #         return np.nan
-    #     y_true_clean = y_true[mask]
-    #     y_probs_clean = y_probs[:, mask]
-    #     terciles = np.nanpercentile(y_true_clean[index_start:index_end], [33, 67])
-    #     y_true_clean_class = np.digitize(y_true_clean, bins=terciles, right=True)
-    #     n_categories, n_instances = y_probs_clean.shape
-    #     y_bar = [np.mean(y_true_clean_class == k) for k in range(n_categories)]
-    #     resolution_sum = 0.0
-    #     for k in range(n_categories):
-    #         y_probs_clean_k = y_probs_clean[k, :]
-    #         binned_indices = np.digitize(y_probs_clean_k, bins) - 1
-    #         for b in range(len(bins) - 1):
-    #             bin_mask = binned_indices == b
-    #             n_kb = np.sum(bin_mask)
-    #             if n_kb > 0:
-    #                 y_kb = np.mean(y_true_clean_class[bin_mask] == k)
-    #                 if y_kb > 0 and y_kb < 1:
-    #                     term1 = y_kb * np.log2(y_kb / y_bar[k]) if y_bar[k] > 0 else 0
-    #                     term2 = (1 - y_kb) * np.log2((1 - y_kb) / (1 - y_bar[k])) if y_bar[k] < 1 else 0
-    #                     resolution_sum += (n_kb / n_instances) * (term1 + term2)
-    #     return resolution_sum
-
     def resolution_score_grid(self, y_true, y_probs, index_start, index_end,
                              bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
                                             0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
@@ -1365,59 +1130,6 @@ class WAS_Verification:
                         resolution_sum += (n_kb / n_instances) * (term1 + term2)
         
         return resolution_sum
-
-    # def reliability_score_grid_(self, y_true, y_probs, index_start, index_end,
-    #                           bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
-    #                                          0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-    #                                          0.550, 0.600, 0.650, 0.6700, 0.6750, 0.800,
-    #                                          0.850, 0.900, 0.950, 0.975, 1.000])):
-    #     """
-    #     Compute Reliability Score on a grid based on Weijs (2010).
-
-    #     Measures the calibration of forecast probabilities against observed frequencies.
-
-    #     Parameters
-    #     ----------
-    #     y_true : array-like
-    #         Observed values.
-    #     y_probs : array-like
-    #         Forecast probabilities with shape (n_classes, n_samples).
-    #     index_start : int
-    #         Start index of the climatology period.
-    #     index_end : int
-    #         End index of the climatology period.
-    #     bins : array-like, optional
-    #         Probability bins for discretizing forecast probabilities.
-
-    #     Returns
-    #     -------
-    #     float
-    #         Reliability score. Returns np.nan if insufficient valid data.
-    #     """
-    #     mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
-    #     if not np.any(mask):
-    #         return np.nan
-    #     y_true_clean = y_true[mask]
-    #     y_probs_clean = y_probs[:, mask]
-    #     terciles = np.nanpercentile(y_true_clean[index_start:index_end], [33, 67])
-    #     y_true_clean_class = np.digitize(y_true_clean, bins=terciles, right=True)
-    #     n_categories, n_instances = y_probs_clean.shape
-    #     reliability_sum = 0.0
-    #     for k in range(n_categories):
-    #         y_probs_clean_k = y_probs_clean[k, :]
-    #         binned_indices = np.digitize(y_probs_clean_k, bins) - 1
-    #         for b in range(len(bins) - 1):
-    #             bin_mask = binned_indices == b
-    #             n_kb = np.sum(bin_mask)
-    #             if n_kb > 0:
-    #                 y_kb = np.mean(y_true_clean_class[bin_mask] == k)
-    #                 p_kb = np.mean(y_probs_clean_k[bin_mask])
-    #                 if y_kb > 0 and y_kb < 1 and p_kb > 0 and p_kb < 1:
-    #                     term1 = y_kb * np.log2(y_kb / p_kb) if p_kb > 0 else 0
-    #                     term2 = (1 - y_kb) * np.log2((1 - y_kb) / (1 - p_kb)) if p_kb < 1 else 0
-    #                     reliability_sum += (n_kb / n_instances) * (term1 + term2)
-    #     return reliability_sum
-
     def reliability_score_grid(self, y_true, y_probs, index_start, index_end,
                               bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
                                              0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
@@ -1999,53 +1711,6 @@ class WAS_Verification:
             output_dtypes=['float'],
             dask_gufunc_kwargs={"allow_rechunk": True},
         )
-
-    # def compute_probabilistic_score(self, score_func, obs, prob_pred, clim_year_start, clim_year_end):
-    #     """
-    #     Apply a probabilistic scoring function over xarray DataArrays.
-
-    #     Computes the specified probabilistic metric across the time dimension for each grid point.
-
-    #     Parameters
-    #     ----------
-    #     score_func : callable
-    #         Probabilistic scoring function to apply (e.g., calculate_rpss, calculate_groc).
-    #     obs : xarray.DataArray
-    #         Observed data with dimensions (T, Y, X).
-    #     prob_pred : xarray.DataArray
-    #         Forecast probabilities with dimensions (probability, T, Y, X).
-    #     clim_year_start : int or str
-    #         Start year of the climatology period.
-    #     clim_year_end : int or str
-    #         End year of the climatology period.
-
-    #     Returns
-    #     -------
-    #     xarray.DataArray
-    #         Score values with dimensions (Y, X).
-    #     """
-    #     index_start = obs.get_index("T").get_loc(str(clim_year_start)).start
-    #     index_end = obs.get_index("T").get_loc(str(clim_year_end)).stop
-    #     obs, prob_pred = xr.align(obs, prob_pred)
-    #     return xr.apply_ufunc(
-    #         score_func,
-    #         obs,
-    #         prob_pred,
-    #         input_core_dims=[('T',), ('probability', 'T')],
-    #         vectorize=True,
-    #         kwargs={'index_start': index_start, 'index_end': index_end},
-    #         dask='parallelized',
-    #         output_core_dims=[()],
-    #         output_dtypes=['float'],
-    #         dask_gufunc_kwargs={"allow_rechunk": True},
-    #     )
-
-
-
-    # ------------------------
-    # Plotting Utilities
-    # ------------------------
-
     def plot_model_score(self, model_metric, score, dir_save_score, figure_name="WAS_MLR"):
         """
         Plot a deterministic score on a map.
@@ -2092,64 +1757,6 @@ class WAS_Verification:
         plt.savefig(dir_save_score / f"{figure_name}_{score}.png", dpi=300, bbox_inches='tight')
         plt.show()
         plt.close()
-
-    # def plot_models_score(self, model_metrics, score, dir_save_score):
-    #     """
-    #     Plot multiple model scores on a grid of maps.
-
-    #     Creates a subplot grid with geographical plots for each model's score.
-
-    #     Parameters
-    #     ----------
-    #     model_metrics : dict
-    #         Dictionary of model names and their corresponding score DataArrays (Y, X).
-    #     score : str
-    #         Name of the score to plot (e.g., 'Pearson', 'MAE').
-    #     dir_save_score : str or Path
-    #         Directory to save the plot.
-    #     """
-    #     dir_save_score = Path(dir_save_score)
-    #     dir_save_score.mkdir(parents=True, exist_ok=True)
-    #     score_meta_data = self.scores[score]
-    #     n_scores = len(model_metrics)
-    #     n_cols = min(3, n_scores)
-    #     n_rows = int(np.ceil(n_scores / n_cols))
-    #     fig, axes = plt.subplots(
-    #         n_rows, n_cols,
-    #         figsize=(n_cols * 6, n_rows * 4),
-    #         subplot_kw={'projection': ccrs.PlateCarree()}
-    #     )
-    #     axes = axes.flatten()
-    #     for i, (center, data) in enumerate(model_metrics.items()):
-    #         ax = axes[i]
-    #         im = data.plot(
-    #             ax=ax,
-    #             transform=ccrs.PlateCarree(),
-    #             cmap=score_meta_data[4],
-    #             vmin=score_meta_data[1] if score_meta_data[1] is not None else None,
-    #             vmax=score_meta_data[2] if score_meta_data[2] is not None else None,
-    #             add_colorbar=False
-    #         )
-    #         ax.coastlines(resolution='10m')
-    #         ax.add_feature(cfeature.BORDERS, linestyle='--')
-    #         ax.set_title(f"{score} {center[:-1]}")
-    #         gl = ax.gridlines(draw_labels=True, linewidth=0.1, color='gray', alpha=0.5)
-    #         gl.top_labels = False
-    #         gl.right_labels = False
-    #         cbar = fig.colorbar(im, ax=ax, orientation='horizontal', pad=0.15, shrink=0.7)
-    #         cbar.ax.set_position([ax.get_position().x0, ax.get_position().y0 - 0.12,
-    #                               ax.get_position().width, 0.03])
-    #         name, _, _, _, _, _, unit = self.scores[score]
-    #         label = f"{name} {unit}".rstrip()  
-    #         cbar.set_label(label)
-    #     for j in range(i + 1, len(axes)):
-    #         fig.delaxes(axes[j])
-    #     plt.subplots_adjust(wspace=0.3, hspace=0.3)
-    #     plt.savefig(dir_save_score / f"{score}_all_models.png", dpi=300, bbox_inches='tight')
-    #     plt.show()
-    #     plt.close()
-
-
     def plot_models_score(self, model_metrics, score, dir_save_score):
         """
         Plot multiple model scores on a grid of maps.
