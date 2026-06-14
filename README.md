@@ -1,6 +1,5 @@
 # wass2s: A python-based tool for seasonal climate forecast
 
-![Modules in WAS_S2S](./modules.png)
 
 **wass2s** is a comprehensive tool developed to enhance the accuracy and reproducibility of seasonal forecasts in West Africa and the Sahel. This initiative aligns with the World Meteorological Organization's (WMO) guidelines for objective, operational, and scientifically rigorous seasonal forecasting methods.
 
@@ -128,5 +127,8 @@ Your valuable feedback has significantly contributed to the improvement of this 
 We also extend our heartfelt thanks to the **AICCRA project** for supporting this development, and to **Dr. Abdou ALI**, Head of the **Climate-Water-Meteorology Department at AGRHYMET RCC-WAS**, for his guidance and support.
 ---
 
-📖 For more detailed information, tutorials, and support, please visit the [WAS_S2S Training Documentation](https://hmandela.github.io/WAS_S2S_Training/).
+📖 For more detailed information, tutorials, and support, please visit the
 
+- [WAS_S2S Training Documentation](https://hmandela.github.io/WAS_S2S_Training/).
+
+- [WAS_S2S Training Documentation](https://wass2s-readthedocs.readthedocs.io/en/latest/).
