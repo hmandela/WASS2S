@@ -205,15 +205,15 @@ class WAS_Cross_Validator:
                          WAS_GradientBoosting_Model, WAS_AdaBoost_Model,
                          WAS_XGBoost_Model, WAS_LightGBM_Model,
                          WAS_SVR_Model, WAS_KNN_Model]
+                         
+        same_kind_count = [WAS_PoissonRegression, WAS_NegativeBinomial_Model, WAS_ZINB_Model, WAS_HurdleNB_Model]
 
-        same_kind_model2 = [WAS_mme_MLP, WAS_mme_hpELM,
-                            WAS_mme_MLP_, WAS_mme_hpELM_,
-                           WAS_mme_Stacking_, WAS_mme_Stacking,
+        same_kind_model2 = [WAS_KNN_Classifier_Model, WAS_SVC_Classifier_Model, WAS_RandomForest_Classifier_Model, WAS_ExtraTrees_Classifier_Model, WAS_GradientBoosting_Classifier_Model, WAS_AdaBoost_Classifier_Model, WAS_LightGBM_Classifier_Model, WAS_XGBoost_Classifier_Model, WAS_NaiveBayes_Classifier_Model, WAS_LinearDiscriminant_Classifier_Model, WAS_QuadraticDiscriminant_Classifier_Model, WAS_LogisticRegression_Model]
+
+
+        same_kind_model3 = [WAS_mme_MLP, WAS_mme_hpELM,
                             WAS_mme_XGBoosting, WAS_mme_RF,
-                            WAS_mme_XGBoosting_, WAS_mme_RF_,
-                           WAS_mme_RF_New, WAS_mme_PCR,
-                           WAS_mme_XGBoosting_New, WAS_mme_hpELM_New,
-                           WAS_mme_MLP_New]
+                            WAS_mme_PCR]
 
         if isinstance(model, WAS_CCA_op):
             all_params = {**model_params}
@@ -996,78 +996,247 @@ class WAS_Cross_Validator:
 
             return hindcast_prob, hindcast_prob
 
-        # reorganisez après ceci
-        elif isinstance(model, WAS_LogisticRegression_Model) or (
-            isinstance(model, WAS_PCR) and isinstance(model.__dict__['reg_model'], WAS_LogisticRegression_Model)):
-
-            all_params = {**model_params}
-
+        # ── same_kind_model2: non-neural classifiers ──────────────────────
+        elif any(isinstance(model, cls) for cls in same_kind_model2):
+        
+            all_params   = {**model_params}
+            params_models = {
+                key: value for key, value in all_params.items()
+                if key in model.compute_model.__code__.co_varnames
+            }
             params_prob = {
                 key: value for key, value in all_params.items()
                 if key not in model.compute_model.__code__.co_varnames
             }
 
-            params_models = {
-                key: value for key, value in all_params.items()
-                if key not in params_prob
-            }
+            mask = (
+                xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan)
+                .drop_vars(["T"])
+                .squeeze()
+                .to_numpy()
+            )
 
-            mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-
-            if "M" in Predictant.coords:
-                Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-            else:
-                Predictant = Predictant
-
-            verify = WAS_Verification()
-            Predictant_class = verify.compute_class(Predictant, clim_year_start, clim_year_end)
-
-            # Predictor_st = standardize_timeseries(Predictor, clim_year_start, clim_year_end)
+            Predictant_class, _, _ = model.compute_class(
+                Predictant, clim_year_start, clim_year_end
+            )
 
             print("Cross-validation ongoing")
-            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(Predictor['T'], self.nb_omit), total=n_splits), start=1):
-                X_train, X_test = Predictor.isel(T=train_index), Predictor.isel(T=test_index)
-                y_train, y_test = Predictant_class.isel(T=train_index), Predictant.isel(T=test_index)
-                pred_prob = model.compute_model(X_train, y_train, X_test, y_test, clim_year_start, clim_year_end, **model_params)
+            for i, (train_index, test_index) in enumerate(
+                tqdm(
+                    self.custom_cv.split(Predictor["T"], self.nb_omit),
+                    total=n_splits,
+                ),
+                start=1,
+            ):
+                X_train       = Predictor.isel(T=train_index)
+                X_test        = Predictor.isel(T=test_index)
+                y_class_train = Predictant_class.isel(T=train_index)
+
+                pred_prob = model.compute_model(
+                    X_train, y_class_train, X_test, **params_models
+                )
                 hindcast_prob.append(pred_prob)
 
             hindcast_prob = xr.concat(hindcast_prob, dim="T")
-            hindcast_prob['T'] = Predictant['T']
+            hindcast_prob["T"] = Predictant["T"]
+            hindcast_prob = (
+                hindcast_prob
+                .transpose("probability", "T", "Y", "X")
+                * mask
+            )
 
             return hindcast_prob, hindcast_prob
 
-        # reorganisez après ceci
-        elif isinstance(model, WAS_PoissonRegression) or (
-            isinstance(model, WAS_PCR) and isinstance(model.__dict__['reg_model'], WAS_PoissonRegression)):
-            all_params = {**model_params}
+        # ── WAS_PCR wrapping a same_kind_model2 classifier ───────────────
+        elif (
+            isinstance(model, WAS_PCR)
+            and any(isinstance(model.__dict__["reg_model"], cls) for cls in same_kind_model2)
+        ):
 
-            params_prob = {
-                key: value for key, value in all_params.items()
-                if key not in model.compute_model.__code__.co_varnames
-            }
+            inner_model = model.__dict__["reg_model"]
 
+            all_params    = {**model_params}
             params_models = {
                 key: value for key, value in all_params.items()
-                if key not in params_prob
+                if key in inner_model.compute_model.__code__.co_varnames
+            }
+            params_prob = {
+                key: value for key, value in all_params.items()
+                if key not in inner_model.compute_model.__code__.co_varnames
             }
 
-            mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+            mask = (
+                xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan)
+                .drop_vars(["T"])
+                .squeeze()
+                .to_numpy()
+            )
+
+            Predictant_class, _, _ = inner_model.compute_class(
+                Predictant, clim_year_start, clim_year_end
+            )
 
             print("Cross-validation ongoing")
-            for i, (train_index, test_index) in enumerate(tqdm(self.custom_cv.split(_pcr_T_index(Predictor), self.nb_omit), total=n_splits), start=1):
-                X_train, X_test = _pcr_isel_T(Predictor, train_index), _pcr_isel_T(Predictor, test_index)
-                y_train, y_test = Predictant.isel(T=train_index), Predictant.isel(T=test_index)
-                pred_det = model.compute_model(X_train, y_train, X_test, y_test, **params_models)
+            for i, (train_index, test_index) in enumerate(
+                tqdm(
+                    self.custom_cv.split(
+                        _pcr_T_index(Predictor), self.nb_omit
+                    ),
+                    total=n_splits,
+                ),
+                start=1,
+            ):
+                X_train       = _pcr_isel_T(Predictor, train_index)
+                X_test        = _pcr_isel_T(Predictor, test_index)
+                y_class_train = Predictant_class.isel(T=train_index)
+
+                pred_prob = model.compute_model(
+                    X_train, y_class_train, X_test, **params_models
+                )
+                hindcast_prob.append(pred_prob)
+
+            hindcast_prob = xr.concat(hindcast_prob, dim="T")
+            hindcast_prob["T"] = Predictant["T"]
+            hindcast_prob = (
+                hindcast_prob
+                .transpose("probability", "T", "Y", "X")
+                * mask
+            )
+
+            return hindcast_prob, hindcast_prob
+            
+             
+        # ── count regression models (Poisson, NB, ZINB, Hurdle) ──────────
+        elif any(isinstance(model, cls) for cls in same_kind_count):
+
+            # Param split — same co_varnames introspection as same_kind_model1
+            all_params    = {**model_params}
+            params_models = {
+                k: v for k, v in all_params.items()
+                if k in model.compute_model.__code__.co_varnames
+            }
+            params_prob = {
+                k: v for k, v in all_params.items()
+                if k not in model.compute_model.__code__.co_varnames
+            }
+
+            mask = (
+                xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan)
+                .drop_vars(["T"])
+                .squeeze()
+                .to_numpy()
+            )
+
+            if "M" in Predictant.dims:
+                Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+
+            # No standardize_timeseries — Poisson/NB require raw non-negative
+            # counts; standardisation produces negative / non-integer values
+            # that break the log-link GLM.
+            
+            Predictant = Predictant.transpose("T", "Y", "X")
+
+            print("Cross-validation ongoing")
+            for i, (train_index, test_index) in enumerate(
+                tqdm(
+                    self.custom_cv.split(Predictor["T"], self.nb_omit),
+                    total=n_splits,
+                ),
+                start=1,
+            ):
+                X_train = Predictor.isel(T=train_index)
+                X_test  = Predictor.isel(T=test_index)
+                y_train = Predictant.isel(T=train_index)   # raw counts
+                y_test  = Predictant.isel(T=test_index)    # raw counts
+
+                # compute_model returns (Y, X) for T=1 folds
+                pred_det = model.compute_model(
+                    X_train, y_train, X_test, y_test, **params_models
+                )
+
+                # Restore T dimension before concatenation
+                if "T" not in pred_det.dims:
+                    pred_det = pred_det.expand_dims(
+                        T=Predictant.isel(T=test_index)["T"].values
+                    )
                 hindcast_det.append(pred_det)
 
             hindcast_det = xr.concat(hindcast_det, dim="T")
-            hindcast_det['T'] = Predictant['T']
-            hindcast_det = hindcast_det*mask
-            hindcast_prob = model.compute_prob(Predictant, clim_year_start, clim_year_end, hindcast_det, **params_prob)
+            hindcast_det["T"] = Predictant["T"]
+            hindcast_det = hindcast_det.transpose("T", "Y", "X") * mask
 
-            return hindcast_det*mask, hindcast_prob*mask
+            # No reverse_standardize — predictions are already in raw count units
+            hindcast_prob = model.compute_prob(
+                Predictant, clim_year_start, clim_year_end,
+                hindcast_det, **params_prob
+            )
+            return hindcast_det * mask, hindcast_prob * mask
 
-        elif any(isinstance(model, i) for i in same_kind_model2):
+        # ── WAS_PCR wrapping a count model ────────────────────────────────
+        elif (
+            isinstance(model, WAS_PCR)
+            and any(isinstance(model.__dict__["reg_model"], cls) for cls in same_kind_count)
+        ):
+            inner_model = model.__dict__["reg_model"]
+
+            all_params    = {**model_params}
+            params_models = {
+                k: v for k, v in all_params.items()
+                if k in inner_model.compute_model.__code__.co_varnames
+            }
+            params_prob = {
+                k: v for k, v in all_params.items()
+                if k not in inner_model.compute_model.__code__.co_varnames
+            }
+
+            mask = (
+                xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan)
+                .drop_vars(["T"])
+                .squeeze()
+                .to_numpy()
+            )
+
+            if "M" in Predictant.dims:
+                Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+
+            Predictant = Predictant.transpose("T", "Y", "X")
+
+            print("Cross-validation ongoing")
+            for i, (train_index, test_index) in enumerate(
+                tqdm(
+                    self.custom_cv.split(
+                        _pcr_T_index(Predictor), self.nb_omit
+                    ),
+                    total=n_splits,
+                ),
+                start=1,
+            ):
+                X_train = _pcr_isel_T(Predictor, train_index)
+                X_test  = _pcr_isel_T(Predictor, test_index)
+                y_train = Predictant.isel(T=train_index)
+                y_test  = Predictant.isel(T=test_index)
+
+                pred_det = model.compute_model(
+                    X_train, y_train, X_test, y_test, **params_models
+                )
+
+                if "T" not in pred_det.dims:
+                    pred_det = pred_det.expand_dims(
+                        T=Predictant.isel(T=test_index)["T"].values
+                    )
+                hindcast_det.append(pred_det)
+
+            hindcast_det = xr.concat(hindcast_det, dim="T")
+            hindcast_det["T"] = Predictant["T"]
+            hindcast_det = hindcast_det.transpose("T", "Y", "X") * mask
+
+            hindcast_prob = inner_model.compute_prob(
+                Predictant, clim_year_start, clim_year_end,
+                hindcast_det, **params_prob
+            )
+            return hindcast_det * mask, hindcast_prob * mask
+
+        elif any(isinstance(model, i) for i in same_kind_model3):
 
             if "M" in Predictant.coords:
                 Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
