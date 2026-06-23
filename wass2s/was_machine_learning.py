@@ -1327,7 +1327,7 @@ class WAS_PoissonRegression:
         y_c = y[mask]
 
         try:
-            model = PoissonRegressor(max_iter=5s00)
+            model = PoissonRegressor(max_iter=5000)
             model.fit(x_c, y_c)
         except Exception:
             return np.array([np.nan, np.nan], dtype=float)
