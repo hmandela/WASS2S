@@ -3800,7 +3800,7 @@ class WAS_mme_xcELM:
 
 #################################################################################
 ################################################################################
-### NGR
+### NGR
 ##############################################################################
 ##################################################################################
 
@@ -11613,8 +11613,8 @@ class WAS_mme_CCA:
         mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
         
         mean_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-	  std_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-	  Predictor_for_year = (Predictor_for_year - mean_val) / std_val
+        std_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
+        Predictor_for_year = (Predictor_for_year - mean_val) / std_val
 
         # --- predictor: raw field → polynomial detrend 
         Predictor = standardize_timeseries(Predictor, clim_year_start, clim_year_end)
@@ -12046,8 +12046,8 @@ class WAS_mme_CCA_eeof:
         mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
         
         mean_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-	  std_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-	  Predictor_for_year = (Predictor_for_year - mean_val) / std_val
+        std_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
+        Predictor_for_year = (Predictor_for_year - mean_val) / std_val
 
         # ----- predictor side: EEOF-detrended field over all training years
         Predictor = standardize_timeseries(Predictor, clim_year_start, clim_year_end)
