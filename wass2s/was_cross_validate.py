@@ -1347,5 +1347,283 @@ class WAS_Cross_Validator:
 
             return hindcast_det.transpose('T', 'Y', 'X')*mask, hindcast_prob*mask
 
+        #### This to test method do not consider scientifically now...............
+            
+        elif isinstance(model, (WAS_mme_CCA, WAS_mme_CCA_eeof)):
+            import inspect
+
+            all_params = {**model_params}
+
+            compute_model_args = set(
+                inspect.signature(model.compute_model).parameters.keys()
+            )
+
+            params_models = {
+                k: v for k, v in all_params.items()
+                if k in compute_model_args
+            }
+
+            params_prob = {
+                k: v for k, v in all_params.items()
+                if k not in compute_model_args
+            }
+
+            if Predictor is None:
+                raise ValueError(
+                    "Predictor is required for WAS_mme_CCA / WAS_mme_CCA_eeof cross-validation."
+                )
+
+            # --------------------------------------------------------------
+            # 1. Prepare predictand
+            # --------------------------------------------------------------
+            if "M" in Predictant.dims:
+                Predictant_obs = Predictant.isel(M=0, drop=True)
+            else:
+                Predictant_obs = Predictant
+
+            Predictant_obs = Predictant_obs.transpose("T", "Y", "X")
+
+            mask = xr.where(
+                np.isfinite(Predictant_obs.isel(T=0)),
+                1.0,
+                np.nan,
+            )
+
+            # --------------------------------------------------------------
+            # 2. Prepare predictor time axis
+            # --------------------------------------------------------------
+            Predictor_cv = Predictor.copy(deep=False)
+
+            if (
+                "T" in Predictor_cv.dims
+                and Predictor_cv.sizes["T"] == Predictant_obs.sizes["T"]
+            ):
+                Predictor_cv = Predictor_cv.assign_coords(
+                    T=Predictant_obs["T"].values
+                )
+
+            n_splits = len(Predictant_obs.get_index("T"))
+
+            # --------------------------------------------------------------
+            # 3. Small local helpers
+            # --------------------------------------------------------------
+            def _standardize_from_train(train_da, test_da):
+                """
+                Standardize train and test using training-fold climatology only.
+                This avoids using the validation year to estimate mean/std.
+                """
+                clim_train = train_da.sel(
+                    T=slice(str(clim_year_start), str(clim_year_end))
+                )
+
+                if clim_train.sizes.get("T", 0) < 2:
+                    raise ValueError(
+                        "Not enough training years inside the climatology period "
+                        "to standardize this fold."
+                    )
+
+                mean_val = clim_train.mean(dim="T", skipna=True)
+                std_val = clim_train.std(dim="T", skipna=True)
+                std_val = xr.where(
+                    np.isfinite(std_val) & (std_val != 0.0),
+                    std_val,
+                    np.nan,
+                )
+
+                train_st = (train_da - mean_val) / std_val
+                test_st = (test_da - mean_val) / std_val
+
+                return train_st, test_st
+
+            def _fill_field(da, ref=None):
+                """
+                Fill missing predictor values with training-fold information.
+                Works for fields with or without M dimension.
+                """
+                if ref is None:
+                    ref = da
+
+                ref_mean = ref.mean(dim="T", skipna=True) if "T" in ref.dims else ref
+                out = da.fillna(ref_mean)
+
+                for dim in ("Y", "X", "lat", "lon"):
+                    if dim in out.dims:
+                        out = out.ffill(dim=dim).bfill(dim=dim)
+
+                return out.fillna(0.0)
+
+            print("Cross-validation ongoing")
+
+            hindcast_list = []
+
+            # --------------------------------------------------------------
+            # 4. Fold-safe cross-validation
+            # --------------------------------------------------------------
+            for train_index, test_index in tqdm(
+                self.custom_cv.split(Predictor_cv["T"], self.nb_omit),
+                total=n_splits,
+            ):
+                X_train_raw = Predictor_cv.isel(T=train_index)
+                X_test_raw = Predictor_cv.isel(T=test_index)
+
+                y_train_raw = Predictant_obs.isel(T=train_index)
+                y_test_raw = Predictant_obs.isel(T=test_index)
+
+                # ----------------------------------------------------------
+                # 4.1 Standardize predictor with training-fold climatology
+                # ----------------------------------------------------------
+                X_train_st, X_test_st = _standardize_from_train(
+                    X_train_raw,
+                    X_test_raw,
+                )
+
+                field_train = model._field(X_train_st)
+                field_test = model._field(X_test_st)
+
+                field_train = _fill_field(field_train)
+                field_test = _fill_field(field_test, ref=field_train)
+
+                # ----------------------------------------------------------
+                # 4.2 Standardize predictand with training-fold climatology
+                # ----------------------------------------------------------
+                y_train_st, _ = _standardize_from_train(
+                    y_train_raw,
+                    y_test_raw,
+                )
+
+                y_train_st = y_train_st.transpose("T", "Y", "X")
+                y_train_st = y_train_st.where(np.isfinite(y_train_st))
+
+                # ----------------------------------------------------------
+                # 4.3 Model-specific transformed space
+                # ----------------------------------------------------------
+                if isinstance(model, WAS_mme_CCA):
+                    # Polynomial detrend version.
+                    if getattr(model, "detrend", True):
+                        field_train_fit, coeffs_X, meta_X = detrended_data(
+                            field_train,
+                            dim="T",
+                        )
+
+                        field_test_fit = field_test - apply_detrend_data(
+                            field_test,
+                            coeffs_X,
+                            meta_X,
+                        )
+
+                        y_train_fit, coeffs_Y, meta_Y = detrended_data(
+                            y_train_st,
+                            dim="T",
+                        )
+                    else:
+                        field_train_fit = field_train
+                        field_test_fit = field_test
+                        y_train_fit = y_train_st
+                        coeffs_Y = None
+                        meta_Y = None
+
+                    field_train_fit = field_train_fit.fillna(0.0)
+                    field_test_fit = field_test_fit.fillna(0.0)
+                    y_train_fit = y_train_fit.fillna(0.0)
+
+                    pred_st = model.compute_model(
+                        field_train_fit,
+                        y_train_fit,
+                        field_test_fit,
+                        y_test_raw,
+                        **params_models,
+                    )
+
+                    pred_st = pred_st.transpose("T", "Y", "X")
+
+                    # Add predictand trend back before reverse standardization.
+                    if getattr(model, "detrend", True):
+                        pred_st = pred_st + apply_detrend_data(
+                            pred_st,
+                            coeffs_Y,
+                            meta_Y,
+                        )
+
+                else:
+                    # WAS_mme_CCA_eeof: legacy EEOF version.
+                    if getattr(model, "eeof_detrend", True):
+                        field_train_fit = model._eeof_remove(field_train)
+                        y_train_fit = model._eeof_remove(y_train_st)
+
+                        # Forecast/test year is standardized and gap-filled,
+                        # but not EEOF-detrended, matching the forecast method.
+                        field_test_fit = field_test
+                    else:
+                        field_train_fit = field_train
+                        field_test_fit = field_test
+                        y_train_fit = y_train_st
+
+                    field_train_fit = field_train_fit.fillna(0.0)
+                    field_test_fit = field_test_fit.fillna(0.0)
+                    y_train_fit = y_train_fit.fillna(0.0)
+
+                    pred_st = model.compute_model(
+                        field_train_fit,
+                        y_train_fit,
+                        field_test_fit,
+                        y_test_raw,
+                        **params_models,
+                    )
+
+                    pred_st = pred_st.transpose("T", "Y", "X")
+
+                # ----------------------------------------------------------
+                # 4.4 Back to physical predictand scale using training fold
+                # ----------------------------------------------------------
+                pred_det = reverse_standardize(
+                    pred_st,
+                    y_train_raw,
+                    clim_year_start,
+                    clim_year_end,
+                )
+
+                pred_det = pred_det.transpose("T", "Y", "X")
+                pred_det = pred_det * mask
+                pred_det = pred_det.clip(min=0.0)
+
+                hindcast_list.append(pred_det)
+
+            # --------------------------------------------------------------
+            # 5. Concatenate deterministic hindcasts
+            # --------------------------------------------------------------
+            hindcast_det = xr.concat(hindcast_list, dim="T")
+            hindcast_det = hindcast_det.sortby("T")
+            hindcast_det = hindcast_det.reindex(T=Predictant_obs["T"])
+            hindcast_det = hindcast_det.transpose("T", "Y", "X")
+            hindcast_det = hindcast_det * mask
+            hindcast_det = hindcast_det.clip(min=0.0)
+
+            # --------------------------------------------------------------
+            # 6. Probabilistic hindcast
+            # --------------------------------------------------------------
+            hindcast_prob = model.compute_prob(
+                Predictant_obs,
+                clim_year_start,
+                clim_year_end,
+                hindcast_det,
+                **params_prob,
+            )
+
+            hindcast_prob = hindcast_prob.transpose("probability", "T", "Y", "X")
+            hindcast_prob = hindcast_prob * mask
+            hindcast_prob = hindcast_prob.clip(min=0.0, max=1.0)
+
+            # Ensure PB + PN + PA = 1 where probabilities exist.
+            prob_sum = hindcast_prob.sum(dim="probability")
+            hindcast_prob = xr.where(
+                prob_sum > 0,
+                hindcast_prob / prob_sum,
+                np.nan,
+            )
+
+            hindcast_prob = hindcast_prob * mask
+
+            return hindcast_det, hindcast_prob
+
         else:
             print("not defined models for cross-validation")

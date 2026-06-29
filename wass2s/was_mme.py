@@ -10930,7 +10930,8 @@ class WAS_mme_PCR:
 
         return forecast_det * mask, forecast_prob * mask
 
-
+#################### Please from here to down is just to test ################
+###### Not approved scientifically please ####################################
 ############################Expert knowledge #################################
 
 _PROB_LABELS = ["PB", "PN", "PA"]
@@ -11251,3 +11252,843 @@ class WAS_mme_ExpertKnowledge:
 # prob = mme.compute_model(train_probs, obs_class_train, test_probs)   # (probability, T, Y, X)
 # mme.summary()
 
+
+
+from wass2s.utils import (
+    standardize_timeseries,
+    reverse_standardize,
+    detrended_data,
+    apply_detrend_data,
+    extract_leading_eeof_component
+)
+
+
+class WAS_mme_CCA:
+    """
+    Canonical Correlation Analysis MME.
+
+    Parameters
+    ----------
+    n_modes : int
+        Number of canonical modes for xeofs.cross.CCA (default 4).
+    n_pca_modes : int
+        PCA modes kept before CCA when ``use_pca`` is True (default 8).
+    standardize : bool
+        Passed to xeofs.cross.CCA. Keep False; the framework already
+        standardizes (default False).
+    use_coslat : bool
+        Cosine-latitude weighting inside the CCA (default True).
+    use_pca : bool
+        Pre-filter each field with PCA before the CCA (default True).
+    combine : {'mean', 'meof'}
+        How the M models enter the CCA predictor field.
+    detrend : bool
+        Apply ``detrended_data`` to both predictor and predictand in
+        ``forecast``, exactly like ``WAS_CCA_op`` does unconditionally
+        (default True). Set False only for ablation comparisons.
+    dist_method : {'nonparam', 'bestfit'}
+        Tercile-probability strategy (default 'nonparam').
+    """
+
+    def __init__(self, n_modes=4, n_pca_modes=8, standardize=False,
+                 use_coslat=True, use_pca=True, combine="mean",
+                 detrend=True, dist_method="nonparam"):
+        if combine not in ("mean", "meof"):
+            raise ValueError("combine must be 'mean' or 'meof'.")
+        self.n_modes = n_modes
+        self.n_pca_modes = n_pca_modes
+        self.standardize = standardize
+        self.use_coslat = use_coslat
+        self.use_pca = use_pca
+        self.combine = combine
+        self.detrend = detrend
+        self.dist_method = dist_method
+
+        self.cca = None
+        self.cca_model = None
+
+    # ------------------------------------------------------------------ utils
+    def _new_cca(self):
+        """Fresh xeofs CCA instance (one per fold → leakage-free CV)."""
+        return xe.cross.CCA(
+            n_modes=self.n_modes,
+            standardize=self.standardize,
+            use_coslat=self.use_coslat,
+            use_pca=self.use_pca,
+            n_pca_modes=self.n_pca_modes,
+        )
+
+    def _field(self, X):
+        """Build the CCA predictor field from the predictor cube (T, Y, X, M)."""
+        if "M" not in X.dims:
+            return X
+        if self.combine == "meof":
+            return X
+        return X.mean("M")
+
+    @staticmethod
+    def _to_latlon(da):
+        """WAS dims (Y, X[, M]) → xeofs dims (lat, lon[, M]); order (T, lat, lon, ...)."""
+        rename = {}
+        if "Y" in da.dims:
+            rename["Y"] = "lat"
+        if "X" in da.dims:
+            rename["X"] = "lon"
+        da = da.rename(rename)
+        lead = [d for d in ("T", "lat", "lon") if d in da.dims]
+        rest = [d for d in da.dims if d not in lead]
+        return da.transpose(*lead, *rest)
+
+    @staticmethod
+    def _from_latlon(da):
+        """xeofs dims (lat, lon) → WAS dims (Y, X); order (T, Y, X)."""
+        rename = {}
+        if "lat" in da.dims:
+            rename["lat"] = "Y"
+        if "lon" in da.dims:
+            rename["lon"] = "X"
+        da = da.rename(rename)
+        return da.transpose("T", "Y", "X")
+
+    # --------------------------------------------------------------- CCA core
+    def _fit_predict_cca(self, field_train, y_train, field_test):
+        """
+        Fit CCA on the training field, predict the test field, return the
+        physical-space predictand on the WAS grid (T, Y, X). NaNs are filled
+        with the training mean (no leakage). Physical space is recovered with
+        the codebase idiom: ``inverse_transform(transform(X), predict(X))[1]``.
+        """
+        Xtr = self._to_latlon(field_train)
+        Ytr = self._to_latlon(y_train)
+
+        Xtr_mean = Xtr.mean(dim="T", skipna=True)
+        Xtr = Xtr.fillna(Xtr_mean)
+        Ytr = Ytr.fillna(Ytr.mean(dim="T", skipna=True))
+
+        self.cca = self._new_cca()
+        self.cca_model = self.cca.fit(Xtr, Ytr, dim="T")
+
+        Xte = self._to_latlon(field_test).fillna(Xtr_mean)
+        y_pred = self.cca_model.predict(Xte)
+        y_pred = self.cca_model.inverse_transform(
+            self.cca_model.transform(Xte), y_pred
+        )[1]
+        y_pred["T"] = field_test["T"]
+
+        return self._from_latlon(y_pred)
+
+    # ----------------------------------------------- probability calculation
+    @staticmethod
+    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
+        if np.isnan(dist_code):
+            return np.nan, np.nan
+        code = int(dist_code)
+        try:
+            if code == 1:
+                return norm.ppf(1/3, loc=loc, scale=scale), norm.ppf(2/3, loc=loc, scale=scale)
+            if code == 2:
+                return lognorm.ppf(1/3, s=shape, loc=loc, scale=scale), lognorm.ppf(2/3, s=shape, loc=loc, scale=scale)
+            if code == 3:
+                return expon.ppf(1/3, loc=loc, scale=scale), expon.ppf(2/3, loc=loc, scale=scale)
+            if code == 4:
+                return gamma.ppf(1/3, a=shape, loc=loc, scale=scale), gamma.ppf(2/3, a=shape, loc=loc, scale=scale)
+            if code == 5:
+                return weibull_min.ppf(1/3, c=shape, loc=loc, scale=scale), weibull_min.ppf(2/3, c=shape, loc=loc, scale=scale)
+            if code == 6:
+                return t.ppf(1/3, df=shape, loc=loc, scale=scale), t.ppf(2/3, df=shape, loc=loc, scale=scale)
+            if code == 7:
+                return poisson.ppf(1/3, mu=shape, loc=loc), poisson.ppf(2/3, mu=shape, loc=loc)
+            if code == 8:
+                return nbinom.ppf(1/3, n=shape, p=scale, loc=loc), nbinom.ppf(2/3, n=shape, p=scale, loc=loc)
+        except Exception:
+            return np.nan, np.nan
+        return np.nan, np.nan
+
+    @staticmethod
+    def weibull_shape_solver(k, M, V):
+        if k <= 0:
+            return -np.inf
+        try:
+            g1 = gamma_function(1 + 1 / k)
+            g2 = gamma_function(1 + 2 / k)
+            return (V / (M ** 2)) - ((g2 / (g1 ** 2)) - 1)
+        except Exception:
+            return -np.inf
+
+    @staticmethod
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_variance = float(error_variance)
+        n_time = best_guess.size
+        out = np.full((3, n_time), np.nan, dtype=float)
+
+        if (np.all(np.isnan(best_guess)) or not np.isfinite(error_variance)
+                or error_variance <= 0 or not np.isfinite(T1) or not np.isfinite(T2)
+                or np.isnan(dist_code)):
+            return out
+
+        code = int(dist_code)
+        try:
+            if code == 1:
+                s = np.sqrt(error_variance)
+                c1, c2 = norm.cdf(T1, loc=best_guess, scale=s), norm.cdf(T2, loc=best_guess, scale=s)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 2:
+                valid = best_guess > 0
+                sigma = np.full(n_time, np.nan); mu = np.full(n_time, np.nan)
+                sigma[valid] = np.sqrt(np.log(1.0 + error_variance / (best_guess[valid] ** 2)))
+                mu[valid] = np.log(best_guess[valid]) - 0.5 * sigma[valid] ** 2
+                c1, c2 = lognorm.cdf(T1, s=sigma, scale=np.exp(mu)), lognorm.cdf(T2, s=sigma, scale=np.exp(mu))
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 3:
+                scale = np.sqrt(error_variance); loc = best_guess - scale
+                c1, c2 = expon.cdf(T1, loc=loc, scale=scale), expon.cdf(T2, loc=loc, scale=scale)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 4:
+                valid = best_guess > 0
+                alpha = np.full(n_time, np.nan); theta = np.full(n_time, np.nan)
+                alpha[valid] = (best_guess[valid] ** 2) / error_variance
+                theta[valid] = error_variance / best_guess[valid]
+                c1, c2 = gamma.cdf(T1, a=alpha, scale=theta), gamma.cdf(T2, a=alpha, scale=theta)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 5:
+                for i in range(n_time):
+                    M, V = best_guess[i], error_variance
+                    if not np.isfinite(M) or M <= 0 or V <= 0:
+                        continue
+                    k = fsolve(WAS_mme_CCA.weibull_shape_solver, 2.0, args=(M, V))[0]
+                    if not np.isfinite(k) or k <= 0:
+                        continue
+                    lam = M / gamma_function(1 + 1 / k)
+                    c1, c2 = weibull_min.cdf(T1, c=k, loc=0, scale=lam), weibull_min.cdf(T2, c=k, loc=0, scale=lam)
+                    out[0, i], out[1, i], out[2, i] = c1, c2 - c1, 1.0 - c2
+            elif code == 6:
+                if dof <= 2:
+                    return out
+                scale = np.sqrt(error_variance * (dof - 2) / dof)
+                c1, c2 = t.cdf(T1, df=dof, loc=best_guess, scale=scale), t.cdf(T2, df=dof, loc=best_guess, scale=scale)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 7:
+                mu = np.where(best_guess >= 0, best_guess, np.nan)
+                c1, c2 = poisson.cdf(T1, mu=mu), poisson.cdf(T2, mu=mu)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 8:
+                valid = error_variance > best_guess
+                p = np.where(valid, best_guess / error_variance, np.nan)
+                n = np.where(valid, best_guess ** 2 / (error_variance - best_guess), np.nan)
+                c1, c2 = nbinom.cdf(T1, n=n, p=p), nbinom.cdf(T2, n=n, p=p)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            else:
+                return out
+        except Exception:
+            return out
+
+        out = np.clip(out, 0, 1)
+        total = np.nansum(out, axis=0)
+        ok = np.isfinite(total) & (total > 0)
+        out[:, ok] = out[:, ok] / total[ok]
+        return out
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_samples = np.asarray(error_samples, dtype=float)
+        n_time = best_guess.size
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+
+        valid_errors = error_samples[np.isfinite(error_samples)]
+        if valid_errors.size == 0:
+            return pred_prob
+
+        for i in range(n_time):
+            if not np.isfinite(best_guess[i]):
+                continue
+            d = best_guess[i] + valid_errors
+            p_below = np.mean(d < first_tercile)
+            p_normal = np.mean((d >= first_tercile) & (d < second_tercile))
+            pred_prob[0, i] = p_below
+            pred_prob[1, i] = p_normal
+            pred_prob[2, i] = 1.0 - p_below - p_normal
+        return pred_prob
+
+    @staticmethod
+    def _normalize_probabilities(prob):
+        prob = prob.clip(min=0.0, max=1.0)
+        total = prob.sum(dim="probability")
+        return xr.where(total > 0, prob / total, np.nan)
+
+    def _tercile_probabilities(self, Predictant, deterministic, clim_year_start, clim_year_end,
+                               error_samples, error_variance,
+                               best_code_da=None, best_shape_da=None,
+                               best_loc_da=None, best_scale_da=None):
+        Predictant = Predictant.transpose("T", "Y", "X")
+        deterministic = deterministic.transpose("T", "Y", "X")
+        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+
+        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+        if clim.sizes.get("T", 0) < 3:
+            raise ValueError("Not enough years in climatology period for terciles.")
+        terc = clim.quantile([1.0 / 3.0, 2.0 / 3.0], dim="T")
+        T1_emp = terc.isel(quantile=0).drop_vars("quantile")
+        T2_emp = terc.isel(quantile=1).drop_vars("quantile")
+        dof = max(int(clim.sizes["T"]) - 1, 2)
+
+        if self.dist_method == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+                raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
+                vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_bestfit,
+                deterministic, error_variance, T1, T2, best_code_da,
+                input_core_dims=[("T",), (), (), (), ()], output_core_dims=[("probability", "T")],
+                vectorize=True, kwargs={"dof": dof}, dask="parallelized", output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True})
+        elif self.dist_method == "nonparam":
+            # rename residual sample axis so a length-1 forecast and the
+            # length-n residual record don't collide on the shared 'T' core dim
+            err = error_samples.rename({"T": "__samp"})
+            prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_nonparametric,
+                deterministic, err, T1_emp, T2_emp,
+                input_core_dims=[("T",), ("__samp",), (), ()], output_core_dims=[("probability", "T")],
+                vectorize=True, dask="parallelized", output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True})
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
+
+        prob = prob.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
+        prob = self._normalize_probabilities(prob.transpose("probability", "T", "Y", "X"))
+        return (prob * mask).transpose("probability", "T", "Y", "X")
+
+    # ----------------------------------------------------- framework contract
+    def compute_model(self, X_train, y_train, X_test, y_test=None, **kwargs):
+        """
+        Deterministic CCA hindcast for one CV fold, in the standardized space
+        the framework hands in. No detrend here — matches WAS_CCA_op.compute_model
+        which is also detrend-free. The same_kind_model2 branch reverse-standardizes
+        the output afterwards.
+        """
+        if "M" in y_train.dims:
+            y_train = y_train.isel(M=0, drop=True)
+        field_train = self._field(X_train)
+        field_test = self._field(X_test)
+        return self._fit_predict_cca(field_train, y_train, field_test)
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                     best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+        Predictant = Predictant.transpose("T", "Y", "X")
+        hindcast_det = hindcast_det.transpose("T", "Y", "X")
+        if hindcast_det.sizes["T"] == Predictant.sizes["T"]:
+            hindcast_det = hindcast_det.assign_coords(T=Predictant["T"])
+
+        error_samples = Predictant - hindcast_det
+        error_variance = error_samples.var(dim="T", skipna=True)
+
+        return self._tercile_probabilities(
+            Predictant, hindcast_det, clim_year_start, clim_year_end,
+            error_samples, error_variance,
+            best_code_da, best_shape_da, best_loc_da, best_scale_da)
+
+    # ------------------------------------------------------------- operational
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                 hindcast_det, Predictor_for_year,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
+        """
+        Operational CCA forecast for a single target year.
+
+          predictor →  standardize  →  detrended_data()                 (raw, not pre-standardized)
+          predictand →  standardize  →  detrended_data() (always unconditional)
+          forecast-year predictor  →  apply_detrend_data()
+          fit CCA on (predictor_dt, predictand_st_dt)
+          result  →  + apply_detrend_data()  →  reverse_standardize()
+        """
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+        Predictant = Predictant.transpose("T", "Y", "X")
+        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+        
+        mean_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
+	  std_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
+	  Predictor_for_year = (Predictor_for_year - mean_val) / std_val
+
+        # --- predictor: raw field → polynomial detrend 
+        Predictor = standardize_timeseries(Predictor, clim_year_start, clim_year_end)
+        
+        field_hist = self._field(Predictor)
+        field_year = self._field(Predictor_for_year)
+
+        if self.detrend:
+            field_hist_fit, coeffsX, metaX = detrended_data(field_hist, dim="T")
+            # remove the same fitted trend from the forecast-year field 
+            field_year_fit = field_year - apply_detrend_data(field_year, coeffsX, metaX)
+        else:
+            field_hist_fit = field_hist
+            field_year_fit = field_year
+
+        # --- predictand: standardize → polynomial detrend 
+        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
+        if self.detrend:
+            Predictant_st_fit, coeffsY, metaY = detrended_data(Predictant_st, dim="T")
+        else:
+            Predictant_st_fit = Predictant_st
+
+        # --- fit CCA and predict 
+        pred_st = self._fit_predict_cca(field_hist_fit, Predictant_st_fit, field_year_fit)
+
+        # --- add predictand trend back, then reverse-standardize 
+        if self.detrend:
+            pred_st = pred_st + apply_detrend_data(pred_st, coeffsY, metaY)
+
+        forecast_det = reverse_standardize(pred_st, Predictant, clim_year_start, clim_year_end)
+
+        # target time = forecast year + predictand target month
+        year = Predictor_for_year.coords["T"].values.astype("datetime64[Y]").astype(int)[0] + 1970
+        month = Predictant.isel(T=0).coords["T"].values.astype("datetime64[M]").astype(int) % 12 + 1
+        new_T = np.datetime64(f"{year}-{month:02d}-01")
+        forecast_det = forecast_det.assign_coords(T=xr.DataArray([new_T], dims=["T"]))
+        forecast_det["T"] = forecast_det["T"].astype("datetime64[ns]")
+        forecast_det = forecast_det.clip(min=0)
+
+        error_samples = Predictant - hindcast_det.transpose("T", "Y", "X")
+        error_variance = error_samples.var(dim="T", skipna=True)
+        forecast_prob = self._tercile_probabilities(
+            Predictant, forecast_det, clim_year_start, clim_year_end,
+            error_samples, error_variance,
+            best_code_da, best_shape_da, best_loc_da, best_scale_da)
+
+        return forecast_det * mask, forecast_prob * mask
+        
+
+class WAS_mme_CCA_eeof:
+    """
+    Canonical Correlation Analysis MME, legacy WAS_CCA ideology (EEOF detrend).
+
+    Parameters
+    ----------
+    n_modes : int
+        Number of canonical modes for xeofs.cross.CCA (default 4).
+    n_pca_modes : int
+        PCA modes kept before CCA when ``use_pca`` (default 8).
+    standardize : bool
+        Passed to xeofs.cross.CCA (default False; data are already prepared).
+    use_coslat : bool
+        Cosine-latitude weighting inside the CCA (default True).
+    use_pca : bool
+        Pre-filter each field with PCA before the CCA (default True).
+    combine : {'mean', 'meof'}
+        How the M models enter the CCA predictor field.
+        'mean' (default) collapses M to the multi-model mean before any
+        processing.
+        'meof' keeps M as an extra channel so xeofs sees a joint
+        (lat, lon, M) feature space at both the EEOF detrend stage and the
+        CCA stage. This is scientifically richer but numerically fragile:
+        the internal n_pca_modes=22 of ExtendedEOF may be too small to
+        cover the enlarged feature space, and the CCA PCA pre-filter faces
+        a far worse sample-to-feature ratio. Spatially coarsen the predictor
+        and keep n_pca_modes conservative when using 'meof'.
+    eeof_detrend : bool
+        Apply the legacy EEOF detrend inside ``forecast`` (default True). Set
+        False to fit CCA on the raw standardized fields without EEOF removal.
+    dist_method : {'nonparam', 'bestfit'}
+        Tercile-probability strategy (default 'nonparam').
+    """
+
+    def __init__(self, n_modes=4, n_pca_modes=8, standardize=False,
+                 use_coslat=True, use_pca=True, combine="mean",
+                 eeof_detrend=True, dist_method="nonparam"):
+        if combine not in ("mean", "meof"):
+            raise ValueError("combine must be 'mean' or 'meof'.")
+        self.n_modes = n_modes
+        self.n_pca_modes = n_pca_modes
+        self.standardize = standardize
+        self.use_coslat = use_coslat
+        self.use_pca = use_pca
+        self.combine = combine
+        self.eeof_detrend = eeof_detrend
+        self.dist_method = dist_method
+
+        self.cca = None
+        self.cca_model = None
+
+    # ------------------------------------------------------------------ utils
+    def _new_cca(self):
+        """Fresh xeofs CCA instance (one per fold -> leakage-free CV)."""
+        return xe.cross.CCA(
+            n_modes=self.n_modes,
+            standardize=self.standardize,
+            use_coslat=self.use_coslat,
+            use_pca=self.use_pca,
+            n_pca_modes=self.n_pca_modes,
+        )
+
+    def _field(self, X):
+        """Build the CCA predictor field from the predictor cube (T, Y, X, M)."""
+        if "M" not in X.dims:
+            return X
+        if self.combine == "meof":
+            return X
+        return X.mean("M")
+
+    @staticmethod
+    def _to_latlon(da):
+        """WAS dims (Y, X[, M]) -> xeofs dims (lat, lon[, M]); order (T, lat, lon, ...)."""
+        rename = {}
+        if "Y" in da.dims:
+            rename["Y"] = "lat"
+        if "X" in da.dims:
+            rename["X"] = "lon"
+        da = da.rename(rename)
+        lead = [d for d in ("T", "lat", "lon") if d in da.dims]
+        rest = [d for d in da.dims if d not in lead]
+        return da.transpose(*lead, *rest)
+
+    @staticmethod
+    def _from_latlon(da):
+        """xeofs dims (lat, lon) -> WAS dims (Y, X); order (T, Y, X)."""
+        rename = {}
+        if "lat" in da.dims:
+            rename["lat"] = "Y"
+        if "lon" in da.dims:
+            rename["lon"] = "X"
+        da = da.rename(rename)
+        return da.transpose("T", "Y", "X")
+
+    @staticmethod
+    def _eeof_remove(da):
+        """
+        Legacy EEOF detrend: subtract the leading ExtendedEOF reconstruction.
+
+        Reproduces:
+            da - extract_leading_eeof_component(da).fillna(<last valid slice>)
+        then fills any residual NaN with 0, exactly as legacy WAS_CCA does.
+
+        combine='meof' warning
+        ----------------------
+        When ``da`` has shape (T, lat, lon, M), ExtendedEOF internally flattens
+        all non-T dimensions into (lat x lon x M) features and applies a PCA
+        pre-filter with n_pca_modes=22 (hard-coded inside
+        ``extract_leading_eeof_component``).  If n_models x n_cells >> 22 the
+        leading reconstructed mode may absorb genuine predictive signal rather
+        than only the low-frequency trend.  Coarsen spatially or switch to
+        combine='mean' if this is a concern.
+        """
+        trend = extract_leading_eeof_component(da)
+        # the embedding leaves trailing NaNs in T; fill them with the last
+        # valid reconstructed time slice (legacy used positional index -3)
+        fill_slice = trend.isel(T=-3) if trend.sizes.get("T", 0) >= 3 else trend.isel(T=-1)
+        trend = trend.fillna(fill_slice)
+        return (da - trend).fillna(0)
+
+    # --------------------------------------------------------------- CCA core
+    def _fit_predict_cca(self, field_train, y_train, field_test):
+        """
+        Fit CCA on the training field, predict the test field, return the
+        physical-space predictand on the WAS grid (T, Y, X). NaNs are filled
+        with the training mean (no leakage); physical space is recovered with
+        ``inverse_transform(transform(X), predict(X))[1]`` (codebase idiom).
+        """
+        Xtr = self._to_latlon(field_train)
+        Ytr = self._to_latlon(y_train)
+
+        Xtr_mean = Xtr.mean(dim="T", skipna=True)
+        Xtr = Xtr.fillna(Xtr_mean)
+        Ytr = Ytr.fillna(Ytr.mean(dim="T", skipna=True))
+
+        self.cca = self._new_cca()
+        self.cca_model = self.cca.fit(Xtr, Ytr, dim="T")
+
+        Xte = self._to_latlon(field_test).fillna(Xtr_mean)
+        y_pred = self.cca_model.predict(Xte)
+        y_pred = self.cca_model.inverse_transform(
+            self.cca_model.transform(Xte), y_pred
+        )[1]
+        y_pred["T"] = field_test["T"]
+
+        return self._from_latlon(y_pred)
+
+    # ----------------------------------------------- probability calculation
+    @staticmethod
+    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
+        if np.isnan(dist_code):
+            return np.nan, np.nan
+        code = int(dist_code)
+        try:
+            if code == 1:
+                return norm.ppf(1/3, loc=loc, scale=scale), norm.ppf(2/3, loc=loc, scale=scale)
+            if code == 2:
+                return lognorm.ppf(1/3, s=shape, loc=loc, scale=scale), lognorm.ppf(2/3, s=shape, loc=loc, scale=scale)
+            if code == 3:
+                return expon.ppf(1/3, loc=loc, scale=scale), expon.ppf(2/3, loc=loc, scale=scale)
+            if code == 4:
+                return gamma.ppf(1/3, a=shape, loc=loc, scale=scale), gamma.ppf(2/3, a=shape, loc=loc, scale=scale)
+            if code == 5:
+                return weibull_min.ppf(1/3, c=shape, loc=loc, scale=scale), weibull_min.ppf(2/3, c=shape, loc=loc, scale=scale)
+            if code == 6:
+                return t.ppf(1/3, df=shape, loc=loc, scale=scale), t.ppf(2/3, df=shape, loc=loc, scale=scale)
+            if code == 7:
+                return poisson.ppf(1/3, mu=shape, loc=loc), poisson.ppf(2/3, mu=shape, loc=loc)
+            if code == 8:
+                return nbinom.ppf(1/3, n=shape, p=scale, loc=loc), nbinom.ppf(2/3, n=shape, p=scale, loc=loc)
+        except Exception:
+            return np.nan, np.nan
+        return np.nan, np.nan
+
+    @staticmethod
+    def weibull_shape_solver(k, M, V):
+        if k <= 0:
+            return -np.inf
+        try:
+            g1 = gamma_function(1 + 1 / k)
+            g2 = gamma_function(1 + 2 / k)
+            return (V / (M ** 2)) - ((g2 / (g1 ** 2)) - 1)
+        except Exception:
+            return -np.inf
+
+    @staticmethod
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_variance = float(error_variance)
+        n_time = best_guess.size
+        out = np.full((3, n_time), np.nan, dtype=float)
+
+        if (np.all(np.isnan(best_guess)) or not np.isfinite(error_variance)
+                or error_variance <= 0 or not np.isfinite(T1) or not np.isfinite(T2)
+                or np.isnan(dist_code)):
+            return out
+
+        code = int(dist_code)
+        try:
+            if code == 1:
+                s = np.sqrt(error_variance)
+                c1, c2 = norm.cdf(T1, loc=best_guess, scale=s), norm.cdf(T2, loc=best_guess, scale=s)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 2:
+                valid = best_guess > 0
+                sigma = np.full(n_time, np.nan); mu = np.full(n_time, np.nan)
+                sigma[valid] = np.sqrt(np.log(1.0 + error_variance / (best_guess[valid] ** 2)))
+                mu[valid] = np.log(best_guess[valid]) - 0.5 * sigma[valid] ** 2
+                c1, c2 = lognorm.cdf(T1, s=sigma, scale=np.exp(mu)), lognorm.cdf(T2, s=sigma, scale=np.exp(mu))
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 3:
+                scale = np.sqrt(error_variance); loc = best_guess - scale
+                c1, c2 = expon.cdf(T1, loc=loc, scale=scale), expon.cdf(T2, loc=loc, scale=scale)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 4:
+                valid = best_guess > 0
+                alpha = np.full(n_time, np.nan); theta = np.full(n_time, np.nan)
+                alpha[valid] = (best_guess[valid] ** 2) / error_variance
+                theta[valid] = error_variance / best_guess[valid]
+                c1, c2 = gamma.cdf(T1, a=alpha, scale=theta), gamma.cdf(T2, a=alpha, scale=theta)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 5:
+                for i in range(n_time):
+                    M, V = best_guess[i], error_variance
+                    if not np.isfinite(M) or M <= 0 or V <= 0:
+                        continue
+                    k = fsolve(WAS_mme_CCA_eeof.weibull_shape_solver, 2.0, args=(M, V))[0]
+                    if not np.isfinite(k) or k <= 0:
+                        continue
+                    lam = M / gamma_function(1 + 1 / k)
+                    c1, c2 = weibull_min.cdf(T1, c=k, loc=0, scale=lam), weibull_min.cdf(T2, c=k, loc=0, scale=lam)
+                    out[0, i], out[1, i], out[2, i] = c1, c2 - c1, 1.0 - c2
+            elif code == 6:
+                if dof <= 2:
+                    return out
+                scale = np.sqrt(error_variance * (dof - 2) / dof)
+                c1, c2 = t.cdf(T1, df=dof, loc=best_guess, scale=scale), t.cdf(T2, df=dof, loc=best_guess, scale=scale)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 7:
+                mu = np.where(best_guess >= 0, best_guess, np.nan)
+                c1, c2 = poisson.cdf(T1, mu=mu), poisson.cdf(T2, mu=mu)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            elif code == 8:
+                valid = error_variance > best_guess
+                p = np.where(valid, best_guess / error_variance, np.nan)
+                n = np.where(valid, best_guess ** 2 / (error_variance - best_guess), np.nan)
+                c1, c2 = nbinom.cdf(T1, n=n, p=p), nbinom.cdf(T2, n=n, p=p)
+                out[0, :], out[1, :], out[2, :] = c1, c2 - c1, 1.0 - c2
+            else:
+                return out
+        except Exception:
+            return out
+
+        out = np.clip(out, 0, 1)
+        total = np.nansum(out, axis=0)
+        ok = np.isfinite(total) & (total > 0)
+        out[:, ok] = out[:, ok] / total[ok]
+        return out
+
+    @staticmethod
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        best_guess = np.asarray(best_guess, dtype=float)
+        error_samples = np.asarray(error_samples, dtype=float)
+        n_time = best_guess.size
+        pred_prob = np.full((3, n_time), np.nan, dtype=float)
+
+        valid_errors = error_samples[np.isfinite(error_samples)]
+        if valid_errors.size == 0:
+            return pred_prob
+
+        for i in range(n_time):
+            if not np.isfinite(best_guess[i]):
+                continue
+            d = best_guess[i] + valid_errors
+            p_below = np.mean(d < first_tercile)
+            p_normal = np.mean((d >= first_tercile) & (d < second_tercile))
+            pred_prob[0, i] = p_below
+            pred_prob[1, i] = p_normal
+            pred_prob[2, i] = 1.0 - p_below - p_normal
+        return pred_prob
+
+    @staticmethod
+    def _normalize_probabilities(prob):
+        prob = prob.clip(min=0.0, max=1.0)
+        total = prob.sum(dim="probability")
+        return xr.where(total > 0, prob / total, np.nan)
+
+    def _tercile_probabilities(self, Predictant, deterministic, clim_year_start, clim_year_end,
+                               error_samples, error_variance,
+                               best_code_da=None, best_shape_da=None,
+                               best_loc_da=None, best_scale_da=None):
+        Predictant = Predictant.transpose("T", "Y", "X")
+        deterministic = deterministic.transpose("T", "Y", "X")
+        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+
+        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+        if clim.sizes.get("T", 0) < 3:
+            raise ValueError("Not enough years in climatology period for terciles.")
+        # legacy WAS_CCA tercile quantiles
+        terc = clim.quantile([0.30, 0.67], dim="T")
+        T1_emp = terc.isel(quantile=0).drop_vars("quantile")
+        T2_emp = terc.isel(quantile=1).drop_vars("quantile")
+        dof = max(int(clim.sizes["T"]) - 1, 2)
+
+        if self.dist_method == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+                raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
+                vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_bestfit,
+                deterministic, error_variance, T1, T2, best_code_da,
+                input_core_dims=[("T",), (), (), (), ()], output_core_dims=[("probability", "T")],
+                vectorize=True, kwargs={"dof": dof}, dask="parallelized", output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True})
+        elif self.dist_method == "nonparam":
+            # rename residual sample axis so a length-1 forecast and the
+            # length-n residual record don't collide on the shared 'T' core dim
+            err = error_samples.rename({"T": "__samp"})
+            prob = xr.apply_ufunc(
+                self.calculate_tercile_probabilities_nonparametric,
+                deterministic, err, T1_emp, T2_emp,
+                input_core_dims=[("T",), ("__samp",), (), ()], output_core_dims=[("probability", "T")],
+                vectorize=True, dask="parallelized", output_dtypes=[float],
+                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True})
+        else:
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
+
+        prob = prob.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
+        prob = self._normalize_probabilities(prob.transpose("probability", "T", "Y", "X"))
+        return (prob * mask).transpose("probability", "T", "Y", "X")
+
+    # ----------------------------------------------------- framework contract
+    def compute_model(self, X_train, y_train, X_test, y_test=None, **kwargs):
+        """
+        Deterministic CCA hindcast for one CV fold, in the space the framework
+        hands in (matches legacy WAS_CCA.compute_model: plain CCA, no EEOF
+        detrend; the same_kind_model2 branch reverse-standardizes afterwards).
+        """
+        if "M" in y_train.dims:
+            y_train = y_train.isel(M=0, drop=True)
+        field_train = self._field(X_train)
+        field_test = self._field(X_test)
+        return self._fit_predict_cca(field_train, y_train, field_test)
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                     best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+        Predictant = Predictant.transpose("T", "Y", "X")
+        hindcast_det = hindcast_det.transpose("T", "Y", "X")
+        if hindcast_det.sizes["T"] == Predictant.sizes["T"]:
+            hindcast_det = hindcast_det.assign_coords(T=Predictant["T"])
+
+        error_samples = Predictant - hindcast_det           # out-of-sample (LOYO hindcast)
+        error_variance = error_samples.var(dim="T", skipna=True)
+
+        return self._tercile_probabilities(
+            Predictant, hindcast_det, clim_year_start, clim_year_end,
+            error_samples, error_variance,
+            best_code_da, best_shape_da, best_loc_da, best_scale_da)
+
+    # ------------------------------------------------------------- operational
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                 hindcast_det, Predictor_for_year,
+                 best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
+        """
+        Operational CCA forecast for a single target year, legacy WAS_CCA style:
+
+          * predictor field EEOF-detrended (NOT standardized),
+          * predictand standardized then EEOF-detrended,
+          * forecast-year predictor only gap-filled (NOT detrended),
+          * result reverse-standardized with NO trend added back.
+        """
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+        Predictant = Predictant.transpose("T", "Y", "X")
+        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+        
+        mean_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
+	  std_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
+	  Predictor_for_year = (Predictor_for_year - mean_val) / std_val
+
+        # ----- predictor side: EEOF-detrended field over all training years
+        Predictor = standardize_timeseries(Predictor, clim_year_start, clim_year_end)
+        field_hist = self._field(Predictor)
+        if self.eeof_detrend:
+            field_hist_fit = self._eeof_remove(field_hist)
+        else:
+            field_hist_fit = field_hist.fillna(field_hist.mean(dim="T", skipna=True)).fillna(0)
+
+        # ----- predictand side: standardize, then EEOF-detrend
+        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
+        if self.eeof_detrend:
+            Predictant_fit = self._eeof_remove(Predictant_st)
+        else:
+            Predictant_fit = Predictant_st.fillna(0)
+
+        # ----- forecast-year predictor: gap-fill only, NOT detrended
+        field_year = self._field(Predictor_for_year)
+        field_year = (field_year.fillna(field_hist.mean(dim="T", skipna=True))
+                      .ffill(dim="Y").bfill(dim="Y")
+                      .ffill(dim="X").bfill(dim="X")
+                      .fillna(0))
+
+        # ----- fit CCA and predict
+        pred_st = self._fit_predict_cca(field_hist_fit, Predictant_fit, field_year)
+
+        # ----- back to physical space (no EEOF trend re-added: legacy behavior)
+        forecast_det = reverse_standardize(pred_st, Predictant, clim_year_start, clim_year_end)
+
+        # target time = forecast year + predictand target month
+        year = Predictor_for_year.coords["T"].values.astype("datetime64[Y]").astype(int)[0] + 1970
+        month = Predictant.isel(T=0).coords["T"].values.astype("datetime64[M]").astype(int) % 12 + 1
+        new_T = np.datetime64(f"{year}-{month:02d}-01")
+        forecast_det = forecast_det.assign_coords(T=xr.DataArray([new_T], dims=["T"]))
+        forecast_det["T"] = forecast_det["T"].astype("datetime64[ns]")
+
+        error_samples = Predictant - hindcast_det.transpose("T", "Y", "X")
+        error_variance = error_samples.var(dim="T", skipna=True)
+        forecast_prob = self._tercile_probabilities(
+            Predictant, forecast_det, clim_year_start, clim_year_end,
+            error_samples, error_variance,
+            best_code_da, best_shape_da, best_loc_da, best_scale_da)
+
+        return forecast_det * mask, forecast_prob * mask
