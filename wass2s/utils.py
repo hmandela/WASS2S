@@ -921,7 +921,6 @@ skill_mask
     center, variable = parse_variable(variables_list)
     if model:
         abb_month_ini = calendar.month_abbr[int(month_of_initialization)]
-        season_str = "".join([calendar.month_abbr[(int(i) + int(month_of_initialization)) % 12 or 12] for i in lead_time])
         center = center.lower().replace("_", "")
         
         if lead_time is None:
@@ -929,6 +928,7 @@ skill_mask
             ### A revoir
             filepath_fcst = f"{dir_to_data}/forecast_{center}_{variable}_{abb_month_ini}Ic.nc"
         else:
+            season_str = "".join([calendar.month_abbr[(int(i) + int(month_of_initialization)) % 12 or 12] for i in lead_time])
             filepath_hdcst = f"{dir_to_data}/hindcast_{center}_{variable}_{abb_month_ini}Ic_{season_str}_{lead_time[0]}.nc"
             ### A revoir
             filepath_fcst = f"{dir_to_data}/forecast_{center}_{variable}_{abb_month_ini}Ic_{season_str}_{lead_time[0]}.nc"
