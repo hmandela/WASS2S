@@ -68,7 +68,7 @@ ceac_agro
     station and gridded data (``CEAC_compute_onset``, ``CEAC_compute_cessation``, …).
 """
 
-__version__ = "0.4.8.2"
+__version__ = "0.4.8.5"
 
 # Backward-compatibility shim: scipy removed scipy.interp in 1.14.
 import numpy as _np
