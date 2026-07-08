@@ -50,10 +50,7 @@ dependencies = [
     "cca-zoo",
     "eccodes",
     "cfgrib",
-    "h11==0.14.0",
-    "certifi",
-    "requests",
-    "urllib3"  
+    "certifi", 
     # "torch",
     # "lightning",
     # "cca-zoo"
