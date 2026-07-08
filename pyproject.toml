@@ -47,7 +47,13 @@ dependencies = [
     "ipywidgets",
     "regionmask",
     "pycountry",
-    "cca-zoo"    
+    "cca-zoo",
+    "eccodes",
+    "cfgrib",
+    "h11==0.14.0",
+    "certifi",
+    "requests",
+    "urllib3"  
     # "torch",
     # "lightning",
     # "cca-zoo"
