@@ -6396,7 +6396,7 @@ class WAS_Download:
         dir_to_save = Path(dir_to_save)
         dir_to_save.mkdir(parents=True, exist_ok=True)
         area = tuple(area)
-        season_months = tuple(season_months)  
+ 
         
         product_key = "soilmoisture" if product in ["soilmoisture", "soil_moisture"] else product
         if product_key == "rfe":
