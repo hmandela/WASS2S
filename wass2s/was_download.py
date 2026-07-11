@@ -151,450 +151,446 @@ class WAS_Download:
         """Initialize the WAS_Download class."""
         pass
 
+
     def ModelsName(
         self,
-        source=None,
-        variable=None,
-        product="monthly",
-        include_pressure=True,
-        include_wmolc_aliases=False,
-        return_metadata=False,
+        centre={
+            "BOM_2": "bom",
+            "ECMWF_51": "ecmwf",
+            "UKMO_604": "ukmo",
+            "UKMO_603": "ukmo",
+            "UKMO_605": "ukmo",
+            "UKMO_610": "ukmo",
+            "METEOFRANCE_8": "meteo_france",
+            "METEOFRANCE_9": "meteo_france",
+            "DWD_21": "dwd", # month of initialization available for forecast are Jan to Mar
+            "DWD_22": "dwd", # month of initialization available for forecast are Apr to __ 
+            "CMCC_35": "cmcc",
+            "CMCC_4": "cmcc",
+            "NCEP_2": "ncep",
+            "JMA_3": "jma",
+            "JMA_4": "jma",
+            "ECCC_4": "eccc",
+            "ECCC_5": "eccc",
+            # "CFSV2": "CFS",
+            # "CMC1": "cmc1",
+            # "CMC2": "cmc2",
+            # "GFDL": "gfdl",
+            # "NASA": "nasa",
+            # "NCAR_CCSM4": "ncar",
+            # "NMME" : "nmme"
+            "CFSV2_1": "cfsv2",
+            "CMC1_1": "cmc1",
+            "CMC2_1": "cmc2",
+            "GFDL_1": "gfdl",
+            "NASA_1": "nasa",
+            "NCAR_CCSM4_1": "ncar_ccsm4",
+            "NCAR_CESM1_1": "ncar_cesm1",
+            "NMME_1" : "nmme",
+        },
+        variables_1={
+            "PRCP":  "total_precipitation",
+            "TEMP":  "2m_temperature",
+            "TDEW": "2m_dewpoint_temperature",
+            "TMAX":  "maximum_2m_temperature_in_the_last_24_hours",
+            "TMIN":  "minimum_2m_temperature_in_the_last_24_hours",
+            "UGRD10":"10m_u_component_of_wind",
+            "VGRD10":"10m_v_component_of_wind",
+            "SST":   "sea_surface_temperature",
+            "SLP": "mean_sea_level_pressure",
+            "DSWR": "surface_solar_radiation_downwards",
+            "DLWR": "surface_thermal_radiation_downwards",
+            "NOLR": "top_net_thermal_radiation",
+            "RUNOFF":"mean_surface_runoff_rate"
+        },
+        variables_2={
+            "HUSS_1000": "specific_humidity",
+            "HUSS_925": "specific_humidity",
+            "HUSS_850": "specific_humidity",
+            "UGRD_1000": "u_component_of_wind",
+            "UGRD_925": "u_component_of_wind",
+            "UGRD_850": "u_component_of_wind",
+            "VGRD_1000": "v_component_of_wind",
+            "VGRD_925": "v_component_of_wind",
+            "VGRD_850": "v_component_of_wind",
+        },
     ):
         """
-        Return valid model-variable combinations supported by the downloader.
-    
-        This method avoids creating invalid combinations. For example, WMOLC models
-        such as Beijing, CPTEC or Moscow are not paired with RUNOFF because the
-        current WMOLC direct-download files do not provide runoff.
-    
-        Parameters
-        ----------
-        source : str or list of str, optional
-            Source family to include. Accepted values are:
-            "c3s", "cds", "nmme", "wmolc", or None for all.
-    
-        variable : str or list of str, optional
-            Variable short name(s) to keep, for example "PRCP", "RUNOFF",
-            ["PRCP", "TEMP"], etc. If None, all valid variables are returned.
-    
-        product : {"monthly", "daily"}, default "monthly"
-            Product context. This matters for a few CDS variables whose native
-            names differ between monthly and original daily data, especially RUNOFF.
-    
-        include_pressure : bool, default True
-            If True, include pressure-level variables such as UGRD_850, VGRD_200,
-            HUSS_925, etc.
-    
-        include_wmolc_aliases : bool, default False
-            If True, also include keys such as "WMOLC_Beijing.PRCP".
-            Default is False to avoid duplicate downloads.
-    
-        return_metadata : bool, default False
-            If False, returns the old style:
-                {"ECMWF_51.PRCP": ("ecmwf", "total_precipitation")}
-            If True, returns rich metadata for each key.
-    
-        Returns
-        -------
-        dict
-            Dictionary of valid model-variable combinations.
+        Generate a combined dictionary of model names and variables. 
+        For more information on C3S, browse the `MetaData <https://confluence.ecmwf.int/display/CKB/Description+of+the+C3S+seasonal+multi-system>`_.
+        For more information on NMME, browse the `MetaData <https://confluence.ecmwf.int/display/CKB/Description+of+the+C3S+seasonal+multi-system>`_.
+
+        Parameters:
+            centre (dict): Mapping of model identifiers to model names.
+            variables_1 (dict): Mapping of variable short names to full names for category 1.
+            variables_2 (dict): Mapping of variable short names to full names for category 2.
+
+        Returns:
+            dict: A combined dictionary with keys as model.variable combinations and values as tuples (model name, variable name).
         """
+        combined_dict1 = {
+            f"{c}.{v}": (centre[c], variables_1[v]) for c in centre for v in variables_1
+        }
+        combined_dict2 = {
+            f"{c}.{v}": (centre[c], variables_2[v]) for c in centre for v in variables_2
+        }
+        combined_dict = {**combined_dict1, **combined_dict2}
+        return combined_dict
 
-        # center_variable = [key for key in downloader.ModelsName().keys() if "RUNOFF" in key]
-        # center_variable = list(downloader.ModelsName(variable="RUNOFF").keys())
-        # wmolc_prcp = list(downloader.ModelsName(source="wmolc", variable="PRCP").keys())
-        # models = downloader.ModelsName(variable="PRCP", return_metadata=True)
-        
-        # for key, meta in models.items():
-        #     print(key, meta["source"], meta["centre"], meta["native_variable"])
-
-        # product="monthly" -> RUNOFF = "mean_surface_runoff_rate"
-        # product="daily"   -> RUNOFF = "surface_runoff"
-        
-        if product not in {"monthly", "daily"}:
-            raise ValueError("product must be either 'monthly' or 'daily'.")
-    
-        def _as_set(x):
-            if x is None:
-                return None
-            if isinstance(x, str):
-                return {x.lower()}
-            return {str(i).lower() for i in x}
-    
-        def _as_var_set(x):
-            if x is None:
-                return None
-            if isinstance(x, str):
-                return {x.upper()}
-            return {str(i).upper() for i in x}
-    
-        source_filter = _as_set(source)
-        variable_filter = _as_var_set(variable)
-    
-        def _source_allowed(name):
-            if source_filter is None:
-                return True
-            name = name.lower()
-            if name == "cds":
-                name = "c3s"
-            return name in source_filter or ("cds" in source_filter and name == "c3s")
-    
-        def _variable_allowed(v):
-            return variable_filter is None or v.upper() in variable_filter
-    
-        def _native_name(vmap, product_name):
-            if isinstance(vmap, dict):
-                if product_name in vmap:
-                    return vmap[product_name]
-                if "monthly" in vmap:
-                    return vmap["monthly"]
-                if "daily" in vmap:
-                    return vmap["daily"]
-                return next(iter(vmap.values()))
-            return vmap
-    
-        # ------------------------------------------------------------------
-        # 1. C3S / CDS seasonal models
-        # ------------------------------------------------------------------
-        c3s_models = {
-            "BOM_2":          {"centre": "bom",          "system": "2"},
-            "ECMWF_51":       {"centre": "ecmwf",        "system": "51"},
-            "UKMO_603":       {"centre": "ukmo",         "system": "603"},
-            "UKMO_604":       {"centre": "ukmo",         "system": "604"},
-            "UKMO_605":       {"centre": "ukmo",         "system": "605"},
-            "UKMO_610":       {"centre": "ukmo",         "system": "610"},
-            "METEOFRANCE_8":  {"centre": "meteo_france", "system": "8"},
-            "METEOFRANCE_9":  {"centre": "meteo_france", "system": "9"},
-            "DWD_21":         {"centre": "dwd",          "system": "21"},
-            "DWD_22":         {"centre": "dwd",          "system": "22"},
-            "CMCC_4":         {"centre": "cmcc",         "system": "4"},
-            "CMCC_35":        {"centre": "cmcc",         "system": "35"},
-            "NCEP_2":         {"centre": "ncep",         "system": "2"},
-            "JMA_3":          {"centre": "jma",          "system": "3"},
-            "JMA_4":          {"centre": "jma",          "system": "4"},
-            "ECCC_4":         {"centre": "eccc",         "system": "4"},
-            "ECCC_5":         {"centre": "eccc",         "system": "5"},
-        }
-    
-        c3s_single_variables = {
-            "PRCP":   "total_precipitation",
-            "TEMP":   "2m_temperature",
-            "TDEW":   "2m_dewpoint_temperature",
-            "TMAX":   "maximum_2m_temperature_in_the_last_24_hours",
-            "TMIN":   "minimum_2m_temperature_in_the_last_24_hours",
-            "UGRD10": "10m_u_component_of_wind",
-            "VGRD10": "10m_v_component_of_wind",
-            "SST":    "sea_surface_temperature",
-            "SLP":    "mean_sea_level_pressure",
-            "DSWR":   "surface_solar_radiation_downwards",
-            "DLWR":   "surface_thermal_radiation_downwards",
-            "NOLR":   "top_net_thermal_radiation",
-            "SRUNOFF": {
-                "monthly": "mean_surface_runoff_rate",
-                "daily": "surface_runoff",
-            },
-            "RUNOFF": {
-                "monthly": "mean_runoff_rate",
-                "daily": "runoff",
-            },
-        }
-    
-        c3s_pressure_variables = {
-            "HUSS_1000": "specific_humidity",
-            "HUSS_925":  "specific_humidity",
-            "HUSS_850":  "specific_humidity",
-            "UGRD_1000": "u_component_of_wind",
-            "UGRD_925":  "u_component_of_wind",
-            "UGRD_850":  "u_component_of_wind",
-            "UGRD_700":  "u_component_of_wind",
-            "UGRD_600":  "u_component_of_wind",
-            "UGRD_500":  "u_component_of_wind",
-            "UGRD_200":  "u_component_of_wind",
-            "VGRD_1000": "v_component_of_wind",
-            "VGRD_925":  "v_component_of_wind",
-            "VGRD_850":  "v_component_of_wind",
-            "VGRD_700":  "v_component_of_wind",
-            "VGRD_600":  "v_component_of_wind",
-            "VGRD_500":  "v_component_of_wind",
-            "VGRD_200":  "v_component_of_wind",
-            "HGT_500":   "geopotential",
-        }
-    
-        # ------------------------------------------------------------------
-        # 2. NMME models
-        #    Important: NMME does not provide all C3S variables in your current
-        #    downloader. Do not create RUNOFF, DSWR, DLWR, etc. here.
-        # ------------------------------------------------------------------
-        nmme_models = {
-            "CFSV2_1":       {"centre": "cfsv2",       "system": "1", "netcdf_model": "CFSv2"},
-            "CMC1_1":        {"centre": "cmc1",        "system": "1", "netcdf_model": "CanESM5"},
-            "CMC2_1":        {"centre": "cmc2",        "system": "1", "netcdf_model": "GEM5.2_NEMO"},
-            "GFDL_1":        {"centre": "gfdl",        "system": "1", "netcdf_model": "GFDL-SPEAR"},
-            "NASA_1":        {"centre": "nasa",        "system": "1", "netcdf_model": "NASA_GEOS5v2"},
-            "NCAR_CCSM4_1":  {"centre": "ncar_ccsm4",  "system": "1", "netcdf_model": "NCAR_CCSM4"},
-            "NCAR_CESM1_1":  {"centre": "ncar_cesm1",  "system": "1", "netcdf_model": "NCAR_CESM1"},
-            "NMME_1":        {"centre": "nmme",        "system": "1", "netcdf_model": "NMME"},
-        }
-    
-        nmme_variables = {
-            "PRCP": {"cpt": "precip", "netcdf": "prate"},
-            "TEMP": {"cpt": "tmp2m",  "netcdf": "tmp2m"},
-            "SST":  {"cpt": "sst",    "netcdf": "tmpsfc"},
-        }
-    
-        # ------------------------------------------------------------------
-        # 3. WMO Lead Centre direct-download models
-        #    Only include variables for which your WMOLC downloader has a file
-        #    naming rule.
-        # ------------------------------------------------------------------
-        wmolc_models = {
-            "Beijing":   {"centre": "Beijing",   "file_prefix": "beijing"},
-            "CPTEC":     {"centre": "CPTEC",     "file_prefix": "cptec"},
-            "Offenbach": {"centre": "Offenbach", "file_prefix": "offenbach"},
-            "Montreal":  {"centre": "Montreal",  "file_prefix": "montreal"},
-            "Pune":      {"centre": "Pune",      "file_prefix": "pune"},
-            "Pretoria":  {"centre": "Pretoria",  "file_prefix": "pretoria"},
-            "Moscow":    {"centre": "Moscow",    "file_prefix": "moscow"},
-        }
-    
-        wmolc_variables = {
-            "PRCP": {"file_suffix": "prec", "standard_name": "precipitation"},
-            "TEMP": {"file_suffix": "t2m",  "standard_name": "2m_temperature"},
-            "T2M":  {"file_suffix": "t2m",  "standard_name": "2m_temperature"},
-            "SST":  {"file_suffix": "sst",  "standard_name": "sea_surface_temperature"},
-            "SLP":  {"file_suffix": "mslp", "standard_name": "mean_sea_level_pressure"},
-            "MSLP": {"file_suffix": "mslp", "standard_name": "mean_sea_level_pressure"},
-            "H500": {"file_suffix": "h500", "standard_name": "geopotential_height_500"},
-            "Z500": {"file_suffix": "h500", "standard_name": "geopotential_height_500"},
-        }
-    
-        registry = {}
-    
-        def _add(key, metadata):
-            if return_metadata:
-                registry[key] = metadata
-            else:
-                registry[key] = (
-                    metadata.get("centre"),
-                    metadata.get("native_variable"),
-                )
-    
-        # Add C3S/CDS
-        if _source_allowed("c3s"):
-            for model_id, model_meta in c3s_models.items():
-                for var_code, var_native in c3s_single_variables.items():
-                    if not _variable_allowed(var_code):
-                        continue
-    
-                    native = _native_name(var_native, product)
-                    key = f"{model_id}.{var_code}"
-    
-                    _add(
-                        key,
-                        {
-                            "source": "c3s",
-                            "model_id": model_id,
-                            "centre": model_meta["centre"],
-                            "system": model_meta["system"],
-                            "variable": var_code,
-                            "native_variable": native,
-                            "level_type": "single",
-                            "product": product,
-                            "dataset_monthly": "seasonal-monthly-single-levels",
-                            "dataset_daily": "seasonal-original-single-levels",
-                        },
-                    )
-    
-                if include_pressure:
-                    for var_code, native in c3s_pressure_variables.items():
-                        if not _variable_allowed(var_code):
-                            continue
-    
-                        level = var_code.split("_")[-1]
-                        key = f"{model_id}.{var_code}"
-    
-                        _add(
-                            key,
-                            {
-                                "source": "c3s",
-                                "model_id": model_id,
-                                "centre": model_meta["centre"],
-                                "system": model_meta["system"],
-                                "variable": var_code,
-                                "native_variable": native,
-                                "pressure_level": level,
-                                "level_type": "pressure",
-                                "product": product,
-                                "dataset_monthly": "seasonal-monthly-pressure-levels",
-                                "dataset_daily": "seasonal-original-pressure-levels",
-                            },
-                        )
-    
-        # Add NMME
-        if _source_allowed("nmme"):
-            for model_id, model_meta in nmme_models.items():
-                for var_code, var_meta in nmme_variables.items():
-                    if not _variable_allowed(var_code):
-                        continue
-    
-                    key = f"{model_id}.{var_code}"
-    
-                    _add(
-                        key,
-                        {
-                            "source": "nmme",
-                            "model_id": model_id,
-                            "centre": model_meta["centre"],
-                            "system": model_meta["system"],
-                            "variable": var_code,
-                            "native_variable": var_meta["cpt"],
-                            "cpt_variable": var_meta["cpt"],
-                            "netcdf_variable": var_meta["netcdf"],
-                            "netcdf_model": model_meta["netcdf_model"],
-                            "level_type": "single",
-                            "product": "monthly",
-                        },
-                    )
-    
-        # Add WMOLC
-        if _source_allowed("wmolc"):
-            for model_id, model_meta in wmolc_models.items():
-                for var_code, var_meta in wmolc_variables.items():
-                    if not _variable_allowed(var_code):
-                        continue
-    
-                    key = f"{model_id}.{var_code}"
-    
-                    _add(
-                        key,
-                        {
-                            "source": "wmolc",
-                            "model_id": model_id,
-                            "centre": model_meta["centre"],
-                            "system": None,
-                            "variable": var_code,
-                            "native_variable": var_meta["file_suffix"],
-                            "file_prefix": model_meta["file_prefix"],
-                            "file_suffix": var_meta["file_suffix"],
-                            "standard_name": var_meta["standard_name"],
-                            "level_type": "single",
-                            "product": "monthly",
-                        },
-                    )
-    
-                    if include_wmolc_aliases:
-                        alias_key = f"WMOLC_{model_id}.{var_code}"
-                        _add(
-                            alias_key,
-                            {
-                                "source": "wmolc",
-                                "model_id": f"WMOLC_{model_id}",
-                                "centre": model_meta["centre"],
-                                "system": None,
-                                "variable": var_code,
-                                "native_variable": var_meta["file_suffix"],
-                                "file_prefix": model_meta["file_prefix"],
-                                "file_suffix": var_meta["file_suffix"],
-                                "standard_name": var_meta["standard_name"],
-                                "level_type": "single",
-                                "product": "monthly",
-                                "alias_of": key,
-                            },
-                        )
-    
-        return dict(sorted(registry.items()))
     
     # def ModelsName(
     #     self,
-    #     centre={
-    #         "BOM_2": "bom",
-    #         "ECMWF_51": "ecmwf",
-    #         "UKMO_604": "ukmo",
-    #         "UKMO_603": "ukmo",
-    #         "UKMO_605": "ukmo",
-    #         "UKMO_610": "ukmo",
-    #         "METEOFRANCE_8": "meteo_france",
-    #         "METEOFRANCE_9": "meteo_france",
-    #         "DWD_21": "dwd", # month of initialization available for forecast are Jan to Mar
-    #         "DWD_22": "dwd", # month of initialization available for forecast are Apr to __ 
-    #         "CMCC_35": "cmcc",
-    #         "CMCC_4": "cmcc",
-    #         "NCEP_2": "ncep",
-    #         "JMA_3": "jma",
-    #         "JMA_4": "jma",
-    #         "ECCC_4": "eccc",
-    #         "ECCC_5": "eccc",
-    #         # "CFSV2": "CFS",
-    #         # "CMC1": "cmc1",
-    #         # "CMC2": "cmc2",
-    #         # "GFDL": "gfdl",
-    #         # "NASA": "nasa",
-    #         # "NCAR_CCSM4": "ncar",
-    #         # "NMME" : "nmme"
-    #         "CFSV2_1": "cfsv2",
-    #         "CMC1_1": "cmc1",
-    #         "CMC2_1": "cmc2",
-    #         "GFDL_1": "gfdl",
-    #         "NASA_1": "nasa",
-    #         "NCAR_CCSM4_1": "ncar_ccsm4",
-    #         "NCAR_CESM1_1": "ncar_cesm1",
-    #         "NMME_1" : "nmme",
-    #         "Beijing": "Beijing",
-    #         "CPTEC": "CPTEC",
-    #         "Offenbach": "Offenbach",
-    #         "Montreal": "Montreal",
-    #         "Pune": "Pune",
-    #         "Pretoria": "Pretoria",
-    #         "Moscow": "Moscow",
-    #     },
-    #     variables_1={
-    #         "PRCP":  "total_precipitation",
-    #         "TEMP":  "2m_temperature",
-    #         "TDEW": "2m_dewpoint_temperature",
-    #         "TMAX":  "maximum_2m_temperature_in_the_last_24_hours",
-    #         "TMIN":  "minimum_2m_temperature_in_the_last_24_hours",
-    #         "UGRD10":"10m_u_component_of_wind",
-    #         "VGRD10":"10m_v_component_of_wind",
-    #         "SST":   "sea_surface_temperature",
-    #         "SLP": "mean_sea_level_pressure",
-    #         "DSWR": "surface_solar_radiation_downwards",
-    #         "DLWR": "surface_thermal_radiation_downwards",
-    #         "NOLR": "top_net_thermal_radiation",
-    #         "RUNOFF":"mean_surface_runoff_rate"
-    #     },
-    #     variables_2={
-    #         "HUSS_1000": "specific_humidity",
-    #         "HUSS_925": "specific_humidity",
-    #         "HUSS_850": "specific_humidity",
-    #         "UGRD_1000": "u_component_of_wind",
-    #         "UGRD_925": "u_component_of_wind",
-    #         "UGRD_850": "u_component_of_wind",
-    #         "VGRD_1000": "v_component_of_wind",
-    #         "VGRD_925": "v_component_of_wind",
-    #         "VGRD_850": "v_component_of_wind",
-    #     },
+    #     source=None,
+    #     variable=None,
+    #     product="monthly",
+    #     include_pressure=True,
+    #     include_wmolc_aliases=False,
+    #     return_metadata=False,
     # ):
     #     """
-    #     Generate a combined dictionary of model names and variables. 
-    #     For more information on C3S, browse the `MetaData <https://confluence.ecmwf.int/display/CKB/Description+of+the+C3S+seasonal+multi-system>`_.
-    #     For more information on NMME, browse the `MetaData <https://confluence.ecmwf.int/display/CKB/Description+of+the+C3S+seasonal+multi-system>`_.
-
-    #     Parameters:
-    #         centre (dict): Mapping of model identifiers to model names.
-    #         variables_1 (dict): Mapping of variable short names to full names for category 1.
-    #         variables_2 (dict): Mapping of variable short names to full names for category 2.
-
-    #     Returns:
-    #         dict: A combined dictionary with keys as model.variable combinations and values as tuples (model name, variable name).
+    #     Return valid model-variable combinations supported by the downloader.
+    
+    #     This method avoids creating invalid combinations. For example, WMOLC models
+    #     such as Beijing, CPTEC or Moscow are not paired with RUNOFF because the
+    #     current WMOLC direct-download files do not provide runoff.
+    
+    #     Parameters
+    #     ----------
+    #     source : str or list of str, optional
+    #         Source family to include. Accepted values are:
+    #         "c3s", "cds", "nmme", "wmolc", or None for all.
+    
+    #     variable : str or list of str, optional
+    #         Variable short name(s) to keep, for example "PRCP", "RUNOFF",
+    #         ["PRCP", "TEMP"], etc. If None, all valid variables are returned.
+    
+    #     product : {"monthly", "daily"}, default "monthly"
+    #         Product context. This matters for a few CDS variables whose native
+    #         names differ between monthly and original daily data, especially RUNOFF.
+    
+    #     include_pressure : bool, default True
+    #         If True, include pressure-level variables such as UGRD_850, VGRD_200,
+    #         HUSS_925, etc.
+    
+    #     include_wmolc_aliases : bool, default False
+    #         If True, also include keys such as "WMOLC_Beijing.PRCP".
+    #         Default is False to avoid duplicate downloads.
+    
+    #     return_metadata : bool, default False
+    #         If False, returns the old style:
+    #             {"ECMWF_51.PRCP": ("ecmwf", "total_precipitation")}
+    #         If True, returns rich metadata for each key.
+    
+    #     Returns
+    #     -------
+    #     dict
+    #         Dictionary of valid model-variable combinations.
     #     """
-    #     combined_dict1 = {
-    #         f"{c}.{v}": (centre[c], variables_1[v]) for c in centre for v in variables_1
+
+    #     # center_variable = [key for key in downloader.ModelsName().keys() if "RUNOFF" in key]
+    #     # center_variable = list(downloader.ModelsName(variable="RUNOFF").keys())
+    #     # wmolc_prcp = list(downloader.ModelsName(source="wmolc", variable="PRCP").keys())
+    #     # models = downloader.ModelsName(variable="PRCP", return_metadata=True)
+        
+    #     # for key, meta in models.items():
+    #     #     print(key, meta["source"], meta["centre"], meta["native_variable"])
+
+    #     # product="monthly" -> RUNOFF = "mean_surface_runoff_rate"
+    #     # product="daily"   -> RUNOFF = "surface_runoff"
+        
+    #     if product not in {"monthly", "daily"}:
+    #         raise ValueError("product must be either 'monthly' or 'daily'.")
+    
+    #     def _as_set(x):
+    #         if x is None:
+    #             return None
+    #         if isinstance(x, str):
+    #             return {x.lower()}
+    #         return {str(i).lower() for i in x}
+    
+    #     def _as_var_set(x):
+    #         if x is None:
+    #             return None
+    #         if isinstance(x, str):
+    #             return {x.upper()}
+    #         return {str(i).upper() for i in x}
+    
+    #     source_filter = _as_set(source)
+    #     variable_filter = _as_var_set(variable)
+    
+    #     def _source_allowed(name):
+    #         if source_filter is None:
+    #             return True
+    #         name = name.lower()
+    #         if name == "cds":
+    #             name = "c3s"
+    #         return name in source_filter or ("cds" in source_filter and name == "c3s")
+    
+    #     def _variable_allowed(v):
+    #         return variable_filter is None or v.upper() in variable_filter
+    
+    #     def _native_name(vmap, product_name):
+    #         if isinstance(vmap, dict):
+    #             if product_name in vmap:
+    #                 return vmap[product_name]
+    #             if "monthly" in vmap:
+    #                 return vmap["monthly"]
+    #             if "daily" in vmap:
+    #                 return vmap["daily"]
+    #             return next(iter(vmap.values()))
+    #         return vmap
+    
+    #     # ------------------------------------------------------------------
+    #     # 1. C3S / CDS seasonal models
+    #     # ------------------------------------------------------------------
+    #     c3s_models = {
+    #         "BOM_2":          {"centre": "bom",          "system": "2"},
+    #         "ECMWF_51":       {"centre": "ecmwf",        "system": "51"},
+    #         "UKMO_603":       {"centre": "ukmo",         "system": "603"},
+    #         "UKMO_604":       {"centre": "ukmo",         "system": "604"},
+    #         "UKMO_605":       {"centre": "ukmo",         "system": "605"},
+    #         "UKMO_610":       {"centre": "ukmo",         "system": "610"},
+    #         "METEOFRANCE_8":  {"centre": "meteo_france", "system": "8"},
+    #         "METEOFRANCE_9":  {"centre": "meteo_france", "system": "9"},
+    #         "DWD_21":         {"centre": "dwd",          "system": "21"},
+    #         "DWD_22":         {"centre": "dwd",          "system": "22"},
+    #         "CMCC_4":         {"centre": "cmcc",         "system": "4"},
+    #         "CMCC_35":        {"centre": "cmcc",         "system": "35"},
+    #         "NCEP_2":         {"centre": "ncep",         "system": "2"},
+    #         "JMA_3":          {"centre": "jma",          "system": "3"},
+    #         "JMA_4":          {"centre": "jma",          "system": "4"},
+    #         "ECCC_4":         {"centre": "eccc",         "system": "4"},
+    #         "ECCC_5":         {"centre": "eccc",         "system": "5"},
     #     }
-    #     combined_dict2 = {
-    #         f"{c}.{v}": (centre[c], variables_2[v]) for c in centre for v in variables_2
+    
+    #     c3s_single_variables = {
+    #         "PRCP":   "total_precipitation",
+    #         "TEMP":   "2m_temperature",
+    #         "TDEW":   "2m_dewpoint_temperature",
+    #         "TMAX":   "maximum_2m_temperature_in_the_last_24_hours",
+    #         "TMIN":   "minimum_2m_temperature_in_the_last_24_hours",
+    #         "UGRD10": "10m_u_component_of_wind",
+    #         "VGRD10": "10m_v_component_of_wind",
+    #         "SST":    "sea_surface_temperature",
+    #         "SLP":    "mean_sea_level_pressure",
+    #         "DSWR":   "surface_solar_radiation_downwards",
+    #         "DLWR":   "surface_thermal_radiation_downwards",
+    #         "NOLR":   "top_net_thermal_radiation",
+    #         "SRUNOFF": {
+    #             "monthly": "mean_surface_runoff_rate",
+    #             "daily": "surface_runoff",
+    #         },
+    #         "RUNOFF": {
+    #             "monthly": "mean_runoff_rate",
+    #             "daily": "runoff",
+    #         },
     #     }
-    #     combined_dict = {**combined_dict1, **combined_dict2}
-    #     return combined_dict
+    
+    #     c3s_pressure_variables = {
+    #         "HUSS_1000": "specific_humidity",
+    #         "HUSS_925":  "specific_humidity",
+    #         "HUSS_850":  "specific_humidity",
+    #         "UGRD_1000": "u_component_of_wind",
+    #         "UGRD_925":  "u_component_of_wind",
+    #         "UGRD_850":  "u_component_of_wind",
+    #         "UGRD_700":  "u_component_of_wind",
+    #         "UGRD_600":  "u_component_of_wind",
+    #         "UGRD_500":  "u_component_of_wind",
+    #         "UGRD_200":  "u_component_of_wind",
+    #         "VGRD_1000": "v_component_of_wind",
+    #         "VGRD_925":  "v_component_of_wind",
+    #         "VGRD_850":  "v_component_of_wind",
+    #         "VGRD_700":  "v_component_of_wind",
+    #         "VGRD_600":  "v_component_of_wind",
+    #         "VGRD_500":  "v_component_of_wind",
+    #         "VGRD_200":  "v_component_of_wind",
+    #         "HGT_500":   "geopotential",
+    #     }
+    
+    #     # ------------------------------------------------------------------
+    #     # 2. NMME models
+    #     #    Important: NMME does not provide all C3S variables in your current
+    #     #    downloader. Do not create RUNOFF, DSWR, DLWR, etc. here.
+    #     # ------------------------------------------------------------------
+    #     nmme_models = {
+    #         "CFSV2_1":       {"centre": "cfsv2",       "system": "1", "netcdf_model": "CFSv2"},
+    #         "CMC1_1":        {"centre": "cmc1",        "system": "1", "netcdf_model": "CanESM5"},
+    #         "CMC2_1":        {"centre": "cmc2",        "system": "1", "netcdf_model": "GEM5.2_NEMO"},
+    #         "GFDL_1":        {"centre": "gfdl",        "system": "1", "netcdf_model": "GFDL-SPEAR"},
+    #         "NASA_1":        {"centre": "nasa",        "system": "1", "netcdf_model": "NASA_GEOS5v2"},
+    #         "NCAR_CCSM4_1":  {"centre": "ncar_ccsm4",  "system": "1", "netcdf_model": "NCAR_CCSM4"},
+    #         "NCAR_CESM1_1":  {"centre": "ncar_cesm1",  "system": "1", "netcdf_model": "NCAR_CESM1"},
+    #         "NMME_1":        {"centre": "nmme",        "system": "1", "netcdf_model": "NMME"},
+    #     }
+    
+    #     nmme_variables = {
+    #         "PRCP": {"cpt": "precip", "netcdf": "prate"},
+    #         "TEMP": {"cpt": "tmp2m",  "netcdf": "tmp2m"},
+    #         "SST":  {"cpt": "sst",    "netcdf": "tmpsfc"},
+    #     }
+    
+    #     # ------------------------------------------------------------------
+    #     # 3. WMO Lead Centre direct-download models
+    #     #    Only include variables for which your WMOLC downloader has a file
+    #     #    naming rule.
+    #     # ------------------------------------------------------------------
+    #     wmolc_models = {
+    #         "Beijing":   {"centre": "Beijing",   "file_prefix": "beijing"},
+    #         "CPTEC":     {"centre": "CPTEC",     "file_prefix": "cptec"},
+    #         "Offenbach": {"centre": "Offenbach", "file_prefix": "offenbach"},
+    #         "Montreal":  {"centre": "Montreal",  "file_prefix": "montreal"},
+    #         "Pune":      {"centre": "Pune",      "file_prefix": "pune"},
+    #         "Pretoria":  {"centre": "Pretoria",  "file_prefix": "pretoria"},
+    #         "Moscow":    {"centre": "Moscow",    "file_prefix": "moscow"},
+    #     }
+    
+    #     wmolc_variables = {
+    #         "PRCP": {"file_suffix": "prec", "standard_name": "precipitation"},
+    #         "TEMP": {"file_suffix": "t2m",  "standard_name": "2m_temperature"},
+    #         "T2M":  {"file_suffix": "t2m",  "standard_name": "2m_temperature"},
+    #         "SST":  {"file_suffix": "sst",  "standard_name": "sea_surface_temperature"},
+    #         "SLP":  {"file_suffix": "mslp", "standard_name": "mean_sea_level_pressure"},
+    #         "MSLP": {"file_suffix": "mslp", "standard_name": "mean_sea_level_pressure"},
+    #         "H500": {"file_suffix": "h500", "standard_name": "geopotential_height_500"},
+    #         "Z500": {"file_suffix": "h500", "standard_name": "geopotential_height_500"},
+    #     }
+    
+    #     registry = {}
+    
+    #     def _add(key, metadata):
+    #         if return_metadata:
+    #             registry[key] = metadata
+    #         else:
+    #             registry[key] = (
+    #                 metadata.get("centre"),
+    #                 metadata.get("native_variable"),
+    #             )
+    
+    #     # Add C3S/CDS
+    #     if _source_allowed("c3s"):
+    #         for model_id, model_meta in c3s_models.items():
+    #             for var_code, var_native in c3s_single_variables.items():
+    #                 if not _variable_allowed(var_code):
+    #                     continue
+    
+    #                 native = _native_name(var_native, product)
+    #                 key = f"{model_id}.{var_code}"
+    
+    #                 _add(
+    #                     key,
+    #                     {
+    #                         "source": "c3s",
+    #                         "model_id": model_id,
+    #                         "centre": model_meta["centre"],
+    #                         "system": model_meta["system"],
+    #                         "variable": var_code,
+    #                         "native_variable": native,
+    #                         "level_type": "single",
+    #                         "product": product,
+    #                         "dataset_monthly": "seasonal-monthly-single-levels",
+    #                         "dataset_daily": "seasonal-original-single-levels",
+    #                     },
+    #                 )
+    
+    #             if include_pressure:
+    #                 for var_code, native in c3s_pressure_variables.items():
+    #                     if not _variable_allowed(var_code):
+    #                         continue
+    
+    #                     level = var_code.split("_")[-1]
+    #                     key = f"{model_id}.{var_code}"
+    
+    #                     _add(
+    #                         key,
+    #                         {
+    #                             "source": "c3s",
+    #                             "model_id": model_id,
+    #                             "centre": model_meta["centre"],
+    #                             "system": model_meta["system"],
+    #                             "variable": var_code,
+    #                             "native_variable": native,
+    #                             "pressure_level": level,
+    #                             "level_type": "pressure",
+    #                             "product": product,
+    #                             "dataset_monthly": "seasonal-monthly-pressure-levels",
+    #                             "dataset_daily": "seasonal-original-pressure-levels",
+    #                         },
+    #                     )
+    
+    #     # Add NMME
+    #     if _source_allowed("nmme"):
+    #         for model_id, model_meta in nmme_models.items():
+    #             for var_code, var_meta in nmme_variables.items():
+    #                 if not _variable_allowed(var_code):
+    #                     continue
+    
+    #                 key = f"{model_id}.{var_code}"
+    
+    #                 _add(
+    #                     key,
+    #                     {
+    #                         "source": "nmme",
+    #                         "model_id": model_id,
+    #                         "centre": model_meta["centre"],
+    #                         "system": model_meta["system"],
+    #                         "variable": var_code,
+    #                         "native_variable": var_meta["cpt"],
+    #                         "cpt_variable": var_meta["cpt"],
+    #                         "netcdf_variable": var_meta["netcdf"],
+    #                         "netcdf_model": model_meta["netcdf_model"],
+    #                         "level_type": "single",
+    #                         "product": "monthly",
+    #                     },
+    #                 )
+    
+    #     # Add WMOLC
+    #     if _source_allowed("wmolc"):
+    #         for model_id, model_meta in wmolc_models.items():
+    #             for var_code, var_meta in wmolc_variables.items():
+    #                 if not _variable_allowed(var_code):
+    #                     continue
+    
+    #                 key = f"{model_id}.{var_code}"
+    
+    #                 _add(
+    #                     key,
+    #                     {
+    #                         "source": "wmolc",
+    #                         "model_id": model_id,
+    #                         "centre": model_meta["centre"],
+    #                         "system": None,
+    #                         "variable": var_code,
+    #                         "native_variable": var_meta["file_suffix"],
+    #                         "file_prefix": model_meta["file_prefix"],
+    #                         "file_suffix": var_meta["file_suffix"],
+    #                         "standard_name": var_meta["standard_name"],
+    #                         "level_type": "single",
+    #                         "product": "monthly",
+    #                     },
+    #                 )
+    
+    #                 if include_wmolc_aliases:
+    #                     alias_key = f"WMOLC_{model_id}.{var_code}"
+    #                     _add(
+    #                         alias_key,
+    #                         {
+    #                             "source": "wmolc",
+    #                             "model_id": f"WMOLC_{model_id}",
+    #                             "centre": model_meta["centre"],
+    #                             "system": None,
+    #                             "variable": var_code,
+    #                             "native_variable": var_meta["file_suffix"],
+    #                             "file_prefix": model_meta["file_prefix"],
+    #                             "file_suffix": var_meta["file_suffix"],
+    #                             "standard_name": var_meta["standard_name"],
+    #                             "level_type": "single",
+    #                             "product": "monthly",
+    #                             "alias_of": key,
+    #                         },
+    #                     )
+    
+    #     return dict(sorted(registry.items()))
+    
 
     def ReanalysisName(
         self,
