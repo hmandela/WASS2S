@@ -307,6 +307,21 @@ def fix_time_coord(ds, seas):
     ds["T"] = ds["T"].astype("datetime64[ns]")
     return ds
 
+def _pick_var(ds, variable):
+
+    if variable in ds.data_vars:
+        return variable
+    for cand in (variable.lower(), variable.upper()):
+        if cand in ds.data_vars:
+            return cand
+
+    lower_map = {v.lower(): v for v in ds.data_vars}
+    if variable.lower() in lower_map:
+        return lower_map[variable.lower()]
+    raise KeyError(
+        f"Variable '{variable}' introuvable. Disponibles: {list(ds.data_vars)}"
+    )
+
 def download_file(url, local_path, force_download=False, chunk_size=8192, timeout=120):
     """
     Download a file from a URL to a local path with progress tracking.
@@ -758,7 +773,7 @@ def compute_sst_indices(dir_to_data, indices, variables_list, year_start, year_e
     predictor["TASI"] = predictor["NAT"] - predictor["SAT"]
     predictor["DMI"] = predictor["WTIO"] - predictor["SETIO"]
     selected_indices = {i: predictor[i] for i in indices}
-    data_vars = {key: ds[variable.lower()].rename(key) for key, ds in selected_indices.items()}
+    data_vars = {key: ds[_pick_var(ds, variable)].rename(key) for key, ds in selected_indices.items()}
     combined_dataset = xr.Dataset(data_vars)
     return combined_dataset
 

@@ -1517,6 +1517,7 @@ class WAS_Download:
         force_download=False,
         data_format="netcdf",
         output_layout="valid_time",
+        runoff_units="m3/s",
     ):
         """
         Download daily seasonal hindcast/forecast data from CDS seasonal-original
@@ -1534,6 +1535,7 @@ class WAS_Download:
             - In "valid_time" layout, T is the valid forecast date.
             - In "init_leadtime" layout, T is the initialization date/year.
             - Accumulated variables are deaccumulated along leadtime.
+            - RUNOFF can be saved as "mm" or "m3/s".
         """
         from calendar import month_abbr
         from pathlib import Path
@@ -1562,6 +1564,9 @@ class WAS_Download:
     
         if output_layout not in ["valid_time", "init_leadtime"]:
             raise ValueError("output_layout must be 'valid_time' or 'init_leadtime'.")
+    
+        if runoff_units not in ["mm", "m3/s"]:
+            raise ValueError("runoff_units must be 'mm' or 'm3/s'.")
     
         if year_forecast is None:
             years = [str(y) for y in range(year_start_hindcast, year_end_hindcast + 1)]
@@ -1726,6 +1731,36 @@ class WAS_Download:
             out = out.assign_coords({dim: ds[dim]})
             return out.where(out >= 0, 0)
     
+        def _grid_cell_area_m2(ds):
+            if "Y" not in ds.coords or "X" not in ds.coords:
+                raise ValueError("RUNOFF conversion to m3/s needs X and Y coordinates.")
+            if ds.sizes.get("Y", 0) < 2 or ds.sizes.get("X", 0) < 2:
+                raise ValueError("RUNOFF conversion to m3/s needs at least two X and Y points.")
+    
+            radius = 6371000.0
+            dlat = np.deg2rad(float(abs(ds["Y"].diff("Y").median())))
+            dlon = np.deg2rad(float(abs(ds["X"].diff("X").median())))
+            area_y = (radius ** 2) * dlat * dlon * np.cos(np.deg2rad(ds["Y"]))
+            area_y.attrs["units"] = "m2"
+            return area_y
+    
+        def _leadtime_interval_seconds(ds):
+            if "leadtime" not in ds.coords:
+                raise ValueError("RUNOFF conversion to m3/s needs leadtime coordinates.")
+    
+            lead = ds["leadtime"]
+            if np.issubdtype(lead.dtype, np.timedelta64):
+                lead_seconds = (lead / np.timedelta64(1, "s")).astype(float)
+            else:
+                # CDS leadtime_hour requests are in hours when decoded as numeric values.
+                lead_seconds = lead.astype(float) * 3600.0
+    
+            first = lead_seconds.isel(leadtime=slice(0, 1))
+            diff = lead_seconds.diff("leadtime")
+            seconds = xr.concat([first, diff], dim="leadtime")
+            seconds = seconds.assign_coords(leadtime=lead)
+            return seconds.where(seconds > 0)
+    
         def _apply_units(ds, var_code):
             if var_code in ["TMIN", "TEMP", "TMAX", "SST", "TDEW"]:
                 ds = ds - 273.15
@@ -1743,9 +1778,17 @@ class WAS_Download:
                     ds[name].attrs["units"] = "mm"
     
             elif var_code in ["SRUNOFF", "RUNOFF"]:
-                ds = _deaccumulate(ds) * 1000.0
-                for name in ds.data_vars:
-                    ds[name].attrs["units"] = "mm"
+                ds = _deaccumulate(ds)
+                if runoff_units == "mm":
+                    ds = ds * 1000.0
+                    for name in ds.data_vars:
+                        ds[name].attrs["units"] = "mm"
+                else:
+                    cell_area = _grid_cell_area_m2(ds)
+                    interval_seconds = _leadtime_interval_seconds(ds)
+                    ds = (ds * cell_area) / interval_seconds
+                    for name in ds.data_vars:
+                        ds[name].attrs["units"] = "m3 s-1"
     
             elif var_code in ["DSWR", "DLWR", "NOLR"]:
                 ds = _deaccumulate(ds) / 86400.0
@@ -1816,9 +1859,10 @@ class WAS_Download:
                     request_day = init_day_dict_ncep[month_key]
     
                 day_key = f"{int(request_day):02}"
+                unit_tag = "_m3s" if v == "RUNOFF" and runoff_units == "m3/s" else ""
                 output_file = (
                     dir_to_save
-                    / f"{file_prefix}_{cent}{syst}_{v}_{abb_month_ini}{day_key}_{years_str}_{lead_str}.nc"
+                    / f"{file_prefix}_{cent}{syst}_{v}_{abb_month_ini}{day_key}_{years_str}_{lead_str}{unit_tag}.nc"
                 )
     
                 if output_file.exists() and not force_download:
@@ -1882,6 +1926,8 @@ class WAS_Download:
                 ds.attrs["variable_code"] = v
                 ds.attrs["download_format"] = fmt
                 ds.attrs["output_layout"] = output_layout
+                if v == "RUNOFF":
+                    ds.attrs["runoff_units"] = runoff_units
     
                 encoding = {name: {"zlib": True, "complevel": 4} for name in ds.data_vars}
                 ds.to_netcdf(output_file, encoding=encoding)
@@ -1903,7 +1949,6 @@ class WAS_Download:
             _time.sleep(1)
     
         return store_file_path
-
     
 
     # def WAS_Download_Models_Daily(
@@ -2509,7 +2554,8 @@ class WAS_Download:
 
     def _postprocess_reanalysis_ersst(self, ds, var_name):       
         # Drop unnecessary variables
-        ds = ds.drop_vars('zlev').squeeze()
+        # ds = ds.drop_vars('zlev').squeeze()
+        # ds = ds.drop_vars('lev').squeeze()
         keep_vars = [var_name, 'T', 'X', 'Y']
         drop_vars = [v for v in ds.variables if v not in keep_vars]
         return ds.drop_vars(drop_vars, errors="ignore")
@@ -3259,6 +3305,7 @@ class WAS_Download:
             ds = _normalize_coords(ds)
             ds = _subset_area(ds)
             ds = ds.rename({"sst": "SST"})
+            ds = _postprocess_reanalysis_ersst(ds, "SST")
     
             seasonal = []
             for season_year in range(year_start, year_end + 1):
@@ -3595,7 +3642,7 @@ class WAS_Download:
             "SOILWATER4": "volumetric_soil_water_layer_4",
         }
     
-        total_vars = {"PRCP", "RUNOFF"}
+        total_vars = {"PRCP", "SRUNOFF"}
         flux_vars = {"DSWR", "DLWR", "NOLR"}
         kelvin_vars = {"TEMP", "TDEW"}
     
@@ -3663,9 +3710,9 @@ class WAS_Download:
     
         def _grid_cell_area_m2(ds):
             if "Y" not in ds.coords or "X" not in ds.coords:
-                raise ValueError("RUNOFF conversion to m3/s needs X and Y coordinates.")
+                raise ValueError("SRUNOFF conversion to m3/s needs X and Y coordinates.")
             if ds.sizes.get("Y", 0) < 2 or ds.sizes.get("X", 0) < 2:
-                raise ValueError("RUNOFF conversion to m3/s needs at least two X and Y points.")
+                raise ValueError("SRUNOFF conversion to m3/s needs at least two X and Y points.")
     
             radius = 6371000.0
             dlat = np.deg2rad(float(abs(ds["Y"].diff("Y").median())))
@@ -3681,7 +3728,7 @@ class WAS_Download:
                 ds = ds * (1000.0 * days_in_month)
                 units = "mm/month"
     
-            elif var_code == "RUNOFF":
+            elif var_code in ["SRUNOFF", "RUNOFF"]:
                 if runoff_units == "mm":
                     ds = ds * (1000.0 * days_in_month)
                     units = "mm/month"
@@ -3723,7 +3770,7 @@ class WAS_Download:
                 out = ds.sum("month_index", keep_attrs=True)
                 units = "mm"
     
-            elif var_code == "RUNOFF":
+            elif var_code == "SRUNOFF":
                 if runoff_units == "mm":
                     out = ds.sum("month_index", keep_attrs=True)
                     units = "mm"
@@ -3786,7 +3833,7 @@ class WAS_Download:
             ds.attrs["variable_code"] = var_code
             ds.attrs["season"] = season_str
             ds.attrs["season_months"] = ",".join(season_codes)
-            if var_code == "RUNOFF":
+            if var_code == "SRUNOFF":
                 ds.attrs["runoff_units"] = runoff_units
             return ds
     
@@ -3802,7 +3849,7 @@ class WAS_Download:
                     print(f"Unknown variable for ERA5Land: {var_code}. Skipping.")
                     continue
     
-                unit_tag = "_m3s" if var_code == "RUNOFF" and runoff_units == "m3/s" else ""
+                unit_tag = "_m3s" if var_code == "SRUNOFF" and runoff_units == "m3/s" else ""
                 out_file = dir_to_save / f"ERA5Land_{var_code}_{year_start}_{year_end}_{season_str}{unit_tag}.nc"
                 if out_file.exists() and not force_download:
                     print(f"{out_file} already exists. Skipping.")
@@ -3933,7 +3980,7 @@ class WAS_Download:
             "SRUNOFF": "surface_runoff",
             "RUNOFF": "runoff",
         }
-        accumulated_vars = {"PRCP", "RUNOFF", "DSWR", "DLWR", "NOLR"}
+        accumulated_vars = {"PRCP", "SRUNOFF", "DSWR", "DLWR", "NOLR"}
         temperature_vars = {"TEMP", "TDEW"}
     
         dataset = "reanalysis-era5-land"
@@ -4011,9 +4058,9 @@ class WAS_Download:
     
         def _grid_cell_area_m2(ds):
             if "Y" not in ds.coords or "X" not in ds.coords:
-                raise ValueError("RUNOFF conversion to m3/s needs X and Y coordinates.")
+                raise ValueError("SRUNOFF conversion to m3/s needs X and Y coordinates.")
             if ds.sizes.get("Y", 0) < 2 or ds.sizes.get("X", 0) < 2:
-                raise ValueError("RUNOFF conversion to m3/s needs at least two X and Y points.")
+                raise ValueError("SRUNOFF conversion to m3/s needs at least two X and Y points.")
     
             radius = 6371000.0
             dlat = np.deg2rad(float(abs(ds["Y"].diff("Y").median())))
@@ -4096,7 +4143,7 @@ class WAS_Download:
             ds.attrs["source_dataset"] = dataset
             ds.attrs["center"] = "ERA5Land"
             ds.attrs["variable_code"] = v
-            if v == "RUNOFF":
+            if v in ["SRUNOFF", "RUNOFF"]:
                 ds.attrs["runoff_units"] = runoff_units
             return ds
     
@@ -4113,7 +4160,7 @@ class WAS_Download:
                     continue
     
                 cds_variable = variables_1[v]
-                unit_tag = "_m3s" if v == "RUNOFF" and runoff_units == "m3/s" else ""
+                unit_tag = "_m3s" if v in ["SRUNOFF", "RUNOFF"] and runoff_units == "m3/s" else ""
                 output_path = dir_to_save / f"Daily_{v}_{year_start}_{year_end}{unit_tag}.nc"
     
                 if output_path.exists() and not force_download:
