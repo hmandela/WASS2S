@@ -3305,7 +3305,7 @@ class WAS_Download:
             ds = _normalize_coords(ds)
             ds = _subset_area(ds)
             ds = ds.rename({"sst": "SST"})
-            ds = _postprocess_reanalysis_ersst(ds, "SST")
+            ds = ds.drop_vars("elv", errors="ignore").squeeze()
     
             seasonal = []
             for season_year in range(year_start, year_end + 1):
