@@ -1,11 +1,12 @@
-"""Seasonal diagnostic tools for ERA5 and optional AgERA5 precipitation data.
+"""Seasonal diagnostic tools for ERA5, AgERA5 and NOAA ERSSTv6 data.
 
 This module provides:
 
 Monthly pipeline (six months preceding a target date):
 
 - :data:`VAR_CONFIG` — per-variable download and plotting configuration.
-- :func:`download_data` — ERA5 monthly download, with optional AgERA5 precipitation.
+- :func:`download_data` — ERA5 monthly download, with optional AgERA5
+  precipitation and optional NOAA ERSSTv6 sea-surface temperature.
 - :func:`process_variable` — compute anomalies/ratios and dispatch to plots.
 - :func:`plot_maps` — 6-panel monthly map layout.
 - :func:`plot_hovmoller` — time–longitude Hovmöller diagram.
@@ -38,6 +39,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from dateutil.relativedelta import relativedelta
 import earthkit.data
+import requests
 
 import ipywidgets as widgets
 from IPython.display import display, IFrame
@@ -70,7 +72,12 @@ def _first_data_array(data):
 
 
 PRECIP_SOURCES = {"era5", "agera5"}
+SST_SOURCES = {"era5", "ersstv6"}
 AGERA5_DATASET = "sis-agrometeorological-indicators"
+ERSSTV6_BASE_URL = (
+    "https://www.ncei.noaa.gov/data/"
+    "sea-surface-temperature-extended-reconstructed/v6/access"
+)
 
 
 def _normalise_precip_source(precip_source):
@@ -80,6 +87,22 @@ def _normalise_precip_source(precip_source):
         allowed = ", ".join(sorted(PRECIP_SOURCES))
         raise ValueError(f"precip_source must be one of: {allowed}.")
     return source
+
+
+def _normalise_sst_source(sst_source):
+    """Validate and normalise the monthly SST data-source selector."""
+    source = str(sst_source).strip().lower().replace("-", "")
+    aliases = {
+        "era5": "era5",
+        "ersst": "ersstv6",
+        "ersstv6": "ersstv6",
+        "noaa": "ersstv6",
+        "noaaersstv6": "ersstv6",
+    }
+    if source not in aliases:
+        allowed = ", ".join(sorted(SST_SOURCES))
+        raise ValueError(f"sst_source must be one of: {allowed}.")
+    return aliases[source]
 
 
 def _earthkit_to_xarray(result):
@@ -154,6 +177,163 @@ def _retrieve_agera5_precipitation(request, start=None, end=None):
     if da.sizes.get("time", 0) == 0:
         raise ValueError("The AgERA5 request returned no data in the requested period.")
     return da.sortby("time")
+
+
+def _download_ersstv6_file(url, target, max_retries=3, retry_delay=5):
+    """Download one NOAA ERSSTv6 monthly file with retries and atomic save."""
+    partial = f"{target}.part"
+    for attempt in range(1, max_retries + 1):
+        try:
+            with requests.get(url, stream=True, timeout=(15, 120)) as response:
+                if response.status_code == 404:
+                    if os.path.exists(partial):
+                        os.remove(partial)
+                    return False
+                response.raise_for_status()
+                with open(partial, "wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+            os.replace(partial, target)
+            return True
+        except (requests.RequestException, OSError) as exc:
+            if os.path.exists(partial):
+                os.remove(partial)
+            if attempt == max_retries:
+                print(f"failed after {max_retries} attempts: {exc}")
+                return False
+            print(f"attempt {attempt}/{max_retries} failed; retrying...")
+            import time
+            time.sleep(retry_delay)
+    return False
+
+
+def _subset_ersstv6_extent(ds, extent):
+    """Normalise ERSSTv6 coordinates and crop a north/west/south/east area."""
+    ds = _clean_dataset(ds)
+    if float(ds.longitude.max()) > 180.0:
+        ds = ds.assign_coords(
+            longitude=(((ds.longitude + 180.0) % 360.0) - 180.0)
+        ).sortby("longitude")
+
+    north, west, south, east = map(float, extent)
+    ds = ds.sortby("latitude")
+    ds = ds.sel(latitude=slice(south, north))
+    if west <= east:
+        return ds.sel(longitude=slice(west, east))
+
+    # Areas crossing the dateline are represented by two longitude slices.
+    western = ds.sel(longitude=slice(west, 180.0))
+    eastern = ds.sel(longitude=slice(-180.0, east))
+    return xr.concat([western, eastern], dim="longitude")
+
+
+def _download_ersstv6_monthly_sst(
+    dir_to_save, clim_start, clim_end, extent, target_date,
+    force_download=False, max_retries=3, retry_delay=5,
+):
+    """Download NOAA ERSSTv6 monthly SST for climatology and recent months.
+
+    ERSSTv6 is already expressed in degrees Celsius. Individual NOAA files are
+    cached, combined, normalised to ``time/latitude/longitude`` and cropped to
+    *extent*. A missing latest month is reported and omitted because NOAA's
+    monthly product can lag the current calendar month.
+    """
+    if clim_start < 1854:
+        raise ValueError("ERSSTv6 is available from January 1854.")
+
+    target_month = date(target_date.year, target_date.month, 1)
+    recent_months = [target_month - relativedelta(months=i) for i in range(1, 7)]
+    month_numbers = sorted({item.month for item in recent_months})
+    required = {
+        (year, month)
+        for year in range(clim_start, clim_end + 1)
+        for month in month_numbers
+    }
+    required.update((item.year, item.month) for item in recent_months)
+
+    ext_str = f"{extent[0]}_{extent[1]}_{extent[2]}_{extent[3]}"
+    months_tag = "".join(f"{month:02d}" for month in month_numbers)
+    fname = (
+        f"ersstv6_sst_{clim_start}-{clim_end}_m{months_tag}_"
+        f"target{target_month:%Y%m}_past6_{ext_str}.nc"
+    )
+    fpath = os.path.join(dir_to_save, fname)
+    if os.path.exists(fpath) and not force_download:
+        print(f" Data found: {fname}")
+        return fpath
+
+    cache_dir = os.path.join(dir_to_save, "ersstv6_monthly_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    paths = []
+    unavailable = []
+    current_month = date.today().replace(day=1)
+
+    for year, month in sorted(required):
+        month_date = date(year, month, 1)
+        if month_date >= current_month:
+            unavailable.append(f"{year}-{month:02d}")
+            continue
+
+        nc_name = f"ersst.v6.{year}{month:02d}.nc"
+        local_path = os.path.join(cache_dir, nc_name)
+        had_cached_copy = os.path.exists(local_path)
+        if force_download or not os.path.exists(local_path):
+            print(f"  NOAA ERSSTv6 {year}-{month:02d}...", end=" ", flush=True)
+            ok = _download_ersstv6_file(
+                f"{ERSSTV6_BASE_URL}/{nc_name}", local_path,
+                max_retries=max_retries, retry_delay=retry_delay,
+            )
+            print("ok" if ok else "unavailable")
+            if not ok:
+                if had_cached_copy:
+                    print(f"  Using cached ERSSTv6 copy for {year}-{month:02d}.")
+                else:
+                    unavailable.append(f"{year}-{month:02d}")
+                    continue
+        paths.append(local_path)
+
+    if not paths:
+        print(" No NOAA ERSSTv6 files are available for the requested period.")
+        return None
+
+    parts = []
+    for path in paths:
+        with xr.open_dataset(path) as opened:
+            if "sst" not in opened.data_vars:
+                raise ValueError(f"ERSSTv6 file does not contain 'sst': {path}")
+            part = opened[["sst"]].drop_vars("lev", errors="ignore").squeeze(drop=True)
+            # Keep time even when a file contains a single monthly record.
+            if "time" not in part.dims:
+                part = part.expand_dims(time=opened.time.values)
+            parts.append(part.load())
+
+    output = xr.concat(parts, dim="time").sortby("time")
+    output = output.drop_duplicates("time")
+    output = _subset_ersstv6_extent(output, extent)
+    output = output.rename({"sst": "sea_surface_temperature"})
+
+    sst = output["sea_surface_temperature"]
+    units = str(sst.attrs.get("units", "")).strip().lower()
+    if units in {"k", "kelvin", "degrees_k", "degree_k"}:
+        output["sea_surface_temperature"] = sst - 273.15
+    output["sea_surface_temperature"].attrs.update({
+        "units": "degC",
+        "long_name": "NOAA Extended Reconstructed Sea Surface Temperature v6",
+        "source": "NOAA ERSSTv6",
+    })
+    output.attrs.update({
+        "sst_source": "ersstv6",
+        "source": "NOAA ERSSTv6",
+        "source_url": ERSSTV6_BASE_URL,
+    })
+
+    os.makedirs(dir_to_save, exist_ok=True)
+    output.to_netcdf(fpath)
+    if unavailable:
+        print(" Warning: unavailable ERSSTv6 months: " + ", ".join(unavailable))
+    print(" NOAA ERSSTv6 monthly download complete.")
+    return fpath
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +503,8 @@ def _clean_dataset(ds):
 # ===========================================================================
 
 def _download_agera5_monthly_precipitation(
-    dir_to_save, clim_start, clim_end, extent, target_date, agera5_version="2_0"
+    dir_to_save, clim_start, clim_end, extent, target_date, agera5_version="2_0",
+    force_download=False,
 ):
     """Download daily AgERA5 precipitation and aggregate it to monthly totals.
 
@@ -349,7 +530,7 @@ def _download_agera5_monthly_precipitation(
         f"target{target_month:%Y%m}_past6_{ext_str}.nc"
     )
     fpath = os.path.join(dir_to_save, fname)
-    if os.path.exists(fpath):
+    if os.path.exists(fpath) and not force_download:
         print(f" Data found: {fname}")
         return fpath
 
@@ -363,7 +544,7 @@ def _download_agera5_monthly_precipitation(
             f"agera5_precip_daily_v{agera5_version}_{year}_m{months_tag}_{ext_str}.nc"
         )
         cache_path = os.path.join(cache_dir, cache_name)
-        if not os.path.exists(cache_path):
+        if force_download or not os.path.exists(cache_path):
             request = {
                 "variable": "precipitation_flux",
                 "year": [str(year)],
@@ -412,24 +593,32 @@ def _download_agera5_monthly_precipitation(
 
 def download_data(
     dir_to_save, clim_start, clim_end, var_key, extent, target_date,
-    precip_source="era5", agera5_version="2_0",
+    precip_source="era5", agera5_version="2_0", sst_source="era5",
+    force_download=False,
 ):
     """Download monthly data for the six complete months before target month.
 
     For ``var_key="precip"``, ``precip_source="agera5"`` downloads daily
-    AgERA5 precipitation and aggregates it to monthly totals. All other
-    variables continue to use ERA5.
+    AgERA5 precipitation and aggregates it to monthly totals. For
+    ``var_key="sst"``, ``sst_source="ersstv6"`` directly downloads NOAA's
+    monthly ERSSTv6 product. ERA5 remains the default for both variables.
     """
     if var_key not in VAR_CONFIG:
         raise KeyError(f"Unknown variable key: {var_key!r}")
     if clim_start > clim_end:
         raise ValueError("clim_start must be less than or equal to clim_end.")
 
-    source = _normalise_precip_source(precip_source)
-    if var_key == "precip" and source == "agera5":
+    precip_src = _normalise_precip_source(precip_source)
+    sst_src = _normalise_sst_source(sst_source)
+    if var_key == "precip" and precip_src == "agera5":
         return _download_agera5_monthly_precipitation(
             dir_to_save, clim_start, clim_end, extent, target_date,
-            agera5_version=agera5_version,
+            agera5_version=agera5_version, force_download=force_download,
+        )
+    if var_key == "sst" and sst_src == "ersstv6":
+        return _download_ersstv6_monthly_sst(
+            dir_to_save, clim_start, clim_end, extent, target_date,
+            force_download=force_download,
         )
 
     conf = VAR_CONFIG[var_key]
@@ -448,7 +637,7 @@ def download_data(
     )
     fpath = os.path.join(dir_to_save, fname)
 
-    if os.path.exists(fpath):
+    if os.path.exists(fpath) and not force_download:
         print(f" Data found: {fname}")
         return fpath
 
@@ -755,7 +944,8 @@ def plot_maps(data_main, data_overlay, var_key, title_prefix="Monthly"):
 
 
 def process_variable(fpath, var_key, clim_start, clim_end, target_date,
-                     ratio_mode="monthly", precip_source="era5"):
+                     ratio_mode="monthly", precip_source="era5",
+                     sst_source="era5"):
     """Compute and plot monthly anomalies or precipitation ratios."""
     if var_key not in VAR_CONFIG:
         raise KeyError(f"Unknown variable key: {var_key!r}")
@@ -763,15 +953,22 @@ def process_variable(fpath, var_key, clim_start, clim_end, target_date,
         raise ValueError('ratio_mode must be either "monthly" or "cumulative".')
 
     conf = VAR_CONFIG[var_key]
-    source = _normalise_precip_source(precip_source)
+    precip_src = _normalise_precip_source(precip_source)
+    sst_src = _normalise_sst_source(sst_source)
     with xr.open_dataset(fpath) as opened:
         ds = _clean_dataset(opened).load()
-        file_source = str(opened.attrs.get("precip_source", "")).lower()
+        file_precip_source = str(opened.attrs.get("precip_source", "")).lower()
+        file_sst_source = str(opened.attrs.get("sst_source", "")).lower()
 
     # AgERA5 monthly files are already aggregated to mm/month. ERA5 monthly
     # precipitation still needs conversion from m/day to mm/month.
-    is_agera5_precip = var_key == "precip" and (source == "agera5" or file_source == "agera5")
-    if var_key != "wind_850" and not is_agera5_precip:
+    is_agera5_precip = var_key == "precip" and (
+        precip_src == "agera5" or file_precip_source == "agera5"
+    )
+    is_ersstv6_sst = var_key == "sst" and (
+        sst_src == "ersstv6" or file_sst_source == "ersstv6"
+    )
+    if var_key != "wind_850" and not is_agera5_precip and not is_ersstv6_sst:
         ds = conf["unit_func"](ds)
 
     target_month = date(target_date.year, target_date.month, 1)
@@ -832,18 +1029,33 @@ def process_variable(fpath, var_key, clim_start, clim_end, target_date,
 def main_driver(
     dir_save, clim_start, clim_end, target_date_str, variables_list=None,
     ratio_mode="monthly", precip_source="era5", agera5_version="2_0",
+    sst_source="era5", force_download=False,
 ):
-    """Run the monthly diagnostics with optional AgERA5 precipitation.
+    """Run monthly diagnostics with optional AgERA5 and NOAA ERSSTv6.
 
     Parameters
     ----------
     precip_source : {"era5", "agera5"}, default "era5"
-        Source used only for precipitation. Other variables always use ERA5.
+        Source used only for precipitation. SST is controlled independently
+        by ``sst_source``; the remaining variables use ERA5.
     agera5_version : str, default "2_0"
         AgERA5 version requested from the CDS when ``precip_source="agera5"``.
+    sst_source : {"era5", "ersstv6"}, default "era5"
+        Monthly SST source. ``"ersst"``, ``"noaa"`` and
+        ``"noaa-ersstv6"`` are accepted aliases for ``"ersstv6"``.
+    force_download : bool, default False
+        Re-download the selected monthly data even when a cached output exists.
+
+    Examples
+    --------
+    >>> main_driver(
+    ...     "./data", 1991, 2020, "2026-07-01",
+    ...     variables_list=["sst"], sst_source="ersstv6",
+    ... )
     """
     target_date = date.fromisoformat(target_date_str)
-    source = _normalise_precip_source(precip_source)
+    precip_src = _normalise_precip_source(precip_source)
+    sst_src = _normalise_sst_source(sst_source)
     if variables_list is None:
         variables_list = list(VAR_CONFIG.keys())
 
@@ -851,17 +1063,24 @@ def main_driver(
         if var not in VAR_CONFIG:
             print(f" Skipping unknown variable: {var}")
             continue
-        actual_source = source if var == "precip" else "era5"
+        if var == "precip":
+            actual_source = precip_src
+        elif var == "sst":
+            actual_source = sst_src
+        else:
+            actual_source = "era5"
         print(f"\n Traitement: {var.upper()} (source: {actual_source.upper()})")
         extent = VAR_CONFIG[var]["extent"]
         fpath = download_data(
             dir_save, clim_start, clim_end, var, extent, target_date,
-            precip_source=source, agera5_version=agera5_version,
+            precip_source=precip_src, agera5_version=agera5_version,
+            sst_source=sst_src, force_download=force_download,
         )
         if fpath:
             process_variable(
                 fpath, var, clim_start, clim_end, target_date,
-                ratio_mode=ratio_mode, precip_source=source,
+                ratio_mode=ratio_mode, precip_source=precip_src,
+                sst_source=sst_src,
             )
 
     print("\n Finished.")
@@ -1373,6 +1592,10 @@ def main_daily_driver(
     agera5_version="2_0",
 ):
     """Run daily diagnostics, optionally sourcing precipitation from AgERA5.
+
+    NOAA ERSSTv6 is a monthly product and is therefore available through
+    :func:`main_driver`, not through this daily pipeline. Daily SST remains
+    sourced from ERA5.
 
     Examples
     --------
