@@ -2024,7 +2024,7 @@ class WAS_mme_logistic:
         model = LogisticRegression(random_state=self.random_state, max_iter=1000)
         cv = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
         gs = GridSearchCV(model, param_grid=self._create_parameter_grids(), cv=cv,
-                          scoring='neg_log_loss', error_score=np.nan, n_jobs=-1)
+                          scoring='neg_log_loss', error_score=np.nan, n_jobs=4)
         gs.fit(X, y)
         return gs.best_params_
 
@@ -2033,7 +2033,7 @@ class WAS_mme_logistic:
         cv = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
         rs = RandomizedSearchCV(model, param_distributions=self._create_parameter_distributions(),
                                 n_iter=self.n_iter_search, cv=cv, scoring='neg_log_loss',
-                                random_state=self.random_state, error_score=np.nan, n_jobs=-1)
+                                random_state=self.random_state, error_score=np.nan, n_jobs=4)
         rs.fit(X, y)
         return rs.best_params_
 
@@ -2828,7 +2828,7 @@ class WAS_mme_gaussian_process:
         n_random_iter=10,
         n_trials=20,
         timeout=None, 
-        n_jobs=-1,  
+        n_jobs=4,  
         warm_start=False, 
     ):
         self.random_state = random_state
@@ -7755,7 +7755,7 @@ class WAS_mme_FullBMA:
         )
 
 ############################################################
-
+### think to allow n_jobs as argument in future version
 
 class WAS_mme_RF:
     """
@@ -7803,6 +7803,11 @@ class WAS_mme_RF:
         Scoring metric for hyperparameter optimization (default is 'neg_mean_squared_error').
     verbose : int, optional
         Verbosity level (default is 0).
+    n_jobs : int, optional
+        Maximum number of parallel workers. ``-1`` uses all available CPUs.
+        Hyperparameter searches parallelize the outer CV/trial loop, while
+        each inner Random Forest fit uses one worker to avoid oversubscription.
+        Final model fitting uses ``n_jobs`` directly (default is 4).
     """
 
     def __init__(self,
@@ -7824,7 +7829,8 @@ class WAS_mme_RF:
                  n_clusters: int = 6,
                  scoring: str = 'neg_mean_squared_error',
                  leave_one_year_out: bool = False,   # ===== 2 =====
-                 verbose: int = 0):
+                 verbose: int = 0,
+                 n_jobs: int = 4):
 
         self.search_method = search_method
         self.n_estimators_range = n_estimators_range
@@ -7845,6 +7851,10 @@ class WAS_mme_RF:
         self.scoring = scoring
         self.leave_one_year_out = leave_one_year_out
         self.verbose = verbose
+        if n_jobs == 0:
+            raise ValueError("n_jobs cannot be 0; use a positive integer or -1.")
+        self.n_jobs = n_jobs
+        self._inner_n_jobs = 1
         self.rf = None
         self.best_params_dict = {}
         self.cluster_da = None
@@ -7918,7 +7928,7 @@ class WAS_mme_RF:
         model = RandomForestRegressor(
             **params,
             random_state=self.random_state,
-            n_jobs=-1,
+            n_jobs=self._inner_n_jobs,
             warm_start=self.warm_start
         )
 
@@ -7929,7 +7939,7 @@ class WAS_mme_RF:
                 model, X_train, y_train,
                 cv=cv, groups=groups,
                 scoring=self.scoring,
-                n_jobs=-1
+                n_jobs=self._inner_n_jobs
             )
             return np.mean(scores)
         except Exception as e:
@@ -7951,12 +7961,14 @@ class WAS_mme_RF:
             'min_impurity_decrease': self.min_impurity_decrease_range,
             'ccp_alpha': self.ccp_alpha_range,
         }
-        model = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
+        model = RandomForestRegressor(
+            random_state=self.random_state, n_jobs=self._inner_n_jobs
+        )
         cv = self._cv_splitter(groups)  # ===== 2 =====
         grid_search = GridSearchCV(
             model, param_grid=param_grid,
             cv=cv, scoring=self.scoring,
-            n_jobs=-1, verbose=self.verbose
+            n_jobs=self.n_jobs, verbose=self.verbose
         )
         grid_search.fit(X, y, groups=groups)  # ===== 2 =====
         if self.verbose > 0:
@@ -7977,13 +7989,15 @@ class WAS_mme_RF:
             'min_impurity_decrease': self.min_impurity_decrease_range,
             'ccp_alpha': self.ccp_alpha_range,
         }
-        model = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
+        model = RandomForestRegressor(
+            random_state=self.random_state, n_jobs=self._inner_n_jobs
+        )
         cv = self._cv_splitter(groups)  # ===== 2 =====
         random_search = RandomizedSearchCV(
             model, param_distributions=param_dist,
             n_iter=self.n_iter_search, cv=cv,
             scoring=self.scoring, random_state=self.random_state,
-            n_jobs=-1, verbose=self.verbose
+            n_jobs=self.n_jobs, verbose=self.verbose
         )
         random_search.fit(X, y, groups=groups)  # ===== 2 =====
         if self.verbose > 0:
@@ -8001,6 +8015,7 @@ class WAS_mme_RF:
         study.optimize(
             objective_with_data,
             n_trials=self.n_iter_search,
+            n_jobs=self.n_jobs,
             show_progress_bar=self.verbose > 0
         )
         best_params = study.best_params
@@ -8169,7 +8184,7 @@ class WAS_mme_RF:
             rf_c = RandomForestRegressor(
                 **{k: v for k, v in bp.items() if k in RandomForestRegressor().get_params()},
                 random_state=self.random_state,
-                n_jobs=-1,
+                n_jobs=self.n_jobs,
                 warm_start=self.warm_start
             )
 
@@ -8495,7 +8510,7 @@ class WAS_mme_RF:
             rf_c = RandomForestRegressor(
                 **{k: v for k, v in bp.items() if k in RandomForestRegressor().get_params()},
                 random_state=self.random_state,
-                n_jobs=-1,
+                n_jobs=self.n_jobs,
                 warm_start=self.warm_start
             )
 
@@ -8649,9 +8664,15 @@ class WAS_mme_XGBoosting:
     n_clusters : int, optional
         Number of clusters for homogenized zones (default is 4).
     optuna_n_jobs : int, optional
-        Number of parallel jobs for Optuna (default is 1).
+        Optional Optuna-specific worker count. When ``None``, it inherits
+        ``n_jobs`` (default is None).
     optuna_timeout : int, optional
         Timeout in seconds for Optuna optimization (default is None).
+    n_jobs : int, optional
+        Maximum number of parallel workers. ``-1`` uses all available CPUs.
+        Search CV/trials run in parallel at the outer level; inner XGBoost
+        fits use one thread during tuning. Final zone models use ``n_jobs``
+        directly (default is 4).
     """
 
 
@@ -8674,9 +8695,10 @@ class WAS_mme_XGBoosting:
                  cv_folds=3,
                  n_clusters=4,
                  leave_one_year_out=False,          # >>> E
-                 optuna_n_jobs=1,
+                 optuna_n_jobs=None,
                  optuna_timeout=None,
-                 verbose=0):
+                 verbose=0,
+                 n_jobs=4):
 
         self.search_method = search_method
         self.n_estimators_range = n_estimators_range
@@ -8698,7 +8720,13 @@ class WAS_mme_XGBoosting:
         self.cv_folds = cv_folds
         self.n_clusters = n_clusters
         self.leave_one_year_out = leave_one_year_out
-        self.optuna_n_jobs = optuna_n_jobs
+        if n_jobs == 0:
+            raise ValueError("n_jobs cannot be 0; use a positive integer or -1.")
+        if optuna_n_jobs == 0:
+            raise ValueError("optuna_n_jobs cannot be 0.")
+        self.n_jobs = n_jobs
+        self._inner_n_jobs = 1
+        self.optuna_n_jobs = n_jobs if optuna_n_jobs is None else optuna_n_jobs
         self.optuna_timeout = optuna_timeout
         self.verbose = verbose
         self.xgb = {}
@@ -8748,9 +8776,10 @@ class WAS_mme_XGBoosting:
 
         model = _XGBRegressorES(**params, es_validation_fraction=self.es_validation_fraction,
                                 eval_metric='rmse', random_state=self.random_state,
-                                verbosity=0, n_jobs=-1)
+                                verbosity=0, n_jobs=self._inner_n_jobs)
         scores = cross_val_score(model, X, y, cv=self._cv_splitter(groups), groups=groups,
-                                 scoring='neg_mean_absolute_error', n_jobs=-1)
+                                 scoring='neg_mean_absolute_error',
+                                 n_jobs=self._inner_n_jobs)
         return float(np.mean(scores))
 
     def _param_space(self):
@@ -8781,21 +8810,21 @@ class WAS_mme_XGBoosting:
     def _grid_search(self, X, y, groups):
         model = _XGBRegressorES(es_validation_fraction=self.es_validation_fraction,
                                 eval_metric='rmse', random_state=self.random_state,
-                                verbosity=0, n_jobs=-1)
+                                verbosity=0, n_jobs=self._inner_n_jobs)
         gs = GridSearchCV(model, param_grid=self._grid_space(),
                           cv=self._cv_splitter(groups), scoring='neg_mean_absolute_error',
-                          error_score=np.nan, n_jobs=-1)
+                          error_score=np.nan, n_jobs=self.n_jobs)
         gs.fit(X, y, groups=groups)          # >>> E
         return gs.best_params_
 
     def _random_search(self, X, y, groups):
         model = _XGBRegressorES(es_validation_fraction=self.es_validation_fraction,
                                 eval_metric='rmse', random_state=self.random_state,
-                                verbosity=0, n_jobs=-1)
+                                verbosity=0, n_jobs=self._inner_n_jobs)
         rs = RandomizedSearchCV(model, param_distributions=self._param_space(),
                                 n_iter=self.n_iter_search, cv=self._cv_splitter(groups),
                                 scoring='neg_mean_absolute_error', random_state=self.random_state,
-                                error_score=np.nan, n_jobs=-1)
+                                error_score=np.nan, n_jobs=self.n_jobs)
         rs.fit(X, y, groups=groups)          # >>> E
         return rs.best_params_
 
@@ -8882,7 +8911,7 @@ class WAS_mme_XGBoosting:
 
     # ============================================================ deterministic
     @staticmethod
-    def _base_params(bp, random_state, es_validation_fraction=0.15):
+    def _base_params(bp, random_state, es_validation_fraction=0.15, n_jobs=1):
         base = {
             'n_estimators': bp.get('n_estimators', 200),
             'learning_rate': bp.get('learning_rate', 0.05),
@@ -8893,7 +8922,7 @@ class WAS_mme_XGBoosting:
             'early_stopping_rounds': bp.get('early_stopping_rounds', None),
             'es_validation_fraction': es_validation_fraction,
             'eval_metric': 'rmse',
-            'random_state': random_state, 'verbosity': 0, 'n_jobs': -1,
+            'random_state': random_state, 'verbosity': 0, 'n_jobs': n_jobs,
         }
         for k in ('gamma', 'reg_alpha', 'reg_lambda'):
             if k in bp:
@@ -8939,7 +8968,8 @@ class WAS_mme_XGBoosting:
                 continue
 
             xgb_c = _XGBRegressorES(**self._base_params(bp, self.random_state,
-                                                        self.es_validation_fraction))
+                                                        self.es_validation_fraction,
+                                                        n_jobs=self.n_jobs))
             xgb_c.fit(Xtr_c, ytr_c)
             self.xgb[c] = xgb_c
 
@@ -9230,7 +9260,8 @@ class WAS_mme_XGBoosting:
                 continue
 
             xgb_c = _XGBRegressorES(**self._base_params(bp, self.random_state,
-                                                        self.es_validation_fraction))
+                                                        self.es_validation_fraction,
+                                                        n_jobs=self.n_jobs))
             xgb_c.fit(Xtr_c, ytr_c)
             self.xgb[c] = xgb_c
 
@@ -9374,6 +9405,10 @@ class WAS_mme_hpELM:
         Sampler for Bayesian optimization: 'tpe' or 'random' (default='tpe').
     scoring : str, optional
         Scoring metric for optimization (default='neg_mean_squared_error').
+    n_jobs : int, optional
+        Maximum number of parallel workers for grid/random search and Optuna.
+        ``-1`` uses all available CPUs. Inner CV is serial during parallel
+        Optuna trials to prevent nested oversubscription (default is 4).
     """
 
 
@@ -9392,7 +9427,8 @@ class WAS_mme_hpELM:
                  n_trials_bayesian=50,
                  bayesian_sampler='tpe',
                  scoring='neg_mean_squared_error',
-                 verbose=0):
+                 verbose=0,
+                 n_jobs=4):
 
         self.neurons_range = neurons_range
         self.activation_options = activation_options
@@ -9408,6 +9444,10 @@ class WAS_mme_hpELM:
         self.bayesian_sampler = bayesian_sampler
         self.scoring = scoring
         self.verbose = verbose
+        if n_jobs == 0:
+            raise ValueError("n_jobs cannot be 0; use a positive integer or -1.")
+        self.n_jobs = n_jobs
+        self._inner_n_jobs = 1
         self.hpelm = None
         self.best_params_dict = None
         self.bayesian_studies = {}
@@ -9453,7 +9493,7 @@ class WAS_mme_hpELM:
         model = HPELMWrapper(neurons=neurons, activation=activation, norm=norm_,
                              random_state=self.random_state)
         scores = cross_val_score(model, X, y, cv=self._cv_splitter(groups), groups=groups,
-                                 scoring=self.scoring, n_jobs=1)
+                                 scoring=self.scoring, n_jobs=self._inner_n_jobs)
         return float(np.mean(scores))
 
     def _grid_search_optimization(self, X, y, groups):
@@ -9469,7 +9509,8 @@ class WAS_mme_hpELM:
             else:
                 param_grid[name] = list(p_range)
         gs = GridSearchCV(HPELMWrapper(random_state=self.random_state), param_grid=param_grid,
-                          cv=self._cv_splitter(groups), scoring=self.scoring, n_jobs=-1)
+                          cv=self._cv_splitter(groups), scoring=self.scoring,
+                          n_jobs=self.n_jobs)
         gs.fit(X, y, groups=groups)        # >>> E
         return gs.best_params_
 
@@ -9479,7 +9520,7 @@ class WAS_mme_hpELM:
         rs = RandomizedSearchCV(HPELMWrapper(random_state=self.random_state),
                                 param_distributions=param_dist, n_iter=self.n_iter_search,
                                 cv=self._cv_splitter(groups), scoring=self.scoring,
-                                random_state=self.random_state, n_jobs=-1)
+                                random_state=self.random_state, n_jobs=self.n_jobs)
         rs.fit(X, y, groups=groups)        # >>> E
         return rs.best_params_
 
@@ -9491,7 +9532,7 @@ class WAS_mme_hpELM:
             sampler=self._create_bayesian_sampler(),
             study_name=f"cluster_{cluster_id}" if cluster_id is not None else "global")
         study.optimize(partial(self._bayesian_objective, X=X, y=y, groups=groups),
-                       n_trials=self.n_trials_bayesian, n_jobs=1)
+                       n_trials=self.n_trials_bayesian, n_jobs=self.n_jobs)
         if cluster_id is not None:
             self.bayesian_studies[cluster_id] = study
         return study.best_params
@@ -9958,6 +9999,16 @@ class WAS_mme_MLP:
     hindcast via compute_model; tercile probabilities via compute_prob
     ('nonparam' or 'bestfit'). Mirrors the WAS_mme_RF / WAS_mme_XGBoosting
     contract so it plugs into the same_kind_model2 branch of WAS_Cross_Validator.
+
+    Parameters
+    ----------
+    n_jobs : int, optional
+        Maximum number of parallel workers for grid/random search. ``-1``
+        uses all available CPUs (default is 4). MLPRegressor itself has no
+        ``n_jobs`` parameter, so this controls parallel hyperparameter fits.
+    optuna_n_jobs : int, optional
+        Optional Optuna-specific worker count. When ``None``, it inherits
+        ``n_jobs`` (default is None).
     """
 
     def __init__(self,
@@ -9977,8 +10028,9 @@ class WAS_mme_MLP:
                  validation_fraction=0.1,
                  n_iter_no_change=10,
                  leave_one_year_out=False,
-                 optuna_n_jobs=1,
-                 optuna_timeout=None):
+                 optuna_n_jobs=None,
+                 optuna_timeout=None,
+                 n_jobs=4):
 
         self.search_method = search_method
         self.hidden_layer_sizes_range = hidden_layer_sizes_range
@@ -9999,7 +10051,13 @@ class WAS_mme_MLP:
         self.validation_fraction = validation_fraction
         self.n_iter_no_change = n_iter_no_change
         self.leave_one_year_out = leave_one_year_out      # E
-        self.optuna_n_jobs = optuna_n_jobs
+        if n_jobs == 0:
+            raise ValueError("n_jobs cannot be 0; use a positive integer or -1.")
+        if optuna_n_jobs == 0:
+            raise ValueError("optuna_n_jobs cannot be 0.")
+        self.n_jobs = n_jobs
+        self._inner_n_jobs = 1
+        self.optuna_n_jobs = n_jobs if optuna_n_jobs is None else optuna_n_jobs
         self.optuna_timeout = optuna_timeout
         self.mlp = None
 
@@ -10055,7 +10113,7 @@ class WAS_mme_MLP:
 
         scores = cross_val_score(model, X_train, y_train, cv=splitter,
                                  groups=groups, scoring='neg_mean_squared_error',
-                                 n_jobs=-1)
+                                 n_jobs=self._inner_n_jobs)
         return np.mean(scores)
 
     # ------------------------------------------------------ hyperparameters
@@ -10138,7 +10196,7 @@ class WAS_mme_MLP:
                                      n_iter_no_change=self.n_iter_no_change)
                 grid_search = GridSearchCV(model, param_grid=param_grid, cv=splitter,
                                            scoring='neg_mean_squared_error',
-                                           error_score=np.nan, n_jobs=-1)
+                                           error_score=np.nan, n_jobs=self.n_jobs)
                 grid_search.fit(X_clean_c, y_clean_c, groups=groups_c)
                 best_params_dict[c] = grid_search.best_params_
 
@@ -10157,7 +10215,8 @@ class WAS_mme_MLP:
                 random_search = RandomizedSearchCV(
                     model, param_distributions=param_dist, n_iter=self.n_iter_search,
                     cv=splitter, scoring='neg_mean_squared_error',
-                    random_state=self.random_state, error_score=np.nan, n_jobs=-1)
+                    random_state=self.random_state, error_score=np.nan,
+                    n_jobs=self.n_jobs)
                 random_search.fit(X_clean_c, y_clean_c, groups=groups_c)
                 best_params_dict[c] = random_search.best_params_
 
@@ -10584,7 +10643,6 @@ class WAS_mme_MLP:
 
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_da * mask, mask * forecast_prob.transpose('probability', 'T', 'Y', 'X')
-
 
 class WAS_mme_PCR:
     """
