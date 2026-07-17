@@ -1859,7 +1859,7 @@ class WAS_Download:
                     request_day = init_day_dict_ncep[month_key]
     
                 day_key = f"{int(request_day):02}"
-                unit_tag = "_m3s" if v == "RUNOFF" and runoff_units == "m3/s" else ""
+                unit_tag = "_m3s" if v in ["RUNOFF", "SRUNOFF"] and runoff_units == "m3/s" else ""
                 output_file = (
                     dir_to_save
                     / f"{file_prefix}_{cent}{syst}_{v}_{abb_month_ini}{day_key}_{years_str}_{lead_str}{unit_tag}.nc"
@@ -1926,7 +1926,7 @@ class WAS_Download:
                 ds.attrs["variable_code"] = v
                 ds.attrs["download_format"] = fmt
                 ds.attrs["output_layout"] = output_layout
-                if v == "RUNOFF":
+                if v in ["RUNOFF", "SRUNOFF"]:
                     ds.attrs["runoff_units"] = runoff_units
     
                 encoding = {name: {"zlib": True, "complevel": 4} for name in ds.data_vars}
@@ -5427,7 +5427,7 @@ class WAS_Download:
             raise ValueError("blend_type must be 'ERA5' or 'IMERGlate-v07'.")
     
         product_tag = blend_map[blend_type]
-        output_path = dir_to_save / f"Daily_PRCP_CHIRPSv3_{product_tag}_{year_start}_{year_end}.nc"
+        output_path = dir_to_save / f"Daily_PRCP_{year_start}_{year_end}.nc"
         if output_path.exists() and not force_download:
             print(f"{output_path} already exists. Skipping download.")
             return output_path
@@ -5603,7 +5603,7 @@ class WAS_Download:
         season_months_int = [int(m) for m in season_months]
         pivot = season_months_int[0]
         season_str = "".join(calendar.month_abbr[m] for m in season_months_int)
-        out_nc = dir_to_save / f"Obs_PRCP_CHIRPSv3_{year_start}_{year_end}_{season_str}.nc"
+        out_nc = dir_to_save / f"Obs_PRCP_{year_start}_{year_end}_{season_str}.nc"
         if out_nc.exists() and not force_download:
             print(f"[INFO] {out_nc} already exists. Skipping.")
             return out_nc
@@ -5774,7 +5774,7 @@ class WAS_Download:
         season_months_int = [int(m) for m in season_months]
         pivot = season_months_int[0]
         season_str = "".join(calendar.month_abbr[m] for m in season_months_int)
-        out_nc = dir_to_save / f"Obs_TAMSAT_{product_key}_{year_start}_{year_end}_{season_str}.nc"
+        out_nc = dir_to_save / f"Obs_PRCP_{year_start}_{year_end}_{season_str}.nc"
         if out_nc.exists() and not force_download:
             print(f"[INFO] {out_nc} already exists. Skipping.")
             return out_nc
@@ -6067,7 +6067,7 @@ class WAS_Download:
         if start > end:
             raise ValueError("year_start/start date must be <= year_end/end date.")
     
-        out_nc = dir_to_save / f"Daily_TAMSAT_{product_key}_{start:%Y%m%d}_{end:%Y%m%d}.nc"
+        out_nc = dir_to_save / f"Daily_PRCP_{year_start}_{year_end}.nc"
         if out_nc.exists() and not force_download:
             print(f"[INFO] {out_nc} already exists. Skipping.")
             return out_nc

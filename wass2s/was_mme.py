@@ -157,1015 +157,1165 @@ from wass2s.was_verification import *
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 warnings.filterwarnings('ignore', category=ConvergenceWarning)
 
+def process_datasets_for_mme(
+    rainfall,
+    hdcsted=None,
+    fcsted=None,
+    gcm=False,
+    agroparam=False,
+    Prob=False,
+    hydro=False,
+    ELM_ELR=False,
+    dir_to_save_model=None,
+    best_models=None,
+    scores=None,
+    year_start=None,
+    year_end=None,
+    model=False,
+    month_of_initialization=None,
+    lead_time=None,
+    year_forecast=None,
+    score_metric="GROC",
+    var="PRCP",
+):
+    """Prepare deterministic or probabilistic fields for an MME.
 
-def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None, 
-                             gcm=False, agroparam=False, Prob=False, hydro=False,
-                             ELM_ELR=False, dir_to_save_model=None,
-                             best_models=None, scores=None,
-                             year_start=None, year_end=None, 
-                             model=False, month_of_initialization=None, 
-                             lead_time=None, year_forecast=None, 
-                             score_metric='GROC', var="PRCP"):
+    The function guarantees the following output conventions:
+
+    * deterministic fields: ``(T, M, Y, X)``;
+    * probabilistic fields: ``(probability, T, M, Y, X)``;
+    * xcast ELM/ELR fields: ``(S, M, Y, X)``;
+    * observations: ``(T, M, Y, X)`` with a singleton ``M`` dimension;
+    * score fields: one strictly spatial ``(Y, X)`` array per model.
+
+    In particular, a score carrying an ``M`` dimension is explicitly reduced
+    to the requested model before it can be used. This prevents accidental
+    xarray broadcasting from reintroducing ``M`` into a deterministic MME.
     """
-    Process hindcast and forecast datasets for a multi-model ensemble.
 
-    This function loads, interpolates, and concatenates hindcast and forecast datasets from various sources 
-    (GCMs, agroparameters, or others) to prepare them for a multi-model ensemble. It supports different score 
-    metrics and configurations for probabilistic or deterministic outputs.
+    def _as_dataarray(obj, label):
+        if isinstance(obj, xr.DataArray):
+            return obj
+        if isinstance(obj, xr.Dataset):
+            if len(obj.data_vars) == 1:
+                return next(iter(obj.data_vars.values()))
+            if "Observation" in obj:
+                return obj["Observation"]
+            raise ValueError(
+                f"{label} is a Dataset with several variables: "
+                f"{list(obj.data_vars)}. Select one variable before MME processing."
+            )
+        raise TypeError(f"{label} must be an xarray DataArray or Dataset, got {type(obj)!r}.")
 
-    Parameters
-    ----------
-    rainfall : xarray.DataArray
-        Observed rainfall data used for interpolation and masking.
-    hdcsted : dict, optional
-        Dictionary of hindcast datasets for different models.
-    fcsted : dict, optional
-        Dictionary of forecast datasets for different models.
-    gcm : bool, optional
-        If True, process data as GCM data. Default is True.
-    agroparam : bool, optional
-        If True, process data as agroparameter data. Default is False.
-    Prob : bool, optional
-        If True, process data as probabilistic forecasts. Default is False.
-    ELM_ELR : bool, optional
-        If True, use ELM_ELR configuration for dimension renaming. Default is False.
-    dir_to_save_model : str, optional
-        Directory path to load model data.
-    best_models : list, optional
-        List of model names to include in the ensemble.
-    scores : dict, optional
-        Dictionary containing model scores, with the key specified by `score_metric`.
-    year_start : int, optional
-        Starting year for the data range.
-    year_end : int, optional
-        Ending year for the data range.
-    model : bool, optional
-        If True, treat data as model-based. Default is True.
-    month_of_initialization : int, optional
-        Month when the forecast is initialized.
-    lead_time : int, optional
-        Forecast lead time in months.
-    year_forecast : int, optional
-        Year for which the forecast is generated.
-    score_metric : str, optional
-        Metric used to organize scores (e.g., 'Pearson', 'MAE', 'GROC'). Default is 'GROC'.
-    var: str, optional
-        variables used ( e.g., 'PRCP')
-    Returns
-    -------
-    all_model_hdcst : xarray.DataArray
-        Concatenated hindcast data across models.
-    all_model_fcst : xarray.DataArray
-        Concatenated forecast data across models.
-    obs : xarray.DataArray
-        Observed rainfall data expanded with a model dimension and masked.
-    scores_organized : dict
-        Dictionary of organized scores for selected models.
-    """
+    def _open_dataarray(path, label):
+        ds = xr.open_dataset(path)
+        try:
+            da = _as_dataarray(ds, label).load()
+        finally:
+            ds.close()
+        return da
+
+    def _normalise_name(name):
+        text = str(name).lower().replace(f".{str(var).lower()}", "")
+        return "".join(ch for ch in text if ch.isalnum())
+
+    def _select_observation(da):
+        da = _as_dataarray(da, "rainfall")
+        if "M" in da.dims:
+            if da.sizes["M"] != 1:
+                warnings.warn(
+                    "rainfall contains several M members; the first member is used as observation.",
+                    RuntimeWarning,
+                )
+            da = da.isel(M=0, drop=True)
+        if "M" in da.coords and "M" not in da.dims:
+            da = da.drop_vars("M")
+        missing = {"T", "Y", "X"} - set(da.dims)
+        if missing:
+            raise ValueError(f"rainfall is missing required dimensions {sorted(missing)}; dims={da.dims}.")
+        extras = [d for d in da.dims if d not in ("T", "Y", "X")]
+        for dim in extras:
+            if da.sizes[dim] == 1:
+                da = da.isel({dim: 0}, drop=True)
+            else:
+                raise ValueError(
+                    f"rainfall has unsupported non-singleton dimension {dim!r}: "
+                    f"dims={da.dims}, sizes={dict(da.sizes)}."
+                )
+        return da.transpose("T", "Y", "X")
+
+    def _strip_per_model_member(da, model_name, label):
+        if "M" not in da.dims:
+            return da
+        if da.sizes["M"] == 1:
+            return da.isel(M=0, drop=True)
+        if "M" in da.coords and model_name in da["M"].values.tolist():
+            return da.sel(M=model_name, drop=True)
+        warnings.warn(
+            f"{label} for {model_name!r} still contains {da.sizes['M']} ensemble members; "
+            "their mean is used before concatenating models.",
+            RuntimeWarning,
+        )
+        return da.mean("M", skipna=True)
+
+    def _prepare_field(da, model_name, label, probabilistic=False):
+        da = _as_dataarray(da, label).astype(float)
+        da = _strip_per_model_member(da, model_name, label)
+
+        allowed = {"T", "Y", "X"}
+        if probabilistic:
+            allowed.add("probability")
+
+        for dim in list(da.dims):
+            if dim not in allowed:
+                if da.sizes[dim] == 1:
+                    da = da.isel({dim: 0}, drop=True)
+                else:
+                    raise ValueError(
+                        f"{label} for {model_name!r} has unsupported dimension {dim!r}; "
+                        f"dims={da.dims}, sizes={dict(da.sizes)}."
+                    )
+
+        required = {"T", "Y", "X"} | ({"probability"} if probabilistic else set())
+        missing = required - set(da.dims)
+        if missing:
+            raise ValueError(
+                f"{label} for {model_name!r} is missing dimensions {sorted(missing)}; dims={da.dims}."
+            )
+
+        if not da.Y.identical(obs.Y) or not da.X.identical(obs.X):
+            method = "nearest" if probabilistic else "linear"
+            da = da.interp(
+                Y=obs.Y,
+                X=obs.X,
+                method=method,
+                kwargs={"fill_value": "extrapolate"},
+            )
+
+        order = ("probability", "T", "Y", "X") if probabilistic else ("T", "Y", "X")
+        return da.transpose(*order)
+
+    def _find_path(mapping, model_name, label):
+        if not mapping:
+            raise ValueError(f"No {label} mapping was supplied.")
+        if model_name in mapping:
+            return mapping[model_name]
+        target = _normalise_name(model_name)
+        candidates = [value for key, value in mapping.items() if _normalise_name(key) == target]
+        if not candidates:
+            candidates = [
+                value for value in mapping.values()
+                if target[:5] and target[:5] in _normalise_name(value)
+            ]
+        if len(candidates) != 1:
+            raise KeyError(
+                f"Unable to identify one {label} file for model {model_name!r}; "
+                f"found {len(candidates)} candidates."
+            )
+        return candidates[0]
+
+    def _score_pool_from_input(score_input):
+        if score_input is None:
+            return {}
+        if score_metric in score_input and isinstance(score_input[score_metric], dict):
+            return score_input[score_metric]
+        if all(isinstance(v, xr.DataArray) for v in score_input.values()):
+            return score_input
+        return {}
+
+    def _match_score(model_name, score_pool):
+        if model_name in score_pool:
+            return score_pool[model_name]
+
+        target = _normalise_name(model_name)
+        exact = [(key, value) for key, value in score_pool.items() if _normalise_name(key) == target]
+        if len(exact) == 1:
+            return exact[0][1]
+
+        prefix = [
+            (key, value)
+            for key, value in score_pool.items()
+            if _normalise_name(key).startswith(target) or target.startswith(_normalise_name(key))
+        ]
+        if len(prefix) == 1:
+            return prefix[0][1]
+        if len(prefix) > 1:
+            prefix.sort(key=lambda item: abs(len(_normalise_name(item[0])) - len(target)))
+            best_distance = abs(len(_normalise_name(prefix[0][0])) - len(target))
+            tied = [p for p in prefix if abs(len(_normalise_name(p[0])) - len(target)) == best_distance]
+            if len(tied) == 1:
+                return tied[0][1]
+        return None
+
+    def _prepare_score(score, model_name, model_index):
+        if score is None:
+            warnings.warn(
+                f"No {score_metric} score found for {model_name!r}; a neutral weight of 1 is used.",
+                RuntimeWarning,
+            )
+            return xr.ones_like(mask, dtype=float)
+
+        score = _as_dataarray(score, f"score[{model_name}]").astype(float)
+
+        if "M" in score.dims:
+            if score.sizes["M"] == 1:
+                score = score.isel(M=0, drop=True)
+            elif "M" in score.coords and model_name in score["M"].values.tolist():
+                score = score.sel(M=model_name, drop=True)
+            elif score.sizes["M"] == len(selected_models):
+                score = score.isel(M=model_index, drop=True)
+            else:
+                raise ValueError(
+                    f"Score for {model_name!r} contains an ambiguous M dimension: "
+                    f"dims={score.dims}, sizes={dict(score.sizes)}."
+                )
+
+        for dim in list(score.dims):
+            if dim not in ("Y", "X"):
+                if score.sizes[dim] == 1:
+                    score = score.isel({dim: 0}, drop=True)
+                else:
+                    warnings.warn(
+                        f"Score for {model_name!r} contains dimension {dim!r}; "
+                        "it is averaged before spatial weighting.",
+                        RuntimeWarning,
+                    )
+                    score = score.mean(dim, skipna=True)
+
+        if not {"Y", "X"}.issubset(score.dims):
+            if score.ndim == 0:
+                score = xr.full_like(mask, float(score.values), dtype=float)
+            else:
+                raise ValueError(
+                    f"Score for {model_name!r} must resolve to (Y, X), got {score.dims}."
+                )
+        else:
+            score = score.transpose("Y", "X").interp(
+                Y=obs.Y,
+                X=obs.X,
+                method="nearest",
+                kwargs={"fill_value": "extrapolate"},
+            )
+
+        return score.where(mask.notnull())
+
+    obs = _select_observation(rainfall)
+    mask = xr.where(obs.notnull().any("T"), 1.0, np.nan).transpose("Y", "X")
+    mask.name = None
+
+    hdcsted = {} if hdcsted is None else dict(hdcsted)
+    fcsted = {} if fcsted is None else dict(fcsted)
+
+    if best_models is None:
+        if gcm:
+            best_models = list(hdcsted) if hdcsted else []
+        else:
+            best_models = [name for name in hdcsted if name in fcsted]
+    selected_models = list(dict.fromkeys(best_models))
+    if not selected_models:
+        raise ValueError("best_models is empty; no model can be prepared for the MME.")
 
     all_model_hdcst = {}
     all_model_fcst = {}
-    
-    if gcm:
-        # Standardize model keys for matching.
-        target_prefixes = [m.lower().replace(f".{var.lower()}", '') for m in best_models]
-        # Use the provided score_metric to extract the appropriate scores.
-        scores_organized = {
-            model: da for key, da in scores[score_metric].items() 
-            for model in best_models if any(key.startswith(prefix) for prefix in target_prefixes)
-        }
-        for m in best_models:
+
+    for model_name in selected_models:
+        if gcm:
             hdcst = load_gridded_predictor(
-                dir_to_save_model, m, year_start, year_end, model=True, 
-                month_of_initialization=month_of_initialization, lead_time=lead_time, 
-                year_forecast=None
-            )
-            all_model_hdcst[m] = hdcst.interp(
-                Y=rainfall.Y, X=rainfall.X, method="linear", 
-                kwargs={"fill_value": "extrapolate"}
+                dir_to_save_model,
+                model_name,
+                year_start,
+                year_end,
+                model=True,
+                month_of_initialization=month_of_initialization,
+                lead_time=lead_time,
+                year_forecast=None,
             )
             fcst = load_gridded_predictor(
-                dir_to_save_model, m, year_start, year_end, model=True, 
-                month_of_initialization=month_of_initialization, lead_time=lead_time, 
-                year_forecast=year_forecast
+                dir_to_save_model,
+                model_name,
+                year_start,
+                year_end,
+                model=True,
+                month_of_initialization=month_of_initialization,
+                lead_time=lead_time,
+                year_forecast=year_forecast,
             )
-            all_model_fcst[m] = fcst.interp(
-                Y=rainfall.Y, X=rainfall.X, method="linear", 
-                kwargs={"fill_value": "extrapolate"}
+        elif agroparam:
+            hdcst = _open_dataarray(
+                _find_path(hdcsted, model_name, "hindcast"),
+                f"hindcast[{model_name}]",
             )
-    
-    elif agroparam:
-        target_prefixes = [model.split('.')[0].replace('_','').lower() for model in best_models]
-        scores_organized = {
-            model.split('.')[0].replace('_','').lower(): da for key, da in scores[score_metric].items() 
-            for model in best_models if any(key.startswith(prefix) for prefix in target_prefixes)
-                        }
-        for i in target_prefixes:
-            fic = [f for f in list(hdcsted.values()) if i[0:5] in f][0]        
-            hdcst = xr.open_dataset(fic).to_array().drop_vars("variable").squeeze("variable")
-            hdcst = hdcst.interp(
-                            Y=rainfall.Y,
-                            X=rainfall.X,
-                            method="linear",
-                            kwargs={"fill_value": "extrapolate"}
-                        )
-            all_model_hdcst[i] = myfill(hdcst, rainfall)
-            fic = [f for f in list(fcsted.values()) if i[0:5]  in f][0]
-            fcst = xr.open_dataset(fic).to_array().drop_vars("variable").squeeze("variable")
-            fcst = fcst.interp(
-                            Y=rainfall.Y,
-                            X=rainfall.X,
-                            method="linear",
-                            kwargs={"fill_value": "extrapolate"}
-                        )
-            all_model_fcst[i] = myfill(fcst, rainfall)
-
-    elif hydro:
-        
-        if isinstance(hdcsted[list(hdcsted.keys())[0]], xr.DataArray):
-            target_prefixes = best_models
-            scores_organized = {
-                model: da for key, da in scores[score_metric].items() 
-                for model in list(hdcsted.keys()) if any(model.startswith(prefix) for prefix in target_prefixes)
-            }
-            
-            for m in scores_organized.keys():
-                all_model_hdcst[m] = hdcsted[m]
-                all_model_fcst[m] = fcsted[m]
+            fcst = _open_dataarray(
+                _find_path(fcsted, model_name, "forecast"),
+                f"forecast[{model_name}]",
+            )
+        elif hydro and not isinstance(hdcsted.get(model_name), (xr.DataArray, xr.Dataset)):
+            hdcst = _open_dataarray(hdcsted[model_name], f"hindcast[{model_name}]")
+            fcst = _open_dataarray(fcsted[model_name], f"forecast[{model_name}]")
         else:
+            if model_name not in hdcsted or model_name not in fcsted:
+                raise KeyError(
+                    f"Model {model_name!r} must exist in both hindcast and forecast dictionaries."
+                )
+            hdcst = hdcsted[model_name]
+            fcst = fcsted[model_name]
 
-            target_prefixes = [m.replace('_','').lower() for m in best_models]
-            scores_organized = {
-                model: da for key, da in scores[score_metric].items() 
-                for model in list(hdcsted.keys()) if any(model.startswith(prefix) for prefix in target_prefixes)
-            }
-            for m in scores_organized.keys():
-                hdcst = xr.open_dataset(hdcsted[m])
-                hdcst = hdcst['Observation'].astype(float)
-                all_model_hdcst[m] = hdcst
-    
-                fcst = xr.open_dataset(fcsted[m])
-                fcst = fcst['Observation'].astype(float)
-                all_model_fcst[m] = fcst
+        hdcst = _prepare_field(
+            hdcst,
+            model_name,
+            "hindcast",
+            probabilistic=Prob,
+        )
+        fcst = _prepare_field(
+            fcst,
+            model_name,
+            "forecast",
+            probabilistic=Prob,
+        )
+
+        if not Prob and hdcst.sizes["T"] == obs.sizes["T"]:
+            hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
+
+        all_model_hdcst[model_name] = hdcst
+        all_model_fcst[model_name] = fcst
+
+    # Keep only models successfully loaded in the same explicit order.
+    predictor_names = list(all_model_hdcst)
+    hdcst_list = [all_model_hdcst[name] for name in predictor_names]
+    fcst_list = [all_model_fcst[name] for name in predictor_names]
+
+    if Prob:
+        hdcst_stack = xr.concat(
+            hdcst_list,
+            dim=xr.IndexVariable("M", predictor_names),
+            join="inner",
+            coords="minimal",
+            compat="override",
+        ).transpose("probability", "T", "M", "Y", "X")
+        fcst_stack = xr.concat(
+            fcst_list,
+            dim=xr.IndexVariable("M", predictor_names),
+            join="inner",
+            coords="minimal",
+            compat="override",
+        ).transpose("probability", "T", "M", "Y", "X")
+
+        hdcst_stack = hdcst_stack.where(mask.notnull())
+        hdcst_clim = hdcst_stack.mean("T", skipna=True)
+        hdcst_stack = hdcst_stack.fillna(hdcst_clim)
+        fcst_stack = fcst_stack.where(mask.notnull()).fillna(hdcst_clim)
     else:
-        # target_prefixes = [m.replace(m.split('.')[1], '') for m in best_models]
-        target_prefixes = [m.split('.')[0] for m in best_models]
-        scores_organized = {
-            model: da for key, da in scores[score_metric].items() 
-            for model in list(hdcsted.keys()) if any(model.startswith(prefix) for prefix in target_prefixes)
-        }
-        for m in scores_organized.keys():
-            all_model_hdcst[m] = hdcsted[m].interp(
-                Y=rainfall.Y, X=rainfall.X, method="linear", 
-                kwargs={"fill_value": "extrapolate"}
-            )
-            all_model_fcst[m] = fcsted[m].interp(
-                Y=rainfall.Y, X=rainfall.X, method="linear", 
-                kwargs={"fill_value": "extrapolate"}
-            )
-    
-    # Concatenate datasets along the 'M' dimension.
-    hindcast_det_list = list(all_model_hdcst.values()) 
-    forecast_det_list = list(all_model_fcst.values())
-    predictor_names = list(all_model_hdcst.keys())    
-    
-    # Create a mask based on the rainfall data.
-    mask = xr.where(~np.isnan(rainfall.isel(T=0)), 1, np.nan).drop_vars('T').squeeze()
-    mask.name = None
-    
-    if ELM_ELR:
-        all_model_hdcst = (
-            xr.concat(hindcast_det_list, dim='M')
-              .assign_coords({'M': predictor_names})
-              .rename({'T': 'S'})
-              .transpose('S', 'M', 'Y', 'X')
-        ) * mask
-        all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="S", skipna=True))
-        all_model_fcst = (
-            xr.concat(forecast_det_list, dim='M')
-              .assign_coords({'M': predictor_names})
-              .rename({'T': 'S'})
-              .transpose('S', 'M', 'Y', 'X')
-        ) * mask
-        all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="S", skipna=True))
-        obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
-        obs = obs.fillna(obs.mean(dim="T", skipna=True))
+        hdcst_stack = xr.concat(
+            hdcst_list,
+            dim=xr.IndexVariable("M", predictor_names),
+            join="inner",
+            coords="minimal",
+            compat="override",
+        ).transpose("T", "M", "Y", "X")
+        fcst_stack = xr.concat(
+            fcst_list,
+            dim=xr.IndexVariable("M", predictor_names),
+            join="inner",
+            coords="minimal",
+            compat="override",
+        ).transpose("T", "M", "Y", "X")
 
-    elif Prob:
-        all_model_hdcst = (
-            xr.concat(hindcast_det_list, dim='M')
-              .assign_coords({'M': predictor_names})
-              .transpose('probability', 'T', 'M', 'Y', 'X')
-        ) * mask
-        all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
-        all_model_fcst = (
-            xr.concat(forecast_det_list, dim='M')
-              .assign_coords({'M': predictor_names})
-              .transpose('probability', 'T', 'M', 'Y', 'X')
-        ) * mask
-        all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
-        if "M" in rainfall.coords:
-            obs = rainfall.fillna(rainfall.mean(dim="T", skipna=True))
-        else:
-            obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
-            obs = obs.fillna(obs.mean(dim="T", skipna=True))
+        hdcst_stack = hdcst_stack.where(mask.notnull())
+        hdcst_clim = hdcst_stack.mean("T", skipna=True)
+        hdcst_stack = hdcst_stack.fillna(hdcst_clim)
+        fcst_stack = fcst_stack.where(mask.notnull()).fillna(hdcst_clim)
 
-    else:
-        all_model_hdcst = (
-            xr.concat(hindcast_det_list, dim='M')
-              .assign_coords({'M': predictor_names})
-              .transpose('T', 'M', 'Y', 'X')
-        ) * mask
-        all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
-        all_model_fcst = (
-            xr.concat(forecast_det_list, dim='M')
-              .assign_coords({'M': predictor_names})
-              .transpose('T', 'M', 'Y', 'X')
-        ) * mask
-        all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
-        obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
-        obs = obs.fillna(obs.mean(dim="T", skipna=True))
-    
-    return all_model_hdcst, all_model_fcst, obs, scores_organized
-
-
-def myfill(all_model_fcst, obs):
-
-    """
-    Fill missing values in forecast data using random samples from observations.
-
-    This function fills NaN values in the forecast data by randomly sampling values from the observed 
-    rainfall data along the time dimension.
-
-    Parameters
-    ----------
-    all_model_fcst : xarray.DataArray
-        Forecast data with dimensions (T, M, Y, X) containing possible NaN values.
-    obs : xarray.DataArray
-        Observed rainfall data with dimensions (T, Y, X) used for filling NaNs.
-
-    Returns
-    -------
-    da_filled_random : xarray.DataArray
-        Forecast data with NaN values filled using random samples from observations.
-    """
-
-    # Suppose all_model_hdcst has dimensions: T, M, Y, X
-    da = all_model_fcst
-    
-    T = da.sizes["T"]
-    Y = da.sizes["Y"]
-    X = da.sizes["X"]
-    
-    # Create a DataArray of random T indices with shape (T, M, Y, X)
-    # so that each element gets its own random index along T
-    random_t_indices_full = xr.DataArray(
-        np.random.randint(0, T, size=(T, Y, X)),
-        dims=["T", "Y", "X"]
+    obs_m = (
+        obs.where(mask.notnull())
+        .expand_dims(M=[0])
+        .transpose("T", "M", "Y", "X")
     )
-    
-    # Use vectorized indexing: for each (T, M, Y, X) location,
-    # this picks the value at a random T index for that M, Y, X location.
-    random_slices_full = obs.isel(T=random_t_indices_full)
-    
-    # Fill missing values with these randomly selected values
-    da_filled_random = da.fillna(random_slices_full)
-    return da_filled_random   
+    obs_m = obs_m.fillna(obs_m.mean("T", skipna=True))
 
+    score_pool = _score_pool_from_input(scores)
+    scores_organized = {
+        name: _prepare_score(_match_score(name, score_pool), name, index)
+        for index, name in enumerate(predictor_names)
+    }
+
+    if ELM_ELR:
+        if Prob:
+            raise ValueError("ELM_ELR=True is incompatible with Prob=True.")
+        hdcst_stack = hdcst_stack.rename(T="S").transpose("S", "M", "Y", "X")
+        fcst_stack = fcst_stack.rename(T="S").transpose("S", "M", "Y", "X")
+
+    return hdcst_stack, fcst_stack, obs_m, scores_organized
+
+# def process_datasets_for_mme(rainfall, hdcsted=None, fcsted=None, 
+#                              gcm=False, agroparam=False, Prob=False, hydro=False,
+#                              ELM_ELR=False, dir_to_save_model=None,
+#                              best_models=None, scores=None,
+#                              year_start=None, year_end=None, 
+#                              model=False, month_of_initialization=None, 
+#                              lead_time=None, year_forecast=None, 
+#                              score_metric='GROC', var="PRCP"):
+#     """
+#     Process hindcast and forecast datasets for a multi-model ensemble.
+
+#     This function loads, interpolates, and concatenates hindcast and forecast datasets from various sources 
+#     (GCMs, agroparameters, or others) to prepare them for a multi-model ensemble. It supports different score 
+#     metrics and configurations for probabilistic or deterministic outputs.
+
+#     Parameters
+#     ----------
+#     rainfall : xarray.DataArray
+#         Observed rainfall data used for interpolation and masking.
+#     hdcsted : dict, optional
+#         Dictionary of hindcast datasets for different models.
+#     fcsted : dict, optional
+#         Dictionary of forecast datasets for different models.
+#     gcm : bool, optional
+#         If True, process data as GCM data. Default is True.
+#     agroparam : bool, optional
+#         If True, process data as agroparameter data. Default is False.
+#     Prob : bool, optional
+#         If True, process data as probabilistic forecasts. Default is False.
+#     ELM_ELR : bool, optional
+#         If True, use ELM_ELR configuration for dimension renaming. Default is False.
+#     dir_to_save_model : str, optional
+#         Directory path to load model data.
+#     best_models : list, optional
+#         List of model names to include in the ensemble.
+#     scores : dict, optional
+#         Dictionary containing model scores, with the key specified by `score_metric`.
+#     year_start : int, optional
+#         Starting year for the data range.
+#     year_end : int, optional
+#         Ending year for the data range.
+#     model : bool, optional
+#         If True, treat data as model-based. Default is True.
+#     month_of_initialization : int, optional
+#         Month when the forecast is initialized.
+#     lead_time : int, optional
+#         Forecast lead time in months.
+#     year_forecast : int, optional
+#         Year for which the forecast is generated.
+#     score_metric : str, optional
+#         Metric used to organize scores (e.g., 'Pearson', 'MAE', 'GROC'). Default is 'GROC'.
+#     var: str, optional
+#         variables used ( e.g., 'PRCP')
+#     Returns
+#     -------
+#     all_model_hdcst : xarray.DataArray
+#         Concatenated hindcast data across models.
+#     all_model_fcst : xarray.DataArray
+#         Concatenated forecast data across models.
+#     obs : xarray.DataArray
+#         Observed rainfall data expanded with a model dimension and masked.
+#     scores_organized : dict
+#         Dictionary of organized scores for selected models.
+#     """
+
+#     all_model_hdcst = {}
+#     all_model_fcst = {}
+    
+#     if gcm:
+#         # Standardize model keys for matching.
+#         target_prefixes = [m.lower().replace(f".{var.lower()}", '') for m in best_models]
+#         # Use the provided score_metric to extract the appropriate scores.
+#         scores_organized = {
+#             model: da for key, da in scores[score_metric].items() 
+#             for model in best_models if any(key.startswith(prefix) for prefix in target_prefixes)
+#         }
+#         for m in best_models:
+#             hdcst = load_gridded_predictor(
+#                 dir_to_save_model, m, year_start, year_end, model=True, 
+#                 month_of_initialization=month_of_initialization, lead_time=lead_time, 
+#                 year_forecast=None
+#             )
+#             all_model_hdcst[m] = hdcst.interp(
+#                 Y=rainfall.Y, X=rainfall.X, method="linear", 
+#                 kwargs={"fill_value": "extrapolate"}
+#             )
+#             fcst = load_gridded_predictor(
+#                 dir_to_save_model, m, year_start, year_end, model=True, 
+#                 month_of_initialization=month_of_initialization, lead_time=lead_time, 
+#                 year_forecast=year_forecast
+#             )
+#             all_model_fcst[m] = fcst.interp(
+#                 Y=rainfall.Y, X=rainfall.X, method="linear", 
+#                 kwargs={"fill_value": "extrapolate"}
+#             )
+    
+#     elif agroparam:
+#         target_prefixes = [model.split('.')[0].replace('_','').lower() for model in best_models]
+#         scores_organized = {
+#             model.split('.')[0].replace('_','').lower(): da for key, da in scores[score_metric].items() 
+#             for model in best_models if any(key.startswith(prefix) for prefix in target_prefixes)
+#                         }
+#         for i in target_prefixes:
+#             fic = [f for f in list(hdcsted.values()) if i[0:5] in f][0]        
+#             hdcst = xr.open_dataset(fic).to_array().drop_vars("variable").squeeze("variable")
+#             hdcst = hdcst.interp(
+#                             Y=rainfall.Y,
+#                             X=rainfall.X,
+#                             method="linear",
+#                             kwargs={"fill_value": "extrapolate"}
+#                         )
+#             all_model_hdcst[i] = myfill(hdcst, rainfall)
+#             fic = [f for f in list(fcsted.values()) if i[0:5]  in f][0]
+#             fcst = xr.open_dataset(fic).to_array().drop_vars("variable").squeeze("variable")
+#             fcst = fcst.interp(
+#                             Y=rainfall.Y,
+#                             X=rainfall.X,
+#                             method="linear",
+#                             kwargs={"fill_value": "extrapolate"}
+#                         )
+#             all_model_fcst[i] = myfill(fcst, rainfall)
+
+#     elif hydro:
+        
+#         if isinstance(hdcsted[list(hdcsted.keys())[0]], xr.DataArray):
+#             target_prefixes = best_models
+#             scores_organized = {
+#                 model: da for key, da in scores[score_metric].items() 
+#                 for model in list(hdcsted.keys()) if any(model.startswith(prefix) for prefix in target_prefixes)
+#             }
+            
+#             for m in scores_organized.keys():
+#                 all_model_hdcst[m] = hdcsted[m]
+#                 all_model_fcst[m] = fcsted[m]
+#         else:
+
+#             target_prefixes = [m.replace('_','').lower() for m in best_models]
+#             scores_organized = {
+#                 model: da for key, da in scores[score_metric].items() 
+#                 for model in list(hdcsted.keys()) if any(model.startswith(prefix) for prefix in target_prefixes)
+#             }
+#             for m in scores_organized.keys():
+#                 hdcst = xr.open_dataset(hdcsted[m])
+#                 hdcst = hdcst['Observation'].astype(float)
+#                 all_model_hdcst[m] = hdcst
+    
+#                 fcst = xr.open_dataset(fcsted[m])
+#                 fcst = fcst['Observation'].astype(float)
+#                 all_model_fcst[m] = fcst
+#     else:
+#         # target_prefixes = [m.replace(m.split('.')[1], '') for m in best_models]
+#         target_prefixes = [m.split('.')[0] for m in best_models]
+#         scores_organized = {
+#             model: da for key, da in scores[score_metric].items() 
+#             for model in list(hdcsted.keys()) if any(model.startswith(prefix) for prefix in target_prefixes)
+#         }
+#         for m in scores_organized.keys():
+#             all_model_hdcst[m] = hdcsted[m].interp(
+#                 Y=rainfall.Y, X=rainfall.X, method="linear", 
+#                 kwargs={"fill_value": "extrapolate"}
+#             )
+#             all_model_fcst[m] = fcsted[m].interp(
+#                 Y=rainfall.Y, X=rainfall.X, method="linear", 
+#                 kwargs={"fill_value": "extrapolate"}
+#             )
+    
+#     # Concatenate datasets along the 'M' dimension.
+#     hindcast_det_list = list(all_model_hdcst.values()) 
+#     forecast_det_list = list(all_model_fcst.values())
+#     predictor_names = list(all_model_hdcst.keys())    
+    
+#     # Create a mask based on the rainfall data.
+#     mask = xr.where(~np.isnan(rainfall.isel(T=0)), 1, np.nan).drop_vars('T').squeeze()
+#     mask.name = None
+    
+#     if ELM_ELR:
+#         all_model_hdcst = (
+#             xr.concat(hindcast_det_list, dim='M')
+#               .assign_coords({'M': predictor_names})
+#               .rename({'T': 'S'})
+#               .transpose('S', 'M', 'Y', 'X')
+#         ) * mask
+#         all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="S", skipna=True))
+#         all_model_fcst = (
+#             xr.concat(forecast_det_list, dim='M')
+#               .assign_coords({'M': predictor_names})
+#               .rename({'T': 'S'})
+#               .transpose('S', 'M', 'Y', 'X')
+#         ) * mask
+#         all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="S", skipna=True))
+#         obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
+#         obs = obs.fillna(obs.mean(dim="T", skipna=True))
+
+#     elif Prob:
+#         all_model_hdcst = (
+#             xr.concat(hindcast_det_list, dim='M')
+#               .assign_coords({'M': predictor_names})
+#               .transpose('probability', 'T', 'M', 'Y', 'X')
+#         ) * mask
+#         all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
+#         all_model_fcst = (
+#             xr.concat(forecast_det_list, dim='M')
+#               .assign_coords({'M': predictor_names})
+#               .transpose('probability', 'T', 'M', 'Y', 'X')
+#         ) * mask
+#         all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
+#         if "M" in rainfall.coords:
+#             obs = rainfall.fillna(rainfall.mean(dim="T", skipna=True))
+#         else:
+#             obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
+#             obs = obs.fillna(obs.mean(dim="T", skipna=True))
+
+#     else:
+#         all_model_hdcst = (
+#             xr.concat(hindcast_det_list, dim='M')
+#               .assign_coords({'M': predictor_names})
+#               .transpose('T', 'M', 'Y', 'X')
+#         ) * mask
+#         all_model_hdcst = all_model_hdcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
+#         all_model_fcst = (
+#             xr.concat(forecast_det_list, dim='M')
+#               .assign_coords({'M': predictor_names})
+#               .transpose('T', 'M', 'Y', 'X')
+#         ) * mask
+#         all_model_fcst = all_model_fcst.fillna(all_model_hdcst.mean(dim="T", skipna=True))
+#         obs = rainfall.expand_dims({'M': [0]}, axis=1) * mask
+#         obs = obs.fillna(obs.mean(dim="T", skipna=True))
+    
+#     return all_model_hdcst, all_model_fcst, obs, scores_organized
+
+
+# def myfill(all_model_fcst, obs):
+
+#     """
+#     Fill missing values in forecast data using random samples from observations.
+
+#     This function fills NaN values in the forecast data by randomly sampling values from the observed 
+#     rainfall data along the time dimension.
+
+#     Parameters
+#     ----------
+#     all_model_fcst : xarray.DataArray
+#         Forecast data with dimensions (T, M, Y, X) containing possible NaN values.
+#     obs : xarray.DataArray
+#         Observed rainfall data with dimensions (T, Y, X) used for filling NaNs.
+
+#     Returns
+#     -------
+#     da_filled_random : xarray.DataArray
+#         Forecast data with NaN values filled using random samples from observations.
+#     """
+
+#     # Suppose all_model_hdcst has dimensions: T, M, Y, X
+#     da = all_model_fcst
+    
+#     T = da.sizes["T"]
+#     Y = da.sizes["Y"]
+#     X = da.sizes["X"]
+    
+#     # Create a DataArray of random T indices with shape (T, M, Y, X)
+#     # so that each element gets its own random index along T
+#     random_t_indices_full = xr.DataArray(
+#         np.random.randint(0, T, size=(T, Y, X)),
+#         dims=["T", "Y", "X"]
+#     )
+    
+#     # Use vectorized indexing: for each (T, M, Y, X) location,
+#     # this picks the value at a random T index for that M, Y, X location.
+#     random_slices_full = obs.isel(T=random_t_indices_full)
+    
+#     # Fill missing values with these randomly selected values
+#     da_filled_random = da.fillna(random_slices_full)
+#     return da_filled_random   
 
 class WAS_mme_Weighted:
-    """
-    Weighted Multi-Model Ensemble (MME) for climate forecasting.
+    """Equal- or skill-weighted deterministic MME with tercile probabilities.
 
-    This class implements a weighted ensemble approach for combining multiple climate models, 
-    supporting both equal weighting and score-based weighting. It also provides methods for 
-    computing tercile probabilities using various statistical distributions.
+    All public outputs are dimension-safe:
 
-    Parameters
-    ----------
-    equal_weighted : bool, optional
-        If True, use equal weights for all models; otherwise, use score-based weights. Default is False.
-    dist_method : str, optional
-        Statistical distribution for probability calculations ('t', 'gamma', 'normal', 'lognormal', 
-        'weibull_min', 'nonparam'). Default is 'gamma'.
-    metric : str, optional
-        Performance metric for weighting ('MAE', 'Pearson', 'GROC'). Default is 'GROC'.
-    threshold : float, optional
-        Threshold for score transformation. Default is 0.5.
+    * :meth:`compute` returns ``(T, Y, X)`` deterministic arrays;
+    * :meth:`compute_prob` returns ``(probability, T, Y, X)``;
+    * :meth:`forecast` returns the same deterministic/probabilistic conventions.
+
+    Score arrays are reduced to ``(Y, X)`` before weighting, so an accidental
+    score member dimension can never propagate into the deterministic result.
     """
-    def __init__(self, equal_weighted=False, dist_method="nonparam", metric="GROC", threshold=0.5):
-        """
-        Parameters:
-            equal_weighted (bool): If True, use a simple unweighted mean.
-            dist_method (str): Distribution method (kept for compatibility).
-            metric (str): Score metric name (e.g., 'MAE', 'Pearson', 'GROC').
-            threshold (numeric): Threshold value for masking the score.
-        """
-        self.equal_weighted = equal_weighted
-        self.dist_method = dist_method
-        self.metric = metric
-        self.threshold = threshold
+
+    _PROBABILITY_LABELS = ("PB", "PN", "PA")
+
+    def __init__(
+        self,
+        equal_weighted=False,
+        dist_method="nonparam",
+        metric="GROC",
+        threshold=0.5,
+    ):
+        self.equal_weighted = bool(equal_weighted)
+        self.dist_method = str(dist_method).lower()
+        self.metric = str(metric)
+        self.threshold = float(threshold)
+        self.last_weights_ = None
+
+    @staticmethod
+    def _drop_scalar_coordinate(da, coord):
+        if coord in da.coords and coord not in da.dims:
+            da = da.drop_vars(coord)
+        return da
+
+    @classmethod
+    def _as_observation(cls, da):
+        if not isinstance(da, xr.DataArray):
+            raise TypeError(f"Predictant/rainfall must be a DataArray, got {type(da)!r}.")
+        if "M" in da.dims:
+            if da.sizes["M"] != 1:
+                warnings.warn(
+                    "Observation contains several M members; the first member is used.",
+                    RuntimeWarning,
+                )
+            da = da.isel(M=0, drop=True)
+        da = cls._drop_scalar_coordinate(da, "M")
+        return cls._strict_dims(da, ("T", "Y", "X"), "observation")
+
+    @classmethod
+    def _strict_dims(cls, da, expected, name):
+        if not isinstance(da, xr.DataArray):
+            raise TypeError(f"{name} must be a DataArray, got {type(da)!r}.")
+
+        for dim in list(da.dims):
+            if dim not in expected:
+                if da.sizes[dim] == 1:
+                    da = da.isel({dim: 0}, drop=True)
+                else:
+                    raise ValueError(
+                        f"{name} must have dimensions {expected}; got dims={da.dims}, "
+                        f"sizes={dict(da.sizes)}. Unexpected dimension: {dim!r}."
+                    )
+
+        missing = set(expected) - set(da.dims)
+        if missing:
+            raise ValueError(f"{name} is missing dimensions {sorted(missing)}; dims={da.dims}.")
+
+        for coord in list(da.coords):
+            if coord not in expected and coord not in da.dims:
+                da = da.drop_vars(coord)
+        return da.transpose(*expected)
+
+    @classmethod
+    def _as_ensemble(cls, da, name):
+        return cls._strict_dims(da, ("T", "M", "Y", "X"), name)
+
+    @classmethod
+    def _as_deterministic(cls, da, name):
+        return cls._strict_dims(da, ("T", "Y", "X"), name)
+
+    @staticmethod
+    def _normalise_forecast_time(forecast, observation):
+        if "T" not in forecast.coords or forecast.sizes.get("T", 0) == 0:
+            return forecast
+        try:
+            forecast_year = int(
+                forecast.T.values[0].astype("datetime64[Y]").astype(int) + 1970
+            )
+            obs_month = int(
+                observation.T.values[0].astype("datetime64[M]").astype(int) % 12 + 1
+            )
+            new_time = np.datetime64(f"{forecast_year:04d}-{obs_month:02d}-01", "ns")
+            if forecast.sizes["T"] == 1:
+                forecast = forecast.assign_coords(T=[new_time])
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return forecast
 
     def transform_score(self, score_array):
-        """
-        Transform score array based on the chosen metric and threshold.
+        """Convert a score field into non-negative spatial weights."""
+        metric = self.metric.lower().replace("_", "").replace("-", "")
+        score = score_array.astype(float)
 
-        For 'MAE', scores below the threshold are set to 1, others to 0. For 'Pearson' or 'GROC', 
-        scores above the threshold are set to 1, others to 0.
+        lower_is_better = {"mae", "rmse", "mse", "bias", "crps", "ignorance"}
+        higher_is_better = {
+            "pearson", "correlation", "groc", "rpss", "kge", "nse", "ioa", "roc"
+        }
 
-        Parameters
-        ----------
-        score_array : xarray.DataArray
-            Score array to transform.
-
-        Returns
-        -------
-        transformed_score : xarray.DataArray
-            Transformed score array with binary weights.
-        """
-        if self.metric.lower() == 'mae':
-            return xr.where(
-                score_array <= self.threshold,
-                1,
-                0
-            )
-        elif self.metric.lower() in ['pearson', 'groc']:
-            return xr.where(
-                score_array <= self.threshold,
-                0, 1
-               # xr.where(
-               #     score_array <= 0.6,
-               #     0.6,
-               #     xr.where(score_array <= 0.8, 0.8, 1)
-               # )
-            )
-
+        if metric in lower_is_better:
+            weight = xr.where(score <= self.threshold, 1.0, 0.0)
+        elif metric in higher_is_better:
+            weight = xr.where(score >= self.threshold, 1.0, 0.0)
         else:
-            # Default: no masking applied.
-            return score_array
+            weight = score.clip(min=0.0)
+
+        return weight.where(np.isfinite(weight), 0.0)
+
+    @classmethod
+    def _prepare_score(cls, score, model_name, obs, model_names, model_index):
+        if score is None:
+            warnings.warn(
+                f"Missing score for {model_name!r}; a neutral weight of 1 is used.",
+                RuntimeWarning,
+            )
+            return xr.ones_like(obs.isel(T=0, drop=True), dtype=float)
+
+        if not isinstance(score, xr.DataArray):
+            score = xr.DataArray(score)
+        score = score.astype(float)
+
+        if "M" in score.dims:
+            if score.sizes["M"] == 1:
+                score = score.isel(M=0, drop=True)
+            elif "M" in score.coords and model_name in score.M.values.tolist():
+                score = score.sel(M=model_name, drop=True)
+            elif score.sizes["M"] == len(model_names):
+                score = score.isel(M=model_index, drop=True)
+            else:
+                raise ValueError(
+                    f"Score for {model_name!r} has an ambiguous M dimension: "
+                    f"dims={score.dims}, sizes={dict(score.sizes)}."
+                )
+
+        for dim in list(score.dims):
+            if dim not in ("Y", "X"):
+                if score.sizes[dim] == 1:
+                    score = score.isel({dim: 0}, drop=True)
+                else:
+                    warnings.warn(
+                        f"Score dimension {dim!r} for {model_name!r} is averaged.",
+                        RuntimeWarning,
+                    )
+                    score = score.mean(dim, skipna=True)
+
+        template = obs.isel(T=0, drop=True)
+        if score.ndim == 0:
+            return xr.full_like(template, float(score.values), dtype=float)
+        if not {"Y", "X"}.issubset(score.dims):
+            raise ValueError(
+                f"Score for {model_name!r} must resolve to (Y, X), got dims={score.dims}."
+            )
+        return score.transpose("Y", "X").interp(
+            Y=obs.Y,
+            X=obs.X,
+            method="nearest",
+            kwargs={"fill_value": "extrapolate"},
+        )
 
     def compute(self, rainfall, hdcst, fcst, scores, complete=False):
+        """Compute equal- or skill-weighted deterministic hindcast/forecast."""
+        obs = self._as_observation(rainfall)
+        hdcst = self._as_ensemble(hdcst, "hdcst")
+        fcst = self._as_ensemble(fcst, "fcst")
 
-        """
-        Compute weighted hindcast and forecast using model scores.
+        if hdcst.sizes["T"] != obs.sizes["T"]:
+            raise ValueError(
+                f"hdcst and observation must have the same T length; "
+                f"got {hdcst.sizes['T']} and {obs.sizes['T']}."
+            )
+        hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        fcst = self._normalise_forecast_time(fcst, obs)
 
-        This method calculates weighted averages of hindcast and forecast data based on model scores. 
-        If `complete` is True, missing values are filled with unweighted averages.
+        hdcst = hdcst.interp(
+            Y=obs.Y, X=obs.X, method="nearest", kwargs={"fill_value": "extrapolate"}
+        )
+        fcst = fcst.interp(
+            Y=obs.Y, X=obs.X, method="nearest", kwargs={"fill_value": "extrapolate"}
+        )
 
-        Parameters
-        ----------
-        rainfall : xarray.DataArray
-            Observed rainfall data with dimensions (T, Y, X, M).
-        hdcst : xarray.DataArray
-            Hindcast data with dimensions (T, M, Y, X).
-        fcst : xarray.DataArray
-            Forecast data with dimensions (T, M, Y, X).
-        scores : dict
-            Dictionary mapping model names to score arrays.
-        complete : bool, optional
-            If True, fill missing values with unweighted averages. Default is False.
+        model_names = [str(value) for value in hdcst.M.values.tolist()]
+        forecast_names = [str(value) for value in fcst.M.values.tolist()]
+        if model_names != forecast_names:
+            missing = set(model_names) - set(forecast_names)
+            if missing:
+                raise ValueError(f"Forecast is missing M members: {sorted(missing)}.")
+            fcst = fcst.sel(M=hdcst.M)
 
-        Returns
-        -------
-        hindcast_det : xarray.DataArray
-            Weighted hindcast data with dimensions (T, Y, X).
-        forecast_det : xarray.DataArray
-            Weighted forecast data with dimensions (T, Y, X).
-        """
-        if "M" in rainfall.coords:
-            rainfall = rainfall.isel(M=0).drop_vars("M").squeeze()
-        # Adjust time coordinates as needed.
-        year = fcst.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
-        T_value_1 = rainfall.isel(T=0).coords['T'].values
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
-        
-        fcst = fcst.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        fcst['T'] = fcst['T'].astype('datetime64[ns]')
-        hdcst['T'] = rainfall['T'].astype('datetime64[ns]')
-        
-        # Create a mask based on non-NaN values in the rainfall data.
-        mask = xr.where(~np.isnan(rainfall.isel(T=0)), 1, np.nan)\
-                 .drop_vars(['T']).squeeze().to_numpy()
+        mask = xr.where(obs.notnull().any("T"), 1.0, np.nan)
+        hdcst = hdcst.where(mask.notnull())
+        fcst = fcst.where(mask.notnull())
+
+        unweighted_h = hdcst.mean("M", skipna=True)
+        unweighted_f = fcst.mean("M", skipna=True)
 
         if self.equal_weighted:
-            hindcast_det = hdcst.mean(dim='M')
-            forecast_det = fcst.mean(dim='M')
+            weights = xr.ones_like(hdcst.isel(T=0, drop=True), dtype=float)
         else:
-            model_names = list(hdcst.coords["M"].values)
-            selected_models = model_names
-            
-            hindcast_det = None
-            forecast_det = None
-            score_sum = None
-            hindcast_det_unweighted = None
-            forecast_det_unweighted = None
-
-            for model_name in selected_models:
-                # Interpolate and mask the score array for the current model.
-                score_array = scores[model_name].interp(
-                    Y=rainfall.Y,
-                    X=rainfall.X,
-                    method="nearest",
-                    kwargs={"fill_value": "extrapolate"}
+            scores = {} if scores is None else scores
+            weight_fields = []
+            for index, model_name in enumerate(model_names):
+                score = scores.get(model_name)
+                score = self._prepare_score(
+                    score, model_name, obs, model_names, index
                 )
-                weight_array = self.transform_score(score_array)
-    
-                # Interpolate hindcast and forecast data to the rainfall grid.
-                hindcast_data = hdcst.sel(M=model_name).interp(
-                    Y=rainfall.Y,
-                    X=rainfall.X,
-                    method="nearest",
-                    kwargs={"fill_value": "extrapolate"}
-                )
-    
-                forecast_data = fcst.sel(M=model_name).interp(
-                    Y=rainfall.Y,
-                    X=rainfall.X,
-                    method="nearest",
-                    kwargs={"fill_value": "extrapolate"}
-                )
-    
-                # Multiply by the weight.
-                hindcast_weighted = hindcast_data * weight_array
-                forecast_weighted = forecast_data * weight_array
-    
-                # Also keep an unweighted version for optional complete blending.
-                if hindcast_det is None:
-                    hindcast_det = hindcast_weighted
-                    forecast_det = forecast_weighted
-                    score_sum = weight_array
-                    hindcast_det_unweighted = hindcast_data
-                    forecast_det_unweighted = forecast_data
-                else:
-                    hindcast_det += hindcast_weighted
-                    forecast_det += forecast_weighted
-                    score_sum += weight_array
-                    hindcast_det_unweighted += hindcast_data
-                    forecast_det_unweighted += forecast_data
-                    
-            # Compute the weighted averages.
-            hindcast_det = hindcast_det / score_sum
-            forecast_det = forecast_det / score_sum
+                weight_fields.append(self.transform_score(score))
+            weights = xr.concat(
+                weight_fields,
+                dim=xr.IndexVariable("M", hdcst.M.values),
+            ).transpose("M", "Y", "X")
 
-            # If complete==True, use unweighted averages to fill in missing grid cells.
-            if complete:
-                num_models = len(selected_models)
-                hindcast_det_unweighted = hindcast_det_unweighted / num_models
-                forecast_det_unweighted = forecast_det_unweighted / num_models
-                mask_hd = xr.where(np.isnan(hindcast_det), 1, 0)
-                mask_fc = xr.where(np.isnan(forecast_det), 1, 0)
-                hindcast_det = hindcast_det.fillna(0) + hindcast_det_unweighted * mask_hd
-                forecast_det = forecast_det.fillna(0) + forecast_det_unweighted * mask_fc
+        weights = weights.where(mask.notnull(), 0.0).fillna(0.0)
+        self.last_weights_ = weights
 
-        # Drop any coordinate not in ("T", "Y", "X") for hindcast_det
-        extra_coords_h = [c for c in hindcast_det.coords if c not in ("T", "Y", "X")]
-        if extra_coords_h:
-            hindcast_det = hindcast_det.drop_vars(extra_coords_h)
+        h_weight = weights.where(hdcst.notnull())
+        f_weight = weights.where(fcst.notnull())
+        h_denom = h_weight.sum("M", skipna=True)
+        f_denom = f_weight.sum("M", skipna=True)
 
-        # Drop any coordinate not in ("T", "Y", "X") for forecast_det
-        extra_coords_f = [c for c in forecast_det.coords if c not in ("T", "Y", "X")]
-        if extra_coords_f:
-            forecast_det = forecast_det.drop_vars(extra_coords_f)  
+        hindcast_det = (hdcst * weights).sum("M", skipna=True) / h_denom
+        forecast_det = (fcst * weights).sum("M", skipna=True) / f_denom
+        hindcast_det = hindcast_det.where(h_denom > 0)
+        forecast_det = forecast_det.where(f_denom > 0)
 
-                         
-        return hindcast_det , forecast_det 
+        if complete:
+            hindcast_det = hindcast_det.fillna(unweighted_h)
+            forecast_det = forecast_det.fillna(unweighted_f)
 
-
-    # ------------------ Probability Calculation Methods ------------------
+        hindcast_det = self._as_deterministic(
+            hindcast_det.where(mask.notnull()), "hindcast_det"
+        )
+        forecast_det = self._as_deterministic(
+            forecast_det.where(mask.notnull()), "forecast_det"
+        )
+        return hindcast_det, forecast_det
 
     @staticmethod
     def _ppf_terciles_from_code(dist_code, shape, loc, scale):
-        """
-        Return tercile thresholds (T1, T2) from best-fit distribution parameters.
-    
-        dist_code:
-            1: norm
-            2: lognorm
-            3: expon
-            4: gamma
-            5: weibull_min
-            6: t
-            7: poisson
-            8: nbinom
-        """
-        if np.isnan(dist_code):
+        if not np.isfinite(dist_code):
             return np.nan, np.nan
-    
         code = int(dist_code)
         try:
             if code == 1:
-                return (
-                    norm.ppf(0.33, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 2:
-                return (
-                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
-                )
-            elif code == 3:
-                return (
-                    expon.ppf(0.33, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
-                )
-            elif code == 4:
-                return (
-                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
-                )
-            elif code == 5:
-                return (
-                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
-                )
-            elif code == 6:
-                # Note: Renamed 't_dist' to 't' for standard scipy.stats
-                return (
-                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
-                )
-            elif code == 7:
-                # Poisson: poisson.ppf(q, mu, loc=0)
-                # ASSUMPTION: 'mu' (mean) is passed as 'shape'
-                #             'loc' is passed as 'loc'
-                #             'scale' is unused
-                return (
-                    poisson.ppf(0.33, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
-                )
-            elif code == 8:
-                # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
-                # ASSUMPTION: 'n' (successes) is passed as 'shape'
-                #             'p' (probability) is passed as 'scale'
-                #             'loc' is passed as 'loc'
-                return (
-                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
-                )
-        except Exception:
-            return np.nan, np.nan
-    
-        # Fallback if code is not 1-8
+                return norm.ppf(0.33, loc=loc, scale=scale), norm.ppf(0.67, loc=loc, scale=scale)
+            if code == 2:
+                return lognorm.ppf(0.33, s=shape, loc=loc, scale=scale), lognorm.ppf(0.67, s=shape, loc=loc, scale=scale)
+            if code == 3:
+                return expon.ppf(0.33, loc=loc, scale=scale), expon.ppf(0.67, loc=loc, scale=scale)
+            if code == 4:
+                return gamma_dist.ppf(0.33, a=shape, loc=loc, scale=scale), gamma_dist.ppf(0.67, a=shape, loc=loc, scale=scale)
+            if code == 5:
+                return weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale), weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale)
+            if code == 6:
+                return tdist.ppf(0.33, df=shape, loc=loc, scale=scale), tdist.ppf(0.67, df=shape, loc=loc, scale=scale)
+            if code == 7:
+                return poisson.ppf(0.33, mu=shape, loc=loc), poisson.ppf(0.67, mu=shape, loc=loc)
+            if code == 8:
+                return nbinom.ppf(0.33, n=shape, p=scale, loc=loc), nbinom.ppf(0.67, n=shape, p=scale, loc=loc)
+        except (ValueError, FloatingPointError, TypeError):
+            pass
         return np.nan, np.nan
-        
-    @staticmethod
-    def weibull_shape_solver(k, M, V):
-        """
-        Function to find the root of the Weibull shape parameter 'k'.
-        We find 'k' such that the theoretical variance/mean^2 ratio
-        matches the observed V/M^2 ratio.
-        """
-        # Guard against invalid 'k' values during solving
-        if k <= 0:
-            return -np.inf
-        try:
-            g1 = gamma_function(1 + 1/k)
-            g2 = gamma_function(1 + 2/k)
-            
-            # This is the V/M^2 ratio *implied by k*
-            implied_v_over_m_sq = (g2 / (g1**2)) - 1
-            
-            # This is the *observed* ratio
-            observed_v_over_m_sq = V / (M**2)
-            
-            # Return the difference (we want this to be 0)
-            return observed_v_over_m_sq - implied_v_over_m_sq
-        except ValueError:
-            return -np.inf # Handle math errors
 
     @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
+    def weibull_shape_solver(k, mean, variance):
+        k = float(np.asarray(k).reshape(-1)[0])
+        if k <= 0 or mean <= 0 or variance <= 0:
+            return np.inf
+        g1 = gamma_function(1.0 + 1.0 / k)
+        g2 = gamma_function(1.0 + 2.0 / k)
+        implied = g2 / (g1 * g1) - 1.0
+        observed = variance / (mean * mean)
+        return observed - implied
+
+    @classmethod
+    def calculate_tercile_probabilities_bestfit(
+        cls, best_guess, error_variance, T1, T2, dist_code, dof
     ):
-        """
-        Generic tercile probabilities using best-fit family per grid cell.
-    
-        Inputs (per grid cell):
-        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
-        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
-        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
-        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
-    
-        Strategy:
-        - For each time step, build a predictive distribution of the same family:
-            * Use ``best_guess[t]`` to adjust mean / location;
-            * Keep shape parameters from climatology.
-        - Then compute probabilities:
-            * P(B) = F(T1)
-            * P(N) = F(T2) - F(T1)
-            * P(A) = 1 - F(T2)
-    
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast/hindcast best estimates.
-        error_variance : float
-            Variance of prediction errors.
-        T1 : float
-            Lower tercile threshold.
-        T2 : float
-            Upper tercile threshold.
-        dist_code : int
-            Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
-    
-        Returns
-        -------
-        array-like
-            Probabilities [P(B), P(N), P(A)].
-    
-        Notes
-        -----
-        - Uses :math:`F` as the CDF of the predictive distribution.
-        """
-        
-        best_guess = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        # T1 = np.asarray(T1, dtype=float)
-        # T2 = np.asarray(T2, dtype=float)
-        n_time = best_guess.size
-        out = np.full((3, n_time), np.nan, float)
+        """Compute PB/PN/PA for one grid cell and all requested times."""
+        mean_values = np.asarray(best_guess, dtype=float)
+        variance = float(np.asarray(error_variance))
+        out = np.full((3, mean_values.size), np.nan, dtype=float)
 
-        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
+        if (
+            mean_values.size == 0
+            or not np.isfinite(variance)
+            or variance < 0
+            or not np.isfinite(T1)
+            or not np.isfinite(T2)
+            or not np.isfinite(dist_code)
+        ):
             return out
 
+        eps = np.finfo(float).eps
+        variance = max(variance, eps)
         code = int(dist_code)
 
-        # Normal: loc = forecast; scale from clim
-        if code == 1:
-            error_std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
-
-        # Lognormal: shape = sigma from clim; enforce mean = best_guess
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-            mu = np.log(best_guess) - sigma**2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
-
-
-        # Exponential: keep scale from clim; shift loc so mean = best_guess
-        elif code == 3:
-            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
-            c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        # Gamma: use shape from clim; set scale so mean = best_guess
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5: # Assuming 5 is for Weibull   
-        
-            for i in range(n_time):
-                # Get the scalar values for this specific element (e.g., grid cell)
-                M = best_guess[i]
-                print(M)
-                V = error_variance
-                print(V)
-                
-                # Handle cases with no variance to avoid division by zero
-                if V <= 0 or M <= 0:
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue # Skip to the next element
-        
-                # --- 1. Numerically solve for shape 'k' ---
-                # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
-                initial_guess = 2.0
-                
-                # fsolve finds the root of our helper function
-                k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
-        
-                # --- 2. Check for bad solution and calculate scale 'lambda' ---
-                if k <= 0:
-                    # Solver failed
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
+        for index, mean_value in enumerate(mean_values):
+            if not np.isfinite(mean_value):
+                continue
+            try:
+                if code == 1:
+                    cdf = lambda q: norm.cdf(q, loc=mean_value, scale=np.sqrt(variance))
+                elif code == 2:
+                    if mean_value <= 0:
+                        continue
+                    sigma2 = np.log1p(variance / max(mean_value * mean_value, eps))
+                    sigma = np.sqrt(max(sigma2, eps))
+                    scale_logn = np.exp(np.log(mean_value) - 0.5 * sigma2)
+                    cdf = lambda q: lognorm.cdf(q, s=sigma, loc=0.0, scale=scale_logn)
+                elif code == 3:
+                    scale_exp = np.sqrt(variance)
+                    loc_exp = mean_value - scale_exp
+                    cdf = lambda q: expon.cdf(q, loc=loc_exp, scale=max(scale_exp, eps))
+                elif code == 4:
+                    if mean_value <= 0:
+                        continue
+                    alpha = max(mean_value * mean_value / variance, eps)
+                    theta = max(variance / mean_value, eps)
+                    cdf = lambda q: gamma_dist.cdf(q, a=alpha, loc=0.0, scale=theta)
+                elif code == 5:
+                    if mean_value <= 0:
+                        continue
+                    try:
+                        shape = brentq(
+                            lambda kval: cls.weibull_shape_solver(kval, mean_value, variance),
+                            0.1,
+                            100.0,
+                            maxiter=100,
+                        )
+                    except (ValueError, RuntimeError):
+                        shape = 2.0
+                    scale_weib = mean_value / gamma_function(1.0 + 1.0 / shape)
+                    cdf = lambda q: weibull_min.cdf(q, c=shape, loc=0.0, scale=max(scale_weib, eps))
+                elif code == 6:
+                    df = max(float(dof), 3.0)
+                    scale_t = np.sqrt(variance * (df - 2.0) / df)
+                    cdf = lambda q: tdist.cdf(q, df=df, loc=mean_value, scale=max(scale_t, eps))
+                elif code == 7:
+                    mu = max(mean_value, eps)
+                    cdf = lambda q: poisson.cdf(q, mu=mu)
+                elif code == 8:
+                    if mean_value <= 0:
+                        continue
+                    if variance <= mean_value:
+                        mu = max(mean_value, eps)
+                        cdf = lambda q: poisson.cdf(q, mu=mu)
+                    else:
+                        p = np.clip(mean_value / variance, eps, 1.0 - eps)
+                        n = max(mean_value * mean_value / (variance - mean_value), eps)
+                        cdf = lambda q: nbinom.cdf(q, n=n, p=p)
+                else:
                     continue
-                
-                # With 'k' found, we can now algebraically find scale 'lambda'
-                # In scipy.stats, scale is 'scale'
-                lambda_scale = M / gamma_function(1 + 1/k)
-        
-                # --- 3. Calculate Probabilities ---
-                # In scipy.stats, shape 'k' is 'c'
-                # Use the T1 and T2 values for this specific element
-                
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-        
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
 
-        # Student-t: df from clim; scale from clim; loc = best_guess
-        elif code == 6:       
-            # Check if df is valid for variance calculation
-            if dof <= 2:
-                # Cannot calculate scale, fill with NaNs
-                out[0, :] = np.nan
-                out[1, :] = np.nan
-                out[2, :] = np.nan
-            else:
-                # 1. Calculate t-distribution parameters
-                # 'loc' (mean) is just the best_guess
-                loc = best_guess
-                # 'scale' is calculated from the variance and df
-                # Variance = scale**2 * (df / (df - 2))
-                scale = np.sqrt(error_variance * (dof - 2) / dof)
-                
-                # 2. Calculate probabilities
-                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
-                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
-
-                out[0, :] = c1
-                out[1, :] = c2 - c1
-                out[2, :] = 1.0 - c2
-
-        elif code == 7: # Assuming 7 is for Poisson
-            
-            # --- 1. Set the Poisson parameter 'mu' ---
-            # The 'mu' parameter is the mean.
-            
-            # A warning is strongly recommended if error_variance is different from best_guess
-            if not np.allclose(best_guess, error_variance, atol=0.5):
-                print("Warning: 'error_variance' is not equal to 'best_guess'.")
-                print("Poisson model assumes mean=variance and is likely inappropriate.")
-                print("Consider using Negative Binomial.")
-            
-            mu = best_guess
-        
-            # --- 2. Calculate Probabilities ---
-            # poisson.cdf(k, mu) calculates P(X <= k)
-            
-            c1 = poisson.cdf(T1, mu=mu)
-            c2 = poisson.cdf(T2, mu=mu)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8: # Assuming 8 is for Negative Binomial
-            
-            # --- 1. Calculate Negative Binomial Parameters ---
-            # This model is ONLY valid for overdispersion (Variance > Mean).
-            # We will use np.where to set parameters to NaN if V <= M.
-            
-            # p = Mean / Variance
-            p = np.where(error_variance > best_guess, 
-                         best_guess / error_variance, 
-                         np.nan)
-            
-            # n = Mean^2 / (Variance - Mean)
-            n = np.where(error_variance > best_guess, 
-                         (best_guess**2) / (error_variance - best_guess), 
-                         np.nan)
-            
-            # --- 2. Calculate Probabilities ---
-            # The nbinom.cdf function will propagate NaNs, correctly
-            # handling the cases where the model was invalid.
-            
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-            
-        else:
-            raise ValueError(f"Invalid distribution")
+                c1 = float(cdf(T1))
+                c2 = float(cdf(T2))
+                probabilities = np.array([c1, c2 - c1, 1.0 - c2], dtype=float)
+                probabilities = np.clip(probabilities, 0.0, 1.0)
+                total = probabilities.sum()
+                if total > 0 and np.isfinite(total):
+                    out[:, index] = probabilities / total
+            except (ValueError, FloatingPointError, OverflowError, ZeroDivisionError):
+                continue
 
         return out
 
     @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
+    def calculate_tercile_probabilities_nonparametric(
+        best_guess, error_samples, first_tercile, second_tercile
+    ):
+        best_guess = np.asarray(best_guess, dtype=float)
+        errors = np.asarray(error_samples, dtype=float)
+        errors = errors[np.isfinite(errors)]
+        out = np.full((3, best_guess.size), np.nan, dtype=float)
+        if errors.size == 0:
+            return out
 
+        for index, value in enumerate(best_guess):
+            if not np.isfinite(value):
+                continue
+            distribution = value + errors
+            pb = np.mean(distribution < first_tercile)
+            pn = np.mean((distribution >= first_tercile) & (distribution < second_tercile))
+            pa = 1.0 - pb - pn
+            probs = np.clip(np.array([pb, pn, pa]), 0.0, 1.0)
+            total = probs.sum()
+            if total > 0:
+                out[:, index] = probs / total
+        return out
 
-    def compute_prob(
+    @staticmethod
+    def _prepare_spatial_parameter(parameter, obs, name):
+        if parameter is None:
+            return None
+        if not isinstance(parameter, xr.DataArray):
+            parameter = xr.DataArray(parameter)
+        if "M" in parameter.dims:
+            if parameter.sizes["M"] == 1:
+                parameter = parameter.isel(M=0, drop=True)
+            else:
+                raise ValueError(f"{name} must not contain a non-singleton M dimension.")
+        for dim in list(parameter.dims):
+            if dim not in ("Y", "X"):
+                if parameter.sizes[dim] == 1:
+                    parameter = parameter.isel({dim: 0}, drop=True)
+                else:
+                    raise ValueError(f"{name} contains unsupported dimension {dim!r}.")
+        if parameter.ndim == 0:
+            return xr.full_like(obs.isel(T=0, drop=True), float(parameter.values))
+        return parameter.transpose("Y", "X").interp(
+            Y=obs.Y,
+            X=obs.X,
+            method="nearest",
+            kwargs={"fill_value": "extrapolate"},
+        )
+
+    @classmethod
+    def _normalise_probability_cube(cls, probability, mask):
+        probability = probability.assign_coords(
+            probability=("probability", list(cls._PROBABILITY_LABELS))
+        ).transpose("probability", "T", "Y", "X")
+        probability = probability.clip(min=0.0, max=1.0)
+        total = probability.sum("probability", skipna=True)
+        probability = probability / total.where(total > 0)
+        return probability.where(mask.notnull())
+
+    def _probability_core(
         self,
-        Predictant: xr.DataArray,
+        obs,
+        hindcast_det,
+        target_det,
         clim_year_start,
         clim_year_end,
-        hindcast_det: xr.DataArray,
-        best_code_da: xr.DataArray = None,
-        best_shape_da: xr.DataArray = None,
-        best_loc_da: xr.DataArray = None,
-        best_scale_da: xr.DataArray = None
-    ) -> xr.DataArray:
-        """
-        Compute tercile probabilities for deterministic hindcasts.
+        best_code_da=None,
+        best_shape_da=None,
+        best_loc_da=None,
+        best_scale_da=None,
+    ):
+        climatology = obs.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+        if climatology.sizes.get("T", 0) < 3:
+            raise ValueError(
+                "At least three observation years are required in the climatology period."
+            )
 
-        If dist_method == 'bestfit':
-            - Use cluster-based best-fit distributions to:
-                * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
-                * compute predictive probabilities using the same family.
+        terciles = climatology.quantile([0.33, 0.67], dim="T")
+        t1_emp = terciles.isel(quantile=0, drop=True)
+        t2_emp = terciles.isel(quantile=1, drop=True)
+        errors = obs - hindcast_det
+        error_variance = errors.var("T", skipna=True)
+        # The forecast target may have a different T coordinate/length from the
+        # historical error sample. Give the error sample its own core dimension
+        # so xarray does not try to align forecast T with hindcast T.
+        errors_for_ufunc = errors.rename(T="T_error")
+        dof = max(int(climatology.sizes["T"]) - 1, 3)
 
-        Otherwise:
-            - Use empirical terciles from Predictant climatology and the selected
-              parametric / nonparametric method.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data (T, Y, X) or (T, Y, X, M).
-        clim_year_start, clim_year_end : int or str
-            Climatology period (inclusive) for thresholds.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast (T, Y, X).
-        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
-            Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
-
-        Returns
-        -------
-        hindcast_prob : xarray.DataArray
-            Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
-        """
-        # Handle member dimension if present
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
-
-        # Ensure dimension order
-        Predictant = Predictant.transpose("T", "Y", "X")
-
-        # Spatial mask
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-
-        # Climatology subset
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        # Error variance for predictive distributions
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
-
-        # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-        
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT: zone-wise optimal distributions ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+        if self.dist_method == "bestfit":
+            parameters = (best_code_da, best_shape_da, best_loc_da, best_scale_da)
+            if any(value is None for value in parameters):
                 raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
+                    "dist_method='bestfit' requires best_code_da, best_shape_da, "
+                    "best_loc_da and best_scale_da."
                 )
+            code = self._prepare_spatial_parameter(best_code_da, obs, "best_code_da")
+            shape = self._prepare_spatial_parameter(best_shape_da, obs, "best_shape_da")
+            loc = self._prepare_spatial_parameter(best_loc_da, obs, "best_loc_da")
+            scale = self._prepare_spatial_parameter(best_scale_da, obs, "best_scale_da")
 
-            # T1, T2 from best-fit distributions (per grid)
-            T1, T2 = xr.apply_ufunc(
+            t1, t2 = xr.apply_ufunc(
                 self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
+                code,
+                shape,
+                loc,
+                scale,
+                input_core_dims=[[], [], [], []],
+                output_core_dims=[[], []],
                 vectorize=True,
                 dask="parallelized",
                 output_dtypes=[float, float],
             )
-
-            # Predictive probabilities using same family
-            hindcast_prob = xr.apply_ufunc(
+            probability = xr.apply_ufunc(
                 self.calculate_tercile_probabilities_bestfit,
-                hindcast_det,
+                target_det,
                 error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
-
-
-    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, forecast_det, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-
-        year = forecast_det.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-        forecast_det = forecast_det.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        forecast_det['T'] = forecast_det['T'].astype('datetime64[ns]')
-
-        
-        # Compute tercile probabilities on the predictions
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
-                )
-            
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                forecast_det,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
+                t1,
+                t2,
+                code,
+                input_core_dims=[["T"], [], [], [], []],
+                output_core_dims=[["probability", "T"]],
                 vectorize=True,
                 dask="parallelized",
                 kwargs={"dof": dof},
@@ -1175,18 +1325,15 @@ class WAS_mme_Weighted:
                     "allow_rechunk": True,
                 },
             )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            forecast_prob = xr.apply_ufunc(
+        elif self.dist_method == "nonparam":
+            probability = xr.apply_ufunc(
                 self.calculate_tercile_probabilities_nonparametric,
-                forecast_det,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
+                target_det,
+                errors_for_ufunc,
+                t1_emp,
+                t2_emp,
+                input_core_dims=[["T"], ["T_error"], [], []],
+                output_core_dims=[["probability", "T"]],
                 vectorize=True,
                 dask="parallelized",
                 output_dtypes=[float],
@@ -1195,209 +1342,1462 @@ class WAS_mme_Weighted:
                     "allow_rechunk": True,
                 },
             )
-
         else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-        forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return forecast_det * mask, mask * forecast_prob.transpose('probability', 'T', 'Y', 'X')
+            raise ValueError(
+                f"Invalid dist_method {self.dist_method!r}; expected 'bestfit' or 'nonparam'."
+            )
+
+        mask = xr.where(obs.notnull().any("T"), 1.0, np.nan)
+        return self._normalise_probability_cube(probability, mask)
+
+    def compute_prob(
+        self,
+        Predictant,
+        clim_year_start,
+        clim_year_end,
+        hindcast_det,
+        best_code_da=None,
+        best_shape_da=None,
+        best_loc_da=None,
+        best_scale_da=None,
+    ):
+        """Convert deterministic hindcasts into tercile probabilities."""
+        obs = self._as_observation(Predictant)
+        hindcast_det = self._as_deterministic(hindcast_det, "hindcast_det")
+        if hindcast_det.sizes["T"] != obs.sizes["T"]:
+            raise ValueError(
+                "hindcast_det and Predictant must have the same number of T values."
+            )
+        hindcast_det = hindcast_det.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        hindcast_det = hindcast_det.interp(
+            Y=obs.Y, X=obs.X, method="nearest", kwargs={"fill_value": "extrapolate"}
+        )
+        return self._probability_core(
+            obs,
+            hindcast_det,
+            hindcast_det,
+            clim_year_start,
+            clim_year_end,
+            best_code_da,
+            best_shape_da,
+            best_loc_da,
+            best_scale_da,
+        )
+
+    def forecast(
+        self,
+        Predictant,
+        clim_year_start,
+        clim_year_end,
+        hindcast_det,
+        forecast_det,
+        best_code_da=None,
+        best_shape_da=None,
+        best_loc_da=None,
+        best_scale_da=None,
+    ):
+        """Convert a deterministic forecast into tercile probabilities."""
+        obs = self._as_observation(Predictant)
+        hindcast_det = self._as_deterministic(hindcast_det, "hindcast_det")
+        forecast_det = self._as_deterministic(forecast_det, "forecast_det")
+
+        if hindcast_det.sizes["T"] != obs.sizes["T"]:
+            raise ValueError(
+                "hindcast_det and Predictant must have the same number of T values."
+            )
+        hindcast_det = hindcast_det.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        forecast_det = self._normalise_forecast_time(forecast_det, obs)
+        hindcast_det = hindcast_det.interp(
+            Y=obs.Y, X=obs.X, method="nearest", kwargs={"fill_value": "extrapolate"}
+        )
+        forecast_det = forecast_det.interp(
+            Y=obs.Y, X=obs.X, method="nearest", kwargs={"fill_value": "extrapolate"}
+        )
+
+        forecast_prob = self._probability_core(
+            obs,
+            hindcast_det,
+            forecast_det,
+            clim_year_start,
+            clim_year_end,
+            best_code_da,
+            best_shape_da,
+            best_loc_da,
+            best_scale_da,
+        )
+        mask = xr.where(obs.notnull().any("T"), 1.0, np.nan)
+        return forecast_det.where(mask.notnull()), forecast_prob
+
+# class WAS_mme_Weighted:
+#     """
+#     Weighted Multi-Model Ensemble (MME) for climate forecasting.
+
+#     This class implements a weighted ensemble approach for combining multiple climate models, 
+#     supporting both equal weighting and score-based weighting. It also provides methods for 
+#     computing tercile probabilities using various statistical distributions.
+
+#     Parameters
+#     ----------
+#     equal_weighted : bool, optional
+#         If True, use equal weights for all models; otherwise, use score-based weights. Default is False.
+#     dist_method : str, optional
+#         Statistical distribution for probability calculations ('t', 'gamma', 'normal', 'lognormal', 
+#         'weibull_min', 'nonparam'). Default is 'gamma'.
+#     metric : str, optional
+#         Performance metric for weighting ('MAE', 'Pearson', 'GROC'). Default is 'GROC'.
+#     threshold : float, optional
+#         Threshold for score transformation. Default is 0.5.
+#     """
+#     def __init__(self, equal_weighted=False, dist_method="nonparam", metric="GROC", threshold=0.5):
+#         """
+#         Parameters:
+#             equal_weighted (bool): If True, use a simple unweighted mean.
+#             dist_method (str): Distribution method (kept for compatibility).
+#             metric (str): Score metric name (e.g., 'MAE', 'Pearson', 'GROC').
+#             threshold (numeric): Threshold value for masking the score.
+#         """
+#         self.equal_weighted = equal_weighted
+#         self.dist_method = dist_method
+#         self.metric = metric
+#         self.threshold = threshold
+
+#     def transform_score(self, score_array):
+#         """
+#         Transform score array based on the chosen metric and threshold.
+
+#         For 'MAE', scores below the threshold are set to 1, others to 0. For 'Pearson' or 'GROC', 
+#         scores above the threshold are set to 1, others to 0.
+
+#         Parameters
+#         ----------
+#         score_array : xarray.DataArray
+#             Score array to transform.
+
+#         Returns
+#         -------
+#         transformed_score : xarray.DataArray
+#             Transformed score array with binary weights.
+#         """
+#         if self.metric.lower() == 'mae':
+#             return xr.where(
+#                 score_array <= self.threshold,
+#                 1,
+#                 0
+#             )
+#         elif self.metric.lower() in ['pearson', 'groc']:
+#             return xr.where(
+#                 score_array <= self.threshold,
+#                 0, 1
+#                # xr.where(
+#                #     score_array <= 0.6,
+#                #     0.6,
+#                #     xr.where(score_array <= 0.8, 0.8, 1)
+#                # )
+#             )
+
+#         else:
+#             # Default: no masking applied.
+#             return score_array
+
+#     def compute(self, rainfall, hdcst, fcst, scores, complete=False):
+
+#         """
+#         Compute weighted hindcast and forecast using model scores.
+
+#         This method calculates weighted averages of hindcast and forecast data based on model scores. 
+#         If `complete` is True, missing values are filled with unweighted averages.
+
+#         Parameters
+#         ----------
+#         rainfall : xarray.DataArray
+#             Observed rainfall data with dimensions (T, Y, X, M).
+#         hdcst : xarray.DataArray
+#             Hindcast data with dimensions (T, M, Y, X).
+#         fcst : xarray.DataArray
+#             Forecast data with dimensions (T, M, Y, X).
+#         scores : dict
+#             Dictionary mapping model names to score arrays.
+#         complete : bool, optional
+#             If True, fill missing values with unweighted averages. Default is False.
+
+#         Returns
+#         -------
+#         hindcast_det : xarray.DataArray
+#             Weighted hindcast data with dimensions (T, Y, X).
+#         forecast_det : xarray.DataArray
+#             Weighted forecast data with dimensions (T, Y, X).
+#         """
+#         if "M" in rainfall.coords:
+#             rainfall = rainfall.isel(M=0).drop_vars("M").squeeze()
+#         # Adjust time coordinates as needed.
+#         year = fcst.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+#         T_value_1 = rainfall.isel(T=0).coords['T'].values
+#         month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1
+#         new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
+        
+#         fcst = fcst.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+#         fcst['T'] = fcst['T'].astype('datetime64[ns]')
+#         hdcst['T'] = rainfall['T'].astype('datetime64[ns]')
+        
+#         # Create a mask based on non-NaN values in the rainfall data.
+#         mask = xr.where(~np.isnan(rainfall.isel(T=0)), 1, np.nan)\
+#                  .drop_vars(['T']).squeeze().to_numpy()
+
+#         if self.equal_weighted:
+#             hindcast_det = hdcst.mean(dim='M')
+#             forecast_det = fcst.mean(dim='M')
+#         else:
+#             model_names = list(hdcst.coords["M"].values)
+#             selected_models = model_names
+            
+#             hindcast_det = None
+#             forecast_det = None
+#             score_sum = None
+#             hindcast_det_unweighted = None
+#             forecast_det_unweighted = None
+
+#             for model_name in selected_models:
+#                 # Interpolate and mask the score array for the current model.
+#                 score_array = scores[model_name].interp(
+#                     Y=rainfall.Y,
+#                     X=rainfall.X,
+#                     method="nearest",
+#                     kwargs={"fill_value": "extrapolate"}
+#                 )
+#                 weight_array = self.transform_score(score_array)
+    
+#                 # Interpolate hindcast and forecast data to the rainfall grid.
+#                 hindcast_data = hdcst.sel(M=model_name).interp(
+#                     Y=rainfall.Y,
+#                     X=rainfall.X,
+#                     method="nearest",
+#                     kwargs={"fill_value": "extrapolate"}
+#                 )
+    
+#                 forecast_data = fcst.sel(M=model_name).interp(
+#                     Y=rainfall.Y,
+#                     X=rainfall.X,
+#                     method="nearest",
+#                     kwargs={"fill_value": "extrapolate"}
+#                 )
+    
+#                 # Multiply by the weight.
+#                 hindcast_weighted = hindcast_data * weight_array
+#                 forecast_weighted = forecast_data * weight_array
+    
+#                 # Also keep an unweighted version for optional complete blending.
+#                 if hindcast_det is None:
+#                     hindcast_det = hindcast_weighted
+#                     forecast_det = forecast_weighted
+#                     score_sum = weight_array
+#                     hindcast_det_unweighted = hindcast_data
+#                     forecast_det_unweighted = forecast_data
+#                 else:
+#                     hindcast_det += hindcast_weighted
+#                     forecast_det += forecast_weighted
+#                     score_sum += weight_array
+#                     hindcast_det_unweighted += hindcast_data
+#                     forecast_det_unweighted += forecast_data
+                    
+#             # Compute the weighted averages.
+#             hindcast_det = hindcast_det / score_sum
+#             forecast_det = forecast_det / score_sum
+
+#             # If complete==True, use unweighted averages to fill in missing grid cells.
+#             if complete:
+#                 num_models = len(selected_models)
+#                 hindcast_det_unweighted = hindcast_det_unweighted / num_models
+#                 forecast_det_unweighted = forecast_det_unweighted / num_models
+#                 mask_hd = xr.where(np.isnan(hindcast_det), 1, 0)
+#                 mask_fc = xr.where(np.isnan(forecast_det), 1, 0)
+#                 hindcast_det = hindcast_det.fillna(0) + hindcast_det_unweighted * mask_hd
+#                 forecast_det = forecast_det.fillna(0) + forecast_det_unweighted * mask_fc
+
+#         # Drop any coordinate not in ("T", "Y", "X") for hindcast_det
+#         extra_coords_h = [c for c in hindcast_det.coords if c not in ("T", "Y", "X")]
+#         if extra_coords_h:
+#             hindcast_det = hindcast_det.drop_vars(extra_coords_h)
+
+#         # Drop any coordinate not in ("T", "Y", "X") for forecast_det
+#         extra_coords_f = [c for c in forecast_det.coords if c not in ("T", "Y", "X")]
+#         if extra_coords_f:
+#             forecast_det = forecast_det.drop_vars(extra_coords_f)  
+
+                         
+#         return hindcast_det , forecast_det 
 
 
-class WAS_ProbWeighted:
-    """
-    Probability-Weighted Multi-Model Ensemble for seasonal rainfall forecasting.
+#     # ------------------ Probability Calculation Methods ------------------
 
-    Implements a threshold-based weighting scheme for combining multiple climate
-    model outputs (hindcasts and forecasts). Model weights are derived from performance.
-    It's currently for only GROC scores. With a stepwise transformation:
-    - ≤ threshold → weight = 0 (excluded)
-    - threshold < score ≤ 0.6 → weight = 0.6
-    - 0.6 < score ≤ 0.8 → weight = 0.8
-    - > 0.8 → weight = 1.0
+#     @staticmethod
+#     def _ppf_terciles_from_code(dist_code, shape, loc, scale):
+#         """
+#         Return tercile thresholds (T1, T2) from best-fit distribution parameters.
+    
+#         dist_code:
+#             1: norm
+#             2: lognorm
+#             3: expon
+#             4: gamma
+#             5: weibull_min
+#             6: t
+#             7: poisson
+#             8: nbinom
+#         """
+#         if np.isnan(dist_code):
+#             return np.nan, np.nan
+    
+#         code = int(dist_code)
+#         try:
+#             if code == 1:
+#                 return (
+#                     norm.ppf(0.33, loc=loc, scale=scale),
+#                     norm.ppf(0.67, loc=loc, scale=scale),
+#                 )
+#             elif code == 2:
+#                 return (
+#                     lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
+#                     lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+#                 )
+#             elif code == 3:
+#                 return (
+#                     expon.ppf(0.33, loc=loc, scale=scale),
+#                     expon.ppf(0.67, loc=loc, scale=scale),
+#                 )
+#             elif code == 4:
+#                 return (
+#                     gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
+#                     gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+#                 )
+#             elif code == 5:
+#                 return (
+#                     weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
+#                     weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+#                 )
+#             elif code == 6:
+#                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
+#                 return (
+#                     t.ppf(0.33, df=shape, loc=loc, scale=scale),
+#                     t.ppf(0.67, df=shape, loc=loc, scale=scale),
+#                 )
+#             elif code == 7:
+#                 # Poisson: poisson.ppf(q, mu, loc=0)
+#                 # ASSUMPTION: 'mu' (mean) is passed as 'shape'
+#                 #             'loc' is passed as 'loc'
+#                 #             'scale' is unused
+#                 return (
+#                     poisson.ppf(0.33, mu=shape, loc=loc),
+#                     poisson.ppf(0.67, mu=shape, loc=loc),
+#                 )
+#             elif code == 8:
+#                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
+#                 # ASSUMPTION: 'n' (successes) is passed as 'shape'
+#                 #             'p' (probability) is passed as 'scale'
+#                 #             'loc' is passed as 'loc'
+#                 return (
+#                     nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
+#                     nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+#                 )
+#         except Exception:
+#             return np.nan, np.nan
+    
+#         # Fallback if code is not 1-8
+#         return np.nan, np.nan
+        
+#     @staticmethod
+#     def weibull_shape_solver(k, M, V):
+#         """
+#         Function to find the root of the Weibull shape parameter 'k'.
+#         We find 'k' such that the theoretical variance/mean^2 ratio
+#         matches the observed V/M^2 ratio.
+#         """
+#         # Guard against invalid 'k' values during solving
+#         if k <= 0:
+#             return -np.inf
+#         try:
+#             g1 = gamma_function(1 + 1/k)
+#             g2 = gamma_function(1 + 2/k)
+            
+#             # This is the V/M^2 ratio *implied by k*
+#             implied_v_over_m_sq = (g2 / (g1**2)) - 1
+            
+#             # This is the *observed* ratio
+#             observed_v_over_m_sq = V / (M**2)
+            
+#             # Return the difference (we want this to be 0)
+#             return observed_v_over_m_sq - implied_v_over_m_sq
+#         except ValueError:
+#             return -np.inf # Handle math errors
 
-    This approach aims to emphasize better-performing models while maintaining some
-    contribution from moderately skilled ones, and completely excluding very poor models.
+#     @staticmethod
+#     def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
+#     ):
+#         """
+#         Generic tercile probabilities using best-fit family per grid cell.
+    
+#         Inputs (per grid cell):
+#         - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+#         - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+#         - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+#         - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+    
+#         Strategy:
+#         - For each time step, build a predictive distribution of the same family:
+#             * Use ``best_guess[t]`` to adjust mean / location;
+#             * Keep shape parameters from climatology.
+#         - Then compute probabilities:
+#             * P(B) = F(T1)
+#             * P(N) = F(T2) - F(T1)
+#             * P(A) = 1 - F(T2)
+    
+#         Parameters
+#         ----------
+#         best_guess : array-like
+#             Forecast/hindcast best estimates.
+#         error_variance : float
+#             Variance of prediction errors.
+#         T1 : float
+#             Lower tercile threshold.
+#         T2 : float
+#             Upper tercile threshold.
+#         dist_code : int
+#             Distribution code (1-8).
+#         shape : float
+#             Shape parameter.
+#         loc : float
+#             Location parameter.
+#         scale : float
+#             Scale parameter.
+    
+#         Returns
+#         -------
+#         array-like
+#             Probabilities [P(B), P(N), P(A)].
+    
+#         Notes
+#         -----
+#         - Uses :math:`F` as the CDF of the predictive distribution.
+#         """
+        
+#         best_guess = np.asarray(best_guess, float)
+#         error_variance = np.asarray(error_variance, dtype=float)
+#         # T1 = np.asarray(T1, dtype=float)
+#         # T2 = np.asarray(T2, dtype=float)
+#         n_time = best_guess.size
+#         out = np.full((3, n_time), np.nan, float)
+
+#         if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
+#             return out
+
+#         code = int(dist_code)
+
+#         # Normal: loc = forecast; scale from clim
+#         if code == 1:
+#             error_std = np.sqrt(error_variance)
+#             out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
+#             out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
+#             out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
+
+#         # Lognormal: shape = sigma from clim; enforce mean = best_guess
+#         elif code == 2:
+#             sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
+#             mu = np.log(best_guess) - sigma**2 / 2
+#             out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+#             out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+#             out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
+
+
+#         # Exponential: keep scale from clim; shift loc so mean = best_guess
+#         elif code == 3:
+#             c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
+#             c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
+#             out[0, :] = c1
+#             out[1, :] = c2 - c1
+#             out[2, :] = 1.0 - c2
+
+#         # Gamma: use shape from clim; set scale so mean = best_guess
+#         elif code == 4:
+#             alpha = (best_guess ** 2) / error_variance
+#             theta = error_variance / best_guess
+#             c1 = gamma.cdf(T1, a=alpha, scale=theta)
+#             c2 = gamma.cdf(T2, a=alpha, scale=theta)
+#             out[0, :] = c1
+#             out[1, :] = c2 - c1
+#             out[2, :] = 1.0 - c2
+
+#         elif code == 5: # Assuming 5 is for Weibull   
+        
+#             for i in range(n_time):
+#                 # Get the scalar values for this specific element (e.g., grid cell)
+#                 M = best_guess[i]
+#                 print(M)
+#                 V = error_variance
+#                 print(V)
+                
+#                 # Handle cases with no variance to avoid division by zero
+#                 if V <= 0 or M <= 0:
+#                     out[0, i] = np.nan
+#                     out[1, i] = np.nan
+#                     out[2, i] = np.nan
+#                     continue # Skip to the next element
+        
+#                 # --- 1. Numerically solve for shape 'k' ---
+#                 # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
+#                 initial_guess = 2.0
+                
+#                 # fsolve finds the root of our helper function
+#                 k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
+        
+#                 # --- 2. Check for bad solution and calculate scale 'lambda' ---
+#                 if k <= 0:
+#                     # Solver failed
+#                     out[0, i] = np.nan
+#                     out[1, i] = np.nan
+#                     out[2, i] = np.nan
+#                     continue
+                
+#                 # With 'k' found, we can now algebraically find scale 'lambda'
+#                 # In scipy.stats, scale is 'scale'
+#                 lambda_scale = M / gamma_function(1 + 1/k)
+        
+#                 # --- 3. Calculate Probabilities ---
+#                 # In scipy.stats, shape 'k' is 'c'
+#                 # Use the T1 and T2 values for this specific element
+                
+#                 c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
+#                 c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
+        
+#                 out[0, i] = c1
+#                 out[1, i] = c2 - c1
+#                 out[2, i] = 1.0 - c2
+
+#         # Student-t: df from clim; scale from clim; loc = best_guess
+#         elif code == 6:       
+#             # Check if df is valid for variance calculation
+#             if dof <= 2:
+#                 # Cannot calculate scale, fill with NaNs
+#                 out[0, :] = np.nan
+#                 out[1, :] = np.nan
+#                 out[2, :] = np.nan
+#             else:
+#                 # 1. Calculate t-distribution parameters
+#                 # 'loc' (mean) is just the best_guess
+#                 loc = best_guess
+#                 # 'scale' is calculated from the variance and df
+#                 # Variance = scale**2 * (df / (df - 2))
+#                 scale = np.sqrt(error_variance * (dof - 2) / dof)
+                
+#                 # 2. Calculate probabilities
+#                 c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
+#                 c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
+
+#                 out[0, :] = c1
+#                 out[1, :] = c2 - c1
+#                 out[2, :] = 1.0 - c2
+
+#         elif code == 7: # Assuming 7 is for Poisson
+            
+#             # --- 1. Set the Poisson parameter 'mu' ---
+#             # The 'mu' parameter is the mean.
+            
+#             # A warning is strongly recommended if error_variance is different from best_guess
+#             if not np.allclose(best_guess, error_variance, atol=0.5):
+#                 print("Warning: 'error_variance' is not equal to 'best_guess'.")
+#                 print("Poisson model assumes mean=variance and is likely inappropriate.")
+#                 print("Consider using Negative Binomial.")
+            
+#             mu = best_guess
+        
+#             # --- 2. Calculate Probabilities ---
+#             # poisson.cdf(k, mu) calculates P(X <= k)
+            
+#             c1 = poisson.cdf(T1, mu=mu)
+#             c2 = poisson.cdf(T2, mu=mu)
+            
+#             out[0, :] = c1
+#             out[1, :] = c2 - c1
+#             out[2, :] = 1.0 - c2
+
+#         elif code == 8: # Assuming 8 is for Negative Binomial
+            
+#             # --- 1. Calculate Negative Binomial Parameters ---
+#             # This model is ONLY valid for overdispersion (Variance > Mean).
+#             # We will use np.where to set parameters to NaN if V <= M.
+            
+#             # p = Mean / Variance
+#             p = np.where(error_variance > best_guess, 
+#                          best_guess / error_variance, 
+#                          np.nan)
+            
+#             # n = Mean^2 / (Variance - Mean)
+#             n = np.where(error_variance > best_guess, 
+#                          (best_guess**2) / (error_variance - best_guess), 
+#                          np.nan)
+            
+#             # --- 2. Calculate Probabilities ---
+#             # The nbinom.cdf function will propagate NaNs, correctly
+#             # handling the cases where the model was invalid.
+            
+#             c1 = nbinom.cdf(T1, n=n, p=p)
+#             c2 = nbinom.cdf(T2, n=n, p=p)
+            
+#             out[0, :] = c1
+#             out[1, :] = c2 - c1
+#             out[2, :] = 1.0 - c2
+            
+#         else:
+#             raise ValueError(f"Invalid distribution")
+
+#         return out
+
+#     @staticmethod
+#     def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+#         """Non-parametric method using historical error samples."""
+#         n_time = len(best_guess)
+#         pred_prob = np.full((3, n_time), np.nan, dtype=float)
+#         for t in range(n_time):
+#             if np.isnan(best_guess[t]):
+#                 continue
+#             dist = best_guess[t] + error_samples
+#             dist = dist[np.isfinite(dist)]
+#             if len(dist) == 0:
+#                 continue
+#             p_below = np.mean(dist < first_tercile)
+#             p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
+#             p_above = 1.0 - (p_below + p_between)
+#             pred_prob[0, t] = p_below
+#             pred_prob[1, t] = p_between
+#             pred_prob[2, t] = p_above
+#         return pred_prob
+
+
+#     def compute_prob(
+#         self,
+#         Predictant: xr.DataArray,
+#         clim_year_start,
+#         clim_year_end,
+#         hindcast_det: xr.DataArray,
+#         best_code_da: xr.DataArray = None,
+#         best_shape_da: xr.DataArray = None,
+#         best_loc_da: xr.DataArray = None,
+#         best_scale_da: xr.DataArray = None
+#     ) -> xr.DataArray:
+#         """
+#         Compute tercile probabilities for deterministic hindcasts.
+
+#         If dist_method == 'bestfit':
+#             - Use cluster-based best-fit distributions to:
+#                 * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
+#                 * compute predictive probabilities using the same family.
+
+#         Otherwise:
+#             - Use empirical terciles from Predictant climatology and the selected
+#               parametric / nonparametric method.
+
+#         Parameters
+#         ----------
+#         Predictant : xarray.DataArray
+#             Observed data (T, Y, X) or (T, Y, X, M).
+#         clim_year_start, clim_year_end : int or str
+#             Climatology period (inclusive) for thresholds.
+#         hindcast_det : xarray.DataArray
+#             Deterministic hindcast (T, Y, X).
+#         best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
+#             Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
+
+#         Returns
+#         -------
+#         hindcast_prob : xarray.DataArray
+#             Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
+#         """
+#         # Handle member dimension if present
+#         if "M" in Predictant.dims:
+#             Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+
+#         # Ensure dimension order
+#         Predictant = Predictant.transpose("T", "Y", "X")
+
+#         # Spatial mask
+#         mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+
+#         # Climatology subset
+#         clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+#         if clim.sizes.get("T", 0) < 3:
+#             raise ValueError("Not enough years in climatology period for terciles.")
+
+#         # Error variance for predictive distributions
+#         error_variance = (Predictant - hindcast_det).var(dim="T")
+#         dof = max(int(clim.sizes["T"]) - 1, 2)
+
+#         # Empirical terciles (used by non-bestfit methods)
+#         terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+#         T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
+#         T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
+        
+
+#         dm = self.dist_method
+
+#         # ---------- BESTFIT: zone-wise optimal distributions ----------
+#         if dm == "bestfit":
+#             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+#                 raise ValueError(
+#                     "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
+#                 )
+
+#             # T1, T2 from best-fit distributions (per grid)
+#             T1, T2 = xr.apply_ufunc(
+#                 self._ppf_terciles_from_code,
+#                 best_code_da,
+#                 best_shape_da,
+#                 best_loc_da,
+#                 best_scale_da,
+#                 input_core_dims=[(), (), (), ()],
+#                 output_core_dims=[(), ()],
+#                 vectorize=True,
+#                 dask="parallelized",
+#                 output_dtypes=[float, float],
+#             )
+
+#             # Predictive probabilities using same family
+#             hindcast_prob = xr.apply_ufunc(
+#                 self.calculate_tercile_probabilities_bestfit,
+#                 hindcast_det,
+#                 error_variance,
+#                 T1,
+#                 T2,
+#                 best_code_da,
+#                 input_core_dims=[("T",), (), (), (), ()],
+#                 output_core_dims=[("probability", "T")],
+#                 vectorize=True,
+#                 kwargs={'dof': dof},
+#                 dask="parallelized",
+#                 output_dtypes=[float],
+#                 dask_gufunc_kwargs={
+#                     "output_sizes": {"probability": 3},
+#                     "allow_rechunk": True,
+#                 },
+#             )
+
+#         # ---------- Nonparametric ----------
+#         elif dm == "nonparam":
+#             error_samples = Predictant - hindcast_det
+#             hindcast_prob = xr.apply_ufunc(
+#                 self.calculate_tercile_probabilities_nonparametric,
+#                 hindcast_det,
+#                 error_samples,
+#                 T1_emp,
+#                 T2_emp,
+#                 input_core_dims=[("T",), ("T",), (), ()],
+#                 output_core_dims=[("probability", "T")],
+#                 vectorize=True,
+#                 dask="parallelized",
+#                 output_dtypes=[float],
+#                 dask_gufunc_kwargs={
+#                     "output_sizes": {"probability": 3},
+#                     "allow_rechunk": True,
+#                 },
+#             )
+
+#         else:
+#             raise ValueError(f"Invalid dist_method: {self.dist_method}")
+
+#         hindcast_prob = hindcast_prob.assign_coords(
+#             probability=("probability", ["PB", "PN", "PA"])
+#         )
+#         return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
+
+
+#     def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det, forecast_det, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
+#         if "M" in Predictant.coords:
+#             Predictant = Predictant.isel(M=0).drop_vars('M').squeeze()
+#         mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+
+#         year = forecast_det.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970  # Convert from epoch
+#         T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
+#         month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
+#         new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
+#         forecast_det = forecast_det.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+#         forecast_det['T'] = forecast_det['T'].astype('datetime64[ns]')
+
+        
+#         # Compute tercile probabilities on the predictions
+#         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
+#         index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+#         rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
+#         terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
+#         T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
+#         T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
+#         error_variance = (Predictant - hindcast_det).var(dim='T')
+#         dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
+
+#         dm = self.dist_method
+
+#         # ---------- BESTFIT ----------
+#         if dm == "bestfit":
+#             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+#                 raise ValueError(
+#                     "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
+#                 )
+            
+#             T1, T2 = xr.apply_ufunc(
+#                 self._ppf_terciles_from_code,
+#                 best_code_da,
+#                 best_shape_da,
+#                 best_loc_da,
+#                 best_scale_da,
+#                 input_core_dims=[(), (), (), ()],
+#                 output_core_dims=[(), ()],
+#                 vectorize=True,
+#                 dask="parallelized",
+#                 output_dtypes=[float, float],
+#             )
+
+#             forecast_prob = xr.apply_ufunc(
+#                 self.calculate_tercile_probabilities_bestfit,
+#                 forecast_det,
+#                 error_variance,
+#                 T1,
+#                 T2,
+#                 best_code_da,
+#                 input_core_dims=[("T",), (), (), (), ()],
+#                 output_core_dims=[("probability", "T")],
+#                 vectorize=True,
+#                 dask="parallelized",
+#                 kwargs={"dof": dof},
+#                 output_dtypes=[float],
+#                 dask_gufunc_kwargs={
+#                     "output_sizes": {"probability": 3},
+#                     "allow_rechunk": True,
+#                 },
+#             )
+
+#         # ---------- Nonparametric ----------
+#         elif dm == "nonparam":
+#             error_samples = Predictant - hindcast_det
+#             forecast_prob = xr.apply_ufunc(
+#                 self.calculate_tercile_probabilities_nonparametric,
+#                 forecast_det,
+#                 error_samples,
+#                 T1_emp,
+#                 T2_emp,
+#                 input_core_dims=[("T",), ("T",), (), ()],
+#                 output_core_dims=[("probability", "T")],
+#                 vectorize=True,
+#                 dask="parallelized",
+#                 output_dtypes=[float],
+#                 dask_gufunc_kwargs={
+#                     "output_sizes": {"probability": 3},
+#                     "allow_rechunk": True,
+#                 },
+#             )
+
+#         else:
+#             raise ValueError(f"Invalid dist_method: {self.dist_method}")
+#         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
+#         return forecast_det * mask, mask * forecast_prob.transpose('probability', 'T', 'Y', 'X')
+
+
+# class WAS_ProbWeighted:
+#     """
+#     Probability-Weighted Multi-Model Ensemble for seasonal rainfall forecasting.
+
+#     Implements a threshold-based weighting scheme for combining multiple climate
+#     model outputs (hindcasts and forecasts). Model weights are derived from performance.
+#     It's currently for only GROC scores. With a stepwise transformation:
+#     - ≤ threshold → weight = 0 (excluded)
+#     - threshold < score ≤ 0.6 → weight = 0.6
+#     - 0.6 < score ≤ 0.8 → weight = 0.8
+#     - > 0.8 → weight = 1.0
+
+#     This approach aims to emphasize better-performing models while maintaining some
+#     contribution from moderately skilled ones, and completely excluding very poor models.
+
+#     Parameters
+#     ----------
+#     None
+
+#     Notes
+#     -----
+#     - All input data (hindcast, forecast, scores) are interpolated to the rainfall grid
+#       using nearest-neighbor interpolation with extrapolation.
+#     - A spatial mask is derived from the first time step of rainfall observations.
+#     - Supports an optional 'complete' mode that fills missing values with simple
+#       unweighted ensemble mean.
+#     - Designed primarily for seasonal climate forecasting applications.
+#     """
+
+#     def __init__(self):
+#         # Initialize any required attributes here
+#         pass
+
+#     def compute(self, rainfall, hdcst, fcst, scores, threshold=0.5, complete=False):
+#         """
+#         Compute probability-weighted multi-model ensemble mean for hindcast and forecast.
+
+#         Parameters
+#         ----------
+#         rainfall : xarray.DataArray
+#             Observed rainfall used as reference grid and for masking.
+#             Expected dimensions: (T, Y, X, M) or (T, Y, X).
+#             The M dimension (if present) is ignored.
+#         hdcst : xarray.DataArray
+#             Multi-model hindcast dataset.
+#             Expected dimensions: (T, M, Y, X)
+#         fcst : xarray.DataArray
+#             Multi-model forecast dataset (single lead time).
+#             Expected dimensions: (T, M, Y, X)
+#         scores : dict
+#             Dictionary mapping model names (str) to performance score arrays.
+#             Each score array should be an xarray.DataArray with spatial coordinates (Y, X).
+#         threshold : float, default=0.5 for GROC
+#             Minimum score value below which a model is completely excluded (weight = 0).
+#         complete : bool, default=False
+#             If True, areas where weighted mean is NaN are filled with the simple
+#             unweighted ensemble mean.
+
+#         Returns
+#         -------
+#         hindcast_weighted : xarray.DataArray
+#             Weighted hindcast ensemble mean.
+#             Dimensions: (T, Y, X)
+#         forecast_weighted : xarray.DataArray
+#             Weighted forecast ensemble mean.
+#             Dimensions: (T, Y, X)
+
+#         Notes
+#         -----
+#         - Time coordinate of forecast is adjusted to match the expected seasonal month
+#           based on the first timestep of rainfall observations.
+#         - All interpolations use 'nearest' method with extrapolation for boundary points.
+#         - Final output is masked using the spatial coverage of observed rainfall.
+#         - Models with NaN scores or failed interpolation will contribute zero weight.
+#         - The stepwise weighting is currently hardcoded (0.6 / 0.8 / 1.0 breakpoints). 
+#         - It's only for GROC currently.
+ 
+
+#         Warnings
+#         --------
+#         - Make sure that model names in `hdcst.M`, `fcst.M` and `scores.keys()` match exactly.
+#         - Performance may degrade if score grids have very different resolution/spatial extent
+#           from the rainfall target grid.
+#         """
+        
+        
+#         # --- Adjust time coordinates ---
+#         # Extract the year from the forecast's T coordinate (assuming epoch conversion)
+#         year = fcst.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
+#         T_value_1 = rainfall.isel(T=0).coords['T'].values  # Get the initial time value from rainfall
+#         month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month (1-12)
+#         new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
+        
+#         # Update forecast and hindcast time coordinates
+#         fcst = fcst.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
+#         fcst['T'] = fcst['T'].astype('datetime64[ns]')
+#         hdcst['T'] = rainfall['T'].astype('datetime64[ns]')
+        
+#         # Create a spatial mask from rainfall (using first time and model)
+#         if "M" in rainfall.coords:
+#             rainfall = rainfall.isel(M=0).drop_vars("M").squeeze()
+#         mask = xr.where(~np.isnan(rainfall.isel(T=0)), 1, np.nan).drop_vars('T').squeeze().to_numpy()
+
+#         # --- Initialize accumulators for weighted and unweighted sums ---
+#         weighted_hindcast_sum = None
+#         weighted_forecast_sum = None
+#         score_sum = None
+
+#         hindcast_sum = None
+#         forecast_sum = None
+
+#         model_names = list(hdcst.coords["M"].values)
+        
+#         # --- Loop over each model ---
+#         for model_name in model_names:
+#             # Interpolate the score array to the rainfall grid
+#             score_array = scores[model_name].interp(
+#                 Y=rainfall.Y,
+#                 X=rainfall.X,
+#                 method="nearest",
+#                 kwargs={"fill_value": "extrapolate"}
+#             )
+#             # Apply weighting rules: below threshold set to 0; between threshold and 0.6 -> 0.6; 
+#             # between 0.6 and 0.8 -> 0.8; above 0.8 -> 1.
+
+#             score_array = xr.where(
+#                score_array <= threshold,
+#                 0,
+#                 xr.where(
+#                     score_array <= 0.6,
+#                     0.6,
+#                    xr.where(score_array <= 0.8, 0.8, 1)
+#                 )
+#             )
+
+#             # score_array = xr.where(
+#             #     score_array <= threshold,
+#             #     0,1
+#             # )
+            
+#             # Interpolate hindcast and forecast data for the model to the rainfall grid
+#             hindcast_data = hdcst.sel(M=model_name).interp(
+#                 Y=rainfall.Y,
+#                 X=rainfall.X,
+#                 method="nearest",
+#                 kwargs={"fill_value": "extrapolate"}
+#             )
+#             forecast_data = fcst.sel(M=model_name).interp(
+#                 Y=rainfall.Y,
+#                 X=rainfall.X,
+#                 method="nearest",
+#                 kwargs={"fill_value": "extrapolate"}
+#             )
+
+#             # Weight the datasets by the score_array
+#             weighted_hindcast = hindcast_data * score_array
+#             weighted_forecast = forecast_data * score_array
+
+#             # Accumulate weighted and unweighted sums
+#             if weighted_hindcast_sum is None:
+#                 weighted_hindcast_sum = weighted_hindcast
+#                 weighted_forecast_sum = weighted_forecast
+#                 score_sum = score_array
+#                 hindcast_sum = hindcast_data
+#                 forecast_sum = forecast_data
+#             else:
+#                 weighted_hindcast_sum += weighted_hindcast
+#                 weighted_forecast_sum += weighted_forecast
+#                 score_sum += score_array
+#                 hindcast_sum += hindcast_data
+#                 forecast_sum += forecast_data
+
+#         # --- Compute weighted ensemble (weighted average) ---
+#         hindcast_weighted = weighted_hindcast_sum / score_sum
+#         forecast_weighted = weighted_forecast_sum / score_sum
+        
+#         # --- Optionally complete missing values with unweighted average ---
+#         if complete:
+#             n_models = len(model_names)
+#             hindcast_unweighted = hindcast_sum / n_models
+#             forecast_unweighted = forecast_sum / n_models
+            
+#             # Identify missing areas in the weighted estimates
+#             mask_hd = xr.where(np.isnan(hindcast_weighted), 1, 0)
+#             mask_fc = xr.where(np.isnan(forecast_weighted), 1, 0)
+            
+#             hindcast_weighted = hindcast_weighted.fillna(0) + hindcast_unweighted * mask_hd
+#             forecast_weighted = forecast_weighted.fillna(0) + forecast_unweighted * mask_fc
+
+#         # --- Drop the 'M' dimension if present ---
+#         if "M" in hindcast_weighted.coords:
+#             hindcast_weighted = hindcast_weighted.drop_vars('M')
+#         if "M" in forecast_weighted.coords:
+#             forecast_weighted = forecast_weighted.drop_vars('M')
+        
+#         return (hindcast_weighted * mask).transpose("probability", "T", "Y", "X"), (forecast_weighted * mask).transpose("probability", "T", "Y", "X")
+
+class WAS_ProbWeighted(WAS_mme_Weighted):
+    """Skill-weighted combination of multi-model tercile probabilities.
 
     Parameters
     ----------
-    None
+    metric : str, default="GROC"
+        Skill metric represented by ``scores``. The stepwise transformation is
+        designed for higher-is-better scores bounded approximately by 0 and 1.
+    threshold : float, default=0.5
+        Scores less than or equal to this value receive zero weight.
+    moderate_break : float, default=0.6
+        Upper score boundary of the moderate-skill class.
+    high_break : float, default=0.8
+        Upper score boundary of the high-skill class.
+    moderate_weight : float, default=0.6
+        Weight assigned when ``threshold < score <= moderate_break``.
+    high_weight : float, default=0.8
+        Weight assigned when ``moderate_break < score <= high_break``.
+    top_weight : float, default=1.0
+        Weight assigned when ``score > high_break``.
+    missing_score : {"zero", "one", "raise"}, default="zero"
+        Behaviour when no score can be associated with a model. ``"zero"``
+        excludes it, ``"one"`` assigns full weight, and ``"raise"`` stops.
+    normalize_probabilities : bool, default=True
+        Normalize every complete probability vector before and after the MME.
+        This also converts percentage inputs summing to 100 into fractions.
 
     Notes
     -----
-    - All input data (hindcast, forecast, scores) are interpolated to the rainfall grid
-      using nearest-neighbor interpolation with extrapolation.
-    - A spatial mask is derived from the first time step of rainfall observations.
-    - Supports an optional 'complete' mode that fills missing values with simple
-      unweighted ensemble mean.
-    - Designed primarily for seasonal climate forecasting applications.
+    Expected ensemble dimensions are ``(probability, T, M, Y, X)``. Public
+    outputs are always ``(probability, T, Y, X)``. A score is always reduced to
+    ``(Y, X)`` before weighting, preventing an accidental ``M`` dimension from
+    leaking into the result.
     """
 
-    def __init__(self):
-        # Initialize any required attributes here
-        pass
+    _EXPECTED_PROB_DIMS = ("probability", "T", "M", "Y", "X")
+    _OUTPUT_PROB_DIMS = ("probability", "T", "Y", "X")
 
-    def compute(self, rainfall, hdcst, fcst, scores, threshold=0.5, complete=False):
-        """
-        Compute probability-weighted multi-model ensemble mean for hindcast and forecast.
+    def __init__(
+        self,
+        metric="GROC",
+        threshold=0.5,
+        moderate_break=0.6,
+        high_break=0.8,
+        moderate_weight=0.6,
+        high_weight=0.8,
+        top_weight=1.0,
+        missing_score="zero",
+        normalize_probabilities=True,
+    ):
+        super().__init__(
+            equal_weighted=False,
+            dist_method="nonparam",
+            metric=metric,
+            threshold=threshold,
+        )
+
+        self.moderate_break = float(moderate_break)
+        self.high_break = float(high_break)
+        self.moderate_weight = float(moderate_weight)
+        self.high_weight = float(high_weight)
+        self.top_weight = float(top_weight)
+        self.missing_score = str(missing_score).lower()
+        self.normalize_probabilities = bool(normalize_probabilities)
+
+        if not np.isfinite(self.threshold):
+            raise ValueError("threshold must be finite.")
+        if not self.moderate_break < self.high_break:
+            raise ValueError("moderate_break must be strictly smaller than high_break.")
+        if min(self.moderate_weight, self.high_weight, self.top_weight) < 0:
+            raise ValueError("All weights must be non-negative.")
+        if self.missing_score not in {"zero", "one", "raise"}:
+            raise ValueError("missing_score must be 'zero', 'one', or 'raise'.")
+
+        self.last_effective_hindcast_weights_ = None
+        self.last_effective_forecast_weights_ = None
+
+    @classmethod
+    def _as_probability_ensemble(cls, da, name):
+        """Validate and order a probabilistic multi-model DataArray."""
+        return cls._strict_dims(da, cls._EXPECTED_PROB_DIMS, name)
+
+    @classmethod
+    def _as_probability_output(cls, da, name):
+        """Validate and order a probabilistic MME output."""
+        return cls._strict_dims(da, cls._OUTPUT_PROB_DIMS, name)
+
+    @staticmethod
+    def _canonical_model_name(value):
+        """Return a conservative normalized model identifier for matching."""
+        return "".join(char for char in str(value).lower() if char.isalnum())
+
+    @classmethod
+    def _align_named_axis(cls, reference, other, dim, reference_name, other_name):
+        """Reorder ``other[dim]`` to match ``reference[dim]`` by string labels."""
+        reference_values = list(reference[dim].values)
+        other_values = list(other[dim].values)
+
+        reference_keys = [str(value) for value in reference_values]
+        other_lookup = {}
+        for value in other_values:
+            key = str(value)
+            if key in other_lookup:
+                raise ValueError(
+                    f"{other_name}.{dim} contains duplicate string label {key!r}."
+                )
+            other_lookup[key] = value
+
+        if len(reference_keys) != len(set(reference_keys)):
+            raise ValueError(
+                f"{reference_name}.{dim} contains duplicate string labels: "
+                f"{reference_keys}."
+            )
+
+        missing = [key for key in reference_keys if key not in other_lookup]
+        if missing:
+            raise ValueError(
+                f"{other_name} is missing {dim} labels required by {reference_name}: "
+                f"{missing}."
+            )
+
+        aligned = other.sel({dim: [other_lookup[key] for key in reference_keys]})
+        return aligned.assign_coords({dim: reference[dim].values})
+
+    def _score_pool(self, scores):
+        """Accept either a direct model-score mapping or a metric-nested mapping."""
+        if scores is None:
+            return {}
+        if isinstance(scores, xr.DataArray):
+            return scores
+        if not isinstance(scores, dict):
+            raise TypeError(
+                "scores must be a dict, a metric-nested dict, a DataArray, or None."
+            )
+
+        metric_keys = [self.metric, self.metric.upper(), self.metric.lower()]
+        for key in metric_keys:
+            candidate = scores.get(key)
+            if isinstance(candidate, dict) or isinstance(candidate, xr.DataArray):
+                return candidate
+        return scores
+
+    def _lookup_score(self, scores, model_name, model_index, model_names):
+        """Resolve one model's score without silently selecting an unrelated model."""
+        pool = self._score_pool(scores)
+
+        if isinstance(pool, xr.DataArray):
+            return pool
+        if not pool:
+            return None
+
+        if model_name in pool:
+            return pool[model_name]
+
+        string_lookup = {str(key): key for key in pool}
+        if model_name in string_lookup:
+            return pool[string_lookup[model_name]]
+
+        target = self._canonical_model_name(model_name)
+        canonical_matches = [
+            key
+            for key in pool
+            if self._canonical_model_name(key) == target
+        ]
+        if len(canonical_matches) == 1:
+            return pool[canonical_matches[0]]
+        if len(canonical_matches) > 1:
+            raise ValueError(
+                f"Ambiguous score keys for model {model_name!r}: "
+                f"{[str(key) for key in canonical_matches]}."
+            )
+
+        # Prefix matching is only accepted when it identifies exactly one key.
+        prefix_matches = [
+            key
+            for key in pool
+            if self._canonical_model_name(key).startswith(target)
+            or target.startswith(self._canonical_model_name(key))
+        ]
+        if len(prefix_matches) == 1:
+            return pool[prefix_matches[0]]
+        if len(prefix_matches) > 1:
+            raise ValueError(
+                f"Ambiguous prefix score keys for model {model_name!r}: "
+                f"{[str(key) for key in prefix_matches]}."
+            )
+
+        return None
+
+    def _missing_score_field(self, obs, model_name):
+        template = obs.isel(T=0, drop=True)
+        if self.missing_score == "raise":
+            raise KeyError(f"No score was found for model {model_name!r}.")
+        if self.missing_score == "one":
+            warnings.warn(
+                f"No score found for {model_name!r}; full weight is used.",
+                RuntimeWarning,
+            )
+            return xr.ones_like(template, dtype=float)
+
+        warnings.warn(
+            f"No score found for {model_name!r}; the model is excluded.",
+            RuntimeWarning,
+        )
+        return xr.zeros_like(template, dtype=float)
+
+    def transform_score(self, score_array, threshold=None):
+        """Convert a GROC-like skill field into stepwise non-negative weights."""
+        cutoff = self.threshold if threshold is None else float(threshold)
+        if not np.isfinite(cutoff):
+            raise ValueError("threshold must be finite.")
+
+        metric = self.metric.lower().replace("_", "").replace("-", "")
+        if metric not in {"groc", "roc", "auc", "rpss", "pearson", "correlation"}:
+            warnings.warn(
+                f"Stepwise ProbWeighted transformation is being applied to metric "
+                f"{self.metric!r}; verify that higher values indicate better skill.",
+                RuntimeWarning,
+            )
+
+        score = score_array.astype(float)
+        finite = np.isfinite(score)
+        weight = xr.where(
+            ~finite,
+            0.0,
+            xr.where(
+                score <= cutoff,
+                0.0,
+                xr.where(
+                    score <= self.moderate_break,
+                    self.moderate_weight,
+                    xr.where(
+                        score <= self.high_break,
+                        self.high_weight,
+                        self.top_weight,
+                    ),
+                ),
+            ),
+        )
+        return weight.clip(min=0.0)
+
+    @staticmethod
+    def _normalise_probability_vectors(da):
+        """Normalize complete probability vectors and reject incomplete vectors."""
+        complete_vector = da.notnull().all("probability")
+        nonnegative = da.clip(min=0.0)
+        total = nonnegative.sum("probability", skipna=False)
+        valid = complete_vector & np.isfinite(total) & (total > 0)
+        return (nonnegative / total).where(valid)
+
+    def compute(
+        self,
+        rainfall,
+        hdcst,
+        fcst,
+        scores,
+        threshold=None,
+        complete=False,
+    ):
+        """Compute a skill-weighted MME of tercile probabilities.
 
         Parameters
         ----------
         rainfall : xarray.DataArray
-            Observed rainfall used as reference grid and for masking.
-            Expected dimensions: (T, Y, X, M) or (T, Y, X).
-            The M dimension (if present) is ignored.
-        hdcst : xarray.DataArray
-            Multi-model hindcast dataset.
-            Expected dimensions: (T, M, Y, X)
-        fcst : xarray.DataArray
-            Multi-model forecast dataset (single lead time).
-            Expected dimensions: (T, M, Y, X)
-        scores : dict
-            Dictionary mapping model names (str) to performance score arrays.
-            Each score array should be an xarray.DataArray with spatial coordinates (Y, X).
-        threshold : float, default=0.5 for GROC
-            Minimum score value below which a model is completely excluded (weight = 0).
+            Observation field with dimensions ``(T, Y, X)``. A singleton or
+            multi-valued ``M`` dimension is accepted; the first member is used.
+        hdcst, fcst : xarray.DataArray
+            Probabilistic model ensembles with dimensions
+            ``(probability, T, M, Y, X)`` in any order.
+        scores : dict or xarray.DataArray
+            Model skill fields. Every selected score is reduced to ``(Y, X)``.
+        threshold : float, optional
+            Runtime override of the instance exclusion threshold.
         complete : bool, default=False
-            If True, areas where weighted mean is NaN are filled with the simple
-            unweighted ensemble mean.
+            Fill cells with no positively weighted model using the unweighted
+            multi-model probability mean.
 
         Returns
         -------
-        hindcast_weighted : xarray.DataArray
-            Weighted hindcast ensemble mean.
-            Dimensions: (T, Y, X)
-        forecast_weighted : xarray.DataArray
-            Weighted forecast ensemble mean.
-            Dimensions: (T, Y, X)
-
-        Notes
-        -----
-        - Time coordinate of forecast is adjusted to match the expected seasonal month
-          based on the first timestep of rainfall observations.
-        - All interpolations use 'nearest' method with extrapolation for boundary points.
-        - Final output is masked using the spatial coverage of observed rainfall.
-        - Models with NaN scores or failed interpolation will contribute zero weight.
-        - The stepwise weighting is currently hardcoded (0.6 / 0.8 / 1.0 breakpoints). 
-        - It's only for GROC currently.
- 
-
-        Warnings
-        --------
-        - Make sure that model names in `hdcst.M`, `fcst.M` and `scores.keys()` match exactly.
-        - Performance may degrade if score grids have very different resolution/spatial extent
-          from the rainfall target grid.
+        hindcast_weighted, forecast_weighted : xarray.DataArray
+            Arrays ordered as ``(probability, T, Y, X)``.
         """
-        
-        
-        # --- Adjust time coordinates ---
-        # Extract the year from the forecast's T coordinate (assuming epoch conversion)
-        year = fcst.coords['T'].values.astype('datetime64[Y]').astype(int)[0] + 1970
-        T_value_1 = rainfall.isel(T=0).coords['T'].values  # Get the initial time value from rainfall
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month (1-12)
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
-        
-        # Update forecast and hindcast time coordinates
-        fcst = fcst.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        fcst['T'] = fcst['T'].astype('datetime64[ns]')
-        hdcst['T'] = rainfall['T'].astype('datetime64[ns]')
-        
-        # Create a spatial mask from rainfall (using first time and model)
-        if "M" in rainfall.coords:
-            rainfall = rainfall.isel(M=0).drop_vars("M").squeeze()
-        mask = xr.where(~np.isnan(rainfall.isel(T=0)), 1, np.nan).drop_vars('T').squeeze().to_numpy()
+        obs = self._as_observation(rainfall)
+        hdcst = self._as_probability_ensemble(hdcst, "hdcst")
+        fcst = self._as_probability_ensemble(fcst, "fcst")
 
-        # --- Initialize accumulators for weighted and unweighted sums ---
-        weighted_hindcast_sum = None
-        weighted_forecast_sum = None
-        score_sum = None
-
-        hindcast_sum = None
-        forecast_sum = None
-
-        model_names = list(hdcst.coords["M"].values)
-        
-        # --- Loop over each model ---
-        for model_name in model_names:
-            # Interpolate the score array to the rainfall grid
-            score_array = scores[model_name].interp(
-                Y=rainfall.Y,
-                X=rainfall.X,
-                method="nearest",
-                kwargs={"fill_value": "extrapolate"}
-            )
-            # Apply weighting rules: below threshold set to 0; between threshold and 0.6 -> 0.6; 
-            # between 0.6 and 0.8 -> 0.8; above 0.8 -> 1.
-
-            score_array = xr.where(
-               score_array <= threshold,
-                0,
-                xr.where(
-                    score_array <= 0.6,
-                    0.6,
-                   xr.where(score_array <= 0.8, 0.8, 1)
-                )
+        if hdcst.sizes["T"] != obs.sizes["T"]:
+            raise ValueError(
+                "hdcst and rainfall must have the same T length; "
+                f"got {hdcst.sizes['T']} and {obs.sizes['T']}."
             )
 
-            # score_array = xr.where(
-            #     score_array <= threshold,
-            #     0,1
-            # )
-            
-            # Interpolate hindcast and forecast data for the model to the rainfall grid
-            hindcast_data = hdcst.sel(M=model_name).interp(
-                Y=rainfall.Y,
-                X=rainfall.X,
-                method="nearest",
-                kwargs={"fill_value": "extrapolate"}
-            )
-            forecast_data = fcst.sel(M=model_name).interp(
-                Y=rainfall.Y,
-                X=rainfall.X,
-                method="nearest",
-                kwargs={"fill_value": "extrapolate"}
-            )
+        hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        fcst = self._normalise_forecast_time(fcst, obs)
 
-            # Weight the datasets by the score_array
-            weighted_hindcast = hindcast_data * score_array
-            weighted_forecast = forecast_data * score_array
+        # Forecast model and probability axes must match the hindcast exactly.
+        fcst = self._align_named_axis(hdcst, fcst, "M", "hdcst", "fcst")
+        fcst = self._align_named_axis(
+            hdcst, fcst, "probability", "hdcst", "fcst"
+        )
 
-            # Accumulate weighted and unweighted sums
-            if weighted_hindcast_sum is None:
-                weighted_hindcast_sum = weighted_hindcast
-                weighted_forecast_sum = weighted_forecast
-                score_sum = score_array
-                hindcast_sum = hindcast_data
-                forecast_sum = forecast_data
+        hdcst = hdcst.interp(
+            Y=obs.Y,
+            X=obs.X,
+            method="nearest",
+            kwargs={"fill_value": "extrapolate"},
+        )
+        fcst = fcst.interp(
+            Y=obs.Y,
+            X=obs.X,
+            method="nearest",
+            kwargs={"fill_value": "extrapolate"},
+        )
+
+        spatial_mask = xr.where(obs.notnull().any("T"), 1.0, np.nan)
+        hdcst = hdcst.where(spatial_mask.notnull())
+        fcst = fcst.where(spatial_mask.notnull())
+
+        if self.normalize_probabilities:
+            hdcst = self._normalise_probability_vectors(hdcst)
+            fcst = self._normalise_probability_vectors(fcst)
+
+        model_values = list(hdcst.M.values)
+        model_names = [str(value) for value in model_values]
+        if len(model_names) != len(set(model_names)):
+            raise ValueError(f"hdcst.M contains duplicate model labels: {model_names}.")
+
+        weight_fields = []
+        for index, model_name in enumerate(model_names):
+            raw_score = self._lookup_score(
+                scores,
+                model_name=model_name,
+                model_index=index,
+                model_names=model_names,
+            )
+            if raw_score is None:
+                score = self._missing_score_field(obs, model_name)
             else:
-                weighted_hindcast_sum += weighted_hindcast
-                weighted_forecast_sum += weighted_forecast
-                score_sum += score_array
-                hindcast_sum += hindcast_data
-                forecast_sum += forecast_data
+                score = self._prepare_score(
+                    raw_score,
+                    model_name=model_name,
+                    obs=obs,
+                    model_names=model_names,
+                    model_index=index,
+                )
+            weight_fields.append(self.transform_score(score, threshold=threshold))
 
-        # --- Compute weighted ensemble (weighted average) ---
-        hindcast_weighted = weighted_hindcast_sum / score_sum
-        forecast_weighted = weighted_forecast_sum / score_sum
-        
-        # --- Optionally complete missing values with unweighted average ---
+        weights = xr.concat(
+            weight_fields,
+            dim=xr.IndexVariable("M", model_values),
+        ).transpose("M", "Y", "X")
+        weights = weights.where(spatial_mask.notnull(), 0.0).fillna(0.0)
+        self.last_weights_ = weights
+
+        # A model is used only when its entire PB/PN/PA vector is available.
+        valid_hindcast_vector = hdcst.notnull().all("probability")
+        valid_forecast_vector = fcst.notnull().all("probability")
+
+        effective_hindcast_weights = weights.where(valid_hindcast_vector)
+        effective_forecast_weights = weights.where(valid_forecast_vector)
+        self.last_effective_hindcast_weights_ = effective_hindcast_weights
+        self.last_effective_forecast_weights_ = effective_forecast_weights
+
+        hindcast_denominator = effective_hindcast_weights.sum("M", skipna=True)
+        forecast_denominator = effective_forecast_weights.sum("M", skipna=True)
+
+        hindcast_weighted = (
+            (hdcst * effective_hindcast_weights).sum("M", skipna=True)
+            / hindcast_denominator
+        ).where(hindcast_denominator > 0)
+        forecast_weighted = (
+            (fcst * effective_forecast_weights).sum("M", skipna=True)
+            / forecast_denominator
+        ).where(forecast_denominator > 0)
+
         if complete:
-            n_models = len(model_names)
-            hindcast_unweighted = hindcast_sum / n_models
-            forecast_unweighted = forecast_sum / n_models
-            
-            # Identify missing areas in the weighted estimates
-            mask_hd = xr.where(np.isnan(hindcast_weighted), 1, 0)
-            mask_fc = xr.where(np.isnan(forecast_weighted), 1, 0)
-            
-            hindcast_weighted = hindcast_weighted.fillna(0) + hindcast_unweighted * mask_hd
-            forecast_weighted = forecast_weighted.fillna(0) + forecast_unweighted * mask_fc
+            hindcast_unweighted = hdcst.where(valid_hindcast_vector).mean(
+                "M", skipna=True
+            )
+            forecast_unweighted = fcst.where(valid_forecast_vector).mean(
+                "M", skipna=True
+            )
+            hindcast_weighted = hindcast_weighted.fillna(hindcast_unweighted)
+            forecast_weighted = forecast_weighted.fillna(forecast_unweighted)
 
-        # --- Drop the 'M' dimension if present ---
-        if "M" in hindcast_weighted.coords:
-            hindcast_weighted = hindcast_weighted.drop_vars('M')
-        if "M" in forecast_weighted.coords:
-            forecast_weighted = forecast_weighted.drop_vars('M')
-        
-        return (hindcast_weighted * mask).transpose("probability", "T", "Y", "X"), (forecast_weighted * mask).transpose("probability", "T", "Y", "X")
+        if self.normalize_probabilities:
+            hindcast_weighted = self._normalise_probability_vectors(
+                hindcast_weighted
+            )
+            forecast_weighted = self._normalise_probability_vectors(
+                forecast_weighted
+            )
+
+        hindcast_weighted = self._as_probability_output(
+            hindcast_weighted.where(spatial_mask.notnull()),
+            "hindcast_weighted",
+        )
+        forecast_weighted = self._as_probability_output(
+            forecast_weighted.where(spatial_mask.notnull()),
+            "forecast_weighted",
+        )
+        return hindcast_weighted, forecast_weighted
+
+
 class WAS_Min2009_ProbWeighted:
     """
     Min et al. (2009) Probability-Weighted Multi-Model Ensemble (PMME).
@@ -1473,6 +2873,97 @@ class WAS_Min2009_ProbWeighted:
             raise ValueError(f"{name}: missing required dims {missing}. Got dims={da.dims}")
 
     @staticmethod
+    def _normalise_dimension_coordinate(
+        da: xr.DataArray,
+        dim: str,
+        name: str = "DataArray",
+    ) -> xr.DataArray:
+        """Ensure that a dimension coordinate is strictly one-dimensional.
+
+        ``xr.concat`` may promote a coordinate such as ``T`` to ``(M, T)``
+        when models carry slightly different coordinate metadata.  Such an
+        auxiliary coordinate cannot be used as the ``dim`` argument of a
+        later ``xr.concat``.  This helper recovers a common 1-D coordinate
+        when possible and otherwise installs a positional index.
+        """
+        if dim not in da.dims:
+            return da
+
+        n = int(da.sizes[dim])
+        coord = da.coords.get(dim)
+
+        if coord is not None and coord.dims == (dim,) and coord.size == n:
+            return da
+
+        recovered = None
+        if coord is not None and dim in coord.dims:
+            try:
+                other_dims = [d for d in coord.dims if d != dim]
+                matrix = (
+                    coord.transpose(dim, *other_dims)
+                    .values
+                    .reshape(n, -1)
+                )
+                first = matrix[:, 0]
+                same = (matrix == first[:, None])
+                try:
+                    same = same | (
+                        pd.isna(matrix) & pd.isna(first[:, None])
+                    )
+                except Exception:
+                    pass
+                if bool(np.all(same)):
+                    recovered = first
+            except Exception:
+                recovered = None
+
+        if recovered is None:
+            try:
+                index = da.get_index(dim)
+                if len(index) == n:
+                    recovered = np.asarray(index)
+            except Exception:
+                recovered = None
+
+        if recovered is None or np.asarray(recovered).size != n:
+            warnings.warn(
+                f"{name}: coordinate {dim!r} is not one-dimensional; "
+                "using a positional index.",
+                RuntimeWarning,
+            )
+            recovered = np.arange(n)
+
+        if dim in da.coords:
+            da = da.drop_vars(dim)
+
+        return da.assign_coords(
+            {dim: xr.IndexVariable(dim, np.asarray(recovered))}
+        )
+
+    @classmethod
+    def _normalise_pmme_input(
+        cls,
+        da: xr.DataArray,
+        name: str,
+        require_time: bool,
+    ) -> xr.DataArray:
+        """Validate and standardise PMME forecast/hindcast coordinates."""
+        if not isinstance(da, xr.DataArray):
+            raise TypeError(f"{name} must be an xarray.DataArray.")
+
+        required = ("T", "M") if require_time else ("M",)
+        cls._require_dims(da, required, name=name)
+
+        da = cls._normalise_dimension_coordinate(da, "M", name)
+        if "T" in da.dims:
+            da = cls._normalise_dimension_coordinate(da, "T", name)
+
+        # Keep core dimensions first while preserving arbitrary spatial dims.
+        leading = [d for d in ("T", "M") if d in da.dims]
+        trailing = [d for d in da.dims if d not in leading]
+        return da.transpose(*(leading + trailing))
+
+    @staticmethod
     def _norm_cdf(z: xr.DataArray) -> xr.DataArray:
         return xr.apply_ufunc(stats.norm.cdf, z)
 
@@ -1491,12 +2982,29 @@ class WAS_Min2009_ProbWeighted:
         return p_bn, p_nn, p_an
 
     def _compute_model_weights(self, ensemble_sizes: Dict[str, int]) -> Dict[str, float]:
-        """w_m = sqrt(N_m) / sum_k sqrt(N_k)  [Min 2009 eq. 1]"""
-        sqrt_sizes = {m: np.sqrt(float(n)) for m, n in ensemble_sizes.items()}
-        tot = float(sum(sqrt_sizes.values()))
-        if tot <= 0:
-            raise ValueError("Sum of sqrt(ensemble_sizes) must be > 0.")
-        return {m: sqrt_sizes[m] / tot for m in ensemble_sizes}
+        """Return Min (2009) weights ``sqrt(N_m) / sum(sqrt(N_k))``."""
+        if not ensemble_sizes:
+            raise ValueError("ensemble_sizes cannot be empty.")
+
+        invalid = {
+            model: size
+            for model, size in ensemble_sizes.items()
+            if not np.isfinite(float(size)) or float(size) <= 0
+        }
+        if invalid:
+            raise ValueError(
+                "Every retained PMME model must have a positive ensemble size. "
+                f"Invalid entries: {invalid}"
+            )
+
+        sqrt_sizes = {
+            model: np.sqrt(float(size))
+            for model, size in ensemble_sizes.items()
+        }
+        total = float(sum(sqrt_sizes.values()))
+        if not np.isfinite(total) or total <= 0:
+            raise ValueError("Sum of sqrt(ensemble_sizes) must be finite and > 0.")
+        return {model: value / total for model, value in sqrt_sizes.items()}
 
     def _compute_n_for_chisq(
         self, ensemble_sizes: Dict[str, int], model_names: List[str]
@@ -1515,52 +3023,119 @@ class WAS_Min2009_ProbWeighted:
     def _compute_cross_validated_stats(
         self, hindcasts: xr.DataArray
     ) -> Tuple[xr.DataArray, xr.DataArray]:
+        """Compute full-pool or cross-validated hindcast mean and spread.
+
+        The returned cross-validated arrays always carry a genuine 1-D ``T``
+        dimension.  In particular, the method never passes ``hindcasts["T"]``
+        directly to ``xr.concat`` because that coordinate can be promoted to
+        ``(M, T)`` by an earlier multi-model concatenation.
         """
-        Return (mu, sigma) computed from the hindcast pool.
-        cv_method=None -> full pool.
-        cv_method='leave_one_out' / 'rolling_window' -> time-varying stats
-        with the current year withheld.
-        """
-        self._require_dims(hindcasts, ("T", "M"), name="hindcasts")
+        hindcasts = self._normalise_pmme_input(
+            hindcasts, name="hindcasts", require_time=True
+        )
+
+        full_mu = hindcasts.mean(dim=("T", "M"), skipna=True)
+        full_sigma = hindcasts.std(dim=("T", "M"), skipna=True)
 
         if self.cv_method is None:
-            mu    = hindcasts.mean(dim=("T", "M"))
-            sigma = hindcasts.std(dim=("T", "M"))
-            return mu, sigma
+            return full_mu, full_sigma
 
-        n_times = hindcasts.sizes["T"]
+        n_times = int(hindcasts.sizes["T"])
+        if n_times < 2:
+            warnings.warn(
+                "Cross-validated PMME statistics require at least two T values; "
+                "using full-pool statistics.",
+                RuntimeWarning,
+            )
+            return full_mu, full_sigma
+
+        time_values = np.asarray(hindcasts["T"].values)
+        mu_list: List[xr.DataArray] = []
+        sigma_list: List[xr.DataArray] = []
 
         if self.cv_method == "leave_one_out":
-            mu_list, sig_list = [], []
+            all_indices = np.arange(n_times)
             for i in range(n_times):
-                h_train = hindcasts.isel(T=[j for j in range(n_times) if j != i])
-                mu_list.append(h_train.mean(dim=("T", "M")))
-                sig_list.append(h_train.std(dim=("T", "M")))
-            return (
-                xr.concat(mu_list,  dim=hindcasts["T"]),
-                xr.concat(sig_list, dim=hindcasts["T"]),
+                train_indices = all_indices[all_indices != i]
+                h_train = hindcasts.isel(T=train_indices)
+                mu_list.append(h_train.mean(dim=("T", "M"), skipna=True))
+                sigma_list.append(h_train.std(dim=("T", "M"), skipna=True))
+
+        elif self.cv_method == "rolling_window":
+            window = max(2, int(self.rolling_window_size))
+            half = window // 2
+            all_indices = np.arange(n_times)
+
+            for i in range(n_times):
+                start = max(0, i - half)
+                stop = min(n_times, i + half + 1)
+                train_indices = all_indices[start:stop]
+                train_indices = train_indices[train_indices != i]
+
+                # Edge windows can contain only the withheld year.  Fall back
+                # to leave-one-out over the complete period in that case.
+                if train_indices.size == 0:
+                    train_indices = all_indices[all_indices != i]
+
+                h_train = hindcasts.isel(T=train_indices)
+                mu_list.append(h_train.mean(dim=("T", "M"), skipna=True))
+                sigma_list.append(h_train.std(dim=("T", "M"), skipna=True))
+
+        else:
+            raise ValueError(
+                f"Unknown cv_method={self.cv_method!r}. "
+                "Choose None, 'leave_one_out', or 'rolling_window'."
             )
 
-        if self.cv_method == "rolling_window":
-            w = self.rolling_window_size
-            mu_list, sig_list = [], []
-            for i in range(n_times):
-                start = max(0, i - w // 2)
-                end   = min(n_times, i + w // 2 + 1)
-                h_win = hindcasts.isel(T=slice(start, end))
-                local_i = i - start
-                if 0 <= local_i < h_win.sizes["T"]:
-                    h_train = h_win.isel(T=[j for j in range(h_win.sizes["T"]) if j != local_i])
-                else:
-                    h_train = h_win
-                mu_list.append(h_train.mean(dim=("T", "M")))
-                sig_list.append(h_train.std(dim=("T", "M")))
-            return (
-                xr.concat(mu_list,  dim=hindcasts["T"]),
-                xr.concat(sig_list, dim=hindcasts["T"]),
-            )
+        concat_kwargs = {
+            "dim": "T",
+            "coords": "minimal",
+            "compat": "override",
+            "join": "exact",
+            "combine_attrs": "drop_conflicts",
+        }
+        mu = xr.concat(mu_list, **concat_kwargs)
+        sigma = xr.concat(sigma_list, **concat_kwargs)
 
-        raise ValueError(f"Unknown cv_method={self.cv_method!r}")
+        # Assign the time labels only after positional concatenation.
+        time_index = xr.IndexVariable("T", time_values)
+        mu = mu.assign_coords(T=time_index)
+        sigma = sigma.assign_coords(T=time_index)
+        return mu, sigma
+
+    @staticmethod
+    def _time_values_are_datetime(values) -> bool:
+        """Return True when an array uses a NumPy/Pandas datetime dtype."""
+        try:
+            return bool(np.issubdtype(np.asarray(values).dtype, np.datetime64))
+        except TypeError:
+            return False
+
+    @classmethod
+    def _time_labels_contained(cls, target_values, stats_values) -> bool:
+        """Compare time labels without mixing incompatible NumPy dtypes.
+
+        ``np.isin`` raises ``DTypePromotionError`` when one side is datetime64
+        and the other is integer.  A dtype mismatch means the labels are not
+        directly comparable; the caller can then use positional alignment or
+        the full climatology fallback.
+        """
+        target_values = np.asarray(target_values)
+        stats_values = np.asarray(stats_values)
+
+        target_is_dt = cls._time_values_are_datetime(target_values)
+        stats_is_dt = cls._time_values_are_datetime(stats_values)
+
+        if target_is_dt != stats_is_dt:
+            return False
+
+        try:
+            if target_is_dt:
+                target_values = target_values.astype("datetime64[ns]")
+                stats_values = stats_values.astype("datetime64[ns]")
+            return bool(np.all(np.isin(target_values, stats_values)))
+        except (TypeError, ValueError, np.exceptions.DTypePromotionError):
+            return False
 
     def _align_stats(
         self,
@@ -1569,31 +3144,71 @@ class WAS_Min2009_ProbWeighted:
         target: xr.DataArray,
         hindcasts: xr.DataArray,
     ) -> Tuple[xr.DataArray, xr.DataArray]:
+        """Align climatological statistics to a hindcast or forecast target.
+
+        Rules
+        -----
+        1. Matching, comparable labels are selected by label.
+        2. If the target spans the complete hindcast period but labels were
+           degraded to positional integers, align by position and restore the
+           target labels.
+        3. For an operational forecast outside the hindcast period, use the
+           full-pool hindcast climatology.  This is the appropriate PMME
+           fallback and avoids comparing datetime64 labels with integer labels.
         """
-        Broadcast mu/sigma to match target and replace degenerate sigma values
-        with the raw full-hindcast sigma (never NaN).
+        hindcasts = self._normalise_pmme_input(
+            hindcasts, name="hindcasts", require_time=True
+        )
+        if "T" in target.dims:
+            target = self._normalise_dimension_coordinate(target, "T", "target")
 
-        FIX: the original set degenerate sigma to NaN, propagating silence.
-        We fall back to the raw hindcast sigma instead.
-        """
-        # raw full-hindcast sigma as safe fallback
-        sigma_raw = hindcasts.std(dim=("T", "M"))
+        mu_full = hindcasts.mean(dim=("T", "M"), skipna=True)
+        sigma_raw = hindcasts.std(dim=("T", "M"), skipna=True)
 
-        # if cv stats have a T dim and the forecast T doesn't overlap
-        # (operational run outside the hindcast period) -> use full-pool stats
-        if "T" in mu.dims and "T" in target.dims:
-            overlap = np.intersect1d(mu["T"].values, target["T"].values)
-            if overlap.size == 0:
-                mu       = hindcasts.mean(dim=("T", "M"))
-                sigma    = sigma_raw.copy()
+        if "T" in mu.dims:
+            mu = self._normalise_dimension_coordinate(mu, "T", "mu")
+            sigma = self._normalise_dimension_coordinate(sigma, "T", "sigma")
 
-        # replace any floor-or-below sigma with the raw fallback (not NaN)
-        sigma = xr.where(sigma > self.sigma_floor, sigma, sigma_raw)
+            if "T" not in target.dims:
+                mu, sigma = mu_full, sigma_raw
+            else:
+                stats_values = np.asarray(mu["T"].values)
+                target_values = np.asarray(target["T"].values)
 
-        # broadcast to target shape
-        mu    = mu.broadcast_like(target)
-        sigma = sigma.broadcast_like(target)
-        return mu, sigma
+                if self._time_labels_contained(target_values, stats_values):
+                    # Select with a plain IndexVariable so xarray does not
+                    # propagate unrelated coordinates from target.
+                    selector = xr.IndexVariable("T", target_values)
+                    mu = mu.sel(T=selector)
+                    sigma = sigma.sel(T=selector)
+
+                elif (
+                    int(mu.sizes.get("T", -1)) == int(target.sizes.get("T", -2))
+                    and int(target.sizes.get("T", -2))
+                    == int(hindcasts.sizes.get("T", -3))
+                ):
+                    # Cross-validated hindcast case: same sequence length, but
+                    # one side lost its datetime labels during concatenation.
+                    # The arrays are already in the same temporal order.
+                    target_index = xr.IndexVariable("T", target_values)
+                    mu = mu.assign_coords(T=target_index)
+                    sigma = sigma.assign_coords(T=target_index)
+
+                else:
+                    # Operational forecast or otherwise non-overlapping time.
+                    # Full-pool hindcast climatology is intentionally timeless
+                    # and broadcasts cleanly to the forecast target.
+                    mu, sigma = mu_full, sigma_raw
+
+        sigma = xr.where(
+            np.isfinite(sigma) & (sigma > self.sigma_floor),
+            sigma,
+            sigma_raw,
+        )
+
+        mu, _ = xr.broadcast(mu, target)
+        sigma, _ = xr.broadcast(sigma, target)
+        return mu.transpose(*target.dims), sigma.transpose(*target.dims)
 
     def _forecast_sigma(
         self, forecasts: xr.DataArray, sigma_hcst: xr.DataArray
@@ -1636,8 +3251,17 @@ class WAS_Min2009_ProbWeighted:
         Probability: fraction of FORECAST MEMBERS below q33 / above q66
                      [BUG 2 FIX — original used ensemble mean → 0/1 only].
         """
-        self._require_dims(forecasts, ("M",),        name="forecasts")
-        self._require_dims(hindcasts, ("T", "M"),    name="hindcasts")
+        forecasts = self._normalise_pmme_input(
+            forecasts, name="forecasts", require_time=False
+        )
+        hindcasts = self._normalise_pmme_input(
+            hindcasts, name="hindcasts", require_time=True
+        )
+
+        if int(forecasts.sizes["M"]) < 1:
+            raise ValueError("forecasts contains no ensemble member.")
+        if int(hindcasts.sizes["M"]) < 1:
+            raise ValueError("hindcasts contains no ensemble member.")
 
         # quantile z-scores for theoretical tercile boundaries
         z_lo = float(stats.norm.ppf(1.0 / 3.0))   # ≈ -0.4307
@@ -1710,59 +3334,102 @@ class WAS_Min2009_ProbWeighted:
         self,
         forecasts: Dict[str, xr.DataArray],
         hindcasts: Dict[str, xr.DataArray],
-        climatology: Optional[xr.DataArray] = None,   # kept for pipeline compat
+        climatology: Optional[xr.DataArray] = None,
         ensemble_sizes: Optional[Dict[str, int]] = None,
         strict_models: bool = True,
     ) -> Dict[str, xr.DataArray]:
-        """
-        Compute PMME probabilities (PB / PN / PA) across models.
+        """Compute Min (2009) probability-weighted tercile probabilities."""
+        if not isinstance(forecasts, dict) or not isinstance(hindcasts, dict):
+            raise TypeError("forecasts and hindcasts must be dictionaries.")
 
-        Parameters
-        ----------
-        forecasts      : {model_name: DataArray(M, [spatial...])}
-        hindcasts      : {model_name: DataArray(T, M, [spatial...])}
-        climatology    : unused (kept for pipeline compatibility)
-        ensemble_sizes : {model_name: int}  defaults to forecasts[m].sizes['M']
-        strict_models  : if True, require forecasts and hindcasts to have the
-                         same keys.
-
-        Returns
-        -------
-        dict with keys 'PB', 'PN', 'PA'  (each a DataArray over spatial dims).
-        """
-        if strict_models and set(forecasts.keys()) != set(hindcasts.keys()):
+        if strict_models and set(forecasts) != set(hindcasts):
+            missing_forecasts = sorted(set(hindcasts) - set(forecasts))
+            missing_hindcasts = sorted(set(forecasts) - set(hindcasts))
             raise ValueError(
-                "forecasts and hindcasts must have the same model keys "
-                "when strict_models=True."
+                "forecasts and hindcasts must have identical keys when "
+                f"strict_models=True. Missing forecasts={missing_forecasts}; "
+                f"missing hindcasts={missing_hindcasts}."
             )
 
-        model_names = [m for m in forecasts if m in hindcasts]
-        if not model_names:
+        common_models = [model for model in forecasts if model in hindcasts]
+        if not common_models:
             raise ValueError("No common models between forecasts and hindcasts.")
 
-        if ensemble_sizes is None:
-            ensemble_sizes = {m: int(forecasts[m].sizes["M"]) for m in model_names}
+        cleaned_forecasts: Dict[str, xr.DataArray] = {}
+        cleaned_hindcasts: Dict[str, xr.DataArray] = {}
+        retained_sizes: Dict[str, int] = {}
 
-        weights = self._compute_model_weights(ensemble_sizes)
-
-        # per-model probabilities
-        per_model: Dict[str, Dict[str, xr.DataArray]] = {}
-        for m in model_names:
-            p_bn, p_nn, p_an = self._compute_tercile_probabilities_one_model(
-                forecasts[m], hindcasts[m]
+        for model in common_models:
+            forecast = self._normalise_pmme_input(
+                forecasts[model], f"forecasts[{model!r}]", require_time=False
             )
-            per_model[m] = {"PB": p_bn, "PN": p_nn, "PA": p_an}
+            hindcast = self._normalise_pmme_input(
+                hindcasts[model], f"hindcasts[{model!r}]", require_time=True
+            )
 
-        # weighted combination
-        template = per_model[model_names[0]]["PB"]
+            actual_size = min(
+                int(forecast.sizes["M"]),
+                int(hindcast.sizes["M"]),
+            )
+            requested_size = (
+                int(ensemble_sizes[model])
+                if ensemble_sizes is not None and model in ensemble_sizes
+                else actual_size
+            )
+            effective_size = min(actual_size, requested_size)
+
+            if effective_size <= 0:
+                warnings.warn(
+                    f"PMME model {model!r} has no usable ensemble member and "
+                    "will be ignored.",
+                    RuntimeWarning,
+                )
+                continue
+
+            cleaned_forecasts[model] = forecast
+            cleaned_hindcasts[model] = hindcast
+            retained_sizes[model] = effective_size
+
+        model_names = list(cleaned_forecasts)
+        if not model_names:
+            raise ValueError("No PMME model contains at least one usable member.")
+
+        weights = self._compute_model_weights(retained_sizes)
+
+        per_model: Dict[str, Dict[str, xr.DataArray]] = {}
+        for model in model_names:
+            p_bn, p_nn, p_an = self._compute_tercile_probabilities_one_model(
+                cleaned_forecasts[model], cleaned_hindcasts[model]
+            )
+            per_model[model] = {"PB": p_bn, "PN": p_nn, "PA": p_an}
+
+        # Renormalise the model weights locally when a model probability is
+        # missing at a particular time/grid cell.
         pmme: Dict[str, xr.DataArray] = {}
-        for cat in ("PB", "PN", "PA"):
-            wsum = xr.zeros_like(template)
-            for m in model_names:
-                wsum = wsum + per_model[m][cat] * float(weights[m])
-            pmme[cat] = wsum
+        for category in ("PB", "PN", "PA"):
+            numerator = None
+            denominator = None
 
-        # final clip & renorm
+            for model in model_names:
+                probability = per_model[model][category]
+                weight = float(weights[model])
+                valid = probability.notnull()
+                contribution = probability.fillna(0.0) * weight
+                valid_weight = xr.where(valid, weight, 0.0)
+
+                numerator = (
+                    contribution if numerator is None else numerator + contribution
+                )
+                denominator = (
+                    valid_weight if denominator is None else denominator + valid_weight
+                )
+
+            pmme[category] = xr.where(
+                denominator > 0.0,
+                numerator / denominator,
+                np.nan,
+            )
+
         pmme["PB"], pmme["PN"], pmme["PA"] = self._safe_clip_and_renorm(
             pmme["PB"], pmme["PN"], pmme["PA"]
         )
@@ -1824,6 +3491,434 @@ class WAS_Min2009_ProbWeighted:
             "n_samples_used": float(n),
         }
         return combined, chi_square
+
+
+# class WAS_Min2009_ProbWeighted:
+#     """
+#     Min et al. (2009) Probability-Weighted Multi-Model Ensemble (PMME).
+
+#     What this class does
+#     --------------------
+#     1) For each model compute tercile probabilities (PB / PN / PA) at every
+#        grid point from its ensemble forecast using one of three distributions:
+
+#        * 'gaussian'  : Gaussian approximation.
+#                        Boundaries  : T_lo/hi = mu_hcst ± 0.4307 * sigma_hcst
+#                        Probability : Phi( (T_lo/hi - f_mean) / sigma_FORECAST )
+#                        sigma_FORECAST = std of the current forecast ensemble.
+
+#        * 'lognormal' : Same logic in log-space (better for precipitation).
+#                        eps_lognormal is added before taking logs.
+
+#        * 'empirical' : Category boundaries are the hindcast q33/q66.
+#                        Probability = fraction of forecast ensemble members
+#                        below q33 / above q66.
+
+#     2) Combine per-model probabilities with weights w_m ∝ sqrt(N_m) (Min 2009
+#        eq. 1), normalised to sum to 1.
+
+#     3) Optionally compute a combined categorical map with a chi-square
+#        significance test (Min 2009 section 3b, df = 2).
+
+#     Assumed dims
+#     ------------
+#     forecasts[m] : at minimum dim 'M' (ensemble members); spatial dims optional.
+#     hindcasts[m] : dims 'T' (years) and 'M' (members); same spatial dims.
+
+#     Parameters
+#     ----------
+#     distribution : 'gaussian' | 'lognormal' | 'empirical'
+#     cv_method    : None | 'leave_one_out' | 'rolling_window'
+#         How to compute climatological mu / sigma from the hindcast pool.
+#         None -> use the full hindcast pool (no cross-validation).
+#     rolling_window_size : int
+#         Half-width of the rolling window when cv_method='rolling_window'.
+#     n_samples_for_chisq : 'total_ensemble' | 'effective_sample_size' | float
+#         How to compute N for the chi-square test.
+#     eps_lognormal : float
+#         Small offset added before log transform (lognormal path only).
+#     sigma_floor : float
+#         Any sigma <= this value is replaced by the full-hindcast raw sigma.
+#     """
+
+#     def __init__(
+#         self,
+#         distribution: Literal["gaussian", "lognormal", "empirical"] = "gaussian",
+#         cv_method: Optional[Literal["leave_one_out", "rolling_window"]] = None,
+#         rolling_window_size: int = 15,
+#         n_samples_for_chisq: Literal["total_ensemble", "effective_sample_size"] | float | int = "total_ensemble",
+#         eps_lognormal: float = 1e-2,
+#         sigma_floor: float = 1e-12,
+#     ):
+#         self.distribution = distribution
+#         self.cv_method = cv_method
+#         self.rolling_window_size = int(rolling_window_size)
+#         self.n_samples_for_chisq = n_samples_for_chisq
+#         self.eps_lognormal = float(eps_lognormal)
+#         self.sigma_floor = float(sigma_floor)
+
+#     # ------------------------------------------------------------------
+#     # internal helpers
+#     # ------------------------------------------------------------------
+
+#     @staticmethod
+#     def _require_dims(da: xr.DataArray, required: Tuple[str, ...], name: str = "DataArray") -> None:
+#         missing = [d for d in required if d not in da.dims]
+#         if missing:
+#             raise ValueError(f"{name}: missing required dims {missing}. Got dims={da.dims}")
+
+#     @staticmethod
+#     def _norm_cdf(z: xr.DataArray) -> xr.DataArray:
+#         return xr.apply_ufunc(stats.norm.cdf, z)
+
+#     @staticmethod
+#     def _safe_clip_and_renorm(
+#         p_bn: xr.DataArray, p_nn: xr.DataArray, p_an: xr.DataArray
+#     ) -> Tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
+#         p_bn = p_bn.clip(0.0, 1.0)
+#         p_nn = p_nn.clip(0.0, 1.0)
+#         p_an = p_an.clip(0.0, 1.0)
+#         total = p_bn + p_nn + p_an
+#         ok = xr.apply_ufunc(np.isfinite, total) & (total > 0.0)
+#         p_bn = xr.where(ok, p_bn / total, np.nan)
+#         p_nn = xr.where(ok, p_nn / total, np.nan)
+#         p_an = xr.where(ok, p_an / total, np.nan)
+#         return p_bn, p_nn, p_an
+
+#     def _compute_model_weights(self, ensemble_sizes: Dict[str, int]) -> Dict[str, float]:
+#         """w_m = sqrt(N_m) / sum_k sqrt(N_k)  [Min 2009 eq. 1]"""
+#         sqrt_sizes = {m: np.sqrt(float(n)) for m, n in ensemble_sizes.items()}
+#         tot = float(sum(sqrt_sizes.values()))
+#         if tot <= 0:
+#             raise ValueError("Sum of sqrt(ensemble_sizes) must be > 0.")
+#         return {m: sqrt_sizes[m] / tot for m in ensemble_sizes}
+
+#     def _compute_n_for_chisq(
+#         self, ensemble_sizes: Dict[str, int], model_names: List[str]
+#     ) -> float:
+#         total = float(sum(float(ensemble_sizes[m]) for m in model_names))
+#         if isinstance(self.n_samples_for_chisq, (int, float)):
+#             return float(self.n_samples_for_chisq)
+#         if self.n_samples_for_chisq == "effective_sample_size":
+#             return total / np.sqrt(max(1, len(model_names)))
+#         return total  # "total_ensemble"
+
+#     # ------------------------------------------------------------------
+#     # cross-validated climatological stats (mu, sigma from hindcasts)
+#     # ------------------------------------------------------------------
+
+#     def _compute_cross_validated_stats(
+#         self, hindcasts: xr.DataArray
+#     ) -> Tuple[xr.DataArray, xr.DataArray]:
+#         """
+#         Return (mu, sigma) computed from the hindcast pool.
+#         cv_method=None -> full pool.
+#         cv_method='leave_one_out' / 'rolling_window' -> time-varying stats
+#         with the current year withheld.
+#         """
+#         self._require_dims(hindcasts, ("T", "M"), name="hindcasts")
+
+#         if self.cv_method is None:
+#             mu    = hindcasts.mean(dim=("T", "M"))
+#             sigma = hindcasts.std(dim=("T", "M"))
+#             return mu, sigma
+
+#         n_times = hindcasts.sizes["T"]
+
+#         if self.cv_method == "leave_one_out":
+#             mu_list, sig_list = [], []
+#             for i in range(n_times):
+#                 h_train = hindcasts.isel(T=[j for j in range(n_times) if j != i])
+#                 mu_list.append(h_train.mean(dim=("T", "M")))
+#                 sig_list.append(h_train.std(dim=("T", "M")))
+#             return (
+#                 xr.concat(mu_list,  dim=hindcasts["T"]),
+#                 xr.concat(sig_list, dim=hindcasts["T"]),
+#             )
+
+#         if self.cv_method == "rolling_window":
+#             w = self.rolling_window_size
+#             mu_list, sig_list = [], []
+#             for i in range(n_times):
+#                 start = max(0, i - w // 2)
+#                 end   = min(n_times, i + w // 2 + 1)
+#                 h_win = hindcasts.isel(T=slice(start, end))
+#                 local_i = i - start
+#                 if 0 <= local_i < h_win.sizes["T"]:
+#                     h_train = h_win.isel(T=[j for j in range(h_win.sizes["T"]) if j != local_i])
+#                 else:
+#                     h_train = h_win
+#                 mu_list.append(h_train.mean(dim=("T", "M")))
+#                 sig_list.append(h_train.std(dim=("T", "M")))
+#             return (
+#                 xr.concat(mu_list,  dim=hindcasts["T"]),
+#                 xr.concat(sig_list, dim=hindcasts["T"]),
+#             )
+
+#         raise ValueError(f"Unknown cv_method={self.cv_method!r}")
+
+#     def _align_stats(
+#         self,
+#         mu: xr.DataArray,
+#         sigma: xr.DataArray,
+#         target: xr.DataArray,
+#         hindcasts: xr.DataArray,
+#     ) -> Tuple[xr.DataArray, xr.DataArray]:
+#         """
+#         Broadcast mu/sigma to match target and replace degenerate sigma values
+#         with the raw full-hindcast sigma (never NaN).
+
+#         FIX: the original set degenerate sigma to NaN, propagating silence.
+#         We fall back to the raw hindcast sigma instead.
+#         """
+#         # raw full-hindcast sigma as safe fallback
+#         sigma_raw = hindcasts.std(dim=("T", "M"))
+
+#         # if cv stats have a T dim and the forecast T doesn't overlap
+#         # (operational run outside the hindcast period) -> use full-pool stats
+#         if "T" in mu.dims and "T" in target.dims:
+#             overlap = np.intersect1d(mu["T"].values, target["T"].values)
+#             if overlap.size == 0:
+#                 mu       = hindcasts.mean(dim=("T", "M"))
+#                 sigma    = sigma_raw.copy()
+
+#         # replace any floor-or-below sigma with the raw fallback (not NaN)
+#         sigma = xr.where(sigma > self.sigma_floor, sigma, sigma_raw)
+
+#         # broadcast to target shape
+#         mu    = mu.broadcast_like(target)
+#         sigma = sigma.broadcast_like(target)
+#         return mu, sigma
+
+#     def _forecast_sigma(
+#         self, forecasts: xr.DataArray, sigma_hcst: xr.DataArray
+#     ) -> xr.DataArray:
+#         """
+#         Standard deviation of the current forecast ensemble.
+#         Falls back to sigma_hcst where the forecast ensemble collapses
+#         (single member or zero spread).
+#         """
+#         sig_f = forecasts.std(dim="M")
+#         # where forecast is degenerate, borrow the hindcast spread
+#         sig_f = xr.where(sig_f > self.sigma_floor, sig_f, sigma_hcst)
+#         return sig_f
+
+#     # ------------------------------------------------------------------
+#     # per-model probability computation (CORRECTED)
+#     # ------------------------------------------------------------------
+
+#     def _compute_tercile_probabilities_one_model(
+#         self,
+#         forecasts: xr.DataArray,
+#         hindcasts: xr.DataArray,
+#     ) -> Tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
+#         """
+#         Compute PB / PN / PA for a single model.
+
+#         Gaussian & lognormal
+#         --------------------
+#         Category boundaries come from the HINDCAST climatology:
+#             T_lower = mu_hcst + z_{1/3} * sigma_hcst   (= mu - 0.4307*sigma)
+#             T_upper = mu_hcst + z_{2/3} * sigma_hcst   (= mu + 0.4307*sigma)
+
+#         Probabilities use the FORECAST ENSEMBLE spread  [BUG 1 FIX]:
+#             P(BN) = Phi( (T_lower - f_mean) / sigma_FORECAST )
+#             P(AN) = 1 - Phi( (T_upper - f_mean) / sigma_FORECAST )
+
+#         Empirical
+#         ---------
+#         Boundaries : q33 / q66 from all hindcast members.
+#         Probability: fraction of FORECAST MEMBERS below q33 / above q66
+#                      [BUG 2 FIX — original used ensemble mean → 0/1 only].
+#         """
+#         self._require_dims(forecasts, ("M",),        name="forecasts")
+#         self._require_dims(hindcasts, ("T", "M"),    name="hindcasts")
+
+#         # quantile z-scores for theoretical tercile boundaries
+#         z_lo = float(stats.norm.ppf(1.0 / 3.0))   # ≈ -0.4307
+#         z_hi = float(stats.norm.ppf(2.0 / 3.0))   # ≈ +0.4307
+
+#         f_mean = forecasts.mean(dim="M")
+
+#         # ---- Gaussian ------------------------------------------------
+#         if self.distribution == "gaussian":
+#             mu, sigma_hcst = self._compute_cross_validated_stats(hindcasts)
+#             mu, sigma_hcst = self._align_stats(mu, sigma_hcst, f_mean, hindcasts)
+
+#             # category boundaries from hindcast climatology
+#             T_lower = mu + z_lo * sigma_hcst
+#             T_upper = mu + z_hi * sigma_hcst
+
+#             # 1: use FORECAST ensemble spread, not hindcast sigma
+#             sigma_f = self._forecast_sigma(forecasts, sigma_hcst)
+
+#             p_bn = self._norm_cdf((T_lower - f_mean) / sigma_f)
+#             p_an = 1.0 - self._norm_cdf((T_upper - f_mean) / sigma_f)
+#             p_nn = 1.0 - p_bn - p_an
+#             return self._safe_clip_and_renorm(p_bn, p_nn, p_an)
+
+#         # ---- Lognormal -----------------------------------------------
+#         if self.distribution == "lognormal":
+#             eps = self.eps_lognormal
+
+#             h_log = np.log(xr.where(hindcasts > 0, hindcasts, eps))
+#             f_log = np.log(xr.where(forecasts  > 0, forecasts,  eps))
+
+#             f_log_mean = f_log.mean(dim="M")
+
+#             mu_l, sigma_hcst_l = self._compute_cross_validated_stats(h_log)
+#             mu_l, sigma_hcst_l = self._align_stats(mu_l, sigma_hcst_l, f_log_mean, h_log)
+
+#             # category boundaries in log-space
+#             T_lower_l = mu_l + z_lo * sigma_hcst_l
+#             T_upper_l = mu_l + z_hi * sigma_hcst_l
+
+#             # 1 (lognormal): use FORECAST log-space spread
+#             sigma_f_l = self._forecast_sigma(f_log, sigma_hcst_l)
+
+#             p_bn = self._norm_cdf((T_lower_l - f_log_mean) / sigma_f_l)
+#             p_an = 1.0 - self._norm_cdf((T_upper_l - f_log_mean) / sigma_f_l)
+#             p_nn = 1.0 - p_bn - p_an
+#             return self._safe_clip_and_renorm(p_bn, p_nn, p_an)
+
+#         # ---- Empirical -----------------------------------------------
+#         if self.distribution == "empirical":
+#             q33 = hindcasts.quantile(1.0 / 3.0, dim=("T", "M")).drop_vars("quantile", errors="ignore")
+#             q66 = hindcasts.quantile(2.0 / 3.0, dim=("T", "M")).drop_vars("quantile", errors="ignore")
+
+#             # 2: count ENSEMBLE MEMBERS, not just compare the mean
+#             p_bn = (forecasts < q33).mean(dim="M").astype(float)
+#             p_an = (forecasts > q66).mean(dim="M").astype(float)
+#             p_nn = 1.0 - p_bn - p_an
+#             return self._safe_clip_and_renorm(p_bn, p_nn, p_an)
+
+#         raise ValueError(
+#             f"Unknown distribution={self.distribution!r}. "
+#             "Choose 'gaussian', 'lognormal', or 'empirical'."
+#         )
+
+#     # ------------------------------------------------------------------
+#     # public API
+#     # ------------------------------------------------------------------
+
+#     def compute_pmme_probabilities(
+#         self,
+#         forecasts: Dict[str, xr.DataArray],
+#         hindcasts: Dict[str, xr.DataArray],
+#         climatology: Optional[xr.DataArray] = None,   # kept for pipeline compat
+#         ensemble_sizes: Optional[Dict[str, int]] = None,
+#         strict_models: bool = True,
+#     ) -> Dict[str, xr.DataArray]:
+#         """
+#         Compute PMME probabilities (PB / PN / PA) across models.
+
+#         Parameters
+#         ----------
+#         forecasts      : {model_name: DataArray(M, [spatial...])}
+#         hindcasts      : {model_name: DataArray(T, M, [spatial...])}
+#         climatology    : unused (kept for pipeline compatibility)
+#         ensemble_sizes : {model_name: int}  defaults to forecasts[m].sizes['M']
+#         strict_models  : if True, require forecasts and hindcasts to have the
+#                          same keys.
+
+#         Returns
+#         -------
+#         dict with keys 'PB', 'PN', 'PA'  (each a DataArray over spatial dims).
+#         """
+#         if strict_models and set(forecasts.keys()) != set(hindcasts.keys()):
+#             raise ValueError(
+#                 "forecasts and hindcasts must have the same model keys "
+#                 "when strict_models=True."
+#             )
+
+#         model_names = [m for m in forecasts if m in hindcasts]
+#         if not model_names:
+#             raise ValueError("No common models between forecasts and hindcasts.")
+
+#         if ensemble_sizes is None:
+#             ensemble_sizes = {m: int(forecasts[m].sizes["M"]) for m in model_names}
+
+#         weights = self._compute_model_weights(ensemble_sizes)
+
+#         # per-model probabilities
+#         per_model: Dict[str, Dict[str, xr.DataArray]] = {}
+#         for m in model_names:
+#             p_bn, p_nn, p_an = self._compute_tercile_probabilities_one_model(
+#                 forecasts[m], hindcasts[m]
+#             )
+#             per_model[m] = {"PB": p_bn, "PN": p_nn, "PA": p_an}
+
+#         # weighted combination
+#         template = per_model[model_names[0]]["PB"]
+#         pmme: Dict[str, xr.DataArray] = {}
+#         for cat in ("PB", "PN", "PA"):
+#             wsum = xr.zeros_like(template)
+#             for m in model_names:
+#                 wsum = wsum + per_model[m][cat] * float(weights[m])
+#             pmme[cat] = wsum
+
+#         # final clip & renorm
+#         pmme["PB"], pmme["PN"], pmme["PA"] = self._safe_clip_and_renorm(
+#             pmme["PB"], pmme["PN"], pmme["PA"]
+#         )
+#         return pmme
+
+#     def compute_combined_map(
+#         self,
+#         pmme_probs: Dict[str, xr.DataArray],
+#         ensemble_sizes: Dict[str, int],
+#         model_names: List[str],
+#         significance_level: float = 0.05,
+#     ) -> Tuple[xr.DataArray, xr.DataArray]:
+#         """
+#         Combined categorical map with chi-square significance test.
+#         [Min 2009, section 3b]
+
+#         Returns
+#         -------
+#         combined_map : DataArray
+#             0 = no significant deviation from equal probabilities,
+#             1 = PB dominant,  2 = PN dominant,  3 = PA dominant.
+#         chi_square : DataArray
+#             chi-square statistic (df = 2).
+#         """
+#         for k in ("PB", "PN", "PA"):
+#             if k not in pmme_probs:
+#                 raise ValueError(f"pmme_probs missing key {k!r}")
+
+#         probs_stack = xr.concat(
+#             [pmme_probs["PB"], pmme_probs["PN"], pmme_probs["PA"]],
+#             dim=xr.DataArray(["PB", "PN", "PA"], dims="probability"),
+#         )
+#         valid_any = probs_stack.notnull().any("probability")
+
+#         # argmax on the three categories (fill NaN with -inf for argmax only)
+#         dominant = probs_stack.fillna(-np.inf).argmax(dim="probability", skipna=False)
+
+#         # chi-square statistic: N * sum_i (p_i - 1/3)^2 / (1/3)
+#         n = self._compute_n_for_chisq(ensemble_sizes, model_names)
+#         expected = 1.0 / 3.0
+#         chi_square = n * (
+#             (pmme_probs["PB"] - expected) ** 2 / expected
+#             + (pmme_probs["PN"] - expected) ** 2 / expected
+#             + (pmme_probs["PA"] - expected) ** 2 / expected
+#         )
+
+#         critical = float(stats.chi2.ppf(1.0 - float(significance_level), df=2))
+#         combined  = xr.where(valid_any & (chi_square > critical), dominant + 1, 0)
+
+#         combined.attrs  = {
+#             "description": "PMME combined forecast (Min et al. 2009 probability-weighted)",
+#             "values": "0=not significant, 1=PB, 2=PN, 3=PA",
+#             "significance_level": float(significance_level),
+#             "chi2_critical_value": critical,
+#         }
+#         chi_square.attrs = {
+#             "description": "Chi-square statistic for PMME categorical significance",
+#             "df": 2,
+#             "n_samples_used": float(n),
+#         }
+#         return combined, chi_square
 
 
 class WAS_mme_xcELR:
