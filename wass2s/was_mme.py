@@ -52,7 +52,7 @@ import random
 import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 # ---------------------------------------------------------
 # 2. Third-Party Core Data Libraries
@@ -272,6 +272,71 @@ def _mean_if_member(da):
     if "M" in da.dims:
         da = da.mean("M", skipna=True)
     return da.transpose("T", "Y", "X")
+
+
+def _ensure_time_index(
+    da,
+    reference=None,
+    *,
+    name="DataArray",
+    allow_positional=False,
+):
+    """Guarantee that ``T`` is a genuine one-dimensional xarray index.
+
+    ``DataArray.T`` is the transpose of the full array, not the ``T`` coordinate.
+    This helper safely recovers a one-dimensional time coordinate from the array
+    itself or from a reference array with the same temporal length.
+    """
+    if not isinstance(da, xr.DataArray):
+        raise TypeError(f"{name} must be an xarray.DataArray.")
+    if "T" not in da.dims:
+        raise ValueError(f"{name} is missing the T dimension; dims={da.dims}.")
+
+    n_time = int(da.sizes["T"])
+    values = None
+
+    if isinstance(reference, xr.DataArray) and "T" in reference.dims:
+        if int(reference.sizes["T"]) != n_time:
+            raise ValueError(
+                f"{name} and reference have different T lengths: "
+                f"{n_time} != {reference.sizes['T']}."
+            )
+        ref_coord = reference.coords.get("T")
+        if ref_coord is not None and ref_coord.dims == ("T",):
+            values = np.asarray(ref_coord.values)
+
+    if values is None:
+        coord = da.coords.get("T")
+        if coord is not None and coord.dims == ("T",):
+            values = np.asarray(coord.values)
+        elif coord is not None and "T" in coord.dims:
+            other_dims = [dim for dim in coord.dims if dim != "T"]
+            matrix = coord.transpose("T", *other_dims).values.reshape(n_time, -1)
+            first = matrix[:, 0]
+            same = matrix == first[:, None]
+            try:
+                same = same | (pd.isna(matrix) & pd.isna(first[:, None]))
+            except Exception:
+                pass
+            if bool(np.all(same)):
+                values = np.asarray(first)
+
+    if values is None:
+        if not allow_positional:
+            coord_dims = None if "T" not in da.coords else da.coords["T"].dims
+            raise ValueError(
+                f"{name}: unable to recover a one-dimensional T coordinate "
+                f"(current coordinate dims={coord_dims})."
+            )
+        values = np.arange(n_time, dtype=int)
+
+    if "T" in da.coords:
+        da = da.drop_vars("T")
+    da = da.assign_coords(T=xr.IndexVariable("T", np.asarray(values)))
+
+    # Force index creation and fail early if xarray still cannot index T.
+    da.get_index("T")
+    return da
 
 # Suppress specific warnings for cleaner output
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -520,7 +585,10 @@ def process_datasets_for_mme(
 
         return score.where(mask.notnull())
 
-    obs = _select_observation(rainfall)
+    obs = _ensure_time_index(
+        _select_observation(rainfall),
+        name="MME observation",
+    )
     mask = xr.where(obs.notnull().any("T"), 1.0, np.nan).transpose("Y", "X")
     mask.name = None
 
@@ -594,8 +662,28 @@ def process_datasets_for_mme(
             probabilistic=Prob,
         )
 
-        if not Prob and hdcst.sizes["T"] == obs.sizes["T"]:
-            hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        if not Prob:
+            if hdcst.sizes["T"] != obs.sizes["T"]:
+                raise ValueError(
+                    f"hindcast[{model_name}] and observation have different T lengths: "
+                    f"{hdcst.sizes['T']} != {obs.sizes['T']}."
+                )
+            hdcst = _ensure_time_index(
+                hdcst,
+                reference=obs,
+                name=f"hindcast[{model_name}]",
+            )
+            hdcst = hdcst.assign_coords(
+                T=xr.IndexVariable(
+                    "T",
+                    np.asarray(obs["T"].values).astype("datetime64[ns]"),
+                )
+            )
+        fcst = _ensure_time_index(
+            fcst,
+            name=f"forecast[{model_name}]",
+            allow_positional=True,
+        )
 
         all_model_hdcst[model_name] = hdcst
         all_model_fcst[model_name] = fcst
@@ -645,6 +733,18 @@ def process_datasets_for_mme(
         hdcst_clim = hdcst_stack.mean("T", skipna=True)
         hdcst_stack = hdcst_stack.fillna(hdcst_clim)
         fcst_stack = fcst_stack.where(mask.notnull()).fillna(hdcst_clim)
+
+    hdcst_stack = _ensure_time_index(
+        hdcst_stack,
+        reference=obs if hdcst_stack.sizes["T"] == obs.sizes["T"] else None,
+        name="MME hindcast stack",
+        allow_positional=False,
+    )
+    fcst_stack = _ensure_time_index(
+        fcst_stack,
+        name="MME forecast stack",
+        allow_positional=True,
+    )
 
     obs_m = (
         obs.where(mask.notnull())
@@ -797,10 +897,10 @@ class WAS_mme_Weighted:
             return forecast
         try:
             forecast_year = int(
-                forecast.T.values[0].astype("datetime64[Y]").astype(int) + 1970
+                forecast["T"].values[0].astype("datetime64[Y]").astype(int) + 1970
             )
             obs_month = int(
-                observation.T.values[0].astype("datetime64[M]").astype(int) % 12 + 1
+                observation["T"].values[0].astype("datetime64[M]").astype(int) % 12 + 1
             )
             new_time = np.datetime64(f"{forecast_year:04d}-{obs_month:02d}-01", "ns")
             if forecast.sizes["T"] == 1:
@@ -892,7 +992,7 @@ class WAS_mme_Weighted:
                 f"hdcst and observation must have the same T length; "
                 f"got {hdcst.sizes['T']} and {obs.sizes['T']}."
             )
-        hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        hdcst = hdcst.assign_coords(T=obs["T"].astype("datetime64[ns]"))
         fcst = self._normalise_forecast_time(fcst, obs)
 
         hdcst = hdcst.interp(
@@ -1261,7 +1361,7 @@ class WAS_mme_Weighted:
             raise ValueError(
                 "hindcast_det and Predictant must have the same number of T values."
             )
-        hindcast_det = hindcast_det.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        hindcast_det = hindcast_det.assign_coords(T=obs["T"].astype("datetime64[ns]"))
         hindcast_det = hindcast_det.interp(
             Y=obs.Y, X=obs.X, method="nearest", kwargs={"fill_value": "extrapolate"}
         )
@@ -1298,7 +1398,7 @@ class WAS_mme_Weighted:
             raise ValueError(
                 "hindcast_det and Predictant must have the same number of T values."
             )
-        hindcast_det = hindcast_det.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        hindcast_det = hindcast_det.assign_coords(T=obs["T"].astype("datetime64[ns]"))
         forecast_det = self._normalise_forecast_time(forecast_det, obs)
         hindcast_det = hindcast_det.interp(
             Y=obs.Y, X=obs.X, method="nearest", kwargs={"fill_value": "extrapolate"}
@@ -1613,7 +1713,7 @@ class WAS_ProbWeighted(WAS_mme_Weighted):
                 f"got {hdcst.sizes['T']} and {obs.sizes['T']}."
             )
 
-        hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        hdcst = hdcst.assign_coords(T=obs["T"].astype("datetime64[ns]"))
         fcst = self._normalise_forecast_time(fcst, obs)
 
         # Forecast model and probability axes must match the hindcast exactly.
@@ -2290,9 +2390,9 @@ class WAS_mme_logistic:
                  n_iter_search=20,
                  n_trials=50,
                  timeout=None,
-                 n_jobs=4,
+                 n_jobs=-1,
                  optuna_n_jobs=None,
-                 cv_n_jobs=1):
+                 cv_n_jobs=-1):
 
         self.optimization_method = optimization_method
         self.C_range = C_range
@@ -2307,7 +2407,7 @@ class WAS_mme_logistic:
             raise ValueError("n_jobs, cv_n_jobs and optuna_n_jobs cannot be 0.")
         self.n_jobs = int(n_jobs)
         self.cv_n_jobs = int(cv_n_jobs)
-        self.optuna_n_jobs = self.n_jobs if optuna_n_jobs is None else int(optuna_n_jobs)
+        self.optuna_n_jobs = 1 if optuna_n_jobs is None else int(optuna_n_jobs)
         self.models = None
         self.best_params_dict = None
         self.cluster_da = None
@@ -2457,8 +2557,18 @@ class WAS_mme_logistic:
         Predictors : (T, M, Y, X) RAW predictor cube.
         Predictand : (T, Y, X) RAW predictand (classes are computed here).
         """
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
+        elif "M" in Predictand.coords:
+            Predictand = Predictand.drop_vars("M")
+        Predictand = _ensure_time_index(
+            Predictand, name=f"{self.__class__.__name__} predictand"
+        )
+        Predictors = _ensure_time_index(
+            Predictors,
+            reference=Predictand,
+            name=f"{self.__class__.__name__} predictors",
+        )
         Predictand.name = "varname"
 
         X_train_std = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
@@ -2584,8 +2694,10 @@ class WAS_mme_logistic:
     def forecast(self, Predictant, clim_year_start, clim_year_end,
                  Predictors_train, Predictor_for_year, best_params=None, cluster_da=None):
         """Operational forecast for a single target year (classes + tercile probabilities)."""
-        if "M" in Predictant.coords:
-            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictant.dims:
+            Predictant_no_m = Predictant.isel(M=0, drop=True)
+        elif "M" in Predictant.coords:
+            Predictant_no_m = Predictant.drop_vars("M")
         else:
             Predictant_no_m = Predictant
 
@@ -3155,9 +3267,9 @@ class WAS_mme_gaussian_process:
         n_random_iter=10,
         n_trials=20,
         timeout=None, 
-        n_jobs=4,
+        n_jobs=-1,
         optuna_n_jobs=None,
-        cv_n_jobs=1,
+        cv_n_jobs=-1,
         warm_start=False,
     ):
         self.random_state = random_state
@@ -3188,7 +3300,7 @@ class WAS_mme_gaussian_process:
             raise ValueError("n_jobs, cv_n_jobs and optuna_n_jobs cannot be 0.")
         self.n_jobs = int(n_jobs)
         self.cv_n_jobs = int(cv_n_jobs)
-        self.optuna_n_jobs = self.n_jobs if optuna_n_jobs is None else int(optuna_n_jobs)
+        self.optuna_n_jobs = 1 if optuna_n_jobs is None else int(optuna_n_jobs)
         self.warm_start = bool(warm_start)
         
         if self.hpo_method == 'bayesian' and not OPTUNA_AVAILABLE:
@@ -3268,9 +3380,20 @@ class WAS_mme_gaussian_process:
 
     def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
         """Computes best hyperparameters. Uses rigorous GroupKFold by Time."""
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
-            
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
+        elif "M" in Predictand.coords:
+            Predictand = Predictand.drop_vars("M")
+
+
+        Predictand = _ensure_time_index(
+            Predictand, name=f"{self.__class__.__name__} predictand"
+        )
+        Predictors = _ensure_time_index(
+            Predictors,
+            reference=Predictand,
+            name=f"{self.__class__.__name__} predictors",
+        )
         X_train_std = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
         
         cluster_da = _build_climate_feature_clusters(
@@ -3437,8 +3560,10 @@ class WAS_mme_gaussian_process:
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, Predictors_train, Predictor_for_year, best_params=None, cluster_da=None):
         """Train on entire history, forecast for 1 new time slice."""
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0, drop=True)
+        elif "M" in Predictant.coords:
+            Predictant = Predictant.drop_vars("M")
 
         verify = WAS_Verification()
         Predictant_cls = verify.compute_class(Predictant, clim_year_start, clim_year_end)
@@ -7426,7 +7551,7 @@ class WAS_mme_FullBMA:
         )
 
 ############################################################
-### think to allow n_jobs as argument in future version
+### allow n_jobs as argument in future version
 
 class WAS_mme_RF:
     """
@@ -7501,9 +7626,9 @@ class WAS_mme_RF:
                  scoring: str = 'neg_mean_squared_error',
                  leave_one_year_out: bool = False,   # ===== 2 =====
                  verbose: int = 0,
-                 n_jobs: int = 4,
+                 n_jobs: int = -1,
                  optuna_n_jobs: Optional[int] = None,
-                 cv_n_jobs: int = 1,
+                 cv_n_jobs: int = -1,
                  tuning_model_n_jobs: int = 1):
 
         self.search_method = search_method
@@ -7534,7 +7659,7 @@ class WAS_mme_RF:
         if tuning_model_n_jobs == 0:
             raise ValueError("tuning_model_n_jobs cannot be 0.")
         self.n_jobs = n_jobs
-        self.optuna_n_jobs = n_jobs if optuna_n_jobs is None else optuna_n_jobs
+        self.optuna_n_jobs = 1 if optuna_n_jobs is None else optuna_n_jobs
         self.cv_n_jobs = cv_n_jobs
         self.tuning_model_n_jobs = tuning_model_n_jobs
         self.rf = None
@@ -7752,8 +7877,18 @@ class WAS_mme_RF:
         1970-2000 window AND the double-standardization that happened when the
         framework had already standardized the data.
         """
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
+        elif "M" in Predictand.coords:
+            Predictand = Predictand.drop_vars("M")
+        Predictand = _ensure_time_index(
+            Predictand, name=f"{self.__class__.__name__} predictand"
+        )
+        Predictors = _ensure_time_index(
+            Predictors,
+            reference=Predictand,
+            name=f"{self.__class__.__name__} predictors",
+        )
         Predictand.name = "varname"
 
         if clim_year_start is not None and clim_year_end is not None:
@@ -8140,8 +8275,10 @@ class WAS_mme_RF:
                  hindcast_det_cross, Predictor_for_year, best_params=None, cluster_da=None,
                  best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         """Forecast using the Random Forest model with optimized hyperparameters."""
-        if "M" in Predictant.coords:
-            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictant.dims:
+            Predictant_no_m = Predictant.isel(M=0, drop=True)
+        elif "M" in Predictant.coords:
+            Predictant_no_m = Predictant.drop_vars("M")
         else:
             Predictant_no_m = Predictant
 
@@ -8260,11 +8397,13 @@ class WAS_mme_RF:
 
         elif dm == "nonparam":
             # ===== 3: out-of-sample residuals + drop member dim =====
-            error_samples = Predictant_no_m - hindcast_det_cross
+            # Rename the residual time dim so it does not collide with the
+            # single forecast-year T in apply_ufunc (else alignment fails).
+            error_samples = (Predictant_no_m - hindcast_det_cross).rename({"T": "S"})
             forecast_prob = xr.apply_ufunc(
                 self.calculate_tercile_probabilities_nonparametric,
                 result_da, error_samples, T1_emp, T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
+                input_core_dims=[("T",), ("S",), (), ()],
                 output_core_dims=[("probability", "T")],
                 vectorize=True, dask="parallelized", output_dtypes=[float],
                 dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
@@ -8383,8 +8522,8 @@ class WAS_mme_XGBoosting:
                  optuna_n_jobs=None,
                  optuna_timeout=None,
                  verbose=0,
-                 n_jobs=4,
-                 cv_n_jobs=1,
+                 n_jobs=-1,
+                 cv_n_jobs=-1,
                  tuning_model_n_jobs=1):
 
         self.search_method = search_method
@@ -8418,7 +8557,7 @@ class WAS_mme_XGBoosting:
         self.n_jobs = n_jobs
         self.cv_n_jobs = cv_n_jobs
         self.tuning_model_n_jobs = tuning_model_n_jobs
-        self.optuna_n_jobs = n_jobs if optuna_n_jobs is None else optuna_n_jobs
+        self.optuna_n_jobs = 1 if optuna_n_jobs is None else optuna_n_jobs
         self.optuna_timeout = optuna_timeout
         self.verbose = verbose
         self.xgb = {}
@@ -8543,8 +8682,18 @@ class WAS_mme_XGBoosting:
         Standardization is applied here only if clim years are given; when None,
         the inputs are assumed already standardized (framework path).
         """
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
+        elif "M" in Predictand.coords:
+            Predictand = Predictand.drop_vars("M")
+        Predictand = _ensure_time_index(
+            Predictand, name=f"{self.__class__.__name__} predictand"
+        )
+        Predictors = _ensure_time_index(
+            Predictors,
+            reference=Predictand,
+            name=f"{self.__class__.__name__} predictors",
+        )
         Predictand.name = "varname"
 
         if clim_year_start is not None and clim_year_end is not None:
@@ -8900,8 +9049,10 @@ class WAS_mme_XGBoosting:
                  hindcast_det_cross, Predictor_for_year, best_params=None, cluster_da=None,
                  best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         """Operational forecast for a target year (deterministic + tercile probabilities)."""
-        if "M" in Predictant.coords:
-            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictant.dims:
+            Predictant_no_m = Predictant.isel(M=0, drop=True)
+        elif "M" in Predictant.coords:
+            Predictant_no_m = Predictant.drop_vars("M")
         else:
             Predictant_no_m = Predictant
         mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
@@ -9115,9 +9266,9 @@ class WAS_mme_hpELM:
                  bayesian_sampler='tpe',
                  scoring='neg_mean_squared_error',
                  verbose=0,
-                 n_jobs=4,
+                 n_jobs=-1,
                  optuna_n_jobs=None,
-                 cv_n_jobs=1):
+                 cv_n_jobs=-1):
 
         if HPELM is None:
             raise ImportError("WAS_mme_hpELM requires the optional 'hpelm' package.")
@@ -9150,7 +9301,7 @@ class WAS_mme_hpELM:
         if cv_n_jobs == 0:
             raise ValueError("cv_n_jobs cannot be 0.")
         self.n_jobs = n_jobs
-        self.optuna_n_jobs = n_jobs if optuna_n_jobs is None else optuna_n_jobs
+        self.optuna_n_jobs = 1 if optuna_n_jobs is None else optuna_n_jobs
         self.cv_n_jobs = cv_n_jobs
         self.hpelm = None
         self.best_params_dict = None
@@ -9253,8 +9404,18 @@ class WAS_mme_hpELM:
         np.random.seed(self.random_state)
         random.seed(self.random_state)
 
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
+        elif "M" in Predictand.coords:
+            Predictand = Predictand.drop_vars("M")
+        Predictand = _ensure_time_index(
+            Predictand, name=f"{self.__class__.__name__} predictand"
+        )
+        Predictors = _ensure_time_index(
+            Predictors,
+            reference=Predictand,
+            name=f"{self.__class__.__name__} predictors",
+        )
         Predictand.name = "varname"
 
         if clim_year_start is not None and clim_year_end is not None:
@@ -9577,8 +9738,10 @@ class WAS_mme_hpELM:
                  hindcast_det_cross, Predictor_for_year, best_params=None, cluster_da=None,
                  best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         """Operational forecast for a target year (deterministic + tercile probabilities)."""
-        if "M" in Predictant.coords:
-            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictant.dims:
+            Predictant_no_m = Predictant.isel(M=0, drop=True)
+        elif "M" in Predictant.coords:
+            Predictant_no_m = Predictant.drop_vars("M")
         else:
             Predictant_no_m = Predictant
         mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
@@ -9726,8 +9889,8 @@ class WAS_mme_MLP:
                  leave_one_year_out=False,
                  optuna_n_jobs=None,
                  optuna_timeout=None,
-                 n_jobs=4,
-                 cv_n_jobs=1):
+                 n_jobs=-1,
+                 cv_n_jobs=-1):
 
         self.search_method = search_method
         self.hidden_layer_sizes_range = hidden_layer_sizes_range
@@ -9756,7 +9919,7 @@ class WAS_mme_MLP:
             raise ValueError("cv_n_jobs cannot be 0.")
         self.n_jobs = n_jobs
         self.cv_n_jobs = cv_n_jobs
-        self.optuna_n_jobs = n_jobs if optuna_n_jobs is None else optuna_n_jobs
+        self.optuna_n_jobs = 1 if optuna_n_jobs is None else optuna_n_jobs
         self.optuna_timeout = optuna_timeout
         self.mlp = None
 
@@ -9829,8 +9992,18 @@ class WAS_mme_MLP:
         internally; both None -> assume already standardized (framework path),
         so no double-standardization when called from compute_model.
         """
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
+        elif "M" in Predictand.coords:
+            Predictand = Predictand.drop_vars("M")
+        Predictand = _ensure_time_index(
+            Predictand, name=f"{self.__class__.__name__} predictand"
+        )
+        Predictors = _ensure_time_index(
+            Predictors,
+            reference=Predictand,
+            name=f"{self.__class__.__name__} predictors",
+        )
         Predictand.name = "varname"
 
         if clim_year_start is not None and clim_year_end is not None:
@@ -10260,8 +10433,10 @@ class WAS_mme_MLP:
                  cluster_da=None, best_code_da=None, best_shape_da=None,
                  best_loc_da=None, best_scale_da=None):
         """Deterministic + probabilistic forecast for a single target year."""
-        if "M" in Predictant.coords:
-            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictant.dims:
+            Predictant_no_m = Predictant.isel(M=0, drop=True)
+        elif "M" in Predictant.coords:
+            Predictant_no_m = Predictant.drop_vars("M")
         else:
             Predictant_no_m = Predictant
         mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
@@ -11890,6 +12065,7 @@ class WAS_mme_CCA_eeof:
             best_code_da, best_shape_da, best_loc_da, best_scale_da)
 
         return forecast_det * mask, forecast_prob * mask
+
 
 
 
