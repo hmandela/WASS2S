@@ -8660,17 +8660,55 @@ class WAS_mme_XGBoosting:
         return rs.best_params_
 
     def _bayesian_search(self, X, y, groups):
+        """Run Optuna optimization and report the best XGBoost configuration."""
         if optuna is None:
-            raise ImportError("search_method='bayesian' requires optuna to be installed.")
+            raise ImportError(
+                "search_method='bayesian' requires optuna to be installed."
+            )
+    
         study = optuna.create_study(
-            direction='maximize',
+            direction="maximize",
             sampler=optuna.samplers.TPESampler(seed=self.random_state),
             pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
         )
-        study.optimize(lambda tr: self._objective(tr, X, y, groups),
-                       n_trials=self.n_iter_search, timeout=self.optuna_timeout,
-                       n_jobs=self.optuna_n_jobs)
-        return study.best_params
+    
+        study.optimize(
+            lambda trial: self._objective(trial, X, y, groups),
+            n_trials=self.n_iter_search,
+            timeout=self.optuna_timeout,
+            n_jobs=self.optuna_n_jobs,
+            show_progress_bar=self.verbose > 0,
+        )
+    
+        try:
+            best_trial = study.best_trial
+        except ValueError as exc:
+            raise RuntimeError(
+                "XGBoost Optuna did not complete any valid trial."
+            ) from exc
+    
+        best_params = dict(best_trial.params)
+    
+        # Convert the early-stopping sentinel back to None.
+        if best_params.get("early_stopping_rounds") == 0:
+            best_params["early_stopping_rounds"] = None
+    
+        if self.verbose > 0:
+            print(
+                f"Best XGB trial: {best_trial.number}. "
+                f"Best value: {best_trial.value:.6f}",
+                flush=True,
+            )
+            print(
+                f"Best XGB score: {best_trial.value:.6f}",
+                flush=True,
+            )
+            print(
+                f"Best XGB params: {best_params}",
+                flush=True,
+            )
+    
+        return best_params
 
     # ====================================================== hyperparameters
     def compute_hyperparameters(self, Predictors, Predictand,
@@ -9379,19 +9417,79 @@ class WAS_mme_hpELM:
         rs.fit(X, y, groups=groups)        # >>> E
         return rs.best_params_
 
-    def _bayesian_optimization(self, X, y, groups, cluster_id=None):
+    def _bayesian_optimization(
+        self,
+        X,
+        y,
+        groups,
+        cluster_id=None,
+    ):
+        """Run Optuna optimization and report the best hpELM configuration."""
         if optuna is None:
-            raise ImportError("search_method='bayesian' requires optuna to be installed.")
+            raise ImportError(
+                "search_method='bayesian' requires optuna to be installed."
+            )
+    
+        study_name = (
+            f"cluster_{cluster_id}"
+            if cluster_id is not None
+            else "global"
+        )
+    
         study = optuna.create_study(
-            direction='maximize',
+            direction="maximize",
             sampler=self._create_bayesian_sampler(),
-            study_name=f"cluster_{cluster_id}" if cluster_id is not None else "global")
-        study.optimize(partial(self._bayesian_objective, X=X, y=y, groups=groups),
-                       n_trials=self.n_trials_bayesian, n_jobs=self.optuna_n_jobs)
+            study_name=study_name,
+        )
+    
+        study.optimize(
+            partial(
+                self._bayesian_objective,
+                X=X,
+                y=y,
+                groups=groups,
+            ),
+            n_trials=self.n_trials_bayesian,
+            n_jobs=self.optuna_n_jobs,
+            show_progress_bar=self.verbose > 0,
+        )
+    
+        try:
+            best_trial = study.best_trial
+        except ValueError as exc:
+            raise RuntimeError(
+                f"hpELM Optuna did not complete any valid trial "
+                f"for cluster {cluster_id}."
+            ) from exc
+    
         if cluster_id is not None:
-            self.bayesian_studies[cluster_id] = study
-        return study.best_params
-
+            self.bayesian_studies[int(cluster_id)] = study
+    
+        best_params = dict(best_trial.params)
+    
+        if self.verbose > 0:
+            cluster_label = (
+                f"cluster {int(cluster_id)}"
+                if cluster_id is not None
+                else "global domain"
+            )
+    
+            print(
+                f"Best hpELM trial for {cluster_label}: "
+                f"{best_trial.number}. "
+                f"Best value: {best_trial.value:.6f}",
+                flush=True,
+            )
+            print(
+                f"Best hpELM score: {best_trial.value:.6f}",
+                flush=True,
+            )
+            print(
+                f"Best hpELM params: {best_params}",
+                flush=True,
+            )
+    
+        return best_params
     # ====================================================== hyperparameters
     def compute_hyperparameters(self, Predictors, Predictand,
                                 clim_year_start=None, clim_year_end=None):
@@ -9890,7 +9988,8 @@ class WAS_mme_MLP:
                  optuna_n_jobs=None,
                  optuna_timeout=None,
                  n_jobs=-1,
-                 cv_n_jobs=-1):
+                 cv_n_jobs=-1,
+                 verbose=0):
 
         self.search_method = search_method
         self.hidden_layer_sizes_range = hidden_layer_sizes_range
@@ -9921,6 +10020,7 @@ class WAS_mme_MLP:
         self.cv_n_jobs = cv_n_jobs
         self.optuna_n_jobs = 1 if optuna_n_jobs is None else optuna_n_jobs
         self.optuna_timeout = optuna_timeout
+        self.verbose = int(verbose)
         self.mlp = None
 
     # ----------------------------------------------------- E: grouped CV
@@ -10118,26 +10218,94 @@ class WAS_mme_MLP:
                 random_search.fit(X_clean_c, y_clean_c, groups=groups_c)
                 best_params_dict[c] = random_search.best_params_
 
-            elif self.search_method == 'bayesian':
+            elif self.search_method == "bayesian":
                 if not HAS_OPTUNA:
-                    raise ImportError("search_method='bayesian' requires optuna.")
+                    raise ImportError(
+                        "search_method='bayesian' requires optuna."
+                    )
+            
                 study = optuna.create_study(
-                    direction='maximize',
-                    sampler=optuna.samplers.TPESampler(seed=self.random_state),
-                    pruner=optuna.pruners.MedianPruner(n_startup_trials=5))
-                objective_with_data = (lambda trial:
-                                       self._objective(trial, X_clean_c, y_clean_c, groups_c, splitter))
-                study.optimize(objective_with_data, n_trials=self.n_iter_search,
-                               timeout=self.optuna_timeout, n_jobs=self.optuna_n_jobs)
-                bp = study.best_params
-                best_params_dict[c] = {
-                    'hidden_layer_sizes': bp['hidden_layer_sizes'],
-                    'learning_rate_init': bp.get('learning_rate_init', 0.001),
-                    'activation': bp['activation'],
-                    'solver': bp['solver'],
-                    'alpha': bp['alpha'],
-                    'early_stopping': bp['early_stopping'],
+                    direction="maximize",
+                    sampler=optuna.samplers.TPESampler(
+                        seed=self.random_state
+                    ),
+                    pruner=optuna.pruners.MedianPruner(
+                        n_startup_trials=5
+                    ),
+                    study_name=f"mlp_cluster_{int(c)}",
+                )
+            
+                objective_with_data = lambda trial: self._objective(
+                    trial,
+                    X_clean_c,
+                    y_clean_c,
+                    groups_c,
+                    splitter,
+                )
+            
+                study.optimize(
+                    objective_with_data,
+                    n_trials=self.n_iter_search,
+                    timeout=self.optuna_timeout,
+                    n_jobs=self.optuna_n_jobs,
+                    show_progress_bar=self.verbose > 0,
+                )
+            
+                try:
+                    best_trial = study.best_trial
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"MLP Optuna did not complete any valid trial "
+                        f"for cluster {int(c)}."
+                    ) from exc
+            
+                bp = dict(best_trial.params)
+            
+                # Optuna stores tuples as categorical values, but defensive
+                # conversion is useful if a backend serializes them as lists.
+                hidden_layers = bp["hidden_layer_sizes"]
+                if isinstance(hidden_layers, list):
+                    hidden_layers = tuple(hidden_layers)
+            
+                best_params = {
+                    "hidden_layer_sizes": hidden_layers,
+                    "learning_rate_init": bp.get(
+                        "learning_rate_init",
+                        0.001,
+                    ),
+                    "activation": bp["activation"],
+                    "solver": bp["solver"],
+                    "alpha": bp["alpha"],
+                    "early_stopping": bp.get(
+                        "early_stopping",
+                        False,
+                    ),
                 }
+            
+                # lbfgs does not use early stopping. Keep the final
+                # configuration consistent with the objective.
+                if best_params["solver"] == "lbfgs":
+                    best_params["learning_rate_init"] = 0.001
+                    best_params["early_stopping"] = False
+            
+                best_params_dict[int(c)] = best_params
+            
+                if self.verbose > 0:
+                    print(
+                        f"Best MLP trial for cluster {int(c)}: "
+                        f"{best_trial.number}. "
+                        f"Best value: {best_trial.value:.6f}",
+                        flush=True,
+                    )
+                    print(
+                        f"Best MLP score: "
+                        f"{best_trial.value:.6f}",
+                        flush=True,
+                    )
+                    print(
+                        f"Best MLP params: {best_params}",
+                        flush=True,
+                    )
             else:
                 raise ValueError(f"Unknown search_method: {self.search_method}. "
                                  "Choose from 'grid', 'random', or 'bayesian'.")

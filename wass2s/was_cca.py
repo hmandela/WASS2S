@@ -203,6 +203,26 @@ def _fill_spatial_gaps_safe(da: xr.DataArray) -> xr.DataArray:
     return out
 
 
+def _common_validity_mask(field_imputed: xr.DataArray) -> xr.DataArray:
+    """Shared (Y, X) validity mask for a spatial field fed to xeofs.
+
+    A cell is kept when it is finite at every training step AND not temporally
+    constant (zero variance). Failing cells are excluded (set to NaN) identically
+    in the training, cross-validation and forecast inputs, so xeofs drops the
+    same features on both sides instead of ingesting constant-zero fills. Falls
+    back to the plain finite mask if the strict test would leave nothing.
+    """
+    finite_all = np.isfinite(field_imputed).all(dim="T")
+    non_constant = field_imputed.std(dim="T", skipna=True) > 0
+    mask = finite_all & non_constant
+    try:
+        if not bool(mask.any()):
+            mask = finite_all
+    except Exception:
+        pass
+    return mask
+
+
 def _normalize_probabilities(prob: xr.DataArray) -> xr.DataArray:
     """Enforce finite probabilities in [0, 1] whose category sum is one."""
     prob = prob.clip(min=0.0, max=1.0)
@@ -392,8 +412,19 @@ class WAS_CCA:
     def preprocess_data(self, X, Y):
         X = _prepare_tyx(X, "X_train")
         Y = _prepare_tyx(Y, "y_train")
-        X_final = X.fillna(X.mean(dim="T", skipna=True)).fillna(0.0)
-        Y_final = Y.fillna(Y.mean(dim="T", skipna=True)).fillna(0.0)
+        # Common upstream validity mask: impute partial gaps at otherwise-valid
+        # cells with the training temporal mean, then EXCLUDE (leave NaN) cells
+        # that are not fully observed or are temporally constant, so xeofs drops
+        # those features instead of ingesting constant-zero fills. Mask/reference
+        # are stored so CV and forecast inputs are masked identically.
+        self._x_train_ref = X.mean(dim="T", skipna=True)
+        self._y_train_ref = Y.mean(dim="T", skipna=True)
+        X_imp = X.fillna(self._x_train_ref)
+        Y_imp = Y.fillna(self._y_train_ref)
+        self._x_valid_mask = _common_validity_mask(X_imp)
+        self._y_valid_mask = _common_validity_mask(Y_imp)
+        X_final = X_imp.where(self._x_valid_mask)
+        Y_final = Y_imp.where(self._y_valid_mask)
         return (
             X_final.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
             Y_final.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
@@ -404,8 +435,16 @@ class WAS_CCA:
         y_test = _prepare_tyx(y_test, "y_test")
         X_train = _prepare_tyx(X_train, "X_train")
         y_train = _prepare_tyx(y_train, "y_train")
-        X_test_prepared = X_test.fillna(X_train.mean(dim="T", skipna=True)).fillna(0.0)
-        y_test_prepared = y_test.fillna(y_train.mean(dim="T", skipna=True)).fillna(0.0)
+        x_ref = getattr(self, "_x_train_ref", X_train.mean(dim="T", skipna=True))
+        y_ref = getattr(self, "_y_train_ref", y_train.mean(dim="T", skipna=True))
+        X_test_prepared = X_test.fillna(x_ref)
+        y_test_prepared = y_test.fillna(y_ref)
+        x_mask = getattr(self, "_x_valid_mask", None)
+        y_mask = getattr(self, "_y_valid_mask", None)
+        if x_mask is not None:
+            X_test_prepared = X_test_prepared.where(x_mask)
+        if y_mask is not None:
+            y_test_prepared = y_test_prepared.where(y_mask)
         return (
             X_test_prepared.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
             y_test_prepared.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
@@ -674,9 +713,15 @@ class WAS_CCA:
         ).fillna(0.0).transpose("T", "Y", "X")
 
         self.fit_cca(Predictor_, Predictant_)
-        X_test_prepared = Predictor_for_year_.rename(
-            {"X": "lon", "Y": "lat"}
-        ).transpose("T", "lat", "lon")
+        # Apply the SAME upstream validity mask used at fit time (exclude masked
+        # cells as NaN instead of feeding constant zeros) so predict matches fit.
+        X_test_prepared = (
+            Predictor_for_year_
+            .fillna(self._x_train_ref)
+            .where(self._x_valid_mask)
+            .rename({"X": "lon", "Y": "lat"})
+            .transpose("T", "lat", "lon")
+        )
         y_pred = self.cca_model.predict(X_test_prepared)
         y_pred = self.cca_model.inverse_transform(
             self.cca_model.transform(X_test_prepared), y_pred
@@ -948,8 +993,19 @@ class WAS_CCA_base:
     def preprocess_data(self, X, Y):
         X = _prepare_tyx(X, "X_train")
         Y = _prepare_tyx(Y, "y_train")
-        X_final = X.fillna(X.mean(dim="T", skipna=True)).fillna(0.0)
-        Y_final = Y.fillna(Y.mean(dim="T", skipna=True)).fillna(0.0)
+        # Common upstream validity mask: impute partial gaps at otherwise-valid
+        # cells with the training temporal mean, then EXCLUDE (leave NaN) cells
+        # that are not fully observed or are temporally constant, so xeofs drops
+        # those features instead of ingesting constant-zero fills. Mask/reference
+        # are stored so CV and forecast inputs are masked identically.
+        self._x_train_ref = X.mean(dim="T", skipna=True)
+        self._y_train_ref = Y.mean(dim="T", skipna=True)
+        X_imp = X.fillna(self._x_train_ref)
+        Y_imp = Y.fillna(self._y_train_ref)
+        self._x_valid_mask = _common_validity_mask(X_imp)
+        self._y_valid_mask = _common_validity_mask(Y_imp)
+        X_final = X_imp.where(self._x_valid_mask)
+        Y_final = Y_imp.where(self._y_valid_mask)
         return (
             X_final.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
             Y_final.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
@@ -960,8 +1016,16 @@ class WAS_CCA_base:
         y_test = _prepare_tyx(y_test, "y_test")
         X_train = _prepare_tyx(X_train, "X_train")
         y_train = _prepare_tyx(y_train, "y_train")
-        X_test_prepared = X_test.fillna(X_train.mean(dim="T", skipna=True)).fillna(0.0)
-        y_test_prepared = y_test.fillna(y_train.mean(dim="T", skipna=True)).fillna(0.0)
+        x_ref = getattr(self, "_x_train_ref", X_train.mean(dim="T", skipna=True))
+        y_ref = getattr(self, "_y_train_ref", y_train.mean(dim="T", skipna=True))
+        X_test_prepared = X_test.fillna(x_ref)
+        y_test_prepared = y_test.fillna(y_ref)
+        x_mask = getattr(self, "_x_valid_mask", None)
+        y_mask = getattr(self, "_y_valid_mask", None)
+        if x_mask is not None:
+            X_test_prepared = X_test_prepared.where(x_mask)
+        if y_mask is not None:
+            y_test_prepared = y_test_prepared.where(y_mask)
         return (
             X_test_prepared.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
             y_test_prepared.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
@@ -1273,12 +1337,14 @@ class WAS_CCA_base:
             Predictant, clim_year_start, clim_year_end
         )
         self.fit_cca(Predictor, Predictant_st)
-        Predictor_for_year_filled = Predictor_for_year.fillna(
-            Predictor.mean(dim="T", skipna=True)
-        ).fillna(0.0)
-        X_forecast = Predictor_for_year_filled.rename(
-            {"X": "lon", "Y": "lat"}
-        ).transpose("T", "lat", "lon")
+        # Same upstream validity mask used at fit time (exclude masked cells as NaN).
+        X_forecast = (
+            Predictor_for_year
+            .fillna(self._x_train_ref)
+            .where(self._x_valid_mask)
+            .rename({"X": "lon", "Y": "lat"})
+            .transpose("T", "lat", "lon")
+        )
         y_pred = self.cca_model.predict(X_forecast)
         y_pred = self.cca_model.inverse_transform(
             self.cca_model.transform(X_forecast), y_pred
@@ -1434,8 +1500,19 @@ class WAS_CCA_op:
     def preprocess_data(self, X, Y):
         X = _prepare_tyx(X, "X_train")
         Y = _prepare_tyx(Y, "y_train")
-        X_final = X.fillna(X.mean(dim="T", skipna=True)).fillna(0.0)
-        Y_final = Y.fillna(Y.mean(dim="T", skipna=True)).fillna(0.0)
+        # Common upstream validity mask: impute partial gaps at otherwise-valid
+        # cells with the training temporal mean, then EXCLUDE (leave NaN) cells
+        # that are not fully observed or are temporally constant, so xeofs drops
+        # those features instead of ingesting constant-zero fills. Mask/reference
+        # are stored so CV and forecast inputs are masked identically.
+        self._x_train_ref = X.mean(dim="T", skipna=True)
+        self._y_train_ref = Y.mean(dim="T", skipna=True)
+        X_imp = X.fillna(self._x_train_ref)
+        Y_imp = Y.fillna(self._y_train_ref)
+        self._x_valid_mask = _common_validity_mask(X_imp)
+        self._y_valid_mask = _common_validity_mask(Y_imp)
+        X_final = X_imp.where(self._x_valid_mask)
+        Y_final = Y_imp.where(self._y_valid_mask)
         return (
             X_final.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
             Y_final.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
@@ -1446,8 +1523,16 @@ class WAS_CCA_op:
         y_test = _prepare_tyx(y_test, "y_test")
         X_train = _prepare_tyx(X_train, "X_train")
         y_train = _prepare_tyx(y_train, "y_train")
-        X_test_prepared = X_test.fillna(X_train.mean(dim="T", skipna=True)).fillna(0.0)
-        y_test_prepared = y_test.fillna(y_train.mean(dim="T", skipna=True)).fillna(0.0)
+        x_ref = getattr(self, "_x_train_ref", X_train.mean(dim="T", skipna=True))
+        y_ref = getattr(self, "_y_train_ref", y_train.mean(dim="T", skipna=True))
+        X_test_prepared = X_test.fillna(x_ref)
+        y_test_prepared = y_test.fillna(y_ref)
+        x_mask = getattr(self, "_x_valid_mask", None)
+        y_mask = getattr(self, "_y_valid_mask", None)
+        if x_mask is not None:
+            X_test_prepared = X_test_prepared.where(x_mask)
+        if y_mask is not None:
+            y_test_prepared = y_test_prepared.where(y_mask)
         return (
             X_test_prepared.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
             y_test_prepared.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
@@ -1494,9 +1579,15 @@ class WAS_CCA_op:
         )
 
         self.fit_cca(Predictor_detrend, Predictant_st_detrend)
-        X_test_prepared = Predictor_for_year_detrended.rename(
-            {"X": "lon", "Y": "lat"}
-        ).transpose("T", "lat", "lon")
+        # Same upstream validity mask used at fit time: exclude masked cells as
+        # NaN (never constant-zero fills) so xeofs.predict matches the fit footprint.
+        X_test_prepared = (
+            Predictor_for_year_detrended
+            .fillna(self._x_train_ref)
+            .where(self._x_valid_mask)
+            .rename({"X": "lon", "Y": "lat"})
+            .transpose("T", "lat", "lon")
+        )
         y_pred = self.cca_model.predict(X_test_prepared)
         y_pred = self.cca_model.inverse_transform(
             self.cca_model.transform(X_test_prepared), y_pred
@@ -1950,8 +2041,19 @@ class WAS_CCA_strict:
     def preprocess_data(self, X, Y):
         X = _prepare_tyx(X, "X_train")
         Y = _prepare_tyx(Y, "y_train")
-        X_final = X.fillna(X.mean(dim="T", skipna=True)).fillna(0.0)
-        Y_final = Y.fillna(Y.mean(dim="T", skipna=True)).fillna(0.0)
+        # Common upstream validity mask: impute partial gaps at otherwise-valid
+        # cells with the training temporal mean, then EXCLUDE (leave NaN) cells
+        # that are not fully observed or are temporally constant, so xeofs drops
+        # those features instead of ingesting constant-zero fills. Mask/reference
+        # are stored so CV and forecast inputs are masked identically.
+        self._x_train_ref = X.mean(dim="T", skipna=True)
+        self._y_train_ref = Y.mean(dim="T", skipna=True)
+        X_imp = X.fillna(self._x_train_ref)
+        Y_imp = Y.fillna(self._y_train_ref)
+        self._x_valid_mask = _common_validity_mask(X_imp)
+        self._y_valid_mask = _common_validity_mask(Y_imp)
+        X_final = X_imp.where(self._x_valid_mask)
+        Y_final = Y_imp.where(self._y_valid_mask)
         return (
             X_final.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
             Y_final.rename({"X": "lon", "Y": "lat"}).transpose("T", "lat", "lon"),
@@ -1963,9 +2065,11 @@ class WAS_CCA_strict:
         if X_train is None:
             raise ValueError("X_train is required to fill validation data safely.")
         X_train = _prepare_tyx(X_train, "X_train")
-        X_test_prepared = X_test.fillna(
-            X_train.mean(dim="T", skipna=True)
-        ).fillna(0.0)
+        x_ref = getattr(self, "_x_train_ref", X_train.mean(dim="T", skipna=True))
+        X_test_prepared = X_test.fillna(x_ref)
+        x_mask = getattr(self, "_x_valid_mask", None)
+        if x_mask is not None:
+            X_test_prepared = X_test_prepared.where(x_mask)
         X_test_prepared = self._rename_to_latlon(X_test_prepared)
 
         if y_test is None:
@@ -1974,9 +2078,11 @@ class WAS_CCA_strict:
             raise ValueError("y_train is required to fill validation data safely.")
         y_test = _prepare_tyx(y_test, "y_test")
         y_train = _prepare_tyx(y_train, "y_train")
-        y_test_prepared = y_test.fillna(
-            y_train.mean(dim="T", skipna=True)
-        ).fillna(0.0)
+        y_ref = getattr(self, "_y_train_ref", y_train.mean(dim="T", skipna=True))
+        y_test_prepared = y_test.fillna(y_ref)
+        y_mask = getattr(self, "_y_valid_mask", None)
+        if y_mask is not None:
+            y_test_prepared = y_test_prepared.where(y_mask)
         return X_test_prepared, self._rename_to_latlon(y_test_prepared)
     
     
@@ -2027,9 +2133,13 @@ class WAS_CCA_strict:
         Predictor_for_year_detrended = Predictor_for_year_filled - apply_detrend_data(
             Predictor_for_year_filled, coeffs_X, meta_X
         )
-        Predictor_for_year_detrended = Predictor_for_year_detrended.fillna(0.0)
-
         self.fit_cca(Predictor_detrend, Predictant_st_detrend)
+        # Same upstream validity mask used at fit time (exclude masked cells as NaN).
+        Predictor_for_year_detrended = (
+            Predictor_for_year_detrended
+            .fillna(self._x_train_ref)
+            .where(self._x_valid_mask)
+        )
         X_forecast = self._rename_to_latlon(Predictor_for_year_detrended)
         y_pred = self.cca_model.predict(X_forecast)
         y_pred = self.cca_model.inverse_transform(
@@ -2436,7 +2546,6 @@ class WAS_CCA_strict:
             best_loc_da=best_loc_da,
             best_scale_da=best_scale_da,
         )
-
 
 
 
