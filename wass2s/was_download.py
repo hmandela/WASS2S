@@ -5774,7 +5774,12 @@ class WAS_Download:
         season_months_int = [int(m) for m in season_months]
         pivot = season_months_int[0]
         season_str = "".join(calendar.month_abbr[m] for m in season_months_int)
-        out_nc = dir_to_save / f"Obs_PRCP_{year_start}_{year_end}_{season_str}.nc"
+
+        if product_key == "soilmoisture":
+            out_nc = dir_to_save / f"Obs_SMC_{year_start}_{year_end}_{season_str}.nc"
+        else:
+            out_nc = dir_to_save / f"Obs_PRCP_{year_start}_{year_end}_{season_str}.nc"
+            
         if out_nc.exists() and not force_download:
             print(f"[INFO] {out_nc} already exists. Skipping.")
             return out_nc

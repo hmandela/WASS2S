@@ -42,6 +42,68 @@ import xeofs as xe
 from multiprocessing import cpu_count
 from dask.distributed import Client
 import dask.array as da
+
+
+def _safe_close_client(client):
+    """Close a Dask client (and its LocalCluster) with a bounded timeout,
+    swallowing teardown errors. The compute result is always materialised
+    (`.compute()`) before this is called, so a slow/failed nanny shutdown must
+    never abort the run: without this, `client.close()` can hang on the nanny
+    join and raise TimeoutError (exit code 1 under Slurm)."""
+    if client is None:
+        return
+    import contextlib
+    cluster = getattr(client, "cluster", None)
+    with contextlib.suppress(Exception):
+        client.close(timeout=10)
+    if cluster is not None:
+        with contextlib.suppress(Exception):
+            cluster.close(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# Shared Dask client: created once per process and reused across ALL folds and
+# linear-model calls, instead of spinning up (and tearing down) a fresh
+# LocalCluster on every compute_model — which caused nanny-join hangs and, when
+# several seasonal jobs ran at once, worker oversubscription (stalled folds).
+# ---------------------------------------------------------------------------
+_SHARED_CLIENT = None
+
+
+def _get_compute_client(nb_cores):
+    """Return a process-wide Dask client, creating it lazily on first use and
+    reusing it afterwards. Returns None if a distributed client cannot be
+    created, in which case ``.compute()`` transparently falls back to dask's
+    default (threaded) scheduler — still correct, just without process workers.
+    The client is closed once, at interpreter exit, via a bounded atexit hook."""
+    global _SHARED_CLIENT
+    try:
+        from dask.distributed import Client, LocalCluster, get_client
+        # Reuse a client already active in this process, if any.
+        try:
+            return get_client()
+        except Exception:
+            pass
+        if _SHARED_CLIENT is not None:
+            try:
+                if _SHARED_CLIENT.status == "running":
+                    return _SHARED_CLIENT
+            except Exception:
+                _SHARED_CLIENT = None
+        n = max(1, int(nb_cores))
+        cluster = LocalCluster(
+            n_workers=n,
+            threads_per_worker=1,
+            processes=True,
+            dashboard_address=None,
+            memory_limit=0,
+        )
+        _SHARED_CLIENT = Client(cluster)
+        import atexit
+        atexit.register(_safe_close_client, _SHARED_CLIENT)
+        return _SHARED_CLIENT
+    except Exception:
+        return None
 import optuna
 import warnings
 from wass2s.utils import *
@@ -216,7 +278,7 @@ class WAS_LinearRegression_Model:
         X_test = X_test.squeeze()
         y_test = y_test.drop_vars('T').squeeze().transpose('Y', 'X')
 
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             X_train,
@@ -231,7 +293,6 @@ class WAS_LinearRegression_Model:
             dask_gufunc_kwargs={'output_sizes': {'output': 2}},
         )
         result_ = result_da.compute()
-        client.close()
         return result_.isel(output=1)
     
    # ------------------ Probability Calculation Methods ------------------
@@ -761,7 +822,7 @@ class WAS_LinearRegression_Model:
         Predictor_for_year_ = Predictor_for_year.squeeze()
 
         # 1) Fit+predict in parallel => shape (output=2, Y, X)
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             Predictor,
@@ -781,7 +842,6 @@ class WAS_LinearRegression_Model:
             dask_gufunc_kwargs={'output_sizes': {'output':2}},
         )
         result_ = result_da.compute()
-        client.close()
         result_ = result_.isel(output=1)
         result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end)
             
@@ -1109,7 +1169,7 @@ class WAS_Ridge_Model:
             chunk_x = int(np.ceil(len(predictand_st.X) / self.nb_cores))
             p_st_chunked = predictand_st.chunk({'Y': chunk_y, 'X': chunk_x})
 
-            client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+            client = _get_compute_client(self.nb_cores)
             alpha_array = xr.apply_ufunc(
                 self._optimize_single_cell,
                 p_st_chunked,
@@ -1121,7 +1181,6 @@ class WAS_Ridge_Model:
                 output_dtypes=[float]
             )
             alpha_array = alpha_array.compute()
-            client.close()
             cluster_da = xr.where(~np.isnan(alpha_array), 1, np.nan)
             return alpha_array, cluster_da
 
@@ -1240,7 +1299,7 @@ class WAS_Ridge_Model:
         #          y_train, X_train, clim_year_start, clim_year_end
         #     )
 
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             X_train,
@@ -1262,7 +1321,6 @@ class WAS_Ridge_Model:
             dask_gufunc_kwargs={'output_sizes': {'output': 2}},
         )
         result_ = result_da.compute()
-        client.close()
         return result_.isel(output=1)
 
    # ------------------ Probability Calculation Methods ------------------
@@ -1640,7 +1698,7 @@ class WAS_Ridge_Model:
         Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)        
         Predictant_st, alpha = xr.align(Predictant_st, alpha, join='outer')
 
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             Predictor,
@@ -1662,7 +1720,6 @@ class WAS_Ridge_Model:
             dask_gufunc_kwargs={'output_sizes': {'output': 2}},
         )
         result_ = result_da.compute()
-        client.close()
         result_ = result_.isel(output=1)
         result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end) 
         index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
@@ -2000,7 +2057,7 @@ class WAS_Lasso_Model:
             chunk_x = int(np.ceil(len(predictand_st.X) / self.nb_cores))
             p_st_chunked = predictand_st.chunk({'Y': chunk_y, 'X': chunk_x})
 
-            client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+            client = _get_compute_client(self.nb_cores)
             alpha_array = xr.apply_ufunc(
                 self._optimize_single_cell,
                 p_st_chunked,
@@ -2012,7 +2069,6 @@ class WAS_Lasso_Model:
                 output_dtypes=[float]
             )
             alpha_array = alpha_array.compute()
-            client.close()
             cluster_da = xr.where(~np.isnan(alpha_array), 1, np.nan)
             return alpha_array, cluster_da
 
@@ -2097,7 +2153,7 @@ class WAS_Lasso_Model:
                  y_train, X_train, clim_year_start, clim_year_end
             )
         
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             X_train,
@@ -2119,7 +2175,6 @@ class WAS_Lasso_Model:
             dask_gufunc_kwargs={'output_sizes': {'output': 2}}
         )
         result_ = result_da.compute()
-        client.close()
         return result_.isel(output=1)
    # ------------------ Probability Calculation Methods ------------------
 
@@ -2648,7 +2703,7 @@ class WAS_Lasso_Model:
         Predictant_st, alpha = xr.align(Predictant_st, alpha, join='outer')
 
         # 3) Fit+predict in parallel => produce (2, Y, X)
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             Predictor,
@@ -2670,7 +2725,6 @@ class WAS_Lasso_Model:
             dask_gufunc_kwargs={'output_sizes': {'output': 2}}
         )
         result_ = result_da.compute()
-        client.close()
         result_ = result_.isel(output=1)
         result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end) 
         # result_ => dims (output=2, Y, X). 
@@ -3030,7 +3084,7 @@ class WAS_ElasticNet_Model:
             chunk_x = int(np.ceil(len(predictand_st.X) / self.nb_cores))
             p_st_chunked = predictand_st.chunk({'Y': chunk_y, 'X': chunk_x})
 
-            client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+            client = _get_compute_client(self.nb_cores)
             # Returns a DataArray with a new 'params' dimension [alpha, l1_ratio]
             param_array = xr.apply_ufunc(
                 self._optimize_single_cell, p_st_chunked, predictor,
@@ -3039,7 +3093,6 @@ class WAS_ElasticNet_Model:
                 vectorize=True, dask='parallelized', output_dtypes=[float],
                 dask_gufunc_kwargs={'output_sizes': {'params': 2}}
             ).compute()
-            client.close()
             
             alpha_array = param_array.isel(params=0)
             l1_ratio_array = param_array.isel(params=1)
@@ -3116,7 +3169,7 @@ class WAS_ElasticNet_Model:
                  y_train, X_train, clim_year_start, clim_year_end
             )
 
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             X_train,
@@ -3140,7 +3193,6 @@ class WAS_ElasticNet_Model:
             dask_gufunc_kwargs={'output_sizes': {'output': 2}},
         )
         result_ = result_da.compute()
-        client.close()
         return result_.isel(output=1)
 
    # ------------------ Probability Calculation Methods ------------------
@@ -3676,7 +3728,7 @@ class WAS_ElasticNet_Model:
         Predictant_st, alpha, l1_ratio = xr.align(Predictant_st, alpha, l1_ratio, join="outer")
 
         # 3) Parallel fit+predict => shape (2, Y, X)
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             Predictor,
@@ -3701,7 +3753,6 @@ class WAS_ElasticNet_Model:
             dask_gufunc_kwargs={'output_sizes': {'output': 2}}
         )
         result_ = result_da.compute()
-        client.close()
 
         result_ = result_.isel(output=1)
         result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end)
@@ -4060,7 +4111,7 @@ class WAS_LassoLars_Model:
 
         if self.mode == "grid":
             print(f"LassoLars: Running Pixel-wise optimization on {self.nb_cores} cores...")
-            client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+            client = _get_compute_client(self.nb_cores)
             
             chunk_y = int(np.ceil(len(predictand_st.Y) / self.nb_cores))
             chunk_x = int(np.ceil(len(predictand_st.X) / self.nb_cores))
@@ -4072,7 +4123,6 @@ class WAS_LassoLars_Model:
                 output_core_dims=[()],
                 vectorize=True, dask='parallelized', output_dtypes=[float]
             ).compute()
-            client.close()
             
             cluster_da = xr.where(~np.isnan(alpha_array), 1, np.nan)
             return alpha_array, cluster_da
@@ -4158,7 +4208,7 @@ class WAS_LassoLars_Model:
                  y_train, X_train, clim_year_start, clim_year_end
             )
             
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)        
+        client = _get_compute_client(self.nb_cores)        
         result_da = xr.apply_ufunc(
             self.fit_predict,
             X_train,
@@ -4180,7 +4230,6 @@ class WAS_LassoLars_Model:
             dask_gufunc_kwargs={'output_sizes': {'output': 2}},
         )
         result_ = result_da.compute()
-        client.close()
         return result_.isel(output=1)
     
    # ------------------ Probability Calculation Methods ------------------
@@ -4709,7 +4758,7 @@ class WAS_LassoLars_Model:
         Predictant_st, alpha = xr.align(Predictant_st, alpha, join='outer')
 
         # 3) Parallel fit+predict => (2, Y, X)
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             Predictor,
@@ -4731,7 +4780,6 @@ class WAS_LassoLars_Model:
             dask_gufunc_kwargs={'output_sizes': {'output': 2}}
         )
         result_ = result_da.compute()
-        client.close()
         result_ = result_.isel(output=1)
         result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end) 
         # result_ => dims (output=2, Y, X). 

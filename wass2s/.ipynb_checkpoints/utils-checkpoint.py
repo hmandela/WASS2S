@@ -1,35 +1,150 @@
+"""Shared utility functions for the WASS2S pipeline.
+
+Covers data loading, preprocessing, index computation, predictor retrieval,
+and forecast visualisation.
+
+Data utilities
+--------------
+decode_cf
+    Decode CF-convention time coordinates.
+fix_time_coord
+    Re-assign a seasonal ``T`` coordinate to a dataset.
+standardize_timeseries / reverse_standardize
+    Climatological standardisation / de-standardisation of xarray datasets.
+anomalize_timeseries
+    Climatological anomaly computation.
+detrended_data / apply_detrend_data
+    Fold-safe linear detrending helpers.
+predictant_mask
+    Binary land/ocean mask derived from a predictand DataArray.
+extract_leading_eeof_component
+    Extract the leading extended-EOF component.
+
+Index and predictor loaders
+---------------------------
+compute_sst_indices
+    Compute standard SST indices (Niño 3.4, AMM, IOD, …) from gridded data.
+compute_other_indices
+    Compute arbitrary spatial-average indices over user-defined boxes.
+retrieve_several_zones_for_PCR
+    Build a multivariate predictor list (one field per zone) for PCR.
+retrieve_single_zone_for_PCR
+    Build a single standardized predictor DataArray for PCR.
+load_gridded_predictor
+    Load a gridded model or reanalysis predictor field.
+prepare_predictand
+    Load, merge, and optionally aggregate an observational predictand.
+
+Network utilities
+-----------------
+download_file
+    Stream a file from a URL with progress reporting and retry logic.
+build_iridl_url_ersst / to_iridl_lat / to_iridl_lon
+    Build IRI Data Library URLs for ERSSTv5.
+parse_variable
+    Map user-facing variable names to CDS / NMME field names.
+
+Geo utilities
+-------------
+get_shapefile / get_shapefile_
+    Retrieve country or sub-national shapefiles (Natural Earth / GADM /
+    geoBoundaries).
+plot_map
+    Quick map of a geographic extent with optional SST index overlays.
+get_best_models
+    Select top-N forecast models by a given skill metric.
+
+Visualisation
+-------------
+plot_prob_forecasts / plot_prob_forecastsAlpha
+    Tercile probability forecast map panels.
+"""
+from __future__ import annotations
+
+# =============================================================================
+# Standard library
+# =============================================================================
 import os
+import io
+import zipfile
 import calendar
-import requests
+from pathlib import Path
+from datetime import timedelta
+from typing import Optional, Literal, Tuple, List, Dict, Any
+
+# =============================================================================
+# Core scientific stack
+# =============================================================================
 import numpy as np
 import pandas as pd
 import xarray as xr
+
+# =============================================================================
+# Networking / IO
+# =============================================================================
+import requests
+import urllib3
+import cdsapi
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# =============================================================================
+# Plotting / mapping
+# =============================================================================
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
 from matplotlib.patches import Rectangle
 from matplotlib import gridspec
-from matplotlib.offsetbox import  (OffsetImage, AnnotationBbox)
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+from matplotlib.colors import ListedColormap, BoundaryNorm
+# from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-import matplotlib.image as mpimg
-import matplotlib.image as image
+
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-import xeofs as xe
-from pathlib import Path
-import requests
+
+# Keep mpimg optional if you want to be robust on minimal installs
+try:
+    import matplotlib.image as mpimg
+except Exception:
+    mpimg = None
+
+# =============================================================================
+# Spatial / geospatial
+# =============================================================================
 import rioxarray as rioxr
-from tqdm import tqdm
-from wass2s.was_compute_predictand import *
 from scipy.ndimage import gaussian_filter
+
+# Optional geospatial libs
+try:
+    import geopandas as gpd
+    from cartopy.mpl.path import shapely_to_path
+except Exception:
+    gpd = None
+    shapely_to_path = None
+
+try:
+    import regionmask
+except Exception:
+    regionmask = None
+
+# =============================================================================
+# ML / stats utilities
+# =============================================================================
+import xeofs as xe
 from fitter import Fitter
-from matplotlib.colors import ListedColormap, BoundaryNorm
-import matplotlib.patches as mpatches
-from datetime import timedelta
-import cdsapi
-import urllib3
-from scipy.ndimage import gaussian_filter
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from tqdm import tqdm
+
+# =============================================================================
+# Project imports
+# =============================================================================
+from wass2s.was_compute_predictand import *
+from wass2s.was_bias_correction import *
+
+from rasterio.features import rasterize
+from rasterio.transform import from_bounds
 
 
 def decode_cf(ds, time_var):
@@ -191,6 +306,21 @@ def fix_time_coord(ds, seas):
     ds = ds.assign_coords(T=("T", new_dates))
     ds["T"] = ds["T"].astype("datetime64[ns]")
     return ds
+
+def _pick_var(ds, variable):
+
+    if variable in ds.data_vars:
+        return variable
+    for cand in (variable.lower(), variable.upper()):
+        if cand in ds.data_vars:
+            return cand
+
+    lower_map = {v.lower(): v for v in ds.data_vars}
+    if variable.lower() in lower_map:
+        return lower_map[variable.lower()]
+    raise KeyError(
+        f"Variable '{variable}' introuvable. Disponibles: {list(ds.data_vars)}"
+    )
 
 def download_file(url, local_path, force_download=False, chunk_size=8192, timeout=120):
     """
@@ -383,9 +513,9 @@ def predictant_mask(data):
     mask = mask.where(abs(mask.Y) <= 19.5, np.nan)
     return mask
 
-def trend_data(data):
+def extract_leading_eeof_component(data):
     """
-    Compute trends in data using ExtendedEOF.
+    extract leading eeof component using ExtendedEOF.
 
     Parameters
     ----------
@@ -409,7 +539,7 @@ def trend_data(data):
     """
     try:
         data_filled = data.fillna(data.mean(dim="T", skipna=True))
-        eeof = xe.single.ExtendedEOF(n_modes=2, tau=1, embedding=3, n_pca_modes=20)
+        eeof = xe.single.ExtendedEOF(n_modes=2, tau=1, embedding=3, n_pca_modes=22)
         eeof.fit(data_filled, dim="T")
         scores_ext = eeof.scores()
         data_trends = eeof.inverse_transform(scores_ext.sel(mode=1))
@@ -417,57 +547,110 @@ def trend_data(data):
     except Exception as e:
         raise RuntimeError(f"Failed to detrend data using ExtendedEOF: {e}")
 
+def detrended_data(da, dim="T", min_valid=10):
+    if dim not in da.dims:
+        raise ValueError(f"Dimension '{dim}' not found in DataArray.")
+
+    x = da[dim]
+
+    if np.issubdtype(x.dtype, np.datetime64):
+        x0 = x.isel({dim: 0}).values
+        x_days = (x - x.isel({dim: 0})).astype("timedelta64[D]").astype(np.float64)
+        x_type = "datetime"
+    else:
+        x0 = float(x.isel({dim: 0}).values) if x.size else 0.0
+        x_days = x.astype(np.float64)
+        x_type = "numeric"
+
+    ok = da.notnull().sum(dim=dim) >= int(min_valid)
+    da_fit = da.where(ok)
+
+    try:
+        coeffs = da_fit.assign_coords({dim: x_days}).polyfit(dim=dim, deg=1, skipna=True)
+    except TypeError:
+        coeffs = da_fit.assign_coords({dim: x_days}).polyfit(dim=dim, deg=1)
+
+    if not isinstance(x_days, xr.DataArray):
+         x_days = xr.DataArray(x_days, dims=dim, coords={dim: da[dim]})
+
+    trend = xr.polyval(x_days, coeffs.polyfit_coefficients)
+    da_detrended = da - trend
+    da_detrended.attrs = da.attrs.copy()
+
+    meta = {
+        "dim": dim,
+        "x0": x0,
+        "x_units": "days",
+        "type": x_type,
+        "min_valid": int(min_valid),
+    }
+    return da_detrended, coeffs, meta
+
+def apply_detrend_data(da, coeffs, meta):
+    dim = meta.get("dim", "T")
+    if dim not in da.dims:
+        if "T" in da.dims:
+            dim = "T"
+        elif "time" in da.dims:
+            dim = "time"
+        else:
+            raise ValueError(f"Cannot find time dim. Expected '{meta.get('dim')}'. Found: {da.dims}")
+
+    x = da[dim]
+
+    if meta.get("type") == "datetime":
+        x0 = np.datetime64(meta["x0"])
+        x_days = (x - x0).astype("timedelta64[D]").astype(np.float64)
+    else:
+        x_days = x.astype(np.float64)
+
+    if not isinstance(x_days, xr.DataArray):
+         x_days = xr.DataArray(x_days, dims=dim, coords={dim: da[dim]})
+
+    trend = xr.polyval(x_days, coeffs.polyfit_coefficients)
+    return trend
+
 def prepare_predictand(dir_to_save_Obs, variables_obs, year_start, year_end, season=None, ds=True, daily=False, param="prcp"):
     """
     Prepare the predictand dataset from observational data.
-
-    Parameters
-    ----------
-    dir_to_save_Obs : str
-        Directory path where observational data is stored.
-    variables_obs : list
-        List containing the variable string in the format 'center.variable'.
-    year_start : int
-        Start year of the data.
-    year_end : int
-        End year of the data.
-    season : list, optional
-        List of month numbers defining the season (e.g., [6, 7, 8] for JJA).
-    ds : bool, optional
-        If True, return dataset without converting to array (default is True).
-    daily : bool, optional
-        If True, load daily data; otherwise, load seasonal data (default is False).
-    param : Indicate parameter name
-
-    Returns
-    -------
-    xarray.Dataset or xarray.DataArray
-        Prepared predictand dataset or data array.
-
-    Notes
-    -----
-    Applies a mask for non-daily data based on rainfall thresholds and latitude.
     """
     _, variable = parse_variable(variables_obs[0])
+    
+    # 1. Determine Filepath
     if daily:
         filepath = f'{dir_to_save_Obs}/Daily_{variable}_{year_start}_{year_end}.nc'
-        rainfall = xr.open_dataset(filepath)
-        rainfall = xr.where(rainfall < 0.1, 0, rainfall)
-        rainfall['T'] = rainfall['T'].astype('datetime64[ns]')
     else:
         season_str = "".join([calendar.month_abbr[int(month)] for month in season])
         filepath = f'{dir_to_save_Obs}/Obs_{variable}_{year_start}_{year_end}_{season_str}.nc'
-        rainfall = xr.open_dataset(filepath)
-        mean_rainfall = rainfall.mean(dim="T").to_array().squeeze()
-        mask = xr.where(mean_rainfall <= 20, np.nan, 1)
-        mask = mask.where(abs(mask.Y) <= 20, np.nan)
-        rainfall = xr.where(mask == 1, rainfall, np.nan)
-        rainfall['T'] = rainfall['T'].astype('datetime64[ns]')
+    
+    data = xr.open_dataset(filepath)
+
+    # 2. Conditional Masking: Only apply to Precipitation
+    if param == "prcp":
+        if daily:
+            # Basic daily thresholding
+            data = xr.where(data < 0.1, 0, data)
+        else:
+            # Seasonal masking: Mean rainfall > 20 and Latitude (Y) <= 20
+            mean_val = data.mean(dim="T").to_array().squeeze()
+            mask = xr.where((mean_val > 20) & (abs(data.Y) <= 20), 1, np.nan)
+            data = data.where(mask == 1)
+    
+    # Otherwise, if param is "temp" or others, it skips the masking above.
+
+    # 3. Format Time Coordinate
+    if 'T' in data.coords:
+        data['T'] = data['T'].astype('datetime64[ns]')
+
+    # 4. Final Formatting & Return
+    data_out = data.squeeze().transpose('T', 'Y', 'X').sortby("T")
+    
     if ds:
-        return rainfall.squeeze().transpose('T', 'Y', 'X').sortby("T")
+        return data_out
     else:
-        # Check in future how to define the variable name other than 'prcp'
-        return rainfall.to_array().drop_vars("variable").squeeze().rename(param).transpose('T', 'Y', 'X').sortby("T")
+        # Renames the variable to your 'param' string (e.g., 'temp')
+        return data_out.to_array().drop_vars("variable").squeeze().rename(param)
+
 
 def load_gridded_predictor(dir_to_data, variables_list, year_start, year_end, season=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None):
     """
@@ -590,7 +773,7 @@ def compute_sst_indices(dir_to_data, indices, variables_list, year_start, year_e
     predictor["TASI"] = predictor["NAT"] - predictor["SAT"]
     predictor["DMI"] = predictor["WTIO"] - predictor["SETIO"]
     selected_indices = {i: predictor[i] for i in indices}
-    data_vars = {key: ds[variable.lower()].rename(key) for key, ds in selected_indices.items()}
+    data_vars = {key: ds[_pick_var(ds, variable)].rename(key) for key, ds in selected_indices.items()}
     combined_dataset = xr.Dataset(data_vars)
     return combined_dataset
 
@@ -717,7 +900,7 @@ def retrieve_several_zones_for_PCR(dir_to_data, indices_dict, variables_list, ye
 def retrieve_single_zone_for_PCR(dir_to_data, indices_dict, variables_list, year_start, year_end, season=None, clim_year_start=None, clim_year_end=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None, standardize=True):
     """
     Retrieve data for a single zone for Principal Component Regression (PCR) with interpolation.
-
+skill_mask
     Parameters
     ----------
     dir_to_data : str
@@ -753,11 +936,18 @@ def retrieve_single_zone_for_PCR(dir_to_data, indices_dict, variables_list, year
     center, variable = parse_variable(variables_list)
     if model:
         abb_month_ini = calendar.month_abbr[int(month_of_initialization)]
-        season_str = "".join([calendar.month_abbr[(int(i) + int(month_of_initialization)) % 12 or 12] for i in lead_time])
         center = center.lower().replace("_", "")
-        filepath_hdcst = f"{dir_to_data}/hindcast_{center}_{variable}_{abb_month_ini}Ic_{season_str}_{lead_time[0]}.nc"
-        ### A revoir
-        filepath_fcst = f"{dir_to_data}/forecast_{center}_{variable}_{abb_month_ini}Ic_{season_str}_{lead_time[0]}.nc"
+        
+        if lead_time is None:
+            filepath_hdcst = f"{dir_to_data}/hindcast_{center}_{variable}_{abb_month_ini}Ic.nc"
+            ### A revoir
+            filepath_fcst = f"{dir_to_data}/forecast_{center}_{variable}_{abb_month_ini}Ic.nc"
+        else:
+            season_str = "".join([calendar.month_abbr[(int(i) + int(month_of_initialization)) % 12 or 12] for i in lead_time])
+            filepath_hdcst = f"{dir_to_data}/hindcast_{center}_{variable}_{abb_month_ini}Ic_{season_str}_{lead_time[0]}.nc"
+            ### A revoir
+            filepath_fcst = f"{dir_to_data}/forecast_{center}_{variable}_{abb_month_ini}Ic_{season_str}_{lead_time[0]}.nc"
+            
         data_hdcst = xr.open_dataset(filepath_hdcst).to_array().drop_vars('variable').squeeze('variable')
         data_hdcst['T'] = data_hdcst['T'].astype('datetime64[ns]')
         ### A revoir
@@ -822,7 +1012,7 @@ def plot_map(extent, title="Map", sst_indices=None, fig_size=(10, 8)):
     plt.tight_layout()
     plt.show()
 
-def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n=6, gcm=False, agroparam=False):
+def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n=6, gcm=False, agroparam=False, hydro=False):
 
     # 1. Provide default thresholds if none given
     if threshold is None:
@@ -895,6 +1085,19 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
             
             # Extend the list by all matches (or pick just the first one, depending on your needs)
             selected_vars_in_order.extend(matches)
+    elif hydro:
+        for key in top_n_models:
+            # Key looks like "eccc_5_JanIc_"; we take only "dwd21"
+            key_prefix = key.split(".")[0].lower().replace("_","")
+            
+            # Find all matching variables for this key
+            matches = [            
+                var for var in center_variable
+                if normalize_var(var).startswith(key_prefix)
+            ]
+            
+            # Extend the list by all matches (or pick just the first one, depending on your needs)
+            selected_vars_in_order.extend(matches)
     elif agroparam:
         for key in top_n_models:
             # Key looks like "eccc_5_JanIc_"; we take only "dwd21"
@@ -922,31 +1125,460 @@ def get_best_models(center_variable, scores, metric='MAE', threshold=None, top_n
             selected_vars_in_order.extend(matches)        
     return selected_vars_in_order # selected_vars
 
-def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, logo=None, logo_position="lower left", sigma=None, res=None):
+
+import os
+import requests
+import numpy as np
+import xarray as xr
+import pandas as pd
+import geopandas as gpd
+import regionmask
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import matplotlib.gridspec as gridspec
+import matplotlib.patheffects as path_effects
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from cartopy.io import shapereader
+from cartopy.feature import ShapelyFeature
+from zipfile import ZipFile
+from scipy.ndimage import gaussian_filter
+
+def get_shapefile_(country_code, admin_level=0, source="naturalearth"):
     """
-    Plot probabilistic forecasts with tercile categories.
+    Downloads or loads shapefiles based on country ISO3 code.
+    """
+    if source == "naturalearth":
+        res = '10m'
+        category = 'cultural'
+        name = 'admin_1_states_provinces' if admin_level > 0 else 'admin_0_countries'
+        shp_path = shapereader.natural_earth(resolution=res, category=category, name=name)
+        gdf = gpd.read_file(shp_path)
+        
+        # Natural Earth uses different column names for ISO codes
+        iso_col = 'ADM0_A3' if admin_level == 0 else 'adm0_a3'
+        gdf = gdf[gdf[iso_col].str.contains(country_code.upper())]
+        return gdf
 
-    Parameters
-    ----------
-    dir_to_save : str
-        Directory path to save the plot.
-    forecast_prob : xarray.DataArray
-        Data array containing probability forecasts with a 'probability' dimension.
-    model_name : str or numpy.ndarray
-        Name of the model for the plot title.
-    labels : list, optional
-        Labels for the tercile categories (default is ["Below-Normal", "Near-Normal", "Above-Normal"]).
-    reverse_cmap : bool, optional
-        If True, reverse the colormap order for categories (default is True).
-    logo : str, optional
-        Path to the logo image to be added to the plot (default is None).
-    logo_size : float, optional
-        Size of the logo image in the plot (default is 0.5).    
+    elif source == "gadm":
+        url = f"https://geodata.ucdavis.edu/gadm/gadm4.1/shp/gadm41_{country_code.upper()}_shp.zip"
+        local_zip = f"{country_code}_shp.zip"
+        extract_dir = f"shp_{country_code}"
+        
+        if not os.path.exists(extract_dir):
+            print(f"Downloading GADM {country_code}...")
+            r = requests.get(url)
+            with open(local_zip, 'wb') as f: f.write(r.content)
+            with ZipFile(local_zip, 'r') as zip_ref: zip_ref.extractall(extract_dir)
+        
+        return gpd.read_file(f"{extract_dir}/gadm41_{country_code.upper()}_{admin_level}.shp")
 
-    Notes
-    -----
-    Saves the plot as a PNG file and displays it.
-    Uses custom colormaps for each tercile category.
+def get_shapefile(country_code, admin_level=0, source="naturalearth"):
+    """
+    Downloads or loads shapefiles based on country ISO3 code.
+    Automatically switches to GADM if admin_level > 1.
+    """
+    # Force GADM if level 2 or 3 is requested (Natural Earth doesn't have these)
+    if admin_level >= 2:
+        print(f"Level {admin_level} requested. Switching source to 'gadm'...")
+        source = "gadm"
+
+    if source == "naturalearth":
+        res = '10m'
+        category = 'cultural'
+        # Level 0 is Countries, Level 1 is States/Provinces
+        name = 'admin_1_states_provinces' if admin_level > 0 else 'admin_0_countries'
+        
+        shp_path = shapereader.natural_earth(resolution=res, category=category, name=name)
+        gdf = gpd.read_file(shp_path)
+        
+        # Filter logic
+        iso_col = 'ADM0_A3' if admin_level == 0 else 'adm0_a3'
+        gdf = gdf[gdf[iso_col].str.contains(country_code.upper())]
+        
+        if gdf.empty:
+            print(f"Warning: No data found for {country_code} in Natural Earth level {admin_level}")
+        return gdf
+
+    elif source == "gadm":
+        # Ensure the directory exists
+        extract_dir = f"shp_{country_code}"
+        if not os.path.exists(extract_dir):
+            os.makedirs(extract_dir, exist_ok=True)
+            
+        local_zip = f"{extract_dir}/{country_code}_shp.zip"
+        # GADM 4.1 URL structure
+        url = f"https://geodata.ucdavis.edu/gadm/gadm4.1/shp/gadm41_{country_code.upper()}_shp.zip"
+        
+        shp_file = f"{extract_dir}/gadm41_{country_code.upper()}_{admin_level}.shp"
+        
+        if not os.path.exists(shp_file):
+            print(f"Fetching GADM Level {admin_level} for {country_code}...")
+            try:
+                r = requests.get(url, timeout=30)
+                r.raise_for_status()
+                with open(local_zip, 'wb') as f:
+                    f.write(r.content)
+                with ZipFile(local_zip, 'r') as zip_ref:
+                    zip_ref.extractall(extract_dir)
+            except Exception as e:
+                print(f"Error downloading GADM data: {e}")
+                return None
+        
+        return gpd.read_file(shp_file)
+
+
+def plot_prob_forecastsAlpha(dir_to_save, forecast_prob, model_name, 
+                        country_code="GHA", admin_level=0, source="naturalearth",
+                        labels=["Below-Normal", "Near-Normal", "Above-Normal"], 
+                        reverse_cmap=True, hspace=None, logo=None, 
+                        logo_size=("10%", "10%"), logo_position="lower left", 
+                        sigma=None, res=None, stations_df=None, out="pdf", dynamic_scalebar=False):
+
+    # 3. Spatial Smoothing
+    if sigma:
+        for p in forecast_prob.probability:
+            forecast_prob.loc[{'probability': p}] = gaussian_filter(forecast_prob.sel(probability=p), sigma=sigma)
+
+    if res is not None:
+        min_X = forecast_prob['X'].min().values
+        max_X = forecast_prob['X'].max().values
+        min_Y = forecast_prob['Y'].min().values
+        max_Y = forecast_prob['Y'].max().values
+        num_X = int((max_X - min_X) / res) + 1
+        num_Y = int((max_Y - min_Y) / res) + 1
+        new_X = np.linspace(min_X, max_X, num_X)
+        new_Y = np.linspace(min_Y, max_Y, num_Y)
+        forecast_prob = forecast_prob.interp(X=new_X, Y=new_Y, method='linear',
+                                                kwargs={'fill_value': 'extrapolate'}    
+                                            )
+    
+    # 1. Automatic Shapefile Ingestion
+    gdf = get_shapefile(country_code, admin_level, source)
+    if gdf.crs != "EPSG:4326": gdf = gdf.to_crs("EPSG:4326")
+
+    # 2. Map Cutting (Masking)
+    mask = regionmask.mask_3D_geopandas(gdf, forecast_prob.X, forecast_prob.Y)
+    forecast_prob = forecast_prob.where(mask.any(dim='region'))
+
+    # 4. Tercile Selection
+    max_prob = forecast_prob.max(dim="probability")
+    max_cat = forecast_prob.fillna(-1).argmax(dim="probability")
+    
+    # 5. Global Dynamic Scaling (Calculated ONLY from values inside boundary)
+    plotted_floats = max_prob.values.flatten()
+    plotted_floats = plotted_floats[~np.isnan(plotted_floats)] * 100
+    
+    if dynamic_scalebar and len(plotted_floats) > 0:
+        g_vmin = max(35, np.floor(plotted_floats.min() / 5) * 5)
+        g_vmax = min(100, np.ceil(plotted_floats.max() / 5) * 5)
+        # Create ticks based on dynamic g_vmin and g_vmax with 5% intervals
+        cbar_ticks_bn = np.arange(g_vmin, g_vmax + 1, 5)
+        cbar_ticks_nn = np.arange(g_vmin, g_vmax + 1, 5)
+        cbar_ticks_an = np.arange(g_vmin, g_vmax + 1, 5)
+    else:
+        cbar_ticks_bn = np.arange(35, 85 + 1, 5)
+        cbar_ticks_nn = np.arange(35, 65 + 1, 5)
+        cbar_ticks_an = np.arange(35, 85 + 1, 5)
+
+    num_bins_bn = len(cbar_ticks_bn) - 1
+    num_bins_nn = len(cbar_ticks_nn) - 1
+    num_bins_an = len(cbar_ticks_an) - 1
+    
+    # 6. Plotting Infrastructure
+    fig = plt.figure(figsize=(12, 10))
+    gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2],hspace=hspace or -0.5, wspace=0.3)
+    ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
+    
+    # Zoom to shapefile
+    bounds = gdf.total_bounds
+    ax.set_extent([bounds[0]-0.1, bounds[2]+0.1, bounds[1]-0.1, bounds[3]+0.1])
+
+    # ---- DISCRETE COLORMAP AND BOUNDARY NORM SETUP ----
+    
+
+    # Base Colors
+    an_colors = ['#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443', '#006837', '#004529']
+    bn_colors = ['#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026']
+    nn_colors = ["#ffeda0", "#f7fcb9"]
+    
+    if reverse_cmap:
+        an_colors, bn_colors = bn_colors, an_colors
+
+    # Build discrete colormaps matching the exact number of required bins
+    cmaps = [
+        mcolors.LinearSegmentedColormap.from_list('BN', bn_colors, N=num_bins_bn),
+        mcolors.LinearSegmentedColormap.from_list('NN', nn_colors, N=num_bins_nn),
+        mcolors.LinearSegmentedColormap.from_list('AN', an_colors, N=num_bins_an)
+    ]
+    
+    # Create BoundaryNorms to strictly enforce discrete color blocks
+    norms = [
+        mcolors.BoundaryNorm(cbar_ticks_bn, cmaps[0].N),
+        mcolors.BoundaryNorm(cbar_ticks_nn, cmaps[1].N),
+        mcolors.BoundaryNorm(cbar_ticks_an, cmaps[2].N)
+    ]
+
+    # Plot terciles using the discrete norms
+    data_layers = [
+        (max_prob.where(max_cat == 0)*100), 
+        (max_prob.where(max_cat == 1)*100), 
+        (max_prob.where(max_cat == 2)*100)
+    ]
+    
+    ims = []
+    for i, data in enumerate(data_layers):
+        if np.any(~np.isnan(data.values)):
+            im = ax.pcolormesh(forecast_prob.X, forecast_prob.Y, data, 
+                               cmap=cmaps[i], norm=norms[i], 
+                               transform=ccrs.PlateCarree(), alpha=0.9, zorder=2)
+        else:
+            im = cm.ScalarMappable(norm=norms[i], cmap=cmaps[i])
+            im.set_array([])
+        ims.append(im)
+
+    # 7. Add Boundary & Stations
+    ax.add_feature(ShapelyFeature(gdf.geometry, ccrs.PlateCarree(), facecolor='none', edgecolor='black', lw=1.5), zorder=5)
+    gl = ax.gridlines(draw_labels=True, linewidth=0.01, color='gray', alpha=0.8)
+    gl.top_labels = False
+    gl.right_labels = False
+    
+    if stations_df is not None:
+        for col in stations_df.columns[1:]:
+            lat, lon = stations_df.loc[0, col], stations_df.loc[1, col]
+            if not np.isnan(lat):
+                ax.plot(lon, lat, 'ro', markersize=4, markeredgecolor='w', transform=ccrs.PlateCarree(), zorder=10)
+                txt = ax.text(lon + 0.02, lat + 0.02, col, fontsize=8, transform=ccrs.PlateCarree(), zorder=11)
+                txt.set_path_effects([path_effects.withStroke(linewidth=2, foreground='w')])
+
+    # 8. Add logo if provided
+    if logo is not None:
+        ax_logo = inset_axes(ax,
+                            width=logo_size[0],    
+                            height=logo_size[1],        
+                            loc=logo_position,
+                            borderpad=0)        
+        ax_logo.imshow(mpimg.imread(logo))
+        ax_logo.axis("off") 
+
+
+    # 9. Unified Discrete Colorbars with Inward Ticks
+    all_ticks = [cbar_ticks_bn, cbar_ticks_nn, cbar_ticks_an]
+
+    for i, label in enumerate(labels):
+        current_ticks = all_ticks[i]  # Fetch the specific ticks for this category
+        
+        cax = fig.add_subplot(gs[1, i])
+        
+        cb = plt.colorbar(ims[i], cax=cax, orientation='horizontal', 
+                          spacing='uniform', ticks=current_ticks)
+        
+        cb.set_label(f"{label} (%)", fontsize=10)
+        cb.set_ticklabels([f"{int(t)}" for t in current_ticks])
+        cb.ax.tick_params(axis='x', direction='in', length=6, color='black')
+        
+        # INVERT THE BN AXIS (First loop iteration)s
+        if i == 0:
+            cax.invert_xaxis()
+
+    # 10. Final Aesthetics
+    ax.set_title(f"Probabilistic Seasonal Forecast\n{model_name}", fontsize=14, pad=20, fontweight='bold')
+    ax.add_feature(cfeature.OCEAN.with_scale('50m'), facecolor='#e0f3ff')
+    ax.coastlines(resolution='10m')
+    
+    plt.savefig(os.path.join(dir_to_save, f"{model_name}.{out}"), dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close('all')
+
+
+def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, title = "Seasonal Forecast for Gulf of Guinea Countries \n Valid for March-April-May 2026, Issued February 27, 2026" ,
+                        country_code="GHA", admin_level=0, source="naturalearth",
+                        labels=["Below-Normal", "Near-Normal", "Above-Normal"], 
+                        reverse_cmap=True, hspace=None, 
+                        logo=None, logo_size=("10%", "10%"), logo_position="lower left", 
+                        logo_left=None, logo_left_size=("12%", "12%"), 
+                        logo_right=None, logo_right_size=("12%", "12%"),
+                        sigma=None, res=None, stations_df=None, out="pdf", dynamic_scalebar=False):
+
+    # 3. Spatial Smoothing
+    if sigma:
+        for p in forecast_prob.probability:
+            forecast_prob.loc[{'probability': p}] = gaussian_filter(forecast_prob.sel(probability=p), sigma=sigma)
+
+    if res is not None:
+        min_X = forecast_prob['X'].min().values
+        max_X = forecast_prob['X'].max().values
+        min_Y = forecast_prob['Y'].min().values
+        max_Y = forecast_prob['Y'].max().values
+        num_X = int((max_X - min_X) / res) + 1
+        num_Y = int((max_Y - min_Y) / res) + 1
+        new_X = np.linspace(min_X, max_X, num_X)
+        new_Y = np.linspace(min_Y, max_Y, num_Y)
+        forecast_prob = forecast_prob.interp(X=new_X, Y=new_Y, method='linear',
+                                                kwargs={'fill_value': 'extrapolate'}    
+                                            )
+    
+    # 1. Automatic Shapefile Ingestion
+    gdf = get_shapefile(country_code, admin_level, source)
+    if gdf.crs != "EPSG:4326": gdf = gdf.to_crs("EPSG:4326")
+
+    # 2. Map Cutting (Masking)
+    mask = regionmask.mask_3D_geopandas(gdf, forecast_prob.X, forecast_prob.Y)
+    forecast_prob = forecast_prob.where(mask.any(dim='region'))
+
+    # 4. Tercile Selection
+    max_prob = forecast_prob.max(dim="probability")
+    max_cat = forecast_prob.fillna(-1).argmax(dim="probability")
+    
+    # 5. Global Dynamic Scaling (Calculated ONLY from values inside boundary)
+    plotted_floats = max_prob.values.flatten()
+    plotted_floats = plotted_floats[~np.isnan(plotted_floats)] * 100
+    
+    if dynamic_scalebar and len(plotted_floats) > 0:
+        g_vmin = max(35, np.floor(plotted_floats.min() / 5) * 5)
+        g_vmax = min(100, np.ceil(plotted_floats.max() / 5) * 5)
+        # Create ticks based on dynamic g_vmin and g_vmax with 5% intervals
+        cbar_ticks_bn = np.arange(g_vmin, g_vmax + 1, 5)
+        cbar_ticks_nn = np.arange(g_vmin, g_vmax + 1, 5)
+        cbar_ticks_an = np.arange(g_vmin, g_vmax + 1, 5)
+    else:
+        cbar_ticks_bn = np.arange(35, 85 + 1, 5)
+        cbar_ticks_nn = np.arange(35, 65 + 1, 5)
+        cbar_ticks_an = np.arange(35, 85 + 1, 5)
+
+    num_bins_bn = len(cbar_ticks_bn) - 1
+    num_bins_nn = len(cbar_ticks_nn) - 1
+    num_bins_an = len(cbar_ticks_an) - 1
+    
+    # 6. Plotting Infrastructure
+    fig = plt.figure(figsize=(12, 10))
+    gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2],hspace=hspace or -0.5, wspace=0.3)
+    ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
+    
+    # Zoom to shapefile
+    bounds = gdf.total_bounds
+    ax.set_extent([bounds[0]-0.1, bounds[2]+0.1, bounds[1]-0.1, bounds[3]+0.1])
+
+    # ---- DISCRETE COLORMAP AND BOUNDARY NORM SETUP ----
+    
+    # Base Colors
+    an_colors = ['#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443', '#006837', '#004529']
+    bn_colors = ['#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026']
+    nn_colors = ["#ffeda0", "#f7fcb9"]
+    
+    if reverse_cmap:
+        an_colors, bn_colors, nn_colors  = bn_colors, an_colors, nn_colors[::-1]
+
+    # Build discrete colormaps matching the exact number of required bins
+    cmaps = [
+        mcolors.LinearSegmentedColormap.from_list('BN', bn_colors, N=num_bins_bn),
+        mcolors.LinearSegmentedColormap.from_list('NN', nn_colors, N=num_bins_nn),
+        mcolors.LinearSegmentedColormap.from_list('AN', an_colors, N=num_bins_an)
+    ]
+    
+    # Create BoundaryNorms to strictly enforce discrete color blocks
+    norms = [
+        mcolors.BoundaryNorm(cbar_ticks_bn, cmaps[0].N),
+        mcolors.BoundaryNorm(cbar_ticks_nn, cmaps[1].N),
+        mcolors.BoundaryNorm(cbar_ticks_an, cmaps[2].N)
+    ]
+
+    # Plot terciles using the discrete norms
+    data_layers = [
+        (max_prob.where(max_cat == 0)*100), 
+        (max_prob.where(max_cat == 1)*100), 
+        (max_prob.where(max_cat == 2)*100)
+    ]
+    
+    ims = []
+    for i, data in enumerate(data_layers):
+        if np.any(~np.isnan(data.values)):
+            im = ax.pcolormesh(forecast_prob.X, forecast_prob.Y, data, 
+                               cmap=cmaps[i], norm=norms[i], 
+                               transform=ccrs.PlateCarree(), alpha=0.9, zorder=2)
+        else:
+            im = cm.ScalarMappable(norm=norms[i], cmap=cmaps[i])
+            im.set_array([])
+        ims.append(im)
+
+    # 7. Add Boundary & Stations
+    ax.add_feature(ShapelyFeature(gdf.geometry, ccrs.PlateCarree(), facecolor='none', edgecolor='black', lw=1.5), zorder=5)
+    gl = ax.gridlines(draw_labels=True, linewidth=0.01, color='gray', alpha=0.8)
+    gl.top_labels = False
+    gl.right_labels = False
+    
+    if stations_df is not None:
+        for col in stations_df.columns[1:]:
+            lat, lon = stations_df.loc[0, col], stations_df.loc[1, col]
+            if not np.isnan(lat):
+                ax.plot(lon, lat, 'ro', markersize=4, markeredgecolor='w', transform=ccrs.PlateCarree(), zorder=10)
+                txt = ax.text(lon + 0.02, lat + 0.02, col, fontsize=8, transform=ccrs.PlateCarree(), zorder=11)
+                txt.set_path_effects([path_effects.withStroke(linewidth=2, foreground='w')])
+
+    # ==========================================
+    # 8. ADD LOGOS (Inside and Outside Options)
+    # ==========================================
+    
+    # Original: Logo inside the map
+    if logo is not None:
+        ax_logo = inset_axes(ax, width=logo_size[0], height=logo_size[1], 
+                             loc=logo_position, borderpad=0)        
+        ax_logo.imshow(mpimg.imread(logo))
+        ax_logo.axis("off") 
+
+    # New: Outside Left Logo
+    if logo_left is not None:
+        # bbox_to_anchor creates a bounding box starting slightly above the top-left of the axis (y=1.02)
+        ax_logo_l = inset_axes(ax, width=logo_left_size[0], height=logo_left_size[1],
+                               loc='lower left', bbox_to_anchor=(0.0, 1.06, 1, 1),
+                               bbox_transform=ax.transAxes, borderpad=0)
+        ax_logo_l.imshow(mpimg.imread(logo_left))
+        ax_logo_l.axis("off")
+
+    # New: Outside Right Logo
+    if logo_right is not None:
+        # Pinned to the lower right of the bounding box placed above the axis
+        ax_logo_r = inset_axes(ax, width=logo_right_size[0], height=logo_right_size[1],
+                               loc='lower right', bbox_to_anchor=(0.0, 1.06, 1, 1),
+                               bbox_transform=ax.transAxes, borderpad=0)
+        ax_logo_r.imshow(mpimg.imread(logo_right))
+        ax_logo_r.axis("off")
+
+
+    # 9. Unified Discrete Colorbars with Inward Ticks
+    all_ticks = [cbar_ticks_bn, cbar_ticks_nn, cbar_ticks_an]
+
+    for i, label in enumerate(labels):
+        current_ticks = all_ticks[i]  # Fetch the specific ticks for this category
+        
+        cax = fig.add_subplot(gs[1, i])
+        
+        cb = plt.colorbar(ims[i], cax=cax, orientation='horizontal', 
+                          spacing='uniform', ticks=current_ticks)
+        
+        cb.set_label(f"{label} (%)", fontsize=10)
+        cb.set_ticklabels([f"{int(t)}" for t in current_ticks])
+        cb.ax.tick_params(axis='x', direction='in', length=6, color='black')
+        
+        # INVERT THE BN AXIS (First loop iteration)s
+        if i == 0:
+            cax.invert_xaxis()
+
+    # 10. Final Aesthetics
+    # Dynamically increase title padding if top outside logos are active
+    t_pad = 30 if (logo_left is not None or logo_right is not None) else 20
+    ax.set_title(title.upper(), fontsize=14, pad=t_pad, fontweight='bold')
+    
+    ax.add_feature(cfeature.OCEAN.with_scale('50m'), facecolor='#e0f3ff')
+    ax.coastlines(resolution='10m')
+    
+    # bbox_inches='tight' will automatically ensure the outside logos and new padding are saved cleanly
+    plt.savefig(os.path.join(dir_to_save, f"{model_name}.{out}"), dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close('all')
+def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, hspace=None, logo=None, logo_size=(None,None), logo_position="lower left", sigma=None, res=None):
+    """
+    Plot probabilistic forecasts with tercile categories using discrete block colorbars.
     """
 
     if res is not None:
@@ -964,7 +1596,7 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
 
     if sigma is not None:
         # Create a smoothed copy
-        forecast_prob_smoothed = forecast_prob * 0.0  # Initialize with same shape and coords
+        forecast_prob_smoothed = forecast_prob * 0.0  
         
         # Smooth each probability layer spatially
         for p in forecast_prob.probability.values:
@@ -981,15 +1613,11 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
         # Normalize smoothed probabilities to sum to 1 at each grid point
         sum_probs = forecast_prob_smoothed.sum('probability')
         forecast_prob_smoothed = forecast_prob_smoothed / sum_probs.where(sum_probs != 0, 1.0)
-        
-        # Replace original with smoothed
         forecast_prob = forecast_prob_smoothed
 
     # Step 1: Extract maximum probability and category
-    max_prob = forecast_prob.max(dim="probability", skipna=True)  # Maximum probability at each grid point
-    # Fill NaN values with a very low value 
+    max_prob = forecast_prob.max(dim="probability", skipna=True) 
     filled_prob = forecast_prob.fillna(-9999)
-    # Compute argmax
     max_category = filled_prob.argmax(dim="probability")
     
     # Step 2: Create masks for each category
@@ -997,23 +1625,48 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     mask_nn = max_category == 1  # Near Normal (NN)
     mask_an = max_category == 2  # Above Normal (AN)
     
-    # Step 3: Define custom colormaps
+    # Step 3: Define Custom Colors and Ticks for Discrete Bins
+    def create_ticks(vn=35, vx=86, step=5):
+        return np.arange(vn, vx, step)
+
+    ticks_bn = create_ticks(vn=35, vx=86, step=5) # 11 ticks, 10 bins
+    ticks_nn = create_ticks(vn=35, vx=66, step=5) # 7 ticks, 6 bins
+    ticks_an = create_ticks(vn=35, vx=86, step=5) # 11 ticks, 10 bins
+
+    # Requested Hex Codes
+    colors_bn = ['#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026']
+    colors_nn = ["#ffeda0", "#f7fcb9"] #['#ffeda0', '#ffffcc', '#ffeda0', '#fed976', '#f7fcb9']
+    colors_an = ['#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443', '#006837', '#004529']
+
+    # Build colormaps to have exactly the number of bins as our ticks
     if reverse_cmap:
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ["#ffffe5", "#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ["#f0f0f0","#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252"])
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ["#f7fcfd", "#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"])  
+        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', colors_an, N=len(ticks_bn)-1)
+        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', colors_nn[::-1], N=len(ticks_nn)-1)
+        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', colors_bn, N=len(ticks_an)-1)
     else:
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ["#ffffe5", "#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#662506"]) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ["#f0f0f0","#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252"])
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ["#f7fcfd", "#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"])          
+        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', colors_bn, N=len(ticks_bn)-1)
+        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', colors_nn, N=len(ticks_nn)-1)
+        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', colors_an, N=len(ticks_an)-1)
+        
+    # NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', colors_nn, N=len(ticks_nn)-1)
+
+    # BoundaryNorm maps the exact tick intervals to the discrete colors
+    norm_bn = mcolors.BoundaryNorm(ticks_bn, BN_cmap.N)
+    norm_nn = mcolors.BoundaryNorm(ticks_nn, NN_cmap.N)
+    norm_an = mcolors.BoundaryNorm(ticks_an, AN_cmap.N)
     
     # Create a figure with GridSpec
     fig = plt.figure(figsize=(10, 8))
-    gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2], hspace=-0.6, wspace=0.2)
+    if hspace is None:
+        hspace = -0.6  
+    if logo is not None and logo_size == (None, None):
+        logo_size = ("7%", "21%") 
+
+    import matplotlib.gridspec as gridspec
+    gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2], hspace=hspace, wspace=0.2)
 
     # Main map axis
     ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
-
     gl = ax.gridlines(draw_labels=True, linewidth=0.05, color='gray', alpha=0.8)
     gl.top_labels = False
     gl.right_labels = False
@@ -1022,473 +1675,134 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, labels=["Below-N
     nn_data = (max_prob.where(mask_nn) * 100).values
     an_data = (max_prob.where(mask_an) * 100).values
 
-    # Step 4: Plot each category
-   # def clip_prob(data, mask):
-   #     prob = max_prob.where(mask)
-   #     prob = xr.where(prob > 0.6, 0.6, prob) * 100
-   #     prob = xr.where(prob < 25, 25, prob)
-   #     return prob.values
-
-   # bn_data = clip_prob(max_prob, mask_bn)
-   # nn_data = clip_prob(max_prob, mask_nn)
-   # an_data = clip_prob(max_prob, mask_an)
-
-
-    # Step _: Add  Land colors
-    ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#fde0dd", edgecolor="black", zorder=0) # #dfc27d
+    # Add Land colors
+    ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#fde0dd", edgecolor="black", zorder=0) 
     
-    # # Define the data ranges for color normalization  
-    # vmin = 25  # Minimum probability percentage
-    # vmax = 65  # Maximum probability percentage
-
-    # Plot BN (Below Normal)
+    # Step 4: Plot Discrete Blocks (vmin/vmax are replaced by our custom norms)
     if np.any(~np.isnan(bn_data)):
         bn_plot = ax.pcolormesh(
             forecast_prob['X'], forecast_prob['Y'], bn_data,
-            cmap=BN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=35, vmax=85
+            cmap=BN_cmap, norm=norm_bn, transform=ccrs.PlateCarree(), alpha=0.9
         )
     else:
-        bn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=35, vmax=85), cmap=BN_cmap)
+        bn_plot = cm.ScalarMappable(norm=norm_bn, cmap=BN_cmap)
         bn_plot.set_array([])
 
-    # Plot NN (Near Normal)
     if np.any(~np.isnan(nn_data)):
         nn_plot = ax.pcolormesh(
             forecast_prob['X'], forecast_prob['Y'], nn_data,
-            cmap=NN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=35, vmax=65
+            cmap=NN_cmap, norm=norm_nn, transform=ccrs.PlateCarree(), alpha=0.9
         )
     else:
-        nn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=35, vmax=65), cmap=NN_cmap)
+        nn_plot = cm.ScalarMappable(norm=norm_nn, cmap=NN_cmap)
         nn_plot.set_array([])
 
-    # Plot AN (Above Normal)
     if np.any(~np.isnan(an_data)):
         an_plot = ax.pcolormesh(
             forecast_prob['X'], forecast_prob['Y'], an_data,
-            cmap=AN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=35, vmax=85
+            cmap=AN_cmap, norm=norm_an, transform=ccrs.PlateCarree(), alpha=0.9
         )
     else:
-        an_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=35, vmax=85), cmap=AN_cmap)
+        an_plot = cm.ScalarMappable(norm=norm_an, cmap=AN_cmap)
         an_plot.set_array([])
 
-    # Step 5: Add coastlines and borders and Land
+    # Add coastlines and borders
     ax.coastlines()
     ax.add_feature(cfeature.BORDERS, edgecolor='black', linewidth=1.0, linestyle='solid')
     ax.add_feature(cfeature.OCEAN, facecolor="lightblue")
     
-    # Step 6: Add individual colorbars with fixed ticks
-    def create_ticks(vn=35, vx=86, step=5):
-        ticks = np.arange(vn, vx, step)
-        return ticks
-
-    #ticks = create_ticks(vn=35, vx=86, step=5)
-
+    # Step 6: Add individual colorbars with exact tick snapping
+    
     # For BN (Below Normal)
-    ticks = create_ticks(vn=35, vx=86, step=5)
     cbar_ax_bn = fig.add_subplot(gs[1, 0])
-    cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal')
+    cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal', spacing='uniform', ticks=ticks_bn)
     cbar_bn.set_label(f'{labels[0]} (%)')
-    cbar_bn.set_ticks(ticks)
-    cbar_bn.set_ticklabels([f"{tick}" for tick in ticks])
+    cbar_bn.set_ticklabels([f"{tick}" for tick in ticks_bn])
+    cbar_ax_bn.invert_xaxis() # Invert scale from 85 down to 35
+    cbar_bn.ax.tick_params(axis='x', direction='in', length=6, color='black') # Ticks inward
 
     # For NN (Near Normal)
-    ticks = create_ticks(vn=35, vx=66, step=5)
     cbar_ax_nn = fig.add_subplot(gs[1, 1])
-    cbar_nn = plt.colorbar(nn_plot, cax=cbar_ax_nn, orientation='horizontal')
+    cbar_nn = plt.colorbar(nn_plot, cax=cbar_ax_nn, orientation='horizontal', spacing='uniform', ticks=ticks_nn)
     cbar_nn.set_label(f'{labels[1]} (%)')
-    cbar_nn.set_ticks(ticks)
-    cbar_nn.set_ticklabels([f"{tick}" for tick in ticks])
+    cbar_nn.set_ticklabels([f"{tick}" for tick in ticks_nn])
+    cbar_nn.ax.tick_params(axis='x', direction='in', length=6, color='black') # Ticks inward
 
     # For AN (Above Normal)
-    ticks = create_ticks(vn=35, vx=86, step=5)
     cbar_ax_an = fig.add_subplot(gs[1, 2])
-    cbar_an = plt.colorbar(an_plot, cax=cbar_ax_an, orientation='horizontal')
+    cbar_an = plt.colorbar(an_plot, cax=cbar_ax_an, orientation='horizontal', spacing='uniform', ticks=ticks_an)
     cbar_an.set_label(f'{labels[2]} (%)')
-    cbar_an.set_ticks(ticks)
-    cbar_an.set_ticklabels([f"{tick}" for tick in ticks])
+    cbar_an.set_ticklabels([f"{tick}" for tick in ticks_an])
+    cbar_an.ax.tick_params(axis='x', direction='in', length=6, color='black') # Ticks inward
     
-    # Set the title with the formatted model_name
+    # Set the title
     if isinstance(model_name, np.ndarray):
         model_name_str = str(model_name.item())
     else:
         model_name_str = str(model_name)
     ax.set_title(f"{model_name_str}", fontsize=13, pad=20)
 
-
-    # Step 7: Add logo if provided
-    
+    # Add logo if provided
     if logo is not None:
         ax_logo = inset_axes(ax,
-                            width="7%",          
-                            height="21%",         
+                            width=logo_size[0],        
+                            height=logo_size[1],       
                             loc=logo_position,
                             borderpad=0.1)        
         ax_logo.imshow(mpimg.imread(logo))
         ax_logo.axis("off") 
 
-    # plt.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.03, wspace=0.03)
     plt.subplots_adjust(top=0.95, bottom=0.08, left=0.06, right=0.94, hspace=-0.6, wspace=0.2)
-    plt.savefig(f"{dir_to_save}", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.pdf", dpi=300, bbox_inches='tight')
+    plt.show()
+def plot_det_forecasts(da2d: xr.DataArray, title: str, outpng: str = None):
+    """Plot a 2D field (Y, X) on a PlateCarree map."""
+    if not set(["Y", "X"]).issubset(set(da2d.dims)):
+        raise ValueError(f"Expected dims (Y, X). Got {da2d.dims}")
+
+    # Ensure sorted coords for clean pcolormesh
+    da2d = da2d.sortby(["Y", "X"])
+
+    lon = da2d["X"].values
+    lat = da2d["Y"].values
+    data = da2d.values
+
+    # Robust limits (avoids extreme outliers dominating the color range)
+    vmin = np.nanpercentile(data, 2)
+    vmax = np.nanpercentile(data, 98)
+
+    fig = plt.figure(figsize=(10, 6))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+
+    # Extent: [west, east, south, north]
+    ax.set_extent([float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max())], crs=ccrs.PlateCarree())
+
+    im = ax.pcolormesh(
+        lon, lat, data,
+        transform=ccrs.PlateCarree(),
+        shading="auto",
+        vmin=vmin, vmax=vmax,
+    )
+
+    ax.coastlines(linewidth=1.0)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.8)
+    ax.add_feature(cfeature.LAND, edgecolor="black", linewidth=0.3, alpha=0.2)
+    ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+
+    cb = plt.colorbar(im, ax=ax, orientation="horizontal", pad=0.06, fraction=0.05)
+    # cb.set_label(f"{da2d.name or 'variable'} (units unknown)")
+
+    ax.set_title(title)
+    plt.tight_layout()
+
+    if outpng:
+        plt.savefig(outpng, dpi=200, bbox_inches="tight")
+        print(f"Saved figure: {outpng}")
+
     plt.show()
 
 
-def plot_prob_forecasts1(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, logo=None, logo_size=0.5):
-    """
-    Plot probabilistic forecasts with tercile categories.
-
-    Parameters
-    ----------
-    dir_to_save : str
-        Directory path to save the plot.
-    forecast_prob : xarray.DataArray
-        Data array containing probability forecasts with a 'probability' dimension.
-    model_name : str or numpy.ndarray
-        Name of the model for the plot title.
-    labels : list, optional
-        Labels for the tercile categories (default is ["Below-Normal", "Near-Normal", "Above-Normal"]).
-    reverse_cmap : bool, optional
-        If True, reverse the colormap order for categories (default is True).
-    logo : str, optional
-        Path to the logo image to be added to the plot (default is None).
-    logo_size : float, optional
-        Size of the logo image in the plot (default is 0.5).    
-
-    Notes
-    -----
-    Saves the plot as a PNG file and displays it.
-    Uses custom colormaps for each tercile category.
-    """
-    # Step 1: Extract maximum probability and category
-    max_prob = forecast_prob.max(dim="probability", skipna=True)  # Maximum probability at each grid point
-    # Fill NaN values with a very low value 
-    filled_prob = forecast_prob.fillna(-9999)
-    # Compute argmax
-    max_category = filled_prob.argmax(dim="probability")
-    
-    # Step 2: Create masks for each category
-    mask_bn = max_category == 0  # Below Normal (BN)
-    mask_nn = max_category == 1  # Near Normal (NN)
-    mask_an = max_category == 2  # Above Normal (AN)
-    
-    # Step 3: Define custom colormaps
-    if reverse_cmap:
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#FDAE61', '#F46D43', '#D73027']) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FEE391'])
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#ABDDA4', '#66C2A5', '#3288BD'])  
-    else:
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FDAE61', '#F46D43', '#D73027']) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FEE391'])
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#ABDDA4', '#66C2A5', '#3288BD'])          
-    
-    # Create a figure with GridSpec
-    # fig = plt.figure(figsize=(8, 6.5))  # Increased height to accommodate logo
-    # gs = gridspec.GridSpec(3, 3, height_ratios=[15, 0.8, 0.7], hspace=0.2)
-
-    fig = plt.figure(figsize=(10, 8))
-    gs = gridspec.GridSpec(3, 3, height_ratios=[8, 0.2, 3], hspace=0.03)
-
-    # Main map axis
-    ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
-
-    # Modify by Mandela
-    
-    ###################
-    ##################
-
-    # Step 4: Plot each category
-    # Multiply by 100 to convert probabilities to percentages
-    
-    # bn_data = (max_prob.where(mask_bn) * 100).values
-    # nn_data = (max_prob.where(mask_nn) * 100).values
-    # an_data = (max_prob.where(mask_an) * 100).values
-    
-    # Apply the condition to ensure minimum value of 45% for each category
-    # and a maximum of 60% for BN, NN, and AN
-    # Ensure that the values are at least 45% and at most 60% for each category
-    # and convert to percentage
-    # bn_data = xr.where((max_prob.where(mask_bn) * 100) < 45, 45,
-    #                    xr.where(max_prob.where(mask_bn) * 100 > 60, 60, max_prob.where(mask_bn) * 100)).values
-    # nn_data = xr.where((max_prob.where(mask_nn) * 100) < 45, 45,
-    #                    xr.where(max_prob.where(mask_nn) * 100 > 60, 60, max_prob.where(mask_nn) * 100)).values
-    # an_data = xr.where((max_prob.where(mask_an) * 100) < 45, 45,
-    #                    xr.where(max_prob.where(mask_an) * 100 > 60, 60, max_prob.where(mask_an) * 100)).values    
-
-
-    # Step 4: Plot each category
-    bn_data = xr.where((xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100)<45, 45,
-                       xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100).values  
-    nn_data = xr.where((xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100)<45, 45,
-                   xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100).values
-    an_data = xr.where((xr.where(max_prob.where(mask_an)>0.6,0.6,max_prob.where(mask_an))* 100)<45, 45,
-                   xr.where(max_prob.where(mask_an)>0.6,0.6,max_prob.where(mask_an))* 100).values
-    
-    # Define the data ranges for color normalization  
-    vmin = 35  # Minimum probability percentage
-    vmax = 65  # Maximum probability percentage
-
-    # Plot BN (Below Normal)
-    if np.any(~np.isnan(bn_data)):
-        bn_plot = ax.pcolormesh(
-            forecast_prob['X'], forecast_prob['Y'], bn_data,
-            cmap=BN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
-        )
-    else:
-        bn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=BN_cmap)
-        bn_plot.set_array([])
-
-    # Plot NN (Near Normal)
-    if np.any(~np.isnan(nn_data)):
-        nn_plot = ax.pcolormesh(
-            forecast_prob['X'], forecast_prob['Y'], nn_data,
-            cmap=NN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
-        )
-    else:
-        nn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=NN_cmap)
-        nn_plot.set_array([])
-
-    # Plot AN (Above Normal)
-    if np.any(~np.isnan(an_data)):
-        an_plot = ax.pcolormesh(
-            forecast_prob['X'], forecast_prob['Y'], an_data,
-            cmap=AN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
-        )
-    else:
-        an_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=AN_cmap)
-        an_plot.set_array([])
-
-    # Step 5: Add coastlines and borders
-    ax.coastlines()
-    ax.add_feature(cfeature.BORDERS, linestyle=':')
-    
-    # Step 6: Add individual colorbars with fixed ticks
-    def create_ticks():
-        ticks = np.arange(35, 66, 5)
-        return ticks
-
-    ticks = create_ticks()
-
-    # For BN (Below Normal)
-    cbar_ax_bn = fig.add_subplot(gs[1, 0])
-    cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal')
-    cbar_bn.set_label(f'{labels[0]} (%)')
-    cbar_bn.set_ticks(ticks)
-    cbar_bn.set_ticklabels([f"{tick}" for tick in ticks])
-
-    # For NN (Near Normal)
-    cbar_ax_nn = fig.add_subplot(gs[1, 1])
-    cbar_nn = plt.colorbar(nn_plot, cax=cbar_ax_nn, orientation='horizontal')
-    cbar_nn.set_label(f'{labels[1]} (%)')
-    cbar_nn.set_ticks(ticks)
-    cbar_nn.set_ticklabels([f"{tick}" for tick in ticks])
-
-    # For AN (Above Normal)
-    cbar_ax_an = fig.add_subplot(gs[1, 2])
-    cbar_an = plt.colorbar(an_plot, cax=cbar_ax_an, orientation='horizontal')
-    cbar_an.set_label(f'{labels[2]} (%)')
-    cbar_an.set_ticks(ticks)
-    cbar_an.set_ticklabels([f"{tick}" for tick in ticks])
-    
-    # Set the title with the formatted model_name
-    if isinstance(model_name, np.ndarray):
-        model_name_str = str(model_name.item())
-    else:
-        model_name_str = str(model_name)
-    ax.set_title(f"{model_name_str}", fontsize=13, pad=20)
-
-    # Step 7: Add logo if provided
-    logo_ax = fig.add_subplot(gs[2, 2])
-    logo_ax.axis('off')
-    if logo is not None:
-        im = image.imread(logo)
-        addLogo = OffsetImage(im, zoom=logo_size)
-        ab = AnnotationBbox(addLogo, (0.5, 0.5), frameon=False, xycoords='axes fraction')
-        logo_ax.add_artist(ab)
-
-    plt.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=-0.6, wspace=0.2)
-    plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.png", dpi=300, bbox_inches='tight')
-    plt.show()
-
-def plot_prob_forecasts2(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, logo=None, logo_size=0.5):
-    """
-    Plot probabilistic forecasts with tercile categories.
-
-    Parameters
-    ----------
-    dir_to_save : str
-        Directory path to save the plot.
-    forecast_prob : xarray.DataArray
-        Data array containing probability forecasts with a 'probability' dimension.
-    model_name : str or numpy.ndarray
-        Name of the model for the plot title.
-    labels : list, optional
-        Labels for the tercile categories (default is ["Below-Normal", "Near-Normal", "Above-Normal"]).
-    reverse_cmap : bool, optional
-        If True, reverse the colormap order for categories (default is True).
-    logo : str, optional
-        Path to the logo image to be added to the plot (default is None).
-    logo_size : float, optional
-        Size of the logo image in the plot (default is 0.5).    
-
-    Notes
-    -----
-    Saves the plot as a PNG file and displays it.
-    Uses custom colormaps for each tercile category.
-    """
-    # Step 1: Extract maximum probability and category
-    max_prob = forecast_prob.max(dim="probability", skipna=True)  # Maximum probability at each grid point
-    # Fill NaN values with a very low value 
-    filled_prob = forecast_prob.fillna(-9999)
-    # Compute argmax
-    max_category = filled_prob.argmax(dim="probability")
-    
-    # Step 2: Create masks for each category
-    mask_bn = max_category == 0  # Below Normal (BN)
-    mask_nn = max_category == 1  # Near Normal (NN)
-    mask_an = max_category == 2  # Above Normal (AN)
-    
-    # Step 3: Define custom colormaps
-    if reverse_cmap:
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#FDAE61', '#F46D43', '#D73027']) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FEE391'])
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#ABDDA4', '#66C2A5', '#3288BD'])  
-    else:
-        BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FDAE61', '#F46D43', '#D73027']) 
-        NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#FFFFE5', '#FFF7BC', '#FEE391'])
-        AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#ABDDA4', '#66C2A5', '#3288BD'])          
-    
-    # Create a figure with GridSpec
-    # fig = plt.figure(figsize=(8, 6.5))  # Increased height to accommodate logo
-    # gs = gridspec.GridSpec(3, 3, height_ratios=[15, 0.8, 0.7], hspace=0.2)
-
-    fig = plt.figure(figsize=(10, 8))
-    gs = gridspec.GridSpec(3, 3, height_ratios=[8, 0.2, 3], hspace=0.03)
-
-    # Main map axis
-    ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
-
-    # Modify by Mandela
-    
-    ###################
-    ##################
-    sigma = 2.0  # Smoothing parameter (Gaussian sigma); 
-    
-    # Create a smoothed copy
-    forecast_prob_smoothed = forecast_prob * 0.0  # Initialize with same shape and coords
-    
-    # Smooth each probability layer spatially
-    for p in forecast_prob.probability.values:
-        layer = forecast_prob.sel(probability=p)
-        layer_smoothed = xr.apply_ufunc(
-            gaussian_filter,
-            layer,
-            input_core_dims=[['Y', 'X']],
-            output_core_dims=[['Y', 'X']],
-            kwargs={'sigma': sigma}
-        )
-        forecast_prob_smoothed.loc[{'probability': p}] = layer_smoothed
-    
-    # Normalize smoothed probabilities to sum to 1 at each grid point
-    sum_probs = forecast_prob_smoothed.sum('probability')
-    forecast_prob_smoothed = forecast_prob_smoothed / sum_probs.where(sum_probs != 0, 1.0)
-    
-    # Replace original with smoothed
-    forecast_prob = forecast_prob_smoothed
-
-    # Step 4: Plot each category
-    bn_data = xr.where((xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100)<45, 45,
-                       xr.where(max_prob.where(mask_bn)>0.6,0.6,max_prob.where(mask_bn))* 100).values  
-    nn_data = xr.where((xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100)<45, 45,
-                   xr.where(max_prob.where(mask_nn)>0.6,0.6,max_prob.where(mask_nn))* 100).values
-    an_data = xr.where((xr.where(max_prob.where(mask_an)>0.6,0.6,max_prob.where(mask_an))* 100)<45, 45,
-                   xr.where(max_prob.where(mask_an)>0.6,0.6,max_prob.where(mask_an))* 100).values
-    
-    # Define the data ranges for color normalization  
-    vmin = 35  # Minimum probability percentage
-    vmax = 65  # Maximum probability percentage
-
-    # Plot BN (Below Normal)
-    if np.any(~np.isnan(bn_data)):
-        bn_plot = ax.pcolormesh(
-            forecast_prob['X'], forecast_prob['Y'], bn_data,
-            cmap=BN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
-        )
-    else:
-        bn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=BN_cmap)
-        bn_plot.set_array([])
-
-    # Plot NN (Near Normal)
-    if np.any(~np.isnan(nn_data)):
-        nn_plot = ax.pcolormesh(
-            forecast_prob['X'], forecast_prob['Y'], nn_data,
-            cmap=NN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
-        )
-    else:
-        nn_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=NN_cmap)
-        nn_plot.set_array([])
-
-    # Plot AN (Above Normal)
-    if np.any(~np.isnan(an_data)):
-        an_plot = ax.pcolormesh(
-            forecast_prob['X'], forecast_prob['Y'], an_data,
-            cmap=AN_cmap, transform=ccrs.PlateCarree(), alpha=0.9, vmin=vmin, vmax=vmax
-        )
-    else:
-        an_plot = cm.ScalarMappable(norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap=AN_cmap)
-        an_plot.set_array([])
-
-    # Step 5: Add coastlines and borders
-    ax.coastlines()
-    ax.add_feature(cfeature.BORDERS, linestyle=':')
-    
-    # Step 6: Add individual colorbars with fixed ticks
-    def create_ticks():
-        ticks = np.arange(35, 66, 5)
-        return ticks
-
-    ticks = create_ticks()
-
-    # For BN (Below Normal)
-    cbar_ax_bn = fig.add_subplot(gs[1, 0])
-    cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal')
-    cbar_bn.set_label(f'{labels[0]} (%)')
-    cbar_bn.set_ticks(ticks)
-    cbar_bn.set_ticklabels([f"{tick}" for tick in ticks])
-
-    # For NN (Near Normal)
-    cbar_ax_nn = fig.add_subplot(gs[1, 1])
-    cbar_nn = plt.colorbar(nn_plot, cax=cbar_ax_nn, orientation='horizontal')
-    cbar_nn.set_label(f'{labels[1]} (%)')
-    cbar_nn.set_ticks(ticks)
-    cbar_nn.set_ticklabels([f"{tick}" for tick in ticks])
-
-    # For AN (Above Normal)
-    cbar_ax_an = fig.add_subplot(gs[1, 2])
-    cbar_an = plt.colorbar(an_plot, cax=cbar_ax_an, orientation='horizontal')
-    cbar_an.set_label(f'{labels[2]} (%)')
-    cbar_an.set_ticks(ticks)
-    cbar_an.set_ticklabels([f"{tick}" for tick in ticks])
-    
-    # Set the title with the formatted model_name
-    if isinstance(model_name, np.ndarray):
-        model_name_str = str(model_name.item())
-    else:
-        model_name_str = str(model_name)
-    ax.set_title(f"{model_name_str}", fontsize=13, pad=20)
-
-    # Step 7: Add logo if provided
-    logo_ax = fig.add_subplot(gs[2, 2])
-    logo_ax.axis('off')
-    if logo is not None:
-        im = image.imread(logo)
-        addLogo = OffsetImage(im, zoom=logo_size)
-        ab = AnnotationBbox(addLogo, (0.5, 0.5), frameon=False, xycoords='axes fraction')
-        logo_ax.add_artist(ab)
-
-    plt.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.03, wspace=0.3)
-    plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.png", dpi=300, bbox_inches='tight')
-    plt.show()
-
-def plot_tercile(A):
+def plot_tercile(A, save_dir=None, colors=None, year=None):
     """
     Plot a tercile map with categories: Below, Normal, Above.
 
@@ -1501,9 +1815,12 @@ def plot_tercile(A):
     -----
     Uses a custom colormap and displays a legend for tercile categories.
     """
-    fig = plt.figure(figsize=(8, 6))
+    fig = plt.figure(figsize=(9, 7))
     ax = plt.axes(projection=ccrs.PlateCarree())
-    colors = ['#fc8d59', '#ffffbf', '#99d594']
+    if colors is None:
+        colors = ['#fc8d59', '#bdbdbd', '#99d594']
+    else:
+        colors
     cmap = ListedColormap(colors)
     bounds = [-0.5, 0.5, 1.5, 2.5]
     norm = BoundaryNorm(bounds, cmap.N)
@@ -1513,66 +1830,212 @@ def plot_tercile(A):
     ax.add_feature(cfeature.BORDERS, linewidth=1)
     ax.add_feature(cfeature.COASTLINE, linewidth=1)
     ax.set_extent([lon.min(), lon.max(), lat.min(), lat.max()], crs=ccrs.PlateCarree())
-    plt.title("Terciles MAP", fontsize=16, weight='bold')
+    if year is None:
+        title = "Observed terciles"
+    else:
+        title = f"Observed terciles {year}"
+    plt.title(title, fontsize=16, weight='bold')
     legend_elements = [
-        mpatches.Patch(color='#99d594', label='ABOVE'),
-        mpatches.Patch(color='#ffffbf', label='NORMAL'),
-        mpatches.Patch(color='#fc8d59', label='BELOW')
+        mpatches.Patch(color=colors[2], label='ABOVE AVERAGE'),
+        mpatches.Patch(color=colors[1], label='NEAR AVERAGE'),
+        mpatches.Patch(color=colors[0], label='BELOW AVERAGE')
     ]
     plt.legend(handles=legend_elements, loc='lower left')
     plt.tight_layout()
-    plt.show()
+    if save_dir is None:
+        plt.show()
+    else:
+        plt.savefig(f"{save_dir}.pdf", dpi=300, bbox_inches='tight')
+        plt.show()
 
-def find_best_distribution_grid(rainfall, distribution_map=None):
+
+# Transform consensus#################################################################################"
+######################################################################################################
+
+
+def _parse_forecast_str(s, cats=('PB','PN','PA')):
     """
-    Determine the best-fitting distribution for variables data at each grid cell.
-
-    Parameters
-    ----------
-    rainfall : xarray.DataArray
-        Precipitation data with a time dimension 'T' and spatial dimensions 'Y', 'X'.
-    distribution_map : dict, optional
-        Mapping of distribution names to numeric codes. Defaults to:
-        {'norm': 1, 'lognorm': 2, 'expon': 3, 'gamma': 4, 'weibull_min': 5}
-
-    Returns
-    -------
-    xarray.DataArray
-        Array with numeric codes for the best-fitting distribution at each grid cell.
-
-    Notes
-    -----
-    Uses the Fitter library to fit distributions and select the best based on sum-of-squared errors.
+    Parse strings like '45-35-20' into a dict {PB:0.45, PN:0.35, PA:0.20}.
     """
-    if distribution_map is None:
-        distribution_map = {
-            'norm': 1,
-            'lognorm': 2,
-            'expon': 3,
-            'gamma': 4,
-            'weibull_min': 5
-        }
-    def find_best_distribution(precip_data, distribution_map):
-        precip_data = np.asarray(precip_data)
-        if np.isnan(precip_data).all():
-            return np.nan
-        f = Fitter(precip_data, distributions=list(distribution_map.keys()))
-        f.fit()
-        best_fit = f.get_best(method='sumsquare_error')
-        best_dist_name = list(best_fit.keys())[0]
-        return distribution_map.get(best_dist_name, np.nan)
-    best_fit_da = xr.apply_ufunc(
-        find_best_distribution,
-        rainfall,
-        input_core_dims=[["T"]],
-        kwargs={'distribution_map': distribution_map},
-        vectorize=True,
-        dask="parallelized",
-        output_dtypes=[float]
+    parts = [p.strip() for p in str(s).split('-')]
+    if len(parts) != len(cats):
+        raise ValueError(f"Forecast '{s}' must have {len(cats)} parts")
+    vals = [float(p)/100.0 for p in parts]
+    return dict(zip(cats, vals))
+
+def polygons_to_prob_ds(
+    da_like: xr.DataArray,
+    gdf: gpd.GeoDataFrame,
+    forecast_col: str = "Forecast",
+    categories=('PB','PN','PA'),
+    time_dim: str = "T",
+    y_dim: str = "Y",
+    x_dim: str = "X",
+):
+    """
+    Rasterize polygon forecasts onto the (Y,X) grid of `da_like` and return:
+      xr.Dataset with dims (probability, T, Y, X) and coords probability=['PB','PN','PA'].
+    `da_like` is only used for its coords (1 time step expected).
+    """
+    # --- Safety checks & CRS ---
+    if gdf.crs is None:
+        # assume lon/lat
+        gdf = gdf.set_crs(4326)
+    else:
+        gdf = gdf.to_crs(4326)
+
+    X = da_like.coords[x_dim].values
+    Y = da_like.coords[y_dim].values
+    T = da_like.coords[time_dim].values  # expected shape (1,)
+
+    nx = X.size
+    ny = Y.size
+    if T.size != 1:
+        raise ValueError("This helper expects a single time step in da_like.")
+
+    # --- Build transform aligned to cell edges (coords are assumed centers) ---
+    dx = float(np.mean(np.diff(X)))
+    dy = float(np.mean(np.diff(Y)))
+    west  = float(X.min() - dx/2)
+    east  = float(X.max() + dx/2)
+    south = float(Y.min() - dy/2)
+    north = float(Y.max() + dy/2)
+    transform = from_bounds(west, south, east, north, nx, ny)
+
+    # --- Prepare output arrays per probability category ---
+    out = {cat: np.full((ny, nx), np.nan, dtype=float) for cat in categories}
+
+    # --- Rasterize polygons and assign values ---
+    # If your polygons do not overlap, later ones won't matter; if they do,
+    # later rows in gdf will overwrite earlier ones.
+    for row in gdf.itertuples(index=False):
+        geom = getattr(row, "geometry")
+        fstr = getattr(row, forecast_col)
+        probs = _parse_forecast_str(fstr, categories)
+
+        # mask for this geometry (1 inside polygon, 0 outside)
+        mask = rasterize(
+            [(geom, 1)],
+            out_shape=(ny, nx),
+            transform=transform,
+            fill=0,
+            dtype="uint8",
+            all_touched=False,  # set True if you want a slightly “fatter” polygon fill
+        ).astype(bool)
+
+        # Align raster rows (north→south) with Y coords (south→north)
+        if np.all(np.diff(Y) > 0):   # Y ascending
+            mask = np.flipud(mask)
+
+        for cat in categories:
+            out_arr = out[cat]
+            out_arr[mask] = probs[cat]
+
+    # --- Assemble into xarray with desired dims (probability, T, Y, X) ---
+    data_stack = np.stack([out[cat] for cat in categories], axis=0)  # (probability, Y, X)
+    data_stack = data_stack[:, np.newaxis, :, :]  # add T dim -> (probability, T, Y, X)
+
+    ds = xr.Dataset(
+        data_vars=dict(
+            forecast=(("probability", time_dim, y_dim, x_dim), data_stack)
+        ),
+        coords={
+            "probability": np.array(categories, dtype="<U2"),
+            time_dim: T,
+            y_dim: Y,
+            x_dim: X,
+        },
+        attrs={}
     )
-    return best_fit_da
 
-def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization, year_start, year_end, year_forecast, nb_cores=2, agrometparam="Onset"):
+    return ds
+
+
+def plot_georeferenced_forecast_map(
+    shapefile_zip,
+    column="Forecast",
+    extent_obs=[12, -3.5, 4, 1.5],
+    title="Georeferenced Map of 2024 consensual Forecast",
+    figsize=(9, 7),
+    cmap="tab20",
+    outpath="georeferenced_map.pdf",
+    dpi=300,
+    show=True,
+):
+    n, w, s, e = extent_obs
+    cartopy_extent = [w, e, s, n]
+
+    shapefile_zip = Path(shapefile_zip)
+    outpath = Path(outpath)
+
+    if not shapefile_zip.exists():
+        raise FileNotFoundError(f"Shapefile zip not found: {shapefile_zip}")
+
+    gdf = gpd.read_file(f"zip://{shapefile_zip}")
+
+    if column not in gdf.columns:
+        raise KeyError(f"Column '{column}' not found. Available: {list(gdf.columns)}")
+
+    if gdf.crs is None:
+        gdf = gdf.set_crs(4326)
+    else:
+        gdf = gdf.to_crs(4326)
+
+    proj = ccrs.PlateCarree()
+    fig, ax = plt.subplots(figsize=figsize, subplot_kw={"projection": proj})
+
+    ax.set_extent(cartopy_extent, crs=proj)
+    
+    ax.add_feature(cfeature.OCEAN, zorder=0)
+    ax.add_feature(cfeature.LAND, facecolor="whitesmoke", zorder=0)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+    ax.add_feature(cfeature.LAKES, alpha=0.3)
+    ax.add_feature(cfeature.RIVERS, linewidth=0.5, alpha=0.5)
+
+    gl = ax.gridlines(draw_labels=True, linestyle="--", alpha=0.4)
+    gl.top_labels = False
+    gl.right_labels = False
+
+    gdf.plot(
+        column=column,
+        ax=ax,
+        transform=proj,
+        edgecolor="0.3",
+        linewidth=0.6,
+        cmap=cmap,
+        legend=True,
+        legend_kwds={"title": column},
+        categorical=True,
+    )
+
+    ax.set_title(title, fontsize=12)
+    plt.tight_layout()
+
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(outpath, dpi=dpi)
+
+    if show:
+        plt.show()
+
+    return fig, ax, gdf
+#########################################################################
+import inspect
+
+def process_model_for_other_params(
+    agmParamModel, 
+    dir_to_save, 
+    hdcst_file_path, 
+    fcst_file_path, 
+    obs_hdcst, 
+    obs_fcst_year, 
+    month_of_initialization, 
+    year_start, 
+    year_end, 
+    year_forecast, 
+    nb_cores=2, 
+    agrometparam="Onset"
+):
     """
     Process model hindcast and forecast data for agrometeorological parameters.
 
@@ -1608,6 +2071,26 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
     tuple
         Tuple of dictionaries (saved_hindcast_paths, saved_forecast_paths) mapping model names to saved file paths.
     """
+    
+    # =========================================================================
+    # DYNAMIC ARGUMENT EXTRACTION
+    # Automatically varying arguments based on the specific agmParamModel passed
+    # =========================================================================
+    sig = inspect.signature(agmParamModel.compute)
+    valid_compute_args = sig.parameters.keys()
+    model_attributes = vars(agmParamModel)
+    
+    dynamic_kwargs = {
+        key: model_attributes[key] 
+        for key in valid_compute_args 
+        if key in model_attributes
+    }
+    
+    # Add nb_cores manually if the compute method accepts it
+    if "nb_cores" in valid_compute_args:
+        dynamic_kwargs["nb_cores"] = nb_cores
+    # =========================================================================
+
     mask = xr.where(~np.isnan(obs_fcst_year.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
     t_coord = pd.date_range(start=f"{year_forecast}-01-01", end=f"{year_forecast}-12-31", freq="D")
     y_coords = obs_fcst_year.Y
@@ -1622,8 +2105,6 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
             dims=["T", "Y", "X"]
         ) * mask
     else:
-        # da_noleap = obs_hdcst.sel(T=~((obs_hdcst['T'].dt.month == 2) & (obs_hdcst['T'].dt.day == 29)))
-        # daily_climatology = da_noleap.groupby('T.dayofyear').mean(dim='T')
         daily_climatology = obs_hdcst.groupby('T.dayofyear').mean(dim='T')
         daily_climatology = daily_climatology.sel(dayofyear=~((daily_climatology['dayofyear'] == 60)))
         data = daily_climatology.to_numpy()
@@ -1636,6 +2117,7 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
     abb_mont_ini = calendar.month_abbr[int(month_of_initialization)]
     dir_to_save = Path(f"{dir_to_save}/model_data")
     os.makedirs(dir_to_save, exist_ok=True)
+    
     saved_hindcast_paths = {}
     for i in hdcst_file_path.keys():
         save_path = f"{dir_to_save}/hindcast_{i}_{agrometparam}_{abb_mont_ini}Ic.nc"
@@ -1649,12 +2131,16 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
             ds1_aligned, ds2_aligned = xr.align(hdcst, obs_hdcst_interp, join='outer')
             filled_ds = ds1_aligned.fillna(ds2_aligned)
             ds_filled = filled_ds.copy()
-            agpm_model = agmParamModel.compute(daily_data=ds_filled.sortby("T"), nb_cores=nb_cores)
+            
+            # Use dynamic_kwargs here
+            agpm_model = agmParamModel.compute(ds_filled.sortby("T"), **dynamic_kwargs)
+            
             ds_processed = agpm_model.to_dataset(name=agrometparam)
             ds_processed.to_netcdf(save_path)
         else:
             print(f"[SKIP] {save_path} already exists.")
         saved_hindcast_paths[i] = save_path
+        
     saved_forecast_paths = {}
     for i in fcst_file_path.keys():
         save_path = f"{dir_to_save}/forecast_{i}_{agrometparam}_{abb_mont_ini}Ic.nc"
@@ -1674,15 +2160,17 @@ def process_model_for_other_params(agmParamModel, dir_to_save, hdcst_file_path, 
             filled_fcst_ = ds1_aligned.fillna(ds2_aligned)
             ds_filled = filled_fcst_.copy()
             ds_filled = ds_filled.sortby("T")
-            agpm_model = agmParamModel.compute(daily_data=ds_filled, nb_cores=nb_cores)
+            
+            # Use dynamic_kwargs here
+            agpm_model = agmParamModel.compute(ds_filled, **dynamic_kwargs)
+            
             ds_processed = agpm_model.to_dataset(name=agrometparam)
             ds_processed.to_netcdf(save_path)
         else:
             print(f"[SKIP] {save_path} already exists.")
         saved_forecast_paths[i] = save_path
+        
     return saved_hindcast_paths, saved_forecast_paths
-
-
 def plot_date(A):
     """
     Plot a map of dates, interpreting values as offsets from 2024-01-01.
@@ -1696,6 +2184,7 @@ def plot_date(A):
     -----
     Converts colorbar ticks to calendar dates (e.g., '01-Jan') for readability.
     """
+    A = xr.where(A > 366, A - 366, A)
     fig, ax = plt.subplots(figsize=(8, 6), subplot_kw=dict(projection=ccrs.PlateCarree()))
     plt_obj = A.plot(
         ax=ax,
@@ -1892,6 +2381,77 @@ cessation_dryspell_criteria = {
 }
 
 ########################## Extended seasonal forecast ##########################################
+qmap = WAS_Qmap()
+qmap_ = WAS_bias_correction()
+def proceed_seasonal_daily_bias_correction(dir_to_save_model, observation, hindcast_files, forecast_files, varname="PRCP", method='QUANT', wet_day=True, qstep=0.01, distr=None, transfun=None):
+    hindcast_files_={}
+    forecast_files_={}
+    os.makedirs(f"{dir_to_save_model}/corrected", exist_ok=True)
+    for i in hindcast_files.keys():
+        hcst = xr.open_dataset(hindcast_files[i])[varname]
+        fcst = xr.open_dataset(forecast_files[i])[varname]
+        corrected_hcst = []
+        corrected_fcst = []
+        save_path_hcst = f"{dir_to_save_model}/corrected/{os.path.basename(hindcast_files[i])}"
+        save_path_fcst = f"{dir_to_save_model}/corrected/{os.path.basename(forecast_files[i])}"
+        if not os.path.exists(save_path_hcst):
+            for month in range(1, 13):
+                obs_month = observation.sel(T=observation['T'].dt.month == month).interp(Y=hcst.Y, X=hcst.X, method="linear", kwargs={"fill_value": "extrapolate"})
+                mask = xr.where(~np.isnan(obs_month.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+                hcst_month = hcst.sel(T=hcst['T'].dt.month == month)
+                obs_month['T'] = hcst_month['T']
+                # obs_month, hcst_month = xr.align(obs_month, hcst_month, join='inner')
+                fcst_month = fcst.sel(T=fcst['T'].dt.month == month)
+                if varname == "PRCP":
+                    if method in ['QUANT','RQUANT']:
+                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep)
+                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant, type='linear')
+                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant, type='linear')
+                    elif method == 'SSPLIN':
+                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep)
+                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant)
+                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant)
+                    elif method == 'PTF':
+                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep, transfun=transfun)
+                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant)
+                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant)
+                    elif method == 'DIST':                   
+                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep, distr=distr)
+                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant)
+                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant)  
+                    else:
+                        print('please choose method between QUANT','RQUANT','SSPLIN','DIST','PTF')
+                else:
+                    if method=='QUANT':
+                        fobj_quant = qmap_.fitBC(obs_month, hcst_month, method=method, qstep=qstep, nboot=20)
+                        hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant, type='linear')
+                        fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant, type='linear')
+                    elif method in ['MEAN','VARSCALE']:
+                        fobj_quant = qmap_.fitBC(obs_month, hcst_month, method=method)
+                        hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant)
+                        fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant)
+                    elif method=='DIST':
+                        fobj_quant = qmap_.fitBC(obs_month, hcst_month, method=method, qstep=qstep, distr=distr)
+                        hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant)
+                        fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant)
+                    else:
+                        print('please choose method between QUANT','MEAN','VARSCALE','DIST')
+                corrected_hcst.append(hcst_month_corr)
+                corrected_fcst.append(fcst_month_corr)
+            corrected_hcst_ = xr.concat(corrected_hcst, dim='T').sortby('T').fillna(0) * mask
+            corrected_fcst_ = xr.concat(corrected_fcst, dim='T').sortby('T').fillna(0) * mask
+            corrected_hcst_.to_dataset(name='corrected').to_netcdf(save_path_hcst)
+            corrected_fcst_.to_dataset(name='corrected').to_netcdf(save_path_fcst)
+            hindcast_files_[i] = save_path_hcst
+            forecast_files_[i] = save_path_fcst
+        else:
+            print(f"[SKIP] {save_path_hcst} already exists.")
+            print(f"[SKIP] {save_path_fcst} already exists.")
+            hindcast_files_[i] = save_path_hcst
+            forecast_files_[i] = save_path_fcst 
+    return hindcast_files_, forecast_files_
+
+
 def pre_process_biophysical_model(dir_to_save, hdcst_file_path, 
 fcst_file_path, obs_hdcst, obs_fcst_year, month_of_initialization,
  year_start, year_end, year_forecast, param="PRCP"):
@@ -2200,116 +2760,3 @@ def et0_fao56_daily(tmax, tmin, rs, mlsp, dem, tdew=None, u10=None, v10=None, wf
                            long_name="Reference ET0 (FAO-56 PM)")
     et0.name = "ET0"
     return et0
-
-# Other commmented code to use after
-
-# retrieve Zone for PCR
-
-###### Code to use after in several zones for PCR ##############################
-# pca= xe.single.EOF(n_modes=6, use_coslat=True, standardize=True)
-# pca.fit([i.fillna(i.mean(dim="T", skipna=True)).rename({"X": "lon", "Y": "lat"}) for i in predictor], dim="T")
-# components = pca.components()
-# scores = pca.scores()
-# expl = pca.explained_variance_ratio()
-# expl
-
-
-
-# def plot_prob_forecats(dir_to_save, forecast_prob, model_name):    
-#     # Step 1: Extract maximum probability and category
-#     max_prob = forecast_prob.max(dim="probability", skipna=True)  # Maximum probability at each grid point
-#     # Fill NaN values with a very low value 
-#     filled_prob = forecast_prob.fillna(-9999)
-#     # Compute argmax
-#     max_category = filled_prob.argmax(dim="probability")
-    
-#     # Step 2: Create masks for each category
-#     mask_bn = max_category == 0  # Below Normal (BN)
-#     mask_nn = max_category == 1  # Near Normal (NN)
-#     mask_an = max_category == 2  # Above Normal (AN)
-    
-#     # Step 3: Define custom colormaps
-#     BN_cmap = mcolors.LinearSegmentedColormap.from_list('BN', ['#FFF5F0', '#FB6A4A', '#67000D'])
-#     NN_cmap = mcolors.LinearSegmentedColormap.from_list('NN', ['#F7FCF5', '#74C476', '#00441B'])
-#     AN_cmap = mcolors.LinearSegmentedColormap.from_list('AN', ['#F7FBFF', '#6BAED6', '#08306B'])
-    
-#     # Create a figure with GridSpec
-#     fig = plt.figure(figsize=(8, 6))
-#     gs = gridspec.GridSpec(2, 3, height_ratios=[15, 0.5])
-    
-#     # Main map axis
-#     ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
-    
-#     # Step 4: Plot each category
-#     # Multiply by 100 to convert probabilities to percentages
-#     bn_data = (max_prob.where(mask_bn) * 100).values
-#     nn_data = (max_prob.where(mask_nn) * 100).values
-#     an_data = (max_prob.where(mask_an) * 100).values
-    
-#     # Plot BN (Below Normal)
-#     bn_plot = ax.pcolormesh(
-#         forecast_prob['X'], forecast_prob['Y'], bn_data,
-#         cmap=BN_cmap, transform=ccrs.PlateCarree(), alpha=0.9
-#     )
-    
-#     # Plot NN (Near Normal)
-#     nn_plot = ax.pcolormesh(
-#         forecast_prob['X'], forecast_prob['Y'], nn_data,
-#         cmap=NN_cmap, transform=ccrs.PlateCarree(), alpha=0.9
-#     )
-    
-#     # Plot AN (Above Normal)
-#     an_plot = ax.pcolormesh(
-#         forecast_prob['X'], forecast_prob['Y'], an_data,
-#         cmap=AN_cmap, transform=ccrs.PlateCarree(), alpha=0.9
-#     )
-    
-#     # Step 5: Add coastlines and borders
-#     ax.coastlines()
-#     ax.add_feature(cfeature.BORDERS, linestyle=':')
-    
-#     # Step 6: Add individual colorbars with ticks at intervals of 5
-    
-#     # Function to create ticks at intervals of 5
-#     def create_ticks(data):
-#         data_min = np.nanmin(data)
-#         data_max = np.nanmax(data)
-#         if data_min == data_max:
-#             ticks = [data_min]
-#         else:
-#             # Round min and max to nearest multiples of 5
-#             data_min_rounded = (np.floor(data_min / 5) * 5)+5
-#             data_max_rounded = (np.ceil(data_max / 5) * 5)-5
-#             ticks = np.arange(data_min_rounded, data_max_rounded + 1, 10)
-#         return ticks
-    
-#     # For BN (Below Normal)
-#     bn_ticks = create_ticks(bn_data)
-    
-#     cbar_ax_bn = fig.add_subplot(gs[1, 0])
-#     cbar_bn = plt.colorbar(bn_plot, cax=cbar_ax_bn, orientation='horizontal')
-#     cbar_bn.set_label('BN (%)')
-#     cbar_bn.set_ticks(bn_ticks)
-#     cbar_bn.set_ticklabels([f"{tick:.0f}" for tick in bn_ticks])
-    
-#     # For NN (Near Normal)
-#     nn_ticks = create_ticks(nn_data)
-    
-#     cbar_ax_nn = fig.add_subplot(gs[1, 1])
-#     cbar_nn = plt.colorbar(nn_plot, cax=cbar_ax_nn, orientation='horizontal')
-#     cbar_nn.set_label('NN (%)')
-#     cbar_nn.set_ticks(nn_ticks)
-#     cbar_nn.set_ticklabels([f"{tick:.0f}" for tick in nn_ticks])
-    
-#     # For AN (Above Normal)
-#     an_ticks = create_ticks(an_data)
-    
-#     cbar_ax_an = fig.add_subplot(gs[1, 2])
-#     cbar_an = plt.colorbar(an_plot, cax=cbar_ax_an, orientation='horizontal')
-#     cbar_an.set_label('AN (%)')
-#     cbar_an.set_ticks(an_ticks)
-#     cbar_an.set_ticklabels([f"{tick:.0f}" for tick in an_ticks])
-#     ax.set_title(f"Forecast - {model_name}", fontsize=14, pad=20)
-#     plt.tight_layout()
-#     plt.savefig(f"{dir_to_save}/Forecast_{model_name}_.png", dpi=300, bbox_inches='tight')
-#     plt.show()

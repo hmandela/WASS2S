@@ -49,6 +49,36 @@ from wass2s.utils import *
 from matplotlib.colors import ListedColormap
 
 
+def _verif_num_workers():
+    """Worker count for grid-score parallelism: WAS_NCORES if set by the CLI,
+    else the CPU count. Clamped to >= 1."""
+    import os
+    try:
+        n = int(os.environ.get("WAS_NCORES", "0"))
+        if n <= 0:
+            n = os.cpu_count() or 1
+        return max(1, n)
+    except Exception:
+        return 1
+
+
+def _chunk_grid(da, n):
+    """Chunk a (…, Y, X) field along Y (then X if Y is small) so per-grid-point
+    score cells are spread across `n` worker threads. Returns `da` unchanged if
+    it has no Y dimension."""
+    if not hasattr(da, "dims") or "Y" not in da.dims:
+        return da
+    ny = int(da.sizes.get("Y", 1))
+    chunks = {"Y": max(1, ny // max(1, n))}
+    if ny < n and "X" in da.dims:
+        nx = int(da.sizes.get("X", 1))
+        chunks["X"] = max(1, nx // max(1, n))
+    try:
+        return da.chunk(chunks)
+    except Exception:
+        return da
+
+
 class WAS_Verification:
     """
     Verification class for evaluating weather and climate forecasts.
@@ -447,18 +477,39 @@ class WAS_Verification:
         xarray.DataArray
             Score values with dimensions (Y, X).
         """
+        import os
         obs, pred = xr.align(obs, pred)
-        return xr.apply_ufunc(
-            score_func,
-            obs,
-            pred,
-            input_core_dims=[('T',), ('T',)],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[()],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={"allow_rechunk": True},
-        )
+
+        def _eager():
+            return xr.apply_ufunc(
+                score_func, obs, pred,
+                input_core_dims=[('T',), ('T',)],
+                vectorize=True, dask='parallelized',
+                output_core_dims=[()], output_dtypes=['float'],
+                dask_gufunc_kwargs={"allow_rechunk": True},
+            )
+
+        # Grid-parallel path: chunk over Y/X and run the per-cell score on a
+        # thread pool. Identical results to the eager path (each cell is scored
+        # independently); threads avoid pickling `self`, and numpy score kernels
+        # release the GIL. Falls back to eager on any failure or small grids.
+        if os.environ.get("WAS_VERIF_PARALLEL", "1") != "0":
+            n = _verif_num_workers()
+            ncells = int(obs.sizes.get("Y", 1)) * int(obs.sizes.get("X", 1))
+            min_cells = int(os.environ.get("WAS_VERIF_MIN_CELLS", "4000"))
+            if n > 1 and ncells >= min_cells:
+                try:
+                    res = xr.apply_ufunc(
+                        score_func, _chunk_grid(obs, n), _chunk_grid(pred, n),
+                        input_core_dims=[('T',), ('T',)],
+                        vectorize=True, dask='parallelized',
+                        output_core_dims=[()], output_dtypes=['float'],
+                        dask_gufunc_kwargs={"allow_rechunk": True},
+                    )
+                    return res.compute(scheduler="threads", num_workers=n)
+                except Exception:
+                    pass
+        return _eager()
 
     # ------------------------
     # Probabilistic Metrics
@@ -1698,19 +1749,39 @@ class WAS_Verification:
         
         index_start = obs.get_index("T").get_loc(str(clim_year_start)).start
         index_end   = obs.get_index("T").get_loc(str(clim_year_end)).stop
+        import os
         obs, prob_pred = xr.align(obs, prob_pred)
-        return xr.apply_ufunc(
-            score_func,
-            obs,
-            prob_pred,
-            input_core_dims=[('T',), ('probability', 'T')],
-            vectorize=True,
-            kwargs={'index_start': index_start, 'index_end': index_end, **score_kwargs},
-            dask='parallelized',
-            output_core_dims=[()],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={"allow_rechunk": True},
-        )
+        _kw = {'index_start': index_start, 'index_end': index_end, **score_kwargs}
+
+        def _eager():
+            return xr.apply_ufunc(
+                score_func, obs, prob_pred,
+                input_core_dims=[('T',), ('probability', 'T')],
+                vectorize=True, kwargs=_kw, dask='parallelized',
+                output_core_dims=[()], output_dtypes=['float'],
+                dask_gufunc_kwargs={"allow_rechunk": True},
+            )
+
+        # Grid-parallel path (see compute_deterministic_score): chunk over Y/X
+        # and score on a thread pool; identical results, GIL released in numpy
+        # kernels. Falls back to eager on any failure or small grids.
+        if os.environ.get("WAS_VERIF_PARALLEL", "1") != "0":
+            n = _verif_num_workers()
+            ncells = int(obs.sizes.get("Y", 1)) * int(obs.sizes.get("X", 1))
+            min_cells = int(os.environ.get("WAS_VERIF_MIN_CELLS", "4000"))
+            if n > 1 and ncells >= min_cells:
+                try:
+                    res = xr.apply_ufunc(
+                        score_func, _chunk_grid(obs, n), _chunk_grid(prob_pred, n),
+                        input_core_dims=[('T',), ('probability', 'T')],
+                        vectorize=True, kwargs=_kw, dask='parallelized',
+                        output_core_dims=[()], output_dtypes=['float'],
+                        dask_gufunc_kwargs={"allow_rechunk": True},
+                    )
+                    return res.compute(scheduler="threads", num_workers=n)
+                except Exception:
+                    pass
+        return _eager()
     def plot_model_score(self, model_metric, score, dir_save_score, figure_name="WAS_MLR"):
         """
         Plot a deterministic score on a map.

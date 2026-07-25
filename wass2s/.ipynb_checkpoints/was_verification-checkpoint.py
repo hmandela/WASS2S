@@ -1,3 +1,32 @@
+"""Deterministic and probabilistic forecast verification.
+
+Provides pixel-wise and domain-averaged scores compatible with the
+WASS2S xarray data model (dimensions T, Y, X).
+
+Class
+-----
+WAS_Verification
+    Container for all verification methods.  Scores are applied
+    grid-point by grid-point via ``compute_deterministic_score``, or
+    computed directly over spatial maps.
+
+Deterministic scores
+    Pearson correlation, Spearman correlation, Index of Agreement,
+    Nash–Sutcliffe Efficiency, Kling–Gupta Efficiency, MAE, RMSE,
+    Taylor diagram.
+
+Probabilistic scores
+    GROC (Generalized ROC), RPSS, Ignorance Score, Brier Score,
+    Brier Skill Score, Resolution Score.
+
+Tercile utilities
+    ``classify`` — assign observations to below / near / above-normal
+    tercile classes.
+    ``compute_class`` — classify a full DataArray over a climatological
+    reference period.
+    ``classify_data_into_terciles`` — binary classification with
+    pre-computed thresholds.
+"""
 import numpy as np
 import xarray as xr
 from scipy.stats import pearsonr, norm, linregress
@@ -9,6 +38,8 @@ from pathlib import Path
 from scipy import stats
 from scipy.stats import lognorm, gamma
 import os
+import matplotlib as mpl                     
+from matplotlib import colors as mcolors
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -16,6 +47,37 @@ import properscoring
 import xskillscore as xs
 from wass2s.utils import *
 from matplotlib.colors import ListedColormap
+
+
+def _verif_num_workers():
+    """Worker count for grid-score parallelism: WAS_NCORES if set by the CLI,
+    else the CPU count. Clamped to >= 1."""
+    import os
+    try:
+        n = int(os.environ.get("WAS_NCORES", "0"))
+        if n <= 0:
+            n = os.cpu_count() or 1
+        return max(1, n)
+    except Exception:
+        return 1
+
+
+def _chunk_grid(da, n):
+    """Chunk a (…, Y, X) field along Y (then X if Y is small) so per-grid-point
+    score cells are spread across `n` worker threads. Returns `da` unchanged if
+    it has no Y dimension."""
+    if not hasattr(da, "dims") or "Y" not in da.dims:
+        return da
+    ny = int(da.sizes.get("Y", 1))
+    chunks = {"Y": max(1, ny // max(1, n))}
+    if ny < n and "X" in da.dims:
+        nx = int(da.sizes.get("X", 1))
+        chunks["X"] = max(1, nx // max(1, n))
+    try:
+        return da.chunk(chunks)
+    except Exception:
+        return da
+
 
 class WAS_Verification:
     """
@@ -28,28 +90,32 @@ class WAS_Verification:
     ----------
     dist_method : str, optional
         Distribution method for tercile probability calculations
-        ('t', 'gamma', 'nonparam', 'normal', 'lognormal', 'weibull_min'). Default is 'gamma'.
+        ('bestfit', 'nonparam'). Default is 'nonparam'.
     """
 
-    def __init__(self, dist_method="gamma"):
-        self.scores = {
-            "KGE": ("Kling Gupta Efficiency", -1, 1, "det_score", "RdBu_r", self.kling_gupta_efficiency),
-            "Pearson": ("Pearson Correlation", -1, 1, "det_score", "RdBu_r", self.pearson_corr),
-            "IOA": ("Index Of Agreement", 0, 1, "det_score", "RdBu_r", self.index_of_agreement),
-            "MAE": ("Mean Absolute Error", 0, 200, "det_score", "viridis", self.mean_absolute_error),
-            "RMSE": ("Root Mean Square Error", 0, 200, "det_score", "viridis", self.root_mean_square_error),
-            "NSE": ("Nash Sutcliffe Efficiency", None, 1, "det_score", "RdBu_r", self.nash_sutcliffe_efficiency),
-            "TAYLOR_DIAGRAM": ("Taylor Diagram", None, None, "all_grid_det_score", None, self.taylor_diagram),
-            "GROC": ("Generalized Discrimination Score", 0, 1, "prob_score", "RdBu_r", self.calculate_groc),
-            "RPSS": ("Ranked Probability Skill Score", -1, 1, "prob_score", "RdBu_r", self.calculate_rpss),
-            "IGS": ("Ignorance Score", 0, None, "prob_score", "RdBu", self.ignorance_score),
-            "RES": ("Resolution", 0, None, "prob_score", "RdBu", self.resolution_score_grid),
-            "REL": ("Reliability", None, None, "prob_score", None, self.reliability_score_grid),
-            "RELIABILITY_DIAGRAM": ("Reliability Diagram", None, None, "all_grid_prob_score", None, self.reliability_diagram),
-            "ROC_CURVE": ("ROC CURVE", None, None, "all_grid_prob_score", None, self.plot_roc_curves),
-            "CRPS": ("Continuous Ranked Probability Score with the ensemble distribution", 0, 100, "ensemble_score", "RdBu", self.compute_crps)
-        }
+    def __init__(self, dist_method="nonparam", mae_rmse_crps_thrsd=100):
         self.dist_method = dist_method
+        self.mae_rmse_crps_thrsd = float(mae_rmse_crps_thrsd)
+
+        self.scores = {
+            "KGE": ("Kling Gupta Efficiency", -1, 1, "det_score", "RdBu_r", self.kling_gupta_efficiency, ""),
+            "Pearson": ("Pearson Correlation", -1, 1, "det_score", "RdBu_r", self.pearson_corr, ""),
+            "IOA": ("Index Of Agreement", 0, 1, "det_score", "RdBu_r", self.index_of_agreement, ""),
+            "MAE": ("Mean Absolute Error", 0, self.mae_rmse_crps_thrsd, "det_score", "viridis", self.mean_absolute_error, "[mm]"),
+            "RMSE": ("Root Mean Square Error", 0, self.mae_rmse_crps_thrsd, "det_score", "viridis", self.root_mean_square_error, "[mm]"),
+            "NSE": ("Nash Sutcliffe Efficiency", None, 1, "det_score", "RdBu_r", self.nash_sutcliffe_efficiency, ""),
+            "TAYLOR_DIAGRAM": ("Taylor Diagram", None, None, "all_grid_det_score", None, self.taylor_diagram),
+            "GROC": ("Generalized Discrimination Score", 0, 1, "prob_score", "RdBu_r", self.calculate_groc, ""),
+            "RPSS": ("Ranked Probability Skill Score", -1, 1, "prob_score", "RdBu_r", self.calculate_rpss, ""),
+            "IGS": ("Ignorance Score", 0, None, "prob_score", "RdBu", self.ignorance_score, ""),
+            "RES": ("Resolution", 0, None, "prob_score", "RdBu", self.resolution_score_grid, ""),
+            "REL": ("Reliability", None, None, "prob_score", None, self.reliability_score_grid, ""),
+            "RELIABILITY_DIAGRAM": ("Reliability Diagram", None, None, "all_grid_prob_score", None, self.reliability_diagram, ""),
+            "BS": ("Brier Score", 0, 1, "prob_score", "viridis", self.brier_score, ""),
+            "BSS": ("Brier Skill Score vs climatology", -1, 1, "prob_score", "RdBu_r", self.brier_skill_score, ""),
+            "ROC_CURVE": ("ROC CURVE", None, None, "all_grid_prob_score", None, self.plot_roc_curves, ""),
+            "CRPS": ("Continuous Ranked Probability Score with the ensemble distribution", 0, self.mae_rmse_crps_thrsd, "ensemble_score", "RdBu", self.compute_crps, "[mm]")
+        }
 
     def get_scores_metadata(self):
         """
@@ -122,6 +188,32 @@ class WAS_Verification:
         else:
             return np.nan
 
+    def spearman_corr(self, y_true, y_pred):
+        """
+        Compute Spearman rank correlation coefficient.
+    
+        Parameters
+        ----------
+        y_true : array-like
+            Observed values (1D).
+        y_pred : array-like
+            Predicted values (1D).
+    
+        Returns
+        -------
+        float
+            Spearman's rho in [-1, 1]; np.nan if insufficient valid data.
+        """
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        if np.any(mask) and np.sum(mask) > 2:
+            y_true_clean = y_true[mask]
+            y_pred_clean = y_pred[mask]
+            # Use scipy.stats via `stats` already imported above
+            return stats.spearmanr(y_true_clean, y_pred_clean).correlation
+        else:
+            return np.nan
+
+    
     def index_of_agreement(self, y_true, y_pred):
         """
         Compute Index of Agreement (IOA).
@@ -150,6 +242,7 @@ class WAS_Verification:
             return 1 - (numerator / denominator)
         else:
             return np.nan
+
 
     def mean_absolute_error(self, y_true, y_pred):
         """
@@ -235,25 +328,135 @@ class WAS_Verification:
         else:
             return np.nan
 
-    def taylor_diagram(self, y_true, y_pred):
+    def taylor_diagram(
+        self,
+        obs,
+        models,
+        *,
+        normalize: bool = True,
+        correlation: str = "pearson",
+        labels: dict | None = None,
+        title: str | None = "Taylor diagram",
+        figsize=(7, 6),
+        savepath: str | None = None,
+        hide_rms_numbers: bool = True,
+    ):
         """
-        Placeholder for Taylor Diagram visualization.
-
-        Visualizes model performance in terms of correlation, standard deviation, and RMSE.
-
+        Plot a Taylor diagram comparing one or more model series against observations.
+    
         Parameters
         ----------
-        y_true : array-like
-            Observed values.
-        y_pred : array-like
-            Predicted values.
-
-        Notes
-        -----
-        Implementation pending.
+        obs : xarray.DataArray or np.ndarray
+            Observations. If xarray, can be (T), (T,Y,X), etc.
+        models : dict[str, xarray.DataArray | np.ndarray]
+            Mapping of model name -> forecast array (same shape as obs or broadcastable).
+        normalize : bool, optional
+            If True (default), normalize std and CRMSD by std(obs).
+        correlation : {"pearson","spearman"}, optional
+            Correlation metric used on paired, finite values.
+        labels : dict[str,str], optional
+            Custom display labels for model markers. Defaults to model keys.
+        title : str or None, optional
+            Figure title.
+        figsize : tuple, optional
+            Matplotlib figure size.
+        savepath : str or None, optional
+            If provided, save figure to this path.
+    
+        Returns
+        -------
+        (fig, ax) : matplotlib Figure and Axes
         """
-        pass
-
+   
+        try:
+            import skill_metrics as sm
+        except Exception as e:
+            raise ImportError("SkillMetrics is required. Install with: pip install SkillMetrics") from e
+    
+        def _to_aligned_1d(o, f):
+            if hasattr(o, "dims") or hasattr(f, "dims"):
+                o_al, f_al = xr.align(o, f, join="inner")
+                o_vals = np.asarray(o_al).ravel()
+                f_vals = np.asarray(f_al).ravel()
+            else:
+                o_vals = np.asarray(o).ravel()
+                f_vals = np.asarray(f).ravel()
+            m = np.isfinite(o_vals) & np.isfinite(f_vals)
+            return o_vals[m], f_vals[m]
+    
+        model_names = list(models.keys())
+        if labels is None:
+            labels = {k: k for k in model_names}
+    
+        sdev_list, crmsd_list, corr_list, used_names = [], [], [], []
+        std_obs_plot = None
+    
+        for name in model_names:
+            o, f = _to_aligned_1d(obs, models[name])
+            if o.size < 3:
+                continue
+            r = stats.spearmanr(o, f).correlation if correlation.lower() == "spearman" else np.corrcoef(o, f)[0, 1]
+            std_o = np.std(o, ddof=0)
+            std_f = np.std(f, ddof=0)
+            cr = np.sqrt(std_o**2 + std_f**2 - 2.0 * std_o * std_f * r)
+            if normalize and std_o > 0:
+                std_o_plot, std_f_plot, cr_plot = 1.0, std_f / std_o, cr / std_o
+            else:
+                std_o_plot, std_f_plot, cr_plot = std_o, std_f, cr
+            if std_obs_plot is None:
+                std_obs_plot = std_o_plot
+            sdev_list.append(std_f_plot)
+            crmsd_list.append(cr_plot)
+            corr_list.append(r)
+            used_names.append(name)
+    
+        if not used_names:
+            raise ValueError("No model had ≥3 paired finite values w.r.t. observations.")
+    
+        sdev  = np.concatenate(([std_obs_plot], np.asarray(sdev_list)))
+        crmsd = np.concatenate(([0.0],        np.asarray(crmsd_list)))
+        ccoef = np.concatenate(([1.0],        np.asarray(corr_list)))
+        marker_labels = ["OBS"] + [labels[n] for n in used_names]
+        axis_max = 1.25 * max(np.nanmax(sdev), np.nanmax(crmsd), 1.0)
+    
+        fig, ax = plt.subplots(figsize=figsize)
+        _ = sm.taylor_diagram(
+            sdev, crmsd, ccoef,
+            numberPanels=1,
+            axisMax=axis_max,
+            markerDisplayed="marker",
+            markerLabel=marker_labels,
+            markerLegend="on",
+            styleOBS="-",
+            colOBS="k",
+            markerObs="*",
+            titleOBS="obs",
+            labelRMS="CRMSD" if not normalize else "CRMSD (norm.)",
+            titleSTD="on",
+            titleCOR="on",
+            colCOR="tab:blue",
+            colSTD="black",
+            colRMS="tab:green",
+        )
+    
+        if hide_rms_numbers:
+            green = mcolors.to_rgba("tab:green")
+            for txt in fig.findobj(mpl.text.Text):
+                s = (txt.get_text() or "").strip()
+                if not s:
+                    continue
+                # Remove green numeric labels on RMS arcs
+                try:
+                    if np.allclose(mcolors.to_rgba(txt.get_color()), green, atol=1e-3):
+                        txt.remove()
+                except Exception:
+                    pass
+    
+        if title:
+            ax.set_title(title)
+        if savepath:
+            fig.savefig(savepath, dpi=300, bbox_inches="tight")
+        return fig, ax
     def compute_deterministic_score(self, score_func, obs, pred):
         """
         Apply a deterministic scoring function over xarray DataArrays.
@@ -274,18 +477,39 @@ class WAS_Verification:
         xarray.DataArray
             Score values with dimensions (Y, X).
         """
+        import os
         obs, pred = xr.align(obs, pred)
-        return xr.apply_ufunc(
-            score_func,
-            obs,
-            pred,
-            input_core_dims=[('T',), ('T',)],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[()],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={"allow_rechunk": True},
-        )
+
+        def _eager():
+            return xr.apply_ufunc(
+                score_func, obs, pred,
+                input_core_dims=[('T',), ('T',)],
+                vectorize=True, dask='parallelized',
+                output_core_dims=[()], output_dtypes=['float'],
+                dask_gufunc_kwargs={"allow_rechunk": True},
+            )
+
+        # Grid-parallel path: chunk over Y/X and run the per-cell score on a
+        # thread pool. Identical results to the eager path (each cell is scored
+        # independently); threads avoid pickling `self`, and numpy score kernels
+        # release the GIL. Falls back to eager on any failure or small grids.
+        if os.environ.get("WAS_VERIF_PARALLEL", "1") != "0":
+            n = _verif_num_workers()
+            ncells = int(obs.sizes.get("Y", 1)) * int(obs.sizes.get("X", 1))
+            min_cells = int(os.environ.get("WAS_VERIF_MIN_CELLS", "4000"))
+            if n > 1 and ncells >= min_cells:
+                try:
+                    res = xr.apply_ufunc(
+                        score_func, _chunk_grid(obs, n), _chunk_grid(pred, n),
+                        input_core_dims=[('T',), ('T',)],
+                        vectorize=True, dask='parallelized',
+                        output_core_dims=[()], output_dtypes=['float'],
+                        dask_gufunc_kwargs={"allow_rechunk": True},
+                    )
+                    return res.compute(scheduler="threads", num_workers=n)
+                except Exception:
+                    pass
+        return _eager()
 
     # ------------------------
     # Probabilistic Metrics
@@ -321,7 +545,6 @@ class WAS_Verification:
             return y_class, terciles[0], terciles[1]
         else:
             return np.full(y.shape[0], np.nan), np.nan, np.nan
-
     def compute_class(self, Predictant, clim_year_start, clim_year_end):
         """
         Compute tercile class labels for observed data.
@@ -383,9 +606,9 @@ class WAS_Verification:
         else:
             return np.nan
 
-    def calculate_groc(self, y_true, y_probs, index_start, index_end, n_classes=3):
+    def calculate_groc_(self, y_true, y_probs, index_start, index_end, n_classes=3):
         """
-        Compute Generalized Receiver Operating Characteristic (GROC) score.
+        Compute Generalized Discrimination (GROC) score.
 
         Averages the Area Under the Curve (AUC) for each tercile category.
 
@@ -422,6 +645,275 @@ class WAS_Verification:
         else:
             return np.nan
 
+    def calculate_groc(self, y_true, y_probs, index_start, index_end, n_classes=3):
+        """
+        Compute Generalized Discrimination (GROC) score according to Weigel and Mason (2011).
+        
+        The GROC score averages the Area Under the ROC Curve (AUC) for each category,
+        measuring the ability to distinguish occurrences from non-occurrences of each category.
+        
+        Parameters
+        ----------
+        y_true : array-like
+            Observed values.
+        y_probs : array-like
+            Forecast probabilities with shape (n_classes, n_samples).
+        index_start : int
+            Start index of the climatology period for computing terciles.
+        index_end : int
+            End index of the climatology period for computing terciles.
+        n_classes : int, optional
+            Number of classes (default is 3 for terciles).
+        
+        Returns
+        -------
+        float
+            GROC score, ranging from 0 to 1. 
+            Returns np.nan if insufficient valid data.
+        
+        Reference
+        ---------
+        Weigel, A. P. and Mason, S. J. (2011). 
+        The generalized discrimination score for ensemble forecasts.
+        Monthly Weather Review, 139(9):3069-3074.
+        """
+        from sklearn.metrics import roc_curve, auc
+        
+        # Calculate terciles from climatology period BEFORE masking
+        if index_end <= index_start:
+            return np.nan
+        
+        clim_period = y_true[index_start:index_end]
+        valid_clim_data = clim_period[np.isfinite(clim_period)]
+        
+        # Need at least n_classes data points to calculate percentiles
+        if len(valid_clim_data) < n_classes:
+            return np.nan
+        
+        # Calculate thresholds for n_classes (e.g., terciles for n_classes=3)
+        percentiles = np.linspace(100/n_classes, 100 - 100/n_classes, n_classes-1)
+        thresholds = np.nanpercentile(valid_clim_data, percentiles)
+        
+        # Apply mask to clean the full dataset
+        mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
+        valid_count = np.sum(mask)
+        
+        # Need at least some data to compute ROC
+        if valid_count < 2 * n_classes:  # At least 2 samples per class ideally
+            return np.nan
+        
+        y_true_clean = y_true[mask]
+        y_probs_clean = y_probs[:, mask]
+        
+        # Classify observations into categories
+        y_true_class = np.digitize(y_true_clean, bins=thresholds, right=True)
+        
+        # Ensure we have n_classes
+        unique_classes = np.unique(y_true_class)
+        if len(unique_classes) != n_classes:
+            # Some classes might be missing in the data
+            # We'll still compute, but warn if in debug mode
+            pass
+        
+        # Compute AUC for each category and average
+        auc_scores = []
+        
+        for i in range(n_classes):
+            # Binary classification: 1 if category i occurred, 0 otherwise
+            y_true_binary = (y_true_class == i).astype(int)
+            
+            # Check if we have both positive and negative samples
+            n_pos = np.sum(y_true_binary == 1)
+            n_neg = np.sum(y_true_binary == 0)
+            
+            if n_pos == 0 or n_neg == 0:
+                # If no positive or negative samples, AUC is undefined
+                # According to the paper, we should skip or assign 0.5?
+                # In practice, assign 0.5 (no discrimination skill for this category)
+                auc_scores.append(0.5)
+                continue
+            
+            # Forecast probability for category i
+            y_prob_i = y_probs_clean[i, :]
+            
+            # Compute ROC curve and AUC
+            fpr, tpr, _ = roc_curve(y_true_binary, y_prob_i)
+            
+            # Check if ROC curve is valid (should have at least 2 points)
+            if len(fpr) < 2 or len(tpr) < 2:
+                auc_scores.append(0.5)
+            else:
+                # Use trapezoidal rule for AUC (as in the paper)
+                roc_auc = auc(fpr, tpr)
+                auc_scores.append(roc_auc)
+        
+        # Average AUC across all categories (unweighted)
+        groc_score = np.mean(auc_scores)
+        
+        return groc_score
+
+
+    def calculate_groc_weighted(self, y_true, y_probs, index_start, index_end, n_classes=3):
+        """
+        Compute Generalized Discrimination (GROC) score with category weighting.
+        
+        Weighted average of AUCs by climatological frequency of each category.
+        Alternative: Weighted by climatological frequency as in some applications
+        Parameters
+        ----------
+        y_true : array-like
+            Observed values.
+        y_probs : array-like
+            Forecast probabilities with shape (n_classes, n_samples).
+        index_start : int
+            Start index of the climatology period.
+        index_end : int
+            End index of the climatology period.
+        n_classes : int, optional
+            Number of classes (default is 3 for terciles).
+        
+        Returns
+        -------
+        float
+            Weighted GROC score, ranging from 0 to 1.
+        """
+        from sklearn.metrics import roc_curve, auc
+        
+        # Calculate thresholds
+        clim_period = y_true[index_start:index_end]
+        valid_clim_data = clim_period[np.isfinite(clim_period)]
+        
+        if len(valid_clim_data) < n_classes:
+            return np.nan
+        
+        percentiles = np.linspace(100/n_classes, 100 - 100/n_classes, n_classes-1)
+        thresholds = np.nanpercentile(valid_clim_data, percentiles)
+        
+        # Apply mask
+        mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
+        valid_count = np.sum(mask)
+        
+        if valid_count < 2 * n_classes:
+            return np.nan
+        
+        y_true_clean = y_true[mask]
+        y_probs_clean = y_probs[:, mask]
+        
+        # Classify
+        y_true_class = np.digitize(y_true_clean, bins=thresholds, right=True)
+        
+        # Calculate climatological base rates for weighting
+        base_rates = []
+        for i in range(n_classes):
+            base_rate = np.mean(y_true_class == i)
+            base_rates.append(base_rate)
+        
+        # Normalize base rates (should sum to 1)
+        base_rates = np.array(base_rates)
+        if np.sum(base_rates) > 0:
+            base_rates = base_rates / np.sum(base_rates)
+        else:
+            base_rates = np.ones(n_classes) / n_classes
+        
+        # Compute weighted AUC
+        weighted_sum = 0.0
+        
+        for i in range(n_classes):
+            y_true_binary = (y_true_class == i).astype(int)
+            n_pos = np.sum(y_true_binary == 1)
+            n_neg = np.sum(y_true_binary == 0)
+            
+            if n_pos == 0 or n_neg == 0:
+                # Assign 0.5 for undefined AUC, but weight by base rate
+                weighted_sum += base_rates[i] * 0.5
+            else:
+                y_prob_i = y_probs_clean[i, :]
+                fpr, tpr, _ = roc_curve(y_true_binary, y_prob_i)
+                
+                if len(fpr) < 2 or len(tpr) < 2:
+                    roc_auc = 0.5
+                else:
+                    roc_auc = auc(fpr, tpr)
+                
+                weighted_sum += base_rates[i] * roc_auc
+        
+        return weighted_sum
+
+
+    def calculate_groc_fixed(self, y_true, y_probs, index_start, index_end, n_classes=3):
+        """
+        Fixed from version calculate_groc_ of GROC calculation.
+        
+        Parameters
+        ----------
+        y_true : array-like
+            Observed values.
+        y_probs : array-like
+            Forecast probabilities with shape (n_classes, n_samples).
+        index_start : int
+            Start index of the climatology period.
+        index_end : int
+            End index of the climatology period.
+        n_classes : int, optional
+            Number of classes (default is 3 for terciles).
+        
+        Returns
+        -------
+        float
+            GROC score, ranging from 0 to 1.
+        """
+        from sklearn.metrics import roc_curve, auc
+        
+        if index_end <= index_start:
+            return np.nan
+        
+        # Use climatology period from original y_true
+        clim_data = y_true[index_start:index_end]
+        clim_data_clean = clim_data[np.isfinite(clim_data)]
+        
+        if len(clim_data_clean) < 10:
+            return np.nan
+        
+        if n_classes == 3:
+            percentiles = [33.33, 66.67]
+        else:
+            percentiles = np.linspace(100/n_classes, 100 - 100/n_classes, n_classes-1)
+        
+        thresholds = np.nanpercentile(clim_data_clean, percentiles)
+        
+        # Apply mask
+        mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
+        if not np.any(mask):
+            return np.nan
+        
+        y_true_clean = y_true[mask]
+        y_probs_clean = y_probs[:, mask]
+        
+        y_true_class = np.digitize(y_true_clean, bins=thresholds, right=True)
+        
+        # Compute unweighted average of AUCs
+        auc_sum = 0.0
+        valid_categories = 0
+        
+        for i in range(n_classes):
+            y_true_binary = (y_true_class == i).astype(int)
+            
+            # Skip if no positive or negative samples
+            if np.all(y_true_binary == 0) or np.all(y_true_binary == 1):
+                continue
+            
+            y_prob_i = y_probs_clean[i, :]
+            fpr, tpr, _ = roc_curve(y_true_binary, y_prob_i)
+            category_auc = auc(fpr, tpr)
+            
+            auc_sum += category_auc
+            valid_categories += 1
+        
+        if valid_categories == 0:
+            return np.nan
+        
+        return auc_sum / valid_categories
+    
     def calculate_rpss(self, y_true, y_probs, index_start, index_end):
         """
         Compute Ranked Probability Skill Score (RPSS).
@@ -503,16 +995,103 @@ class WAS_Verification:
         else:
             return np.nan
 
+
+    def brier_score(self, y_true, y_probs, index_start, index_end, event="PA"):
+        """
+        BS for a single tercile event (PB/PN/PA). y_probs has shape (3, N).
+        """
+        
+        mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
+        if np.sum(mask) < 3:
+            return np.nan
+        y = y_true[mask]
+        p = y_probs[:, mask]
+    
+        # terciles from calibration slice
+        T1, T2 = np.nanpercentile(y[index_start:index_end], [33, 67])
+        y_class = np.digitize(y, bins=[T1, T2], right=True)  # 0,1,2
+    
+        emap = {"PB": 0, "PN": 1, "PA": 2, 0: 0, 1: 1, 2: 2}
+        k = emap.get(event, 2)
+    
+        o   = (y_class == k).astype(float)
+        p_k = p[k, :]
+        return float(np.mean((p_k - o)**2))
+    
+    
+    def brier_skill_score(self,
+                            y_true,
+                            y_probs,
+                            index_start,
+                            index_end,
+                            event="PA",
+                            reference="uniform"):
+        """
+        Event-wise Brier Skill Score (BSS) for tercile forecasts.
+    
+        Parameters
+        ----------
+        y_true : 1D array-like
+            Observed values (time series for one grid point).
+        y_probs : 2D array-like, shape (3, N)
+            Forecast probabilities for PB/PN/PA over time.
+        index_start, index_end : int
+            Indices delimiting the calibration slice inside the *masked* series.
+        event : {"PB","PN","PA",0,1,2}, optional
+            Event to score (default "PA" = above-normal).
+        reference : {"uniform","empirical"}, optional
+            - "uniform": climatology is [1/3,1/3,1/3]
+            - "empirical": base rate computed from calibration slice
+    
+        Returns
+        -------
+        float
+            BSS = 1 - BS / BS_ref (np.nan if not computable).
+        """
+
+        bs = self.brier_score_event(y_true, y_probs, index_start, index_end, event=event)
+        if not np.isfinite(bs):
+            return np.nan
+    
+        mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
+        if np.sum(mask) < 3:
+            return np.nan
+        y = y_true[mask]
+        p = y_probs[:, mask]
+    
+
+        T1, T2 = np.nanpercentile(y[index_start:index_end], [33, 67])
+        y_class_all = np.digitize(y, bins=[T1, T2], right=True)  # 0,1,2
+    
+
+        emap = {"PB": 0, "PN": 1, "PA": 2, 0: 0, 1: 1, 2: 2}
+        k = emap.get(event, 2)
+    
+
+        o_all = (y_class_all == k).astype(float)
+    
+
+        ref = str(reference).lower()
+        if ref in ("uniform", "unif", "1/3", "13"):
+            p_ref = 1.0 / 3.0
+        elif ref in ("empirical", "base", "clim", "climatology"):
+
+            p_ref = float(np.mean(o_all[index_start:index_end]))
+        else:
+            raise ValueError("reference must be 'uniform' or 'empirical'")
+    
+        bs_ref = float(np.mean((p_ref - o_all) ** 2))
+        return np.nan if bs_ref == 0 else float(1.0 - bs / bs_ref)
     def resolution_score_grid(self, y_true, y_probs, index_start, index_end,
                              bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
                                             0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-                                            0.550, 0.600, 0.650, 0.700, 0.750, 0.800,
+                                            0.550, 0.600, 0.650, 0.6700, 0.6750, 0.800,
                                             0.850, 0.900, 0.950, 0.975, 1.000])):
         """
         Compute Resolution Score on a grid based on Weijs (2010).
-
+    
         Measures the ability of the forecast to distinguish between different outcomes.
-
+    
         Parameters
         ----------
         y_true : array-like
@@ -525,46 +1104,93 @@ class WAS_Verification:
             End index of the climatology period.
         bins : array-like, optional
             Probability bins for discretizing forecast probabilities.
-
+    
         Returns
         -------
         float
             Resolution score, non-negative. Returns np.nan if insufficient valid data.
         """
+        # Check inputs
+        if len(y_true) == 0 or y_probs.shape[1] == 0:
+            return np.nan
+        
+        # First, calculate terciles from the climatology period in the original y_true
+        if index_end <= index_start:
+            return np.nan
+        
+        # Extract climatology period from original y_true
+        clim_period = y_true[index_start:index_end]
+        
+        # Check if we have enough data in climatology period
+        valid_clim_data = clim_period[np.isfinite(clim_period)]
+        if len(valid_clim_data) < 5:  # Arbitrary threshold
+            return np.nan
+        
+        # Calculate terciles from climatology period
+        terciles = np.nanpercentile(clim_period, [33, 67])
+        
+        # Now apply mask to clean the full dataset
         mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
         if not np.any(mask):
             return np.nan
+        
         y_true_clean = y_true[mask]
         y_probs_clean = y_probs[:, mask]
-        terciles = np.nanpercentile(y_true_clean[index_start:index_end], [33, 67])
-        y_true_clean_class = np.digitize(y_true_clean, bins=terciles, right=True)
+        
+        y_true_clean_class = np.digitize(y_true_clean, bins=terciles, right=False)
+                
         n_categories, n_instances = y_probs_clean.shape
-        y_bar = [np.mean(y_true_clean_class == k) for k in range(n_categories)]
+        
+        # Ensure we have exactly 3 categories (terciles)
+        if n_categories != 3:
+            # Try to see what happened
+            unique_classes = np.unique(y_true_clean_class)
+            if len(unique_classes) != 3:
+                return np.nan
+        
+        # Calculate base rates (climatological frequencies) for each category
+        y_bar = []
+        for k in range(n_categories):
+            base_rate = np.mean(y_true_clean_class == k)
+            y_bar.append(base_rate)
+        
         resolution_sum = 0.0
+        
         for k in range(n_categories):
             y_probs_clean_k = y_probs_clean[k, :]
             binned_indices = np.digitize(y_probs_clean_k, bins) - 1
+            
             for b in range(len(bins) - 1):
                 bin_mask = binned_indices == b
                 n_kb = np.sum(bin_mask)
+                
                 if n_kb > 0:
                     y_kb = np.mean(y_true_clean_class[bin_mask] == k)
+                    
+                    # Check for valid probabilities to avoid log(0)
                     if y_kb > 0 and y_kb < 1:
-                        term1 = y_kb * np.log2(y_kb / y_bar[k]) if y_bar[k] > 0 else 0
-                        term2 = (1 - y_kb) * np.log2((1 - y_kb) / (1 - y_bar[k])) if y_bar[k] < 1 else 0
+                        # Handle cases where base rate is 0 or 1
+                        if y_bar[k] > 0 and y_bar[k] < 1:
+                            term1 = y_kb * np.log2(y_kb / y_bar[k])
+                            term2 = (1 - y_kb) * np.log2((1 - y_kb) / (1 - y_bar[k]))
+                        else:
+                            # If base rate is 0 or 1, resolution is undefined for that category
+                            # Skip this category's contribution
+                            continue
+                        
                         resolution_sum += (n_kb / n_instances) * (term1 + term2)
+        
         return resolution_sum
-
     def reliability_score_grid(self, y_true, y_probs, index_start, index_end,
                               bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
                                              0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-                                             0.550, 0.600, 0.650, 0.700, 0.750, 0.800,
+                                             0.550, 0.600, 0.650, 0.6700, 0.6750, 0.800,
                                              0.850, 0.900, 0.950, 0.975, 1.000])):
         """
         Compute Reliability Score on a grid based on Weijs (2010).
-
+    
         Measures the calibration of forecast probabilities against observed frequencies.
-
+    
         Parameters
         ----------
         y_true : array-like
@@ -577,40 +1203,179 @@ class WAS_Verification:
             End index of the climatology period.
         bins : array-like, optional
             Probability bins for discretizing forecast probabilities.
-
+    
         Returns
         -------
         float
             Reliability score. Returns np.nan if insufficient valid data.
         """
+        # Check inputs
+        if len(y_true) == 0 or y_probs.shape[1] == 0:
+            return np.nan
+        
+        # Calculate terciles from climatology period in original y_true
+        if index_end <= index_start:
+            return np.nan
+        
+        clim_period = y_true[index_start:index_end]
+        valid_clim_data = clim_period[np.isfinite(clim_period)]
+        if len(valid_clim_data) < 10:
+            return np.nan
+        
+        terciles = np.nanpercentile(clim_period, [33, 67])
+        
+        # Apply mask
         mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
         if not np.any(mask):
             return np.nan
+        
         y_true_clean = y_true[mask]
         y_probs_clean = y_probs[:, mask]
-        terciles = np.nanpercentile(y_true_clean[index_start:index_end], [33, 67])
-        y_true_clean_class = np.digitize(y_true_clean, bins=terciles, right=True)
+        
+        # Classify observations
+        y_true_clean_class = np.digitize(y_true_clean, bins=terciles, right=False)
+        
         n_categories, n_instances = y_probs_clean.shape
+        
         reliability_sum = 0.0
+        
         for k in range(n_categories):
             y_probs_clean_k = y_probs_clean[k, :]
             binned_indices = np.digitize(y_probs_clean_k, bins) - 1
+            
             for b in range(len(bins) - 1):
                 bin_mask = binned_indices == b
                 n_kb = np.sum(bin_mask)
+                
                 if n_kb > 0:
                     y_kb = np.mean(y_true_clean_class[bin_mask] == k)
                     p_kb = np.mean(y_probs_clean_k[bin_mask])
+                    
+                    # Check for valid probabilities
                     if y_kb > 0 and y_kb < 1 and p_kb > 0 and p_kb < 1:
-                        term1 = y_kb * np.log2(y_kb / p_kb) if p_kb > 0 else 0
-                        term2 = (1 - y_kb) * np.log2((1 - y_kb) / (1 - p_kb)) if p_kb < 1 else 0
+                        term1 = y_kb * np.log2(y_kb / p_kb)
+                        term2 = (1 - y_kb) * np.log2((1 - y_kb) / (1 - p_kb))
                         reliability_sum += (n_kb / n_instances) * (term1 + term2)
+        
         return reliability_sum
-
-    def resolution_and_reliability_over_all_grid(self, dir_to_save_score, y_true, y_probs, clim_year_start, clim_year_end,
+    
+    def resolution_and_reliability_per_category_grid(self, y_true, y_probs, index_start, index_end,
+                                              bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
+                                                             0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
+                                                             0.550, 0.600, 0.650, 0.6700, 0.6750, 0.800,
+                                                             0.850, 0.900, 0.950, 0.975, 1.000])):
+        """
+        Compute Resolution and Reliability scores per category based on Weijs (2010).
+        
+        Returns both total scores and per-category breakdowns.
+        
+        Parameters
+        ----------
+        y_true : array-like
+            Observed values.
+        y_probs : array-like
+            Forecast probabilities with shape (n_classes, n_samples).
+        index_start : int
+            Start index of the climatology period.
+        index_end : int
+            End index of the climatology period.
+        bins : array-like, optional
+            Probability bins for discretizing forecast probabilities.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing:
+            - 'total_resolution': float
+            - 'total_reliability': float
+            - 'category_resolution': list of floats for each category
+            - 'category_reliability': list of floats for each category
+            - 'category_base_rates': list of floats (climatological frequencies)
+        """
+        # Calculate terciles from climatology period BEFORE masking
+        terciles = np.nanpercentile(y_true[index_start:index_end], [33, 67])
+        
+        # Apply mask
+        mask = np.isfinite(y_true) & np.isfinite(y_probs).all(axis=0)
+        if not np.any(mask):
+            return {
+                'total_resolution': np.nan,
+                'total_reliability': np.nan,
+                'category_resolution': [np.nan, np.nan, np.nan],
+                'category_reliability': [np.nan, np.nan, np.nan],
+                'category_base_rates': [np.nan, np.nan, np.nan]
+            }
+        
+        y_true_clean = y_true[mask]
+        y_probs_clean = y_probs[:, mask]
+        
+        # Classify observations into terciles
+        # Use right=False to match typical tercile definition
+        y_true_clean_class = np.digitize(y_true_clean, bins=terciles, right=False)
+        # Values equal to upper tercile go to category 2
+        y_true_clean_class[y_true_clean == terciles[1]] = 2
+        
+        n_categories, n_instances = y_probs_clean.shape
+        category_resolution = [0.0] * n_categories
+        category_reliability = [0.0] * n_categories
+        
+        # Calculate climatological base rates for each category
+        category_base_rates = []
+        for k in range(n_categories):
+            base_rate = np.mean(y_true_clean_class == k)
+            category_base_rates.append(base_rate)
+        
+        total_resolution = 0.0
+        total_reliability = 0.0
+        
+        for k in range(n_categories):
+            y_probs_clean_k = y_probs_clean[k, :]
+            binned_indices = np.digitize(y_probs_clean_k, bins) - 1
+            
+            # Initialize category sums
+            cat_res_k = 0.0
+            cat_rel_k = 0.0
+            
+            for b in range(len(bins) - 1):
+                bin_mask = binned_indices == b
+                n_kb = np.sum(bin_mask)
+                
+                if n_kb > 0:
+                    # Calculate observed frequency in this bin
+                    y_kb = np.mean(y_true_clean_class[bin_mask] == k)
+                    # Calculate average forecast probability in this bin
+                    p_kb = np.mean(y_probs_clean_k[bin_mask])
+                    
+                    # Resolution term (compares y_kb to climatology)
+                    if y_kb > 0 and y_kb < 1 and category_base_rates[k] > 0 and category_base_rates[k] < 1:
+                        term1_res = y_kb * np.log2(y_kb / category_base_rates[k]) if category_base_rates[k] > 0 else 0
+                        term2_res = (1 - y_kb) * np.log2((1 - y_kb) / (1 - category_base_rates[k])) if category_base_rates[k] < 1 else 0
+                        cat_res_k += (n_kb / n_instances) * (term1_res + term2_res)
+                    
+                    # Reliability term (compares y_kb to p_kb)
+                    if y_kb > 0 and y_kb < 1 and p_kb > 0 and p_kb < 1:
+                        term1_rel = y_kb * np.log2(y_kb / p_kb) if p_kb > 0 else 0
+                        term2_rel = (1 - y_kb) * np.log2((1 - y_kb) / (1 - p_kb)) if p_kb < 1 else 0
+                        cat_rel_k += (n_kb / n_instances) * (term1_rel + term2_rel)
+            
+            category_resolution[k] = cat_res_k
+            category_reliability[k] = cat_rel_k
+            total_resolution += cat_res_k
+            total_reliability += cat_rel_k
+        
+        return {
+            'total_resolution': total_resolution,
+            'total_reliability': total_reliability,
+            'category_resolution': category_resolution,
+            'category_reliability': category_reliability,
+            'category_base_rates': category_base_rates
+        }    
+    
+    
+    def resolution_and_reliability_over_all_grid(self, y_true_class, y_probs, 
                                                 bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
                                                                0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-                                                               0.550, 0.600, 0.650, 0.700, 0.750, 0.800,
+                                                               0.550, 0.600, 0.650, 0.6700, 0.6750, 0.800,
                                                                0.850, 0.900, 0.950, 0.975, 1.000])):
         """
         Compute Resolution and Reliability scores over all grid points.
@@ -619,16 +1384,10 @@ class WAS_Verification:
 
         Parameters
         ----------
-        dir_to_save_score : str or Path
-            Directory to save score outputs.
-        y_true : xarray.DataArray
+        y_true_class : xarray.DataArray
             Observed data with dimensions (T, Y, X).
         y_probs : xarray.DataArray
             Forecast probabilities with dimensions (probability, T, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
         bins : array-like, optional
             Probability bins for discretizing forecast probabilities.
 
@@ -640,8 +1399,8 @@ class WAS_Verification:
             - reliability_sum : float
                 Aggregated reliability score.
         """
-        y_true, y_probs = xr.align(y_true, y_probs)
-        y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
+        y_true_class, y_probs = xr.align(y_true_class, y_probs)
+        # y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
         observed_outcomes = y_true_class.stack(flat_dim=("T", "Y", "X")).values
         predicted_probs = y_probs.stack(flat_dim=("T", "Y", "X")).values
         mask = ~np.isnan(observed_outcomes) & np.isfinite(predicted_probs).all(axis=0)
@@ -678,9 +1437,84 @@ class WAS_Verification:
                         reliability_sum += (n_kb / n_instances) * (term1 + term2)
         return resolution_sum, reliability_sum
 
-    def reliability_diagram(self, modelname, dir_to_save_score, y_true, y_probs, clim_year_start, clim_year_end,
+    def resolution_and_reliability_over_all_grid_per_category(self, y_true_class, y_probs,
+                                                       bins=np.array([0.000, 0.025, 0.050, 0.100, 0.150, 0.200,
+                                                                      0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
+                                                                      0.550, 0.600, 0.650, 0.6700, 0.6750, 0.800,
+                                                                      0.850, 0.900, 0.950, 0.975, 1.000])):
+        """       
+        Assumes y_true_class already contains valid category labels (0, 1, 2).
+        """
+        # Align datasets
+        y_true_class, y_probs = xr.align(y_true_class, y_probs)
+        
+        # Flatten all dimensions
+        observed_outcomes = y_true_class.stack(flat_dim=("T", "Y", "X")).values
+        predicted_probs = y_probs.stack(flat_dim=("T", "Y", "X")).values
+        
+        # Mask invalid values
+        mask = ~np.isnan(observed_outcomes) & np.isfinite(predicted_probs).all(axis=0)
+        observed_classes = observed_outcomes[mask].astype(int)
+        predicted_probabilities = predicted_probs[:, mask]
+        
+        n_categories, n_instances = predicted_probabilities.shape
+        
+        # Base rates (overall climatology)
+        base_rates = []
+        for k in range(n_categories):
+            rate = np.mean(observed_classes == k)
+            base_rates.append(rate)
+        
+        # Initialize results
+        total_resolution = 0.0
+        total_reliability = 0.0
+        category_resolution = [0.0] * n_categories
+        category_reliability = [0.0] * n_categories
+        
+        for k in range(n_categories):
+            y_probs_k = predicted_probabilities[k, :]
+            binned_indices = np.digitize(y_probs_k, bins) - 1
+            
+            cat_res_k = 0.0
+            cat_rel_k = 0.0
+            
+            for b in range(len(bins) - 1):
+                bin_mask = binned_indices == b
+                n_kb = np.sum(bin_mask)
+                
+                if n_kb > 0:
+                    y_kb = np.mean(observed_classes[bin_mask] == k)
+                    p_kb = np.mean(y_probs_k[bin_mask])
+                    
+                    # Resolution
+                    if y_kb > 0 and y_kb < 1 and base_rates[k] > 0 and base_rates[k] < 1:
+                        term1_res = y_kb * np.log2(y_kb / base_rates[k])
+                        term2_res = (1 - y_kb) * np.log2((1 - y_kb) / (1 - base_rates[k]))
+                        cat_res_k += (n_kb / n_instances) * (term1_res + term2_res)
+                    
+                    # Reliability
+                    if y_kb > 0 and y_kb < 1 and p_kb > 0 and p_kb < 1:
+                        term1_rel = y_kb * np.log2(y_kb / p_kb)
+                        term2_rel = (1 - y_kb) * np.log2((1 - y_kb) / (1 - p_kb))
+                        cat_rel_k += (n_kb / n_instances) * (term1_rel + term2_rel)
+            
+            category_resolution[k] = cat_res_k
+            category_reliability[k] = cat_rel_k
+            total_resolution += cat_res_k
+            total_reliability += cat_rel_k
+        
+        return {
+            'total_resolution': total_resolution,
+            'total_reliability': total_reliability,
+            'category_resolution': category_resolution,
+            'category_reliability': category_reliability,
+            'category_base_rates': base_rates,
+            'total_instances': n_instances
+        }
+
+    def reliability_diagram(self, modelname, dir_to_save_score, y_true_class, y_probs,
                            bins=np.array([0.100, 0.150, 0.200, 0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-                                          0.550, 0.600, 0.650, 0.700])):
+                                          0.550, 0.600, 0.650, 0.6700])):
         """
         Plot Reliability Diagrams for probabilistic forecasts.
 
@@ -703,17 +1537,18 @@ class WAS_Verification:
         bins : array-like, optional
             Probability bins for discretizing forecast probabilities.
         """
-        labels = ["Below-normal", "Near-normal", "Above-normal"]
-        y_true, y_probs = xr.align(y_true, y_probs)
-        y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
+        labels = ["BELOW AVERAGE", "NEAR AVERAGE", "ABOVE AVERAGE"]
+        y_true_class, y_probs = xr.align(y_true_class, y_probs)
+        # y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
         observed_outcomes = y_true_class.stack(flat_dim=("T", "Y", "X")).values
         predicted_probs = y_probs.stack(flat_dim=("T", "Y", "X")).values
         mask = ~np.isnan(observed_outcomes) & np.isfinite(predicted_probs).all(axis=0)
         observed_classes = observed_outcomes[mask]
         predicted_probabilities = predicted_probs[:, mask]
-        resolution, reliability = self.resolution_and_reliability_over_all_grid(
-            dir_to_save_score, y_true, y_probs, clim_year_start, clim_year_end, bins
-        )
+        # resolution, reliability = self.resolution_and_reliability_over_all_grid(
+             # y_true_class, y_probs, bins
+        # )
+        result_all = self.resolution_and_reliability_over_all_grid_per_category(y_true_class, y_probs, bins)
         n_bins = len(bins) - 1
         observed_freqs = {0: np.zeros(n_bins), 1: np.zeros(n_bins), 2: np.zeros(n_bins)}
         forecast_counts = {0: np.zeros(n_bins), 1: np.zeros(n_bins), 2: np.zeros(n_bins)}
@@ -735,8 +1570,8 @@ class WAS_Verification:
                 out=np.zeros_like(observed_freqs[tercile]),
                 where=forecast_counts[tercile] != 0
             )
-        fig, axs = plt.subplots(1, 3, figsize=(18, 6))
-        titles = ["Below-normal", "Near-normal", "Above-normal"]
+        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+        titles = ["BELOW AVERAGE", "NEAR AVERAGE", "ABOVE AVERAGE"]
         for idx, tercile in enumerate(range(3)):
             ax = axs[idx]
             ax.plot(bins[:-1] * 100, observed_freqs[tercile] * 100, 'k-', lw=2, color="black", label="Reliability Curve")
@@ -757,20 +1592,22 @@ class WAS_Verification:
                             color='gray', alpha=0.2)
             ax.fill_between(no_skill_x, no_skill_y, 100, where=(no_skill_x >= relative_frequency),
                             color='gray', alpha=0.2)
-            ax.text(0.05, 0.78, f"REL: {reliability:.2f}", transform=ax.transAxes, fontsize=10)
-            ax.text(0.05, 0.71, f"RES: {resolution:.2f}", transform=ax.transAxes, fontsize=10)
+            ax.text(0.05, 0.78, f"REL= {result_all['category_reliability'][idx]:.2f}", transform=ax.transAxes, fontsize=12)
+            ax.text(0.05, 0.671, f"RES= {result_all['category_resolution'][idx]:.2f}", transform=ax.transAxes, fontsize=12)
             ax.bar(bins[:-1] * 100, (forecast_counts[tercile] / total_forecasts) * 100, width=5, color="grey", alpha=0.5, align="edge")
             ax.set_title(titles[tercile])
             ax.set_xlim([0, 100])
             ax.set_ylim([0, 100])
-            ax.set_xlabel("Forecast Probability (%)")
-            ax.set_ylabel("Observed Relative Frequency (%)")
-        fig.suptitle("Reliability Diagrams", fontsize=16)
+            ax.set_xlabel("Forecast Probability (%)", fontsize=14)
+            ax.set_ylabel("Observed Relative Frequency (%)", fontsize=13)
+            ax.tick_params(axis="both", labelsize=12)
+        fig.suptitle(f"Reliability Diagrams {modelname}", fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.savefig(f"{dir_to_save_score}/RELIABILITY_{modelname}_.png", dpi=300, bbox_inches='tight')
+        os.makedirs(f"{dir_to_save_score}", exist_ok=True)
+        plt.savefig(f"{dir_to_save_score}/RELIABILITY_{modelname}_.pdf", dpi=300, bbox_inches='tight')
         plt.show()
 
-    def plot_roc_curves(self, modelname, dir_to_save_score, y_true, y_probs, clim_year_start, clim_year_end,
+    def plot_roc_curves(self, modelname, dir_to_save_score, y_true_class, y_probs,
                         n_bootstraps=200, ci=0.95):
         """
         Plot ROC Curves with Confidence Intervals for probabilistic forecasts.
@@ -783,7 +1620,7 @@ class WAS_Verification:
             Name of the model for labeling the plot.
         dir_to_save_score : str or Path
             Directory to save the plot.
-        y_true : xarray.DataArray
+        y_true_class : xarray.DataArray
             Observed data with dimensions (T, Y, X).
         y_probs : xarray.DataArray
             Forecast probabilities with dimensions (probability, T, Y, X).
@@ -796,15 +1633,15 @@ class WAS_Verification:
         ci : float, optional
             Confidence interval level (e.g., 0.95 for 95%). Default is 0.95.
         """
-        labels = ["Below-normal", "Near-normal", "Above-normal"]
-        y_true, y_probs = xr.align(y_true, y_probs)
-        y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
+        labels = ["BELOW AVERAGE", "NEAR AVERAGE", "ABOVE AVERAGE"]
+        y_true_class, y_probs = xr.align(y_true_class, y_probs)
+        # y_true_class = self.compute_class(y_true, clim_year_start, clim_year_end)
         observed_outcomes = y_true_class.stack(flat_dim=("T", "Y", "X")).values
         predicted_probs = y_probs.stack(flat_dim=("T", "Y", "X")).values
         mask = ~np.isnan(observed_outcomes) & np.isfinite(predicted_probs).all(axis=0)
         observed_outcomes = observed_outcomes[mask]
         predicted_probs = predicted_probs[:, mask]
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
+        fig, axes = plt.subplots(1, 3, figsize=(12, 5), sharey=True)
         for i, ax in enumerate(axes):
             binary_labels = (observed_outcomes == i).astype(int)
             fpr, tpr, _ = roc_curve(binary_labels, predicted_probs[i, :])
@@ -829,9 +1666,9 @@ class WAS_Verification:
             mean_tpr[-1] = 1.0
             lower_tpr = np.percentile(tprs_bootstrap, (1 - ci) / 2 * 100, axis=0)
             upper_tpr = np.percentile(tprs_bootstrap, (1 + ci) / 2 * 100, axis=0)
-            ax.plot(fpr, tpr, color='red', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
-            ax.fill_between(mean_fpr, lower_tpr, upper_tpr, color='red', alpha=0.2,
-                            label=f'{int(ci*100)}% CI')
+            ax.plot(fpr, tpr, color='blue', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+            # ax.fill_between(mean_fpr, lower_tpr, upper_tpr, color='blue', alpha=0.2,
+            #                 label=f'{int(ci*100)}% CI')
             ax.plot([0, 1], [0, 1], 'k--', lw=2, label='No Skill')
             for spine in ax.spines.values():
                 spine.set_edgecolor('black')
@@ -839,15 +1676,17 @@ class WAS_Verification:
                 spine.set_visible(True)
             ax.set_xlim([0, 1])
             ax.set_ylim([0, 1])
-            ax.set_title(f'ROC Curve for {labels[i]} Category')
-            ax.set_xlabel('False Positive Rate')
+            ax.set_title(f'ROC Curve for {labels[i]} Category',fontsize=12)
+            ax.set_xlabel('False Positive Rate', fontsize=14)
             if i == 0:
-                ax.set_ylabel('True Positive Rate')
-            ax.legend(loc="lower right")
+                ax.set_ylabel('True Positive Rate', fontsize=14)
+            ax.legend(fontsize=10,loc="lower right")
+            ax.tick_params(axis="both", labelsize=12)
             ax.grid(True)
-        fig.suptitle(f"ROC Curves for {modelname}", fontsize=16)
+        fig.suptitle(f"ROC Curves for {modelname}", fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.savefig(f"{dir_to_save_score}/ROC_{modelname}_.png", dpi=300, bbox_inches='tight')
+        os.makedirs(f"{dir_to_save_score}", exist_ok=True)
+        plt.savefig(f"{dir_to_save_score}/ROC_{modelname}_.pdf", dpi=300, bbox_inches='tight')
         plt.show()
 
     # ------------------------
@@ -883,7 +1722,7 @@ class WAS_Verification:
     # Probabilistic Scoring
     # ------------------------
 
-    def compute_probabilistic_score(self, score_func, obs, prob_pred, clim_year_start, clim_year_end):
+    def compute_probabilistic_score(self, score_func, obs, prob_pred,clim_year_start, clim_year_end, **score_kwargs):
         """
         Apply a probabilistic scoring function over xarray DataArrays.
 
@@ -907,26 +1746,42 @@ class WAS_Verification:
         xarray.DataArray
             Score values with dimensions (Y, X).
         """
+        
         index_start = obs.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = obs.get_index("T").get_loc(str(clim_year_end)).stop
+        index_end   = obs.get_index("T").get_loc(str(clim_year_end)).stop
+        import os
         obs, prob_pred = xr.align(obs, prob_pred)
-        return xr.apply_ufunc(
-            score_func,
-            obs,
-            prob_pred,
-            input_core_dims=[('T',), ('probability', 'T')],
-            vectorize=True,
-            kwargs={'index_start': index_start, 'index_end': index_end},
-            dask='parallelized',
-            output_core_dims=[()],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={"allow_rechunk": True},
-        )
+        _kw = {'index_start': index_start, 'index_end': index_end, **score_kwargs}
 
-    # ------------------------
-    # Plotting Utilities
-    # ------------------------
+        def _eager():
+            return xr.apply_ufunc(
+                score_func, obs, prob_pred,
+                input_core_dims=[('T',), ('probability', 'T')],
+                vectorize=True, kwargs=_kw, dask='parallelized',
+                output_core_dims=[()], output_dtypes=['float'],
+                dask_gufunc_kwargs={"allow_rechunk": True},
+            )
 
+        # Grid-parallel path (see compute_deterministic_score): chunk over Y/X
+        # and score on a thread pool; identical results, GIL released in numpy
+        # kernels. Falls back to eager on any failure or small grids.
+        if os.environ.get("WAS_VERIF_PARALLEL", "1") != "0":
+            n = _verif_num_workers()
+            ncells = int(obs.sizes.get("Y", 1)) * int(obs.sizes.get("X", 1))
+            min_cells = int(os.environ.get("WAS_VERIF_MIN_CELLS", "4000"))
+            if n > 1 and ncells >= min_cells:
+                try:
+                    res = xr.apply_ufunc(
+                        score_func, _chunk_grid(obs, n), _chunk_grid(prob_pred, n),
+                        input_core_dims=[('T',), ('probability', 'T')],
+                        vectorize=True, kwargs=_kw, dask='parallelized',
+                        output_core_dims=[()], output_dtypes=['float'],
+                        dask_gufunc_kwargs={"allow_rechunk": True},
+                    )
+                    return res.compute(scheduler="threads", num_workers=n)
+                except Exception:
+                    pass
+        return _eager()
     def plot_model_score(self, model_metric, score, dir_save_score, figure_name="WAS_MLR"):
         """
         Plot a deterministic score on a map.
@@ -958,24 +1813,27 @@ class WAS_Verification:
         )
         ax.coastlines(resolution='10m')
         ax.add_feature(cfeature.BORDERS, linestyle='--')
-        ax.set_title(f"{figure_name} {score_meta_data[0]}")
+        ax.set_title(f"{score} {figure_name}")
         gl = ax.gridlines(draw_labels=True, linewidth=0.1, color='gray', alpha=0.5)
         gl.top_labels = False
         gl.right_labels = False
         cbar = fig.colorbar(im, ax=ax, orientation='horizontal', pad=0.05, shrink=0.5)
         cbar.ax.set_position([ax.get_position().x0, ax.get_position().y0 - 0.1,
                               ax.get_position().width, 0.039])
-        cbar.set_label(score_meta_data[0])
+
+        name, _, _, _, _, _, unit = self.scores[score]
+        label = f"{name} {unit}".rstrip()
+        cbar.set_label(label)
+        
         plt.savefig(dir_save_score / f"{figure_name}_{score}.png", dpi=300, bbox_inches='tight')
         plt.show()
         plt.close()
-
     def plot_models_score(self, model_metrics, score, dir_save_score):
         """
         Plot multiple model scores on a grid of maps.
-
+    
         Creates a subplot grid with geographical plots for each model's score.
-
+    
         Parameters
         ----------
         model_metrics : dict
@@ -987,184 +1845,395 @@ class WAS_Verification:
         """
         dir_save_score = Path(dir_save_score)
         dir_save_score.mkdir(parents=True, exist_ok=True)
+        
+        # Check if the score exists in the scores dictionary
+        if score not in self.scores:
+            raise ValueError(f"Score '{score}' is not defined in the scores dictionary. "
+                             f"Available scores: {list(self.scores.keys())}")
+        
         score_meta_data = self.scores[score]
         n_scores = len(model_metrics)
         n_cols = min(3, n_scores)
         n_rows = int(np.ceil(n_scores / n_cols))
+        
+        # Create figure and axes
         fig, axes = plt.subplots(
             n_rows, n_cols,
             figsize=(n_cols * 6, n_rows * 4),
             subplot_kw={'projection': ccrs.PlateCarree()}
         )
+        
+        # Handle single axis case
+        if n_scores == 1:
+            axes = np.array([axes])
+        
         axes = axes.flatten()
+        
+        # Ensure vmin and vmax are numeric (not strings)
+        vmin = score_meta_data[1]
+        vmax = score_meta_data[2]
+        
+        # Convert to float if they're not None and can be converted
+        if vmin is not None:
+            try:
+                vmin = float(vmin)
+            except (ValueError, TypeError):
+                # print(f"Warning: vmin for score '{score}' is not numeric: {vmin}. Setting to None.")
+                vmin = None
+        
+        if vmax is not None:
+            try:
+                vmax = float(vmax)
+            except (ValueError, TypeError):
+                # print(f"Warning: vmax for score '{score}' is not numeric: {vmax}. Setting to None.")
+                vmax = None
+        
         for i, (center, data) in enumerate(model_metrics.items()):
             ax = axes[i]
+            
+            # Plot the data
             im = data.plot(
                 ax=ax,
                 transform=ccrs.PlateCarree(),
-                cmap=score_meta_data[4],
-                vmin=score_meta_data[1] if score_meta_data[1] is not None else None,
-                vmax=score_meta_data[2] if score_meta_data[2] is not None else None,
+                cmap=score_meta_data[4] if score_meta_data[4] else 'viridis',  # Default colormap
+                vmin=vmin,
+                vmax=vmax,
                 add_colorbar=False
             )
+            
+            # Add map features
             ax.coastlines(resolution='10m')
             ax.add_feature(cfeature.BORDERS, linestyle='--')
-            ax.set_title(f"{center} {score_meta_data[0]}")
+            ax.set_title(f"{score} {center[:-1]}")
+            
+            # Add gridlines
             gl = ax.gridlines(draw_labels=True, linewidth=0.1, color='gray', alpha=0.5)
             gl.top_labels = False
             gl.right_labels = False
+            
+            # Add colorbar
             cbar = fig.colorbar(im, ax=ax, orientation='horizontal', pad=0.15, shrink=0.7)
-            cbar.ax.set_position([ax.get_position().x0, ax.get_position().y0 - 0.12,
-                                  ax.get_position().width, 0.03])
-            cbar.set_label(score_meta_data[0])
+            cbar.ax.set_position([
+                ax.get_position().x0, 
+                ax.get_position().y0 - 0.12,
+                ax.get_position().width, 
+                0.03
+            ])
+            
+            # Get score metadata for labeling
+            name, _, _, _, _, _, unit = score_meta_data
+            label = f"{name}"
+            if unit and unit.strip():
+                label += f" {unit}"
+            cbar.set_label(label)
+        
+        # Remove unused subplots
         for j in range(i + 1, len(axes)):
             fig.delaxes(axes[j])
+        
+        # Adjust layout and save
         plt.subplots_adjust(wspace=0.3, hspace=0.3)
         plt.savefig(dir_save_score / f"{score}_all_models.png", dpi=300, bbox_inches='tight')
         plt.show()
         plt.close()
 
-    # ------------------------
-    # GCM Validation
-    # ------------------------
+        
+    # ------------------ Probability Calculation Methods ------------------
 
     @staticmethod
-    def calculate_tercile_probabilities(best_guess, error_variance, first_tercile, second_tercile, dof):
+    def _ppf_terciles_from_code(dist_code, shape, loc, scale):
         """
-        Calculate tercile probabilities using Student's t-distribution.
-
-        Computes probabilities for below-normal, normal, and above-normal categories.
-
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_variance : array-like
-            Variance of forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : int
-            Degrees of freedom for the t-distribution.
-
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
+        Return tercile thresholds (T1, T2) from best-fit distribution parameters.
+    
+        dist_code:
+            1: norm
+            2: lognorm
+            3: expon
+            4: gamma
+            5: weibull_min
+            6: t
+            7: poisson
+            8: nbinom
         """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            first_t = (first_tercile - best_guess) / error_std
-            second_t = (second_tercile - best_guess) / error_std
-            pred_prob[0, :] = stats.t.cdf(first_t, df=dof)
-            pred_prob[1, :] = stats.t.cdf(second_t, df=dof) - stats.t.cdf(first_t, df=dof)
-            pred_prob[2, :] = 1 - stats.t.cdf(second_t, df=dof)
-        return pred_prob
+        if np.isnan(dist_code):
+            return np.nan, np.nan
+    
+        code = int(dist_code)
+        try:
+            if code == 1:
+                return (
+                    norm.ppf(0.33, loc=loc, scale=scale),
+                    norm.ppf(0.67, loc=loc, scale=scale),
+                )
+            elif code == 2:
+                return (
+                    lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                )
+            elif code == 3:
+                return (
+                    expon.ppf(0.33, loc=loc, scale=scale),
+                    expon.ppf(0.67, loc=loc, scale=scale),
+                )
+            elif code == 4:
+                return (
+                    gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                )
+            elif code == 5:
+                return (
+                    weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                )
+            elif code == 6:
+                # Note: Renamed 't_dist' to 't' for standard scipy.stats
+                return (
+                    t.ppf(0.33, df=shape, loc=loc, scale=scale),
+                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                )
+            elif code == 7:
+                # Poisson: poisson.ppf(q, mu, loc=0)
+                # ASSUMPTION: 'mu' (mean) is passed as 'shape'
+                #             'loc' is passed as 'loc'
+                #             'scale' is unused
+                return (
+                    poisson.ppf(0.33, mu=shape, loc=loc),
+                    poisson.ppf(0.67, mu=shape, loc=loc),
+                )
+            elif code == 8:
+                # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
+                # ASSUMPTION: 'n' (successes) is passed as 'shape'
+                #             'p' (probability) is passed as 'scale'
+                #             'loc' is passed as 'loc'
+                return (
+                    nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                )
+        except Exception:
+            return np.nan, np.nan
+    
+        # Fallback if code is not 1-8
+        return np.nan, np.nan
+        
+    @staticmethod
+    def weibull_shape_solver(k, M, V):
+        """
+        Function to find the root of the Weibull shape parameter 'k'.
+        We find 'k' such that the theoretical variance/mean^2 ratio
+        matches the observed V/M^2 ratio.
+        """
+        # Guard against invalid 'k' values during solving
+        if k <= 0:
+            return -np.inf
+        try:
+            g1 = gamma_function(1 + 1/k)
+            g2 = gamma_function(1 + 2/k)
+            
+            # This is the V/M^2 ratio *implied by k*
+            implied_v_over_m_sq = (g2 / (g1**2)) - 1
+            
+            # This is the *observed* ratio
+            observed_v_over_m_sq = V / (M**2)
+            
+            # Return the difference (we want this to be 0)
+            return observed_v_over_m_sq - implied_v_over_m_sq
+        except ValueError:
+            return -np.inf # Handle math errors
 
     @staticmethod
-    def calculate_tercile_probabilities_weibull_min(best_guess, error_variance, first_tercile, second_tercile, dof):
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
+    ):
         """
-        Calculate tercile probabilities using Weibull minimum distribution.
+        Generic tercile probabilities using best-fit family per grid cell.
 
-        Assumes `best_guess` as the location, `error_std` as the scale, and `dof` as the shape parameter.
+        Inputs (per grid cell):
+        - best_guess : 1D array over T (hindcast_det or forecast_det)
+        - T1, T2     : scalar terciles from climatological best-fit distribution
+        - dist_code  : int, as in _ppf_terciles_from_code
+        - shape, loc, scale : scalars from climatology fit
 
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_variance : array-like
-            Variance of forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-        dof : float or array-like
-            Shape parameter for the Weibull minimum distribution.
-
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
+        Strategy:
+        - For each time step, build a predictive distribution of the same family:
+            * Use best_guess[t] to adjust mean / location;
+            * Keep shape parameters from climatology.
+        - Then compute probabilities:
+            P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
         """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std) - \
-                              stats.weibull_min.cdf(first_tercile, c=dof, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.weibull_min.cdf(second_tercile, c=dof, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_gamma(best_guess, error_variance, T1, T2):
-        """
-        Calculate tercile probabilities using Gamma distribution.
-
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_variance : array-like
-            Variance of forecast errors.
-        T1 : array-like
-            First tercile threshold values.
-        T2 : array-like
-            Second tercile threshold values.
-
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time), dtype=float)
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        best_guess = np.asarray(best_guess, dtype=float)
+        
+        best_guess = np.asarray(best_guess, float)
         error_variance = np.asarray(error_variance, dtype=float)
-        T1 = np.asarray(T1, dtype=float)
-        T2 = np.asarray(T2, dtype=float)
-        alpha = (best_guess**2) / error_variance
-        theta = error_variance / best_guess
-        cdf_t1 = gamma.cdf(T1, a=alpha, scale=theta)
-        cdf_t2 = gamma.cdf(T2, a=alpha, scale=theta)
-        pred_prob[0, :] = cdf_t1
-        pred_prob[1, :] = cdf_t2 - cdf_t1
-        pred_prob[2, :] = 1.0 - cdf_t2
-        return pred_prob
+        # T1 = np.asarray(T1, dtype=float)
+        # T2 = np.asarray(T2, dtype=float)
+        n_time = best_guess.size
+        out = np.full((3, n_time), np.nan, float)
+
+        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
+            return out
+
+        code = int(dist_code)
+
+        # Normal: loc = forecast; scale from clim
+        if code == 1:
+            error_std = np.sqrt(error_variance)
+            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
+            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
+
+        # Lognormal: shape = sigma from clim; enforce mean = best_guess
+        elif code == 2:
+            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
+            mu = np.log(best_guess) - sigma**2 / 2
+            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
+            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
+
+
+        # Exponential: keep scale from clim; shift loc so mean = best_guess
+        elif code == 3:
+            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
+            c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        # Gamma: use shape from clim; set scale so mean = best_guess
+        elif code == 4:
+            alpha = (best_guess ** 2) / error_variance
+            theta = error_variance / best_guess
+            c1 = gamma.cdf(T1, a=alpha, scale=theta)
+            c2 = gamma.cdf(T2, a=alpha, scale=theta)
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 5: # Assuming 5 is for Weibull   
+        
+            for i in range(n_time):
+                # Get the scalar values for this specific element (e.g., grid cell)
+                M = best_guess[i]
+                print(M)
+                V = error_variance
+                print(V)
+                
+                # Handle cases with no variance to avoid division by zero
+                if V <= 0 or M <= 0:
+                    out[0, i] = np.nan
+                    out[1, i] = np.nan
+                    out[2, i] = np.nan
+                    continue # Skip to the next element
+        
+                # --- 1. Numerically solve for shape 'k' ---
+                # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
+                initial_guess = 2.0
+                
+                # fsolve finds the root of our helper function
+                k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
+        
+                # --- 2. Check for bad solution and calculate scale 'lambda' ---
+                if k <= 0:
+                    # Solver failed
+                    out[0, i] = np.nan
+                    out[1, i] = np.nan
+                    out[2, i] = np.nan
+                    continue
+                
+                # With 'k' found, we can now algebraically find scale 'lambda'
+                # In scipy.stats, scale is 'scale'
+                lambda_scale = M / gamma_function(1 + 1/k)
+        
+                # --- 3. Calculate Probabilities ---
+                # In scipy.stats, shape 'k' is 'c'
+                # Use the T1 and T2 values for this specific element
+                
+                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
+                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
+        
+                out[0, i] = c1
+                out[1, i] = c2 - c1
+                out[2, i] = 1.0 - c2
+
+        # Student-t: df from clim; scale from clim; loc = best_guess
+        elif code == 6:       
+            # Check if df is valid for variance calculation
+            if dof <= 2:
+                # Cannot calculate scale, fill with NaNs
+                out[0, :] = np.nan
+                out[1, :] = np.nan
+                out[2, :] = np.nan
+            else:
+                # 1. Calculate t-distribution parameters
+                # 'loc' (mean) is just the best_guess
+                loc = best_guess
+                # 'scale' is calculated from the variance and df
+                # Variance = scale**2 * (df / (df - 2))
+                scale = np.sqrt(error_variance * (dof - 2) / dof)
+                
+                # 2. Calculate probabilities
+                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
+                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
+
+                out[0, :] = c1
+                out[1, :] = c2 - c1
+                out[2, :] = 1.0 - c2
+
+        elif code == 7: # Assuming 7 is for Poisson
+            
+            # --- 1. Set the Poisson parameter 'mu' ---
+            # The 'mu' parameter is the mean.
+            
+            # A warning is strongly recommended if error_variance is different from best_guess
+            if not np.allclose(best_guess, error_variance, atol=0.5):
+                print("Warning: 'error_variance' is not equal to 'best_guess'.")
+                print("Poisson model assumes mean=variance and is likely inappropriate.")
+                print("Consider using Negative Binomial.")
+            
+            mu = best_guess
+        
+            # --- 2. Calculate Probabilities ---
+            # poisson.cdf(k, mu) calculates P(X <= k)
+            
+            c1 = poisson.cdf(T1, mu=mu)
+            c2 = poisson.cdf(T2, mu=mu)
+            
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+
+        elif code == 8: # Assuming 8 is for Negative Binomial
+            
+            # --- 1. Calculate Negative Binomial Parameters ---
+            # This model is ONLY valid for overdispersion (Variance > Mean).
+            # We will use np.where to set parameters to NaN if V <= M.
+            
+            # p = Mean / Variance
+            p = np.where(error_variance > best_guess, 
+                         best_guess / error_variance, 
+                         np.nan)
+            
+            # n = Mean^2 / (Variance - Mean)
+            n = np.where(error_variance > best_guess, 
+                         (best_guess**2) / (error_variance - best_guess), 
+                         np.nan)
+            
+            # --- 2. Calculate Probabilities ---
+            # The nbinom.cdf function will propagate NaNs, correctly
+            # handling the cases where the model was invalid.
+            
+            c1 = nbinom.cdf(T1, n=n, p=p)
+            c2 = nbinom.cdf(T2, n=n, p=p)
+            
+            out[0, :] = c1
+            out[1, :] = c2 - c1
+            out[2, :] = 1.0 - c2
+            
+        else:
+            raise ValueError(f"Invalid distribution")
+
+        return out
 
     @staticmethod
     def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """
-        Calculate tercile probabilities using a non-parametric method.
-
-        Uses historical error samples to estimate probabilities empirically.
-
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_samples : array-like
-            Historical error samples.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
-        """
+        """Non-parametric method using historical error samples."""
         n_time = len(best_guess)
         pred_prob = np.full((3, n_time), np.nan, dtype=float)
         for t in range(n_time):
@@ -1182,362 +2251,140 @@ class WAS_Verification:
             pred_prob[2, t] = p_above
         return pred_prob
 
-    @staticmethod
-    def calculate_tercile_probabilities_normal(best_guess, error_variance, first_tercile, second_tercile):
+    def gcm_compute_prob(
+        self,
+        Predictant: xr.DataArray,
+        clim_year_start,
+        clim_year_end,
+        hindcast_det: xr.DataArray,
+        best_code_da: xr.DataArray = None,
+        best_shape_da: xr.DataArray = None,
+        best_loc_da: xr.DataArray = None,
+        best_scale_da: xr.DataArray = None
+    ) -> xr.DataArray:
         """
-        Calculate tercile probabilities using Normal distribution.
+        Compute tercile probabilities for deterministic hindcasts.
 
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_variance : array-like
-            Variance of forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
+        If dist_method == 'bestfit':
+            - Use cluster-based best-fit distributions to:
+                * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
+                * compute predictive probabilities using the same family.
 
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.all(np.isnan(best_guess)):
-            pred_prob[:] = np.nan
-        else:
-            error_std = np.sqrt(error_variance)
-            pred_prob[0, :] = stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[1, :] = stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std) - \
-                              stats.norm.cdf(first_tercile, loc=best_guess, scale=error_std)
-            pred_prob[2, :] = 1 - stats.norm.cdf(second_tercile, loc=best_guess, scale=error_std)
-        return pred_prob
-
-    @staticmethod
-    def calculate_tercile_probabilities_lognormal(best_guess, error_variance, first_tercile, second_tercile):
-        """
-        Calculate tercile probabilities using Lognormal distribution.
-
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast or best-guess values.
-        error_variance : array-like
-            Variance of forecast errors.
-        first_tercile : array-like
-            First tercile threshold values.
-        second_tercile : array-like
-            Second tercile threshold values.
-
-        Returns
-        -------
-        pred_prob : np.ndarray
-            Array of shape (3, n_time) with probabilities for below, normal, and above categories.
-        """
-        n_time = len(best_guess)
-        pred_prob = np.empty((3, n_time))
-        if np.any(np.isnan(best_guess)) or np.any(np.isnan(error_variance)):
-            pred_prob[:] = np.nan
-            return pred_prob
-        sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-        mu = np.log(best_guess) - sigma**2 / 2
-        pred_prob[0, :] = lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[1, :] = lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu)) - \
-                          lognorm.cdf(first_tercile, s=sigma, scale=np.exp(mu))
-        pred_prob[2, :] = 1 - lognorm.cdf(second_tercile, s=sigma, scale=np.exp(mu))
-        return pred_prob
-
-    def gcm_compute_prob_ensemble_method(self, Obs_data, clim_year_start, clim_year_end, model_data, ensemble="mean"):
-        """
-        Compute probabilistic forecasts for GCM ensemble data.
-
-        Uses the specified ensemble statistic to derive best-guess forecasts and computes
-        tercile probabilities.
-
-        Parameters
-        ----------
-        Obs_data : xarray.DataArray
-            Observed data with dimensions (T, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
-        model_data : xarray.DataArray
-            Model ensemble data with dimensions (T, number, Y, X).
-        ensemble : str, optional
-            Ensemble statistic to use ('mean' or other supported methods). Default is 'mean'.
-
-        Returns
-        -------
-        xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X).
-        """
-        index_start = Obs_data.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Obs_data.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Obs_data.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.3, 0.67], dim='T')
-        best_guess_member = getattr(model_data, ensemble)(dim="number")
-        error_variance_member = (Obs_data - model_data).var(dim='number')
-        model_data_prob = xr.apply_ufunc(
-            self.calculate_tercile_probabilities_gamma,
-            best_guess_member,
-            error_variance_member,
-            terciles.isel(quantile=0).drop_vars('quantile'),
-            terciles.isel(quantile=1).drop_vars('quantile'),
-            input_core_dims=[('T',), ('T',), (), ()],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('probability', 'T')],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
-        )
-        model_data_prob = model_data_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA'])).transpose('probability', 'T', 'Y', 'X')
-        return model_data_prob
-
-    def gcm_compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det):
-        """
-        Compute tercile probabilities for GCM hindcasts.
-
-        Supports multiple distribution methods for calculating probabilities.
+        Otherwise:
+            - Use empirical terciles from Predictant climatology and the selected
+              parametric / nonparametric method.
 
         Parameters
         ----------
         Predictant : xarray.DataArray
-            Observed data with dimensions (T, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
+            Observed data (T, Y, X) or (T, Y, X, M).
+        clim_year_start, clim_year_end : int or str
+            Climatology period (inclusive) for thresholds.
         hindcast_det : xarray.DataArray
-            Deterministic hindcast data with dimensions (T, Y, X).
+            Deterministic hindcast (T, Y, X).
+        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
+            Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
 
         Returns
         -------
-        xarray.DataArray
-            Tercile probabilities with dimensions (probability, T, Y, X), where
-            'probability' includes ['PB', 'PN', 'PA'] (below-normal, normal, above-normal).
+        hindcast_prob : xarray.DataArray
+            Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
         """
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim='T')
-        T1 = terciles.isel(quantile=0).drop_vars('quantile')
-        T2 = terciles.isel(quantile=1).drop_vars('quantile')
-        dof = len(Predictant.get_index("T")) - 2
-        if self.dist_method == "t":
-            calc_func = self.calculate_tercile_probabilities
-            error_variance = (Predictant - hindcast_det).var(dim='T')
+        # Handle member dimension if present
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+
+        # Ensure dimension order
+        Predictant = Predictant.transpose("T", "Y", "X")
+
+        # Spatial mask
+        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+
+        # Climatology subset
+        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+        if clim.sizes.get("T", 0) < 3:
+            raise ValueError("Not enough years in climatology period for terciles.")
+
+        # Error variance for predictive distributions
+        error_variance = (Predictant - hindcast_det).var(dim="T")
+        dof = max(int(clim.sizes["T"]) - 1, 2)
+
+        # Empirical terciles (used by non-bestfit methods)
+        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
+        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
+        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
+        
+
+        dm = self.dist_method
+
+        # ---------- BESTFIT: zone-wise optimal distributions ----------
+        if dm == "bestfit":
+            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+                raise ValueError(
+                    "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
+                )
+
+            # T1, T2 from best-fit distributions (per grid)
+            T1, T2 = xr.apply_ufunc(
+                self._ppf_terciles_from_code,
+                best_code_da,
+                best_shape_da,
+                best_loc_da,
+                best_scale_da,
+                input_core_dims=[(), (), (), ()],
+                output_core_dims=[(), ()],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[float, float],
+            )
+
+            # Predictive probabilities using same family
             hindcast_prob = xr.apply_ufunc(
-                calc_func,
+                self.calculate_tercile_probabilities_bestfit,
                 hindcast_det,
                 error_variance,
                 T1,
                 T2,
-                input_core_dims=[('T',), (), (), ()],
+                best_code_da,
+                input_core_dims=[("T",), (), (), (), ()],
+                output_core_dims=[("probability", "T")],
                 vectorize=True,
                 kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
+                dask="parallelized",
+                output_dtypes=[float],
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
             )
-        elif self.dist_method == "weibull_min":
-            calc_func = self.calculate_tercile_probabilities_weibull_min
-            error_variance = (Predictant - hindcast_det).var(dim='T')
+
+        # ---------- Nonparametric ----------
+        elif dm == "nonparam":
+            error_samples = Predictant - hindcast_det
             hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True}
-            )
-        elif self.dist_method == "gamma":
-            calc_func = self.calculate_tercile_probabilities_gamma
-            error_variance = (Predictant - hindcast_det).var(dim='T')
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "normal":
-            calc_func = self.calculate_tercile_probabilities_normal
-            error_variance = (Predictant - hindcast_det).var(dim='T')
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "lognormal":
-            calc_func = self.calculate_tercile_probabilities_lognormal
-            error_variance = (Predictant - hindcast_det).var(dim='T')
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                input_core_dims=[('T',), (), (), ()],
-                vectorize=True,
-                dask='parallelized',
-                output_core_dims=[('probability', 'T')],
-                output_dtypes=['float'],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}, "allow_rechunk": True},
-            )
-        elif self.dist_method == "nonparam":
-            calc_func = self.calculate_tercile_probabilities_nonparametric
-            error_samples = (Predictant - hindcast_det)
-            hindcast_prob = xr.apply_ufunc(
-                calc_func,
+                self.calculate_tercile_probabilities_nonparametric,
                 hindcast_det,
                 error_samples,
-                T1,
-                T2,
-                input_core_dims=[('T',), ('T',), (), ()],
-                output_core_dims=[('probability', 'T')],
+                T1_emp,
+                T2_emp,
+                input_core_dims=[("T",), ("T",), (), ()],
+                output_core_dims=[("probability", "T")],
                 vectorize=True,
-                dask='parallelized',
+                dask="parallelized",
                 output_dtypes=[float],
-                dask_gufunc_kwargs={'output_sizes': {'probability': 3}},
+                dask_gufunc_kwargs={
+                    "output_sizes": {"probability": 3},
+                    "allow_rechunk": True,
+                },
             )
+
         else:
-            raise ValueError(f"Invalid method: {self.dist_method}. Choose 't', 'gamma', 'normal', 'lognormal', or 'nonparam'.")
-        hindcast_prob = hindcast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return hindcast_prob.transpose('probability', 'T', 'Y', 'X')
+            raise ValueError(f"Invalid dist_method: {self.dist_method}")
 
-    def gcm_validation_compute_(self, center_variable, month_of_initialization, lead_time,
-                               dir_model, Obs, year_start, year_end, clim_year_start, clim_year_end, area, score,
-                               dir_to_save_roc_reliability, ensemble_mean=None, gridded=True):
-        """
-        Validate GCM forecasts using specified metrics.
-
-        Computes deterministic, probabilistic, or ensemble scores for GCM hindcasts.
-
-        Parameters
-        ----------
-        center_variable : list of str
-            List of model identifiers (e.g., 'center.variable').
-        month_of_initialization : int
-            Month of forecast initialization (1-12).
-        lead_time : list of int
-            Lead times in months for the forecast season.
-        dir_model : str or Path
-            Directory containing model hindcast files.
-        Obs : xarray.DataArray
-            Observed data with dimensions (T, Y, X).
-        year_start : int
-            Start year of the validation period.
-        year_end : int
-            End year of the validation period.
-        clim_year_start : int
-            Start year of the climatology period.
-        clim_year_end : int
-            End year of the climatology period.
-        area : str
-            Geographical area for validation (not used in current implementation).
-        score : str
-            Score to compute (e.g., 'Pearson', 'RPSS', 'ROC_CURVE').
-        dir_to_save_roc_reliability : str or Path
-            Directory to save ROC and reliability plots.
-        ensemble_mean : str, optional
-            Ensemble statistic to use if needed (e.g., 'mean'). Default is None.
-        gridded : bool, optional
-            Whether to perform gridded validation. Default is True.
-
-        Returns
-        -------
-        dict or None
-            Dictionary of model scores with keys as model identifiers and values as xarray.DataArray,
-            or None for plotting scores (e.g., ROC_CURVE, RELIABILITY_DIAGRAM).
-        """
-        abb_mont_ini = calendar.month_abbr[int(month_of_initialization)]
-        season_months = [((int(month_of_initialization) + int(l) - 1) % 12) + 1 for l in lead_time]
-        season = "".join([calendar.month_abbr[month] for month in season_months])
-        variables = center_variable[0].split(".")[1]
-        x_metric = {}
-        if gridded:
-            Obs_data_ = Obs
-            Obs_data_['T'] = Obs_data_['T'].astype('datetime64[ns]')
-            mean_rainfall = Obs_data_.mean(dim="T").squeeze()
-            mask_ = xr.where(mean_rainfall <= 20, np.nan, 1)
-            mask_ = mask_.where(abs(mask_.Y) <= 22, np.nan)
-            for i in center_variable:
-                score_type = self.scores[score][3]
-                center = i.split(".")[0].lower().replace("_", "")
-                model_file = f"{dir_model}/hindcast_{center}_{variables}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
-                model_data_ = xr.open_dataset(model_file)
-                model_data_['T'] = model_data_['T'].astype('datetime64[ns]')
-                year_start_ = np.unique(model_data_['T'].dt.year)[0]
-                year_end_ = np.unique(model_data_['T'].dt.year)[-1]
-                Obs_data = Obs_data_.sel(T=slice(str(year_start_), str(year_end_))).interp(
-                    Y=model_data_.Y, X=model_data_.X, method="nearest", kwargs={"fill_value": "extrapolate"}
-                )
-                mask = mask_.interp(Y=model_data_.Y, X=model_data_.X, method="nearest", kwargs={"fill_value": "extrapolate"})
-                Obs_data = Obs_data.where(mask == 1, np.nan)
-                model_data = model_data_.where(mask == 1, np.nan).to_array().drop_vars("variable").squeeze()
-                model_data['T'] = Obs_data['T']
-                if score_type == "det_score":
-                    if (ensemble_mean is None) or ("number" in model_data.coords):
-                        model_data = model_data.mean(dim="number", skipna=True)
-                    score_result = self.compute_deterministic_score(
-                        self.scores[score][5], Obs_data, model_data
-                    )
-                    x_metric[f"{center}_{abb_mont_ini}Ic_{season}"] = score_result
-                elif score_type == "prob_score":
-                    if (ensemble_mean is None) or ("number" in model_data.coords):
-                        model_data = model_data.mean(dim="number", skipna=True)
-                    proba_forecast = self.gcm_compute_prob(Obs_data, clim_year_start, clim_year_end, model_data)
-                    score_result = self.compute_probabilistic_score(
-                        self.scores[score][5], Obs_data, proba_forecast, clim_year_start, clim_year_end,
-                    )
-                    x_metric[f"{center}_{abb_mont_ini}Ic_{season}"] = score_result
-                elif score_type == "ensemble_score":
-                    if ensemble_mean is not None:
-                        print("Ensemble score does not require an ensemble mean or median.")
-                    else:
-                        score_result = self.compute_crps(Obs_data, model_data, member_dim='number', dim="T")
-                        x_metric[f"{center}_{abb_mont_ini}Ic_{season}"] = score_result
-                elif score_type == "all_grid_prob_score":
-                    if (ensemble_mean is None) or ("number" in model_data.coords):
-                        model_data = model_data.mean(dim="number", skipna=True)
-                    proba_forecast = self.gcm_compute_prob(Obs_data, clim_year_start, clim_year_end, model_data)
-                    if score == "ROC_CURVE":
-                        self.plot_roc_curves(center, dir_to_save_roc_reliability, Obs_data, proba_forecast,
-                                             clim_year_start, clim_year_end, n_bootstraps=1000, ci=0.95)
-                    elif score == "RELIABILITY_DIAGRAM":
-                        self.reliability_diagram(center, dir_to_save_roc_reliability, Obs_data, proba_forecast,
-                                                clim_year_start, clim_year_end)
-                    else:
-                        print(f"Plotting for score {score} is not implemented.")
-                elif score_type == "all_grid_det_score":
-                    pass
-        else:
-            print("Non-gridded data validation is not implemented yet.")
-        return x_metric if self.scores[score][3] in ["det_score", "prob_score", "ensemble_score"] else None
+        hindcast_prob = hindcast_prob.assign_coords(
+            probability=("probability", ["PB", "PN", "PA"])
+        )
+        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
 
     def gcm_validation_compute(self, models_files_path, Obs, score, month_of_initialization, clim_year_start,
                               clim_year_end, dir_to_save_roc_reliability, lead_time=None, ensemble_mean=None, gridded=True):
@@ -1606,6 +2453,7 @@ class WAS_Verification:
                 Obs_data = Obs_data_.sel(T=slice(str(year_start_), str(year_end_))).interp(
                     Y=model_data_.Y, X=model_data_.X, method="linear", kwargs={"fill_value": "extrapolate"}
                 )
+                
                 model_data = model_data_.to_array().drop_vars("variable").squeeze()
                 model_data['T'] = Obs_data['T']
                 if score_type == "det_score":
@@ -1616,6 +2464,7 @@ class WAS_Verification:
                     )
                     x_metric[f"{i}_{abb_mont_ini}Ic_{season}"] = score_result
                 elif score_type == "prob_score":
+                    ### A revoir aussi
                     if 'number' in model_data.dims:
                         model_data = model_data.mean(dim="number")
                     proba_forecast = self.gcm_compute_prob(Obs_data, clim_year_start, clim_year_end, model_data)
@@ -1627,9 +2476,11 @@ class WAS_Verification:
                     if ensemble_mean is not None:
                         print("Ensemble score does not require an ensemble mean or median.")
                     else:
+                        #### A revoir
                         score_result = self.compute_crps(Obs_data, model_data, member_dim='number', dim="T")
                         x_metric[f"{i}_{abb_mont_ini}Ic_{season}"] = score_result
                 elif score_type == "all_grid_prob_score":
+                    #### A revoir
                     if (ensemble_mean is None) or ("number" in model_data.coords):
                         model_data = model_data.mean(dim="number", skipna=True)
                     proba_forecast = self.gcm_compute_prob(Obs_data, clim_year_start, clim_year_end, model_data)
@@ -1914,7 +2765,7 @@ class WAS_Verification:
         else:
             return np.nan
 
-    def compute_one_year_rpss(self, obs, prob_pred, clim_year_start, clim_year_end, year):
+    def compute_one_year_rpss_(self, obs, prob_pred, clim_year_start, clim_year_end, year):
         """
         Compute and visualize the Ranked Probability Skill Score (RPSS) for a specific year.
 
@@ -1977,3 +2828,82 @@ class WAS_Verification:
         plt.tight_layout()
         plt.show()
            
+
+    def compute_one_year_rpss(self, obs, prob_pred, clim_year_start, clim_year_end, year, shapefile_path=None):
+        """
+        Compute RPSS and display the percentage of skillful grids (RPSS > 0) in the title.
+        """
+        # 1. Classify Observations and Align
+        obs_class = self.compute_class(obs, clim_year_start, clim_year_end)
+        obs_year = obs_class.sel(T=str(year))
+        prob_pred['T'] = obs_year['T']
+        obs_year, prob_pred = xr.align(obs_year, prob_pred)
+    
+        # 2. Compute RPSS using vectorized ufunc
+        rpss_array = xr.apply_ufunc(
+            self.calculate_rpss_,
+            obs_year,
+            prob_pred,
+            input_core_dims=[('T',), ('probability', 'T')],
+            vectorize=True,
+            dask='parallelized',
+            output_core_dims=[()],
+            output_dtypes=['float'],
+            dask_gufunc_kwargs={"allow_rechunk": True},
+        )
+        
+        # Clip values to standard RPSS range
+        rpss_clipped = xr.where(rpss_array > 1, 1, rpss_array)
+    
+        # We only count grids that are NOT NaN (inside the study area/mask)
+        valid_grids = rpss_clipped.notnull().sum().values
+        skillful_grids = (rpss_clipped > 0).sum().values
+        
+        skill_percentage = (skillful_grids / valid_grids * 100) if valid_grids > 0 else 0
+        # ---------------------------------------
+    
+        # 3. Visualization
+        fig = plt.figure(figsize=(10, 8))
+        ax = plt.axes(projection=ccrs.PlateCarree())
+        
+        # Handle Shapefile boundary for the RPSS map if provided
+        if shapefile_path:
+            import geopandas as gpd
+            import regionmask
+            gdf = gpd.read_file(shapefile_path)
+            mask = regionmask.mask_3D_geopandas(gdf, rpss_clipped.X, rpss_clipped.Y)
+            rpss_clipped = rpss_clipped.where(mask.any(dim='region'))
+            
+            bounds = gdf.total_bounds
+            ax.set_extent([bounds[0]-0.5, bounds[2]+0.5, bounds[1]-0.5, bounds[3]+0.5])
+    
+        # Plotting the RPSS Map
+        im = rpss_clipped.plot(
+            ax=ax,
+            transform=ccrs.PlateCarree(),
+            cmap='RdBu_r', # Red for negative skill, Blue for positive
+            vmin=-1, vmax=1,
+            add_colorbar=False # We will create a custom one for the "fine lines"
+        )
+    
+        # 4. Custom Colorbar with "Blank Fine Lines"
+        cbar = fig.colorbar(im, ax=ax, shrink=0.6, extend='both', orientation='vertical')
+        cbar.set_label('Ranked Probability Skill Score (RPSS)', fontsize=10)
+        ticks = [-1, -0.5, 0, 0.5, 1]
+        cbar.set_ticks(ticks)
+        
+        # Draw white separators at ticks
+        # Since orientation is vertical, we use hlines (horizontal lines)
+        tick_locs = (np.array(ticks) - (-1)) / (1 - (-1)) # Normalize to 0-1
+        cbar.ax.hlines(tick_locs, 0, 1, colors='white', linewidth=1.5)
+    
+        # 5. Title with Skill Judgement
+        ax.add_feature(cfeature.BORDERS, edgecolor='gray')
+        ax.add_feature(cfeature.COASTLINE)
+        
+        # Title includes the count/percentage of skillful grids
+        ax.set_title(f"RPSS for {year}\nSkillful Grids (RPSS > 0): {skill_percentage:.1f}%", 
+                     fontsize=13, fontweight='bold', pad=20)
+    
+        plt.tight_layout()
+        plt.show()

@@ -67,6 +67,71 @@ from multiprocessing import cpu_count
 from dask.distributed import Client
 import dask.array as da
 
+
+# ---------------------------------------------------------------------------
+# Shared Dask client: created once per process and reused across ALL folds and
+# models, instead of spinning up (and tearing down) a fresh LocalCluster on
+# every compute_model — which caused nanny-join hangs at close() and worker
+# oversubscription (stalled folds). Closed once, at interpreter exit.
+# ---------------------------------------------------------------------------
+_SHARED_CLIENT = None
+
+
+def _bounded_close(client):
+    """Close a client (and its LocalCluster) with a bounded timeout, swallowing
+    teardown errors so a slow nanny shutdown can never abort the run."""
+    if client is None:
+        return
+    import contextlib
+    cluster = getattr(client, "cluster", None)
+    with contextlib.suppress(Exception):
+        client.close(timeout=10)
+    if cluster is not None:
+        with contextlib.suppress(Exception):
+            cluster.close(timeout=10)
+
+
+def _safe_close_client(client):
+    """Intentional no-op. Every client here comes from _get_compute_client and
+    is process-wide and reused; it must NOT be torn down per fold/call. The
+    shared client is closed exactly once, at interpreter exit, by the atexit
+    hook registered in _get_compute_client (or reaped by the OS/Slurm cgroup
+    when the CLI ends via os._exit). Call sites keep calling this so their
+    'finally:' blocks stay valid without ever closing the shared client."""
+    return
+
+
+def _get_compute_client(nb_cores):
+    """Return a process-wide Dask client, created lazily on first use and reused
+    afterwards. Returns None if a distributed client cannot be created, in which
+    case .compute() falls back to dask's default (threaded) scheduler."""
+    global _SHARED_CLIENT
+    try:
+        from dask.distributed import Client, LocalCluster, get_client
+        try:
+            return get_client()
+        except Exception:
+            pass
+        if _SHARED_CLIENT is not None:
+            try:
+                if _SHARED_CLIENT.status == "running":
+                    return _SHARED_CLIENT
+            except Exception:
+                _SHARED_CLIENT = None
+        cluster = LocalCluster(
+            n_workers=max(1, int(nb_cores)),
+            threads_per_worker=1,
+            processes=True,
+            dashboard_address=None,
+            memory_limit=0,
+        )
+        _SHARED_CLIENT = Client(cluster)
+        import atexit
+        atexit.register(_bounded_close, _SHARED_CLIENT)
+        return _SHARED_CLIENT
+    except Exception:
+        return None
+
 # Typing and Utilities
 from typing import List, Tuple, Optional
 from collections import defaultdict
@@ -600,7 +665,7 @@ class WAS_LogisticRegression_Model:
         # This avoids xarray's T-alignment clash when X_test has a different
         # T index than X_train (which always occurs in LOO-style CV folds).
         client = (
-            Client(n_workers=self.nb_cores, threads_per_worker=1)
+            _get_compute_client(self.nb_cores)
             if self.nb_cores > 1
             else None
         )
@@ -633,7 +698,7 @@ class WAS_LogisticRegression_Model:
                 step_results.append(step)
         finally:
             if client is not None:
-                client.close()
+                _safe_close_client(client)
 
         result_ = xr.concat(step_results, dim="T")
         result_ = result_.assign_coords(
@@ -703,7 +768,7 @@ class WAS_LogisticRegression_Model:
         solver_da = solver_da.astype(str)
 
         client = (
-            Client(n_workers=self.nb_cores, threads_per_worker=1)
+            _get_compute_client(self.nb_cores)
             if self.nb_cores > 1
             else None
         )
@@ -729,7 +794,7 @@ class WAS_LogisticRegression_Model:
             proba_ = proba.compute() if hasattr(proba.data, "compute") else proba
         finally:
             if client is not None:
-                client.close()
+                _safe_close_client(client)
 
         proba_ = proba_.assign_coords(
             probability=("probability", ["PB", "PN", "PA"])
@@ -862,7 +927,7 @@ class WAS_PolynomialRegression:
 
         # FIX 3: try/finally for Dask client
         client = (
-            Client(n_workers=self.nb_cores, threads_per_worker=1)
+            _get_compute_client(self.nb_cores)
             if self.nb_cores > 1 else None
         )
 
@@ -890,7 +955,7 @@ class WAS_PolynomialRegression:
                 step_results.append(step)
         finally:
             if client is not None:
-                client.close()
+                _safe_close_client(client)
 
         result_ = xr.concat(step_results, dim="T")
         # For single-step CV folds return (Y, X); for multi-step return (T, Y, X)
@@ -1169,7 +1234,7 @@ class WAS_PolynomialRegression:
 
         # FIX 8: try/finally for Dask client
         client = (
-            Client(n_workers=self.nb_cores, threads_per_worker=1)
+            _get_compute_client(self.nb_cores)
             if self.nb_cores > 1 else None
         )
         try:
@@ -1189,7 +1254,7 @@ class WAS_PolynomialRegression:
             result_ = result.compute() if hasattr(result.data, "compute") else result
         finally:
             if client is not None:
-                client.close()
+                _safe_close_client(client)
 
         result_ = result_.isel(output=1)
         result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end)
@@ -1375,7 +1440,7 @@ class WAS_PoissonRegression:
         y_test = y_test.squeeze().transpose("Y", "X")
 
         client = (
-            Client(n_workers=self.nb_cores, threads_per_worker=1)
+            _get_compute_client(self.nb_cores)
             if self.nb_cores > 1 else None
         )
 
@@ -1403,7 +1468,7 @@ class WAS_PoissonRegression:
                 step_results.append(step)
         finally:
             if client is not None:
-                client.close()
+                _safe_close_client(client)
 
         result_ = xr.concat(step_results, dim="T")
         # For hindcast (T=n_years), drop the T dimension to stay consistent
@@ -1685,7 +1750,7 @@ class WAS_PoissonRegression:
 
         # FIX 6: try/finally for Dask client
         client = (
-            Client(n_workers=self.nb_cores, threads_per_worker=1)
+            _get_compute_client(self.nb_cores)
             if self.nb_cores > 1 else None
         )
         try:
@@ -1705,7 +1770,7 @@ class WAS_PoissonRegression:
             result_ = result.compute() if hasattr(result.data, "compute") else result
         finally:
             if client is not None:
-                client.close()
+                _safe_close_client(client)
 
         forecast_det = result_.isel(output=1)
 
@@ -2261,7 +2326,7 @@ class WAS_MARS_Model:
         X_test = X_test.squeeze()
         y_test = y_test.drop_vars('T').squeeze().transpose('Y', 'X')
 
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             X_train,
@@ -2276,7 +2341,7 @@ class WAS_MARS_Model:
             dask_gufunc_kwargs={'output_sizes': {'output': 2}},
         )
         result_ = result_da.compute()
-        client.close()
+        _safe_close_client(client)
         return result_.isel(output=1)
     
     # ------------------ Probability Calculation Methods ------------------
@@ -2832,7 +2897,7 @@ class WAS_MARS_Model:
         Predictor_for_year_ = Predictor_for_year.squeeze()
 
         # 1) Fit+predict in parallel => shape (output=2, Y, X)
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             Predictor,
@@ -2852,7 +2917,7 @@ class WAS_MARS_Model:
             dask_gufunc_kwargs={'output_sizes': {'output':2}},
         )
         result_ = result_da.compute()
-        client.close()
+        _safe_close_client(client)
         result_ = result_.isel(output=1)
         result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end)
 
@@ -3287,7 +3352,7 @@ class WAS_NegativeBinomial_Model(_WAS_CountProbMixin):
         y_test = y_test.squeeze().transpose("Y", "X")
 
         client = (
-            Client(n_workers=self.nb_cores, threads_per_worker=1)
+            _get_compute_client(self.nb_cores)
             if self.nb_cores and self.nb_cores > 1 else None
         )
 
@@ -3314,7 +3379,7 @@ class WAS_NegativeBinomial_Model(_WAS_CountProbMixin):
                 step_results.append(step)
         finally:
             if client is not None:
-                client.close()
+                _safe_close_client(client)
 
         result_ = xr.concat(step_results, dim="T")
         # Return (Y, X) for hindcast multi-step or (Y, X) for single step —
@@ -3417,7 +3482,7 @@ class WAS_NegativeBinomial_Model(_WAS_CountProbMixin):
         y_test = xr.full_like(Predictant.isel(T=0), np.nan)
 
         client = (
-            Client(n_workers=self.nb_cores, threads_per_worker=1)
+            _get_compute_client(self.nb_cores)
             if self.nb_cores and self.nb_cores > 1 else None
         )
         try:
@@ -3437,7 +3502,7 @@ class WAS_NegativeBinomial_Model(_WAS_CountProbMixin):
             result_ = result.compute() if hasattr(result.data, "compute") else result
         finally:
             if client is not None:
-                client.close()
+                _safe_close_client(client)
 
         forecast_det = result_.isel(output=1)
 
@@ -3798,7 +3863,7 @@ class _WAS_NonNeural_Base:
             chunk_x = int(np.ceil(len(predictand_st.X) / self.nb_cores))
             p_st_chunked = predictand_st.chunk({"Y": chunk_y, "X": chunk_x})
 
-            client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+            client = _get_compute_client(self.nb_cores)
             hp_array = xr.apply_ufunc(
                 self._optimize_single_cell,
                 p_st_chunked,
@@ -3811,7 +3876,7 @@ class _WAS_NonNeural_Base:
                 dask_gufunc_kwargs={"output_sizes": {"param": len(names)}},
             )
             hp_array = hp_array.compute()
-            client.close()
+            _safe_close_client(client)
 
             hyper_ds = xr.Dataset(
                 {n: hp_array.isel(param=i, drop=True) for i, n in enumerate(names)}
@@ -3905,7 +3970,7 @@ class _WAS_NonNeural_Base:
         ]
         core_dims = [("T", "features"), ("T",), ("features",), ()] + [() for _ in names]
 
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             X_train,
@@ -3921,7 +3986,7 @@ class _WAS_NonNeural_Base:
             dask_gufunc_kwargs={"output_sizes": {"output": 2}},
         )
         result_ = result_da.compute()
-        client.close()
+        _safe_close_client(client)
         return result_.isel(output=1)
 
     # ----- probability calculation (identical to WAS_Ridge_Model) ----
@@ -4184,7 +4249,7 @@ class _WAS_NonNeural_Base:
         ]
         core_dims = [("T", "features"), ("T",), ("features",), ()] + [() for _ in names]
 
-        client = Client(n_workers=self.nb_cores, threads_per_worker=1)
+        client = _get_compute_client(self.nb_cores)
         result_da = xr.apply_ufunc(
             self.fit_predict,
             Predictor,
@@ -4200,7 +4265,7 @@ class _WAS_NonNeural_Base:
             dask_gufunc_kwargs={"output_sizes": {"output": 2}},
         )
         result_ = result_da.compute()
-        client.close()
+        _safe_close_client(client)
         result_ = result_.isel(output=1)
         result_ = reverse_standardize(result_, Predictant,
                                       clim_year_start, clim_year_end)
@@ -4892,7 +4957,7 @@ class _WAS_NonNeural_Classifier_Base:
         )
 
         client = (
-            Client(n_workers=self.nb_cores, threads_per_worker=1)
+            _get_compute_client(self.nb_cores)
             if self.nb_cores > 1
             else None
         )
@@ -4913,7 +4978,7 @@ class _WAS_NonNeural_Classifier_Base:
             result_ = result.compute() if hasattr(result.data, "compute") else result
         finally:
             if client is not None:
-                client.close()
+                _safe_close_client(client)
 
         result_ = result_.assign_coords(
             probability=("probability", ["PB", "PN", "PA"])
@@ -4991,7 +5056,7 @@ class _WAS_NonNeural_Classifier_Base:
         X_test_sq = X_test.transpose("T", "features").squeeze()
 
         client = (
-            Client(n_workers=self.nb_cores, threads_per_worker=1)
+            _get_compute_client(self.nb_cores)
             if self.nb_cores > 1
             else None
         )
@@ -5012,7 +5077,7 @@ class _WAS_NonNeural_Classifier_Base:
             proba_ = proba.compute() if hasattr(proba.data, "compute") else proba
         finally:
             if client is not None:
-                client.close()
+                _safe_close_client(client)
 
         proba_ = proba_.assign_coords(
             probability=("probability", ["PB", "PN", "PA"])
