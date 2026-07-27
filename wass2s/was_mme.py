@@ -639,7 +639,8 @@ def process_datasets_for_mme(
         )
 
         if not Prob and hdcst.sizes["T"] == obs.sizes["T"]:
-            hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
+            # hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
+            hdcst = hdcst.assign_coords(T=obs["T"].astype("datetime64[ns]"))
 
         all_model_hdcst[model_name] = hdcst
         all_model_fcst[model_name] = fcst
@@ -2678,26 +2679,51 @@ class WAS_mme_logistic:
         if self.optimization_method == 'bayesian' and self.study_dict:
             results['optuna_studies'] = self.study_dict
         return results
+        
 class WAS_mme_ELR:
     """
-    Extended Logistic Regression (ELR) multi-model-ensemble tercile forecaster.
+    Extended Logistic Regression (ELR) multi-model-ensemble tercile forecaster,
+    aligned with Wilks (2009, *Meteorol. Appl.* 16, 361-368).
 
-    Standard logistic-regression MOS fits one model per threshold, which can
-    produce crossing (non-monotone) cumulative probabilities -> negative
-    interval probabilities. ELR (Wilks, 2009, *Meteorol. Appl.*) fixes this by
-    fitting a SINGLE logistic regression whose predictors are augmented with a
-    function of the threshold q itself:
+    Single unified equation for every threshold q:
 
         P(Y <= q | x) = sigmoid( b0 + beta . x + alpha * g(q) )
 
-    Because the SAME coefficient `alpha` multiplies g(q) for every threshold,
-    the predicted non-exceedance probabilities are monotone in q (provided
-    alpha > 0, which the data almost always enforce), so the two tercile
-    boundaries yield a coherent below / normal / above split from one fitted
-    model, and probabilities for any threshold can be read off the same fit.
+    What is implemented FROM THE PAPER (vs the previous two-threshold version)
+    -------------------------------------------------------------------------
+    1. MULTI-THRESHOLD FIT. Wilks fits ONE equation to SEVERAL climatological
+       quantiles simultaneously (not just the two needed at output time), which
+       constrains alpha much better and yields coherent probabilities at ANY
+       threshold -- including thresholds never used in fitting. Here the design
+       is stacked over `fit_quantiles` (default a Wilks-style 7-quantile set
+       containing the terciles); the tercile probabilities PB/PN/PA are then
+       read off the same fitted equation.
+    2. GUARANTEED MONOTONE CDF. Monotonicity of P(Y<=q) in q requires alpha>0.
+       Instead of the previous post-hoc min/max reordering of the two
+       cumulative probabilities, the Newton solver PROJECTS alpha onto
+       [alpha_min, inf) at every iteration, so pup >= plo holds by
+       construction and no crossing can occur at any threshold.
+    3. THRESHOLD TRANSFORM g(q). Wilks found g(q) = sqrt(q) clearly superior
+       to g(q) = q for (non-negative, raw) precipitation. 'sqrt' is offered
+       for raw precip; 'cbrt' (default) is the negative-safe analogue for
+       signed predictands; the choice can be tuned by CV (see
+       compute_hyperparameters, which also tunes the fitted-quantile set).
+    4. PREDICTOR TRANSFORM. Wilks' best single predictor was the SQUARE ROOT
+       of the ensemble-mean precipitation. `predictor_transform='sqrt'`
+       applies it to the raw predictor before standardization in
+       compute_hyperparameters / forecast. (The framework CV branch feeds
+       already-standardized predictors to compute_model; for exact
+       consistency, apply the same transform to the raw hindcast before the
+       framework standardizes it.)
+    5. FULL-DISTRIBUTION OUTPUT. The point of the paper: the same fit gives
+       the whole predictive distribution. `predictive_quantiles(p_levels)`
+       inverts the fitted equation analytically,
+           q_p = g^{-1}( (logit(p) - b0 - beta.x) / alpha ),
+       returning predictive quantiles (quantile, T, Y, X) after any
+       compute_model / forecast call.
 
-    For tercile forecasts the two thresholds are the climatological lower and
-    upper terciles T1 < T2 of the predictand, and
+    For tercile forecasts the two output thresholds are the climatological
+    lower and upper terciles T1 < T2 of the predictand, and
 
         PB = P(Y <= T1),
         PN = P(Y <= T2) - P(Y <= T1),
@@ -2712,66 +2738,87 @@ class WAS_mme_ELR:
 
     Thresholds
     ----------
-    Below/normal/above are defined by the climatological terciles. By default
-    they are estimated fold-safe from the TRAINING predictand; pass
-    `clim_terciles=(t1, t2)` (DataArrays on Y, X, same units as y_train) to use
-    fixed climatological boundaries identical to those your verification uses
-    (recommended for exact consistency with WAS_Verification.compute_class).
+    Output terciles are estimated fold-safe from the TRAINING predictand by
+    default; pass `clim_terciles=(t1, t2)` (DataArrays on Y, X, same units as
+    y_train) to pin them to the boundaries your verification uses
+    (WAS_Verification.compute_class). The EXTRA fitting quantiles are always
+    taken fold-safe from the training predictand.
 
     Fitting
     -------
-    One logistic regression per cell, but ALL cells are fitted simultaneously
-    with a vectorized, ridge-stabilized Newton/IRLS solver (no per-cell sklearn
-    loop), so it scales to large grids. Rows with missing predictor/predictand
-    are down-weighted to zero, so partial gaps never break the batch. Cells with
-    too few valid years fall back to climatology [1/3, 1/3, 1/3].
+    One equation per cell, all cells fitted simultaneously with a vectorized,
+    ridge-stabilized projected-Newton/IRLS solver. Rows with missing
+    predictor/predictand are zero-weighted; cells with fewer than `min_obs`
+    valid years fall back to climatology [1/3, 1/3, 1/3]. With K fitting
+    quantiles the stacked-binary objective is a composite likelihood (the K
+    indicator responses per year are correlated) -- exactly Wilks' fitting
+    strategy. In dry cells several low quantiles may coincide (ties at 0);
+    the duplicated rows are harmless, they only re-weight that threshold.
 
     Parameters
     ----------
     predictors : {'mean', 'mean_std', 'models'}
-    threshold_transform : callable or None
-        g(q) applied to the tercile boundaries (default identity). On
-        standardized anomalies the identity is appropriate; for raw
-        precipitation one might pass e.g. np.cbrt.
+    threshold_transform : {'identity','cbrt','sqrt'} or callable
+        g(q). Default 'cbrt'. 'sqrt' only for non-negative predictands
+        (raw precipitation) -- Wilks' empirically best choice there.
+    fit_quantiles : sequence of float in (0, 1)
+        Climatological quantiles whose thresholds enter the fit. The terciles
+        1/3 and 2/3 are always included. Default
+        (0.10, 0.25, 1/3, 0.50, 2/3, 0.75, 0.90).
     l2 : float
-        Ridge penalty on the coefficients (NOT the intercept) for numerical
-        stability / quasi-separation (default 1e-3).
-    n_iter : int
-        Maximum IRLS iterations (default 50).
-    tol : float
-        Early-stop tolerance on the max coefficient update (default 1e-7).
-    min_obs : int
-        Minimum number of valid training years for a cell to be fitted;
-        otherwise that cell is set to climatology (default 5).
+        Ridge penalty on the coefficients (NOT the intercept), default 1e-3.
+    alpha_min : float
+        Positivity floor for the threshold coefficient alpha (monotone CDF),
+        default 1e-3.
+    predictor_transform : {'identity','sqrt','cbrt'} or None
+        Transform applied to the RAW predictor before standardization in
+        compute_hyperparameters / forecast (Wilks: 'sqrt' for raw precip).
+    n_iter, tol : Newton controls (default 50, 1e-7).
+    min_obs : minimum valid training years per cell (default 5).
     """
 
-    # named threshold transforms g(q); all are NON-DECREASING so that the
-    # cumulative forecast p(q)=Pr{V<=q} stays monotone in q (Wilks Eq. 5-7).
-    # 'sqrt' is only valid for non-negative thresholds (raw precipitation);
-    # 'cbrt' is the negative-safe analogue used on standardized anomalies.
+    # named threshold transforms g(q); all NON-DECREASING so that the
+    # cumulative forecast p(q)=Pr{V<=q} stays monotone in q.
     _TRANSFORMS = {"identity": None, "cbrt": np.cbrt, "sqrt": np.sqrt}
+    # analytic inverses g^{-1}(z) for the quantile function (Wilks Sec. 3:
+    # the same equation is solved for q at any cumulative probability p).
+    _INVERSES = {"identity": None,
+                 "cbrt": lambda z: np.power(z, 3),
+                 "sqrt": lambda z: np.square(np.maximum(z, 0.0))}
 
     def __init__(self, predictors="mean", threshold_transform="cbrt",
-                 l2=1e-3, n_iter=50, tol=1e-7, min_obs=5, random_state=42):
+                 fit_quantiles=(0.10, 0.25, 1.0 / 3.0, 0.50, 2.0 / 3.0, 0.75, 0.90),
+                 l2=1e-3, alpha_min=1e-3, n_iter=50, tol=1e-7, min_obs=5,
+                 predictor_transform=None, random_state=42):
         if predictors not in ("mean", "mean_std", "models"):
             raise ValueError("predictors must be 'mean', 'mean_std' or 'models'.")
         self.predictors = predictors
-        # g(q): None/'identity' -> g(q)=q ; 'cbrt' -> np.cbrt ; 'sqrt' -> np.sqrt
-        # (raw precip only) ; or any non-decreasing callable. Default 'cbrt', the
-        # negative-safe analogue of Wilks' empirically-best g(q)=b2*sqrt(q) for a
-        # standardized (signed) predictand.
         self.threshold_transform = threshold_transform
+        self.fit_quantiles = self._check_quantiles(fit_quantiles)
         self.l2 = float(l2)
+        self.alpha_min = float(alpha_min)
         self.n_iter = int(n_iter)
         self.tol = float(tol)
         self.min_obs = int(min_obs)
+        self.predictor_transform = predictor_transform
         self.random_state = random_state
-        # filled by compute_hyperparameters (joint l2 + g(q) tuning)
+        # filled by compute_hyperparameters (joint l2 + g(q) + quantile tuning)
         self.best_params = None
         self.cv_scores_ = None
         self.last_crossing_fraction_ = 0.0
+        self._last_fit_ = None
+        self._last_coords_ = None
 
     # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _check_quantiles(qs):
+        """Sorted unique fitting quantiles, terciles enforced, all in (0, 1)."""
+        qs = np.unique(np.round(np.asarray(list(qs) + [1.0 / 3.0, 2.0 / 3.0],
+                                           dtype=float), 6))
+        if np.any((qs <= 0.0) | (qs >= 1.0)):
+            raise ValueError("fit_quantiles must lie strictly inside (0, 1).")
+        return qs
+
     @classmethod
     def _resolve_transform(cls, transform):
         """Map a transform spec (None | name | callable) to a callable or None."""
@@ -2783,12 +2830,32 @@ class WAS_mme_ELR:
             return cls._TRANSFORMS[transform]
         return transform  # already a callable
 
+    @classmethod
+    def _resolve_inverse(cls, transform):
+        """g^{-1} for the quantile function; named transforms only."""
+        if transform is None or transform == "identity":
+            return None
+        if isinstance(transform, str) and transform in cls._INVERSES:
+            return cls._INVERSES[transform]
+        raise ValueError("predictive_quantiles needs an invertible named "
+                         "transform ('identity', 'cbrt' or 'sqrt').")
+
     def _apply_g(self, q, transform):
         f = self._resolve_transform(transform)
         return q if f is None else f(q)
 
     def _g(self, q):
         return self._apply_g(q, self.threshold_transform)
+
+    def _tx_predictor(self, X):
+        """Wilks' predictor transform (e.g. sqrt of raw ensemble precip)."""
+        f = self._resolve_transform(self.predictor_transform)
+        if f is None:
+            return X
+        if self.predictor_transform == "sqrt":
+            X = X.where(X >= 0.0, 0.0) if isinstance(X, xr.DataArray) \
+                else np.maximum(X, 0.0)
+        return f(X)
 
     def _features(self, X):
         """Reduce a (T, Y, X[, M]) cube to a (T, Y, X, feat) predictor stack."""
@@ -2805,45 +2872,55 @@ class WAS_mme_ELR:
         return xr.concat(feats, dim="feat").transpose("T", "Y", "X", "feat")
 
     # ------------------------------------------------------------- core solver
-    def _fit_predict(self, Ftr, ytr, Fte, t1, t2, l2=None, transform="__self__"):
+    def _fit_predict(self, Ftr, ytr, Fte, t1, t2, l2=None,
+                     transform="__self__", quantiles=None):
         """
-        Batched ELR over all cells.
+        Batched multi-threshold ELR over all cells (Wilks 2009 fit).
 
         Ftr : (n_train, n_cells, F)   ytr : (n_train, n_cells)
-        Fte : (n_test,  n_cells, F)   t1, t2 : (n_cells,)
+        Fte : (n_test,  n_cells, F)   t1, t2 : (n_cells,) output terciles
         l2        : ridge penalty override (default None -> self.l2).
         transform : g(q) override (default '__self__' -> self.threshold_transform).
-                    Used by compute_hyperparameters to score candidate (l2, g).
-        returns probs (3, n_test, n_cells) ordered PB, PN, PA, where
-                PB = Pr{V<=t1}, PN = Pr{V<=t2}-Pr{V<=t1}, PA = 1-Pr{V<=t2}.
+        quantiles : fitting-quantile override (default None -> self.fit_quantiles).
+        returns probs (3, n_test, n_cells) ordered PB, PN, PA.
+
+        The design stacks one binary block per fitting quantile: K
+        climatological thresholds per cell, with the tercile rows pinned to the
+        exact (possibly fixed climatological) t1, t2 used at output time.
+        alpha is projected onto [alpha_min, inf) each Newton step, so the
+        predicted CDF is monotone in q by construction.
         """
         l2 = self.l2 if l2 is None else float(l2)
         tfm = self.threshold_transform if transform == "__self__" else transform
+        qs = self.fit_quantiles if quantiles is None else self._check_quantiles(quantiles)
         n_train, n_cells, F = Ftr.shape
-        n_test = Fte.shape[0]
-        g1, g2 = self._apply_g(t1, tfm), self._apply_g(t2, tfm)  # (n_cells,)
 
-        # ---- extended design: the two threshold blocks stacked along rows ----
-        def block(thr, gthr):
-            col = np.broadcast_to(gthr, (n_train, n_cells))[..., None]
-            Xb = np.concatenate([Ftr, col], axis=2)              # (n_train,n_cells,F+1)
-            yb = (ytr <= thr[None, :]).astype(float)             # (n_train,n_cells)
-            rb = (np.isfinite(ytr) & np.isfinite(Xb).all(axis=2)
-                  & np.isfinite(thr)[None, :])                   # valid-row mask
-            return Xb, yb, rb
+        # ---- K training thresholds per cell (fold-safe quantiles of y) ------
+        with np.errstate(all="ignore"):
+            thr = np.nanquantile(ytr, qs, axis=0)              # (K, n_cells)
+        i1 = int(np.argmin(np.abs(qs - 1.0 / 3.0)))
+        i2 = int(np.argmin(np.abs(qs - 2.0 / 3.0)))
+        thr[i1], thr[i2] = t1, t2      # pin the exact output tercile boundaries
+        K = thr.shape[0]
+        gthr = self._apply_g(thr, tfm)                          # (K, n_cells)
 
-        Xlo, ylo, rlo = block(t1, g1)
-        Xup, yup, rup = block(t2, g2)
-        Xs = np.concatenate([Xlo, Xup], axis=0)                  # (2n, n_cells, F+1)
-        ones = np.ones((Xs.shape[0], n_cells, 1))
-        A = np.nan_to_num(np.concatenate([Xs, ones], axis=2), nan=0.0)
-        Y = np.concatenate([ylo, yup], axis=0)
-        R = np.concatenate([rlo, rup], axis=0).astype(float)
+        # ---- extended design: K threshold blocks stacked along rows ---------
+        valid_xy = np.isfinite(ytr) & np.isfinite(Ftr).all(axis=2)  # (n_train, n_cells)
+        col = np.broadcast_to(gthr[:, None, :], (K, n_train, n_cells))
+        Fb = np.broadcast_to(Ftr[None], (K, n_train, n_cells, F))
+        A = np.concatenate([Fb, col[..., None],
+                            np.ones((K, n_train, n_cells, 1))], axis=3)
+        A = np.nan_to_num(A, nan=0.0).reshape(K * n_train, n_cells, F + 2)
+        Yb = (ytr[None, :, :] <= thr[:, None, :]).astype(float)
+        Yb = Yb.reshape(K * n_train, n_cells)
+        R = (valid_xy[None] & np.isfinite(thr)[:, None, :]
+             & np.isfinite(gthr)[:, None, :])
+        R = R.reshape(K * n_train, n_cells).astype(float)
 
-        n_feat = A.shape[2]
-        A = np.transpose(A, (1, 0, 2))                           # (n_cells, 2n, n_feat)
-        Y = np.where(np.isfinite(Y), Y, 0.0).transpose(1, 0)     # (n_cells, 2n)
-        R = R.transpose(1, 0)                                    # (n_cells, 2n)
+        n_feat = F + 2
+        A = np.transpose(A, (1, 0, 2))                          # (n_cells, Kn, n_feat)
+        Yb = Yb.T                                               # (n_cells, Kn)
+        R = R.T                                                 # (n_cells, Kn)
 
         # ridge on every column except the intercept (last)
         pen = np.full(n_feat, l2); pen[-1] = 0.0
@@ -2851,11 +2928,12 @@ class WAS_mme_ELR:
         jitter = 1e-8 * np.eye(n_feat)[None]
 
         beta = np.zeros((n_cells, n_feat))
+        beta[:, F] = self.alpha_min          # start feasible (alpha > 0)
         for _ in range(self.n_iter):
             eta = np.clip(np.einsum("crf,cf->cr", A, beta), -35.0, 35.0)
             p = expit(eta)
             w = R * np.maximum(p * (1.0 - p), 1e-9)
-            grad = np.einsum("crf,cr->cf", A, R * (Y - p)) - beta * pen[None, :]
+            grad = np.einsum("crf,cr->cf", A, R * (Yb - p)) - beta * pen[None, :]
             H = np.einsum("crf,crg->cfg", A * w[:, :, None], A) + eyepen + jitter
             try:
                 step = np.linalg.solve(H, grad[..., None])[..., 0]
@@ -2864,37 +2942,44 @@ class WAS_mme_ELR:
                 step = np.linalg.solve(H, grad[..., None])[..., 0]
             step = np.clip(step, -10.0, 10.0)
             beta = np.clip(beta + step, -50.0, 50.0)
+            # Wilks monotonicity: project alpha onto [alpha_min, inf)
+            beta[:, F] = np.maximum(beta[:, F], self.alpha_min)
             if np.nanmax(np.abs(step)) < self.tol:
                 break
 
-        # ---- predict the two test-fold cumulative probabilities -------------
+        # ---- tercile probabilities from the single fitted equation ----------
         bpred, alpha, b0 = beta[:, :F], beta[:, F], beta[:, F + 1]
-        Fc = np.transpose(np.nan_to_num(Fte, nan=0.0), (1, 0, 2))   # (n_cells, n_test, F)
+        g1 = self._apply_g(t1, tfm)
+        g2 = self._apply_g(t2, tfm)
+        Fc = np.transpose(np.nan_to_num(Fte, nan=0.0), (1, 0, 2))  # (n_cells, n_test, F)
         lin = np.einsum("ctf,cf->ct", Fc, bpred) + b0[:, None]
-        plo = expit(lin + alpha[:, None] * g1[:, None])
-        pup = expit(lin + alpha[:, None] * g2[:, None])
+        plo = expit(np.clip(lin + alpha[:, None] * g1[:, None], -35.0, 35.0))
+        pup = expit(np.clip(lin + alpha[:, None] * g2[:, None], -35.0, 35.0))
 
+        # alpha >= alpha_min > 0 and g non-decreasing => pup >= plo by
+        # construction; keep the tracker as a numerical sanity check only.
         crossing = np.isfinite(plo) & np.isfinite(pup) & (pup < plo)
         self.last_crossing_fraction_ = float(np.mean(crossing)) if crossing.size else 0.0
-        # Enforce ordered cumulative probabilities even when the unconstrained
-        # IRLS threshold coefficient has the wrong sign.
-        p_lower = np.minimum(plo, pup)
-        p_upper = np.maximum(plo, pup)
-        PB = p_lower
-        PN = np.clip(p_upper - p_lower, 0.0, None)
-        PA = np.clip(1.0 - p_upper, 0.0, None)
+
+        PB = plo
+        PN = np.clip(pup - plo, 0.0, None)
+        PA = np.clip(1.0 - pup, 0.0, None)
         tot = PB + PN + PA
         tot = np.where(tot > 0, tot, np.nan)
-        probs = np.stack([PB / tot, PN / tot, PA / tot], axis=0)    # (3, n_cells, n_test)
+        probs = np.stack([PB / tot, PN / tot, PA / tot], axis=0)   # (3, n_cells, n_test)
 
         # robustness: climatology where too few valid years; NaN where no thresholds
-        nvalid = rlo.sum(axis=0)                                    # finite predictor & y per cell
+        nvalid = valid_xy.sum(axis=0)
         clim_cells = (nvalid < self.min_obs) & np.isfinite(t1) & np.isfinite(t2)
         probs[:, clim_cells, :] = 1.0 / 3.0
         bad = ~(np.isfinite(t1) & np.isfinite(t2))
         probs[:, bad, :] = np.nan
 
-        return np.transpose(probs, (0, 2, 1))                       # (3, n_test, n_cells)
+        # stash the fit for full-distribution queries (predictive_quantiles)
+        self._last_fit_ = {"lin": lin, "alpha": alpha, "transform": tfm,
+                           "clim_cells": clim_cells, "bad": bad}
+
+        return np.transpose(probs, (0, 2, 1))                      # (3, n_test, n_cells)
 
     # ------------------------------------------------------ framework contract
     def compute_model(self, X_train, y_train, X_test, y_test=None,
@@ -2905,19 +2990,19 @@ class WAS_mme_ELR:
         probabilities (dims probability, T, Y, X; probability=['PB','PN','PA']).
 
         X_train / X_test : standardized predictor cubes (T, Y, X[, M]).
-        y_train          : predictand (T, Y, X). Used to set the tercile
-                           thresholds (fold-safe) unless clim_terciles is given.
-                           Keep it RAW (un-standardized): the fit is invariant to
-                           predictand scaling, and raw values let g(q) act in
-                           physical units (so g='sqrt' is valid for precipitation).
+        y_train          : predictand (T, Y, X), kept RAW (un-standardized):
+                           the fit is invariant to predictand scaling and raw
+                           values let g(q) act in physical units (so g='sqrt'
+                           is valid for precipitation, per Wilks).
         clim_terciles    : optional (t1, t2) DataArrays (Y, X) of fixed
-                           climatological boundaries in the SAME units as y_train
-                           (i.e. physical/raw) -- pass the same terciles your
-                           verification uses.
-        best_params      : optional {'l2': value, 'g': name}. If given, overrides
-                           the penalty and/or g(q) transform for this call;
-                           otherwise self.l2 / self.threshold_transform are used
-                           (which compute_hyperparameters updates in place).
+                           climatological boundaries in the SAME units as
+                           y_train -- pass the same terciles your verification
+                           uses (WAS_Verification.compute_class).
+        best_params      : optional {'l2':..., 'g':..., 'quantiles':...}.
+                           Overrides for this call; otherwise self.l2 /
+                           self.threshold_transform / self.fit_quantiles are
+                           used (which compute_hyperparameters updates in
+                           place).
         """
         if "M" in y_train.dims:
             y_train = y_train.isel(M=0, drop=True)
@@ -2941,8 +3026,13 @@ class WAS_mme_ELR:
 
         l2_use = best_params.get("l2") if best_params else None
         g_use = best_params.get("g", "__self__") if best_params else "__self__"
+        q_use = best_params.get("quantiles") if best_params else None
         probs = self._fit_predict(Ftr_s.values, ytr_s.values, Fte_s.values,
-                                  t1, t2, l2=l2_use, transform=g_use)
+                                  t1, t2, l2=l2_use, transform=g_use,
+                                  quantiles=q_use)
+
+        # coords for full-distribution queries on this fit
+        self._last_coords_ = {"T": Fte_s["T"], "cell": ytr_s["cell"]}
 
         out = xr.DataArray(
             probs,
@@ -2950,6 +3040,44 @@ class WAS_mme_ELR:
             coords={"probability": ["PB", "PN", "PA"],
                     "T": Fte_s["T"], "cell": ytr_s["cell"]},
         ).unstack("cell").transpose("probability", "T", "Y", "X")
+        return out
+
+    # ------------------------------------------------- full predictive dist.
+    def predictive_quantiles(self, p_levels=(0.10, 0.25, 0.50, 0.75, 0.90)):
+        """
+        Predictive quantiles of the LAST fitted forecast -- Wilks (2009)'s
+        central result: the single fitted equation delivers the full predictive
+        distribution, so any quantile is available in closed form,
+
+            q_p = g^{-1}( (logit(p) - b0 - beta.x) / alpha ).
+
+        Call after compute_model / forecast. Requires a named invertible g
+        ('identity', 'cbrt', 'sqrt'). With g='sqrt' negative arguments (i.e.
+        p below the probability of zero precip) map to q_p = 0.
+
+        Returns
+        -------
+        DataArray (quantile, T, Y, X) in the predictand's physical units.
+        Cells that fell back to climatology or lack thresholds are NaN.
+        """
+        if self._last_fit_ is None or self._last_coords_ is None:
+            raise RuntimeError("call compute_model or forecast first.")
+        fit = self._last_fit_
+        inv = self._resolve_inverse(fit["transform"])
+        p = np.asarray(p_levels, dtype=float)
+        if np.any((p <= 0.0) | (p >= 1.0)):
+            raise ValueError("p_levels must lie strictly inside (0, 1).")
+
+        z = (logit(p)[:, None, None] - fit["lin"][None]) / fit["alpha"][None, :, None]
+        q = z if inv is None else inv(z)                     # (P, n_cells, n_test)
+        q[:, fit["clim_cells"] | fit["bad"], :] = np.nan
+
+        out = xr.DataArray(
+            np.transpose(q, (0, 2, 1)),
+            dims=("quantile", "T", "cell"),
+            coords={"quantile": p, "T": self._last_coords_["T"],
+                    "cell": self._last_coords_["cell"]},
+        ).unstack("cell").transpose("quantile", "T", "Y", "X")
         return out
 
     # ------------------------------------------------------ hyperparameters
@@ -3006,46 +3134,47 @@ class WAS_mme_ELR:
     def compute_hyperparameters(self, Predictor, Predictand,
                                 clim_year_start, clim_year_end,
                                 clim_terciles=None, l2_grid=None, g_grid=None,
-                                score="rps", cv_folds=5,
+                                quantile_grid=None, score="rps", cv_folds=5,
                                 leave_one_year_out=False):
         """
-        Jointly tune the ridge penalty l2 AND the threshold transform g(q) by
-        year-grouped cross-validation. The winners are stored in self.l2 and
-        self.threshold_transform (and self.best_params) so the existing CV branch
-        / compute_model use them with no further plumbing.
+        Jointly tune the ridge penalty l2, the threshold transform g(q) AND the
+        fitting-quantile set by year-grouped cross-validation. Winners are
+        stored in self.l2 / self.threshold_transform / self.fit_quantiles (and
+        self.best_params) so the existing CV branch / compute_model use them
+        with no further plumbing.
 
-        Why tune g(q): Wilks (2009) shows the FORM of g(q) drives ELR quality and
-        must be chosen per setting (g(q)=b2*sqrt(q) was substantially better than
-        g(q)=b2*q for raw precipitation). Here we let the data pick g among
-        non-decreasing options, so the cumulative p(q)=Pr{V<=q} stays monotone.
+        Why tune g(q) and the quantile set: Wilks (2009) shows the FORM of g(q)
+        drives ELR quality (g(q)=sqrt(q) was substantially better than
+        g(q)=q for raw precipitation), and fits one equation to several
+        climatological quantiles at once. Here the data pick both, among
+        non-decreasing g options, so p(q)=Pr{V<=q} stays monotone.
 
-        Observed truth = tercile CLASSES (like the logistic class)
-        ----------------------------------------------------------
-        Forecast probabilities are scored against WAS_Verification.compute_class
-        (0=below=Pr{V<=q1/3}, 1=normal, 2=above) -- the categorical target the
-        RPSS verification uses. RPS by default, or multiclass log-loss.
+        Observed truth = tercile CLASSES: forecast probabilities are scored
+        against WAS_Verification.compute_class (0=below, 1=normal, 2=above),
+        the categorical target the RPSS verification uses. RPS by default, or
+        multiclass log-loss.
 
-        Inputs / standardization: only the PREDICTOR is standardized (over the
-        clim window) for f(x); the PREDICTAND stays RAW so the thresholds and
-        g(q) are in physical units (the fit is invariant to predictand scaling).
-        compute_class is computed on the raw predictand.
+        Standardization: only the PREDICTOR is standardized over the clim
+        window (after predictor_transform, if set); the PREDICTAND stays RAW so
+        thresholds and g(q) act in physical units.
 
         Parameters
         ----------
         l2_grid : sequence of float, optional. Default np.logspace(-4, 1, 6).
         g_grid  : sequence of {'identity','cbrt','sqrt'} or callables, optional.
-                  Default ['identity', 'cbrt'] (+ 'sqrt' only when all thresholds
-                  are non-negative, i.e. a raw non-negative predictand).
-        score   : {'rps', 'log_loss'} -- proper score MINIMIZED over the folds.
+                  Default ['identity', 'cbrt'] (+ 'sqrt' only when all
+                  thresholds are non-negative, i.e. raw precipitation).
+        quantile_grid : sequence of quantile tuples, optional. Default
+                  [terciles only, self.fit_quantiles] -- i.e. two-threshold
+                  vs Wilks-style multi-threshold fit.
+        score   : {'rps', 'log_loss'} -- proper score MINIMIZED over folds.
         cv_folds, leave_one_year_out : year-grouped CV controls.
-        clim_terciles : optional (t1, t2) in PHYSICAL (raw predictand) units --
-                  the same fixed boundaries your CV branch passes to
-                  compute_model. If None, fold-safe raw terciles are estimated per
-                  training fold.
+        clim_terciles : optional (t1, t2) in PHYSICAL units -- same fixed
+                  boundaries your CV branch passes to compute_model.
 
         Returns
         -------
-        best_params : dict {'l2': best_l2, 'g': best_g_name}
+        best_params : dict {'l2':..., 'g':..., 'quantiles':...}
         """
         if score not in ("rps", "log_loss"):
             raise ValueError("score must be 'rps' or 'log_loss'.")
@@ -3061,11 +3190,8 @@ class WAS_mme_ELR:
         obs_class = verify.compute_class(Predictand, clim_year_start,
                                          clim_year_end).transpose("T", "Y", "X")
 
-        # ---- standardize the PREDICTOR only; keep the PREDICTAND RAW --------
-        # The predictand enters the ELR only through the binary indicators
-        # (V <= threshold), which are INVARIANT to a monotone per-cell rescaling.
-        # Keeping it raw lets g(q) see the threshold in PHYSICAL units, so Wilks'
-        # g(q)=sqrt(q) is valid for a non-negative (precipitation) predictand.
+        # ---- transform + standardize the PREDICTOR only; PREDICTAND RAW ------
+        Predictor = self._tx_predictor(Predictor)
         clim = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end)))
         sX = clim.std("T"); sX = sX.where(sX > 0)
         Predictor_st = (Predictor - clim.mean("T")) / sX
@@ -3101,40 +3227,52 @@ class WAS_mme_ELR:
         if not g_grid:
             g_grid = ["identity"]
 
+        # ---- fitting-quantile candidates ------------------------------------
+        if quantile_grid is None:
+            quantile_grid = [(1.0 / 3.0, 2.0 / 3.0), tuple(self.fit_quantiles)]
+        quantile_grid = [self._check_quantiles(qc) for qc in quantile_grid]
+
         years = self._year_groups(Predictand["T"])
         splits = self._year_splits(years, cv_folds, leave_one_year_out)
         if not splits:
             raise ValueError("Not enough years to build a CV split for tuning.")
 
-        scores, best_key, best_val = {}, (l2_grid[0], g_grid[0]), np.inf
-        for g in g_grid:
-            for l2 in l2_grid:
-                fold_vals = []
-                for tr_idx, va_idx in splits:
-                    if t1_fix is not None:
-                        t1, t2 = t1_fix, t2_fix
-                    else:
-                        with np.errstate(all="ignore"):
-                            qs = np.nanquantile(Yv[tr_idx], [1.0 / 3.0, 2.0 / 3.0], axis=0)
-                        t1, t2 = qs[0], qs[1]
-                    probs = self._fit_predict(Fv[tr_idx], Yv[tr_idx], Fv[va_idx],
-                                              t1, t2, l2=l2, transform=g)
-                    s = self._score_vs_class(probs, Ov[va_idx], score)
-                    if np.isfinite(s):
-                        fold_vals.append(s)
-                val = float(np.mean(fold_vals)) if fold_vals else np.inf
-                gname = g if isinstance(g, str) else getattr(g, "__name__", "callable")
-                scores[(gname, l2)] = val
-                if val < best_val:
-                    best_val, best_key = val, (l2, g)
+        scores = {}
+        best_key, best_val = (l2_grid[0], g_grid[0], quantile_grid[0]), np.inf
+        for qc in quantile_grid:
+            for g in g_grid:
+                for l2 in l2_grid:
+                    fold_vals = []
+                    for tr_idx, va_idx in splits:
+                        if t1_fix is not None:
+                            t1, t2 = t1_fix, t2_fix
+                        else:
+                            with np.errstate(all="ignore"):
+                                qs = np.nanquantile(Yv[tr_idx],
+                                                    [1.0 / 3.0, 2.0 / 3.0], axis=0)
+                            t1, t2 = qs[0], qs[1]
+                        probs = self._fit_predict(Fv[tr_idx], Yv[tr_idx],
+                                                  Fv[va_idx], t1, t2,
+                                                  l2=l2, transform=g,
+                                                  quantiles=qc)
+                        s = self._score_vs_class(probs, Ov[va_idx], score)
+                        if np.isfinite(s):
+                            fold_vals.append(s)
+                    val = float(np.mean(fold_vals)) if fold_vals else np.inf
+                    gname = g if isinstance(g, str) else getattr(g, "__name__", "callable")
+                    scores[(gname, l2, tuple(np.round(qc, 4)))] = val
+                    if val < best_val:
+                        best_val, best_key = val, (l2, g, qc)
 
-        best_l2, best_g = best_key
+        best_l2, best_g, best_qc = best_key
         best_gname = best_g if isinstance(best_g, str) else getattr(best_g, "__name__", "callable")
         self.l2 = float(best_l2)
         self.threshold_transform = best_g
-        self.best_params = {"l2": float(best_l2), "g": best_gname}
+        self.fit_quantiles = best_qc
+        self.best_params = {"l2": float(best_l2), "g": best_gname,
+                            "quantiles": tuple(best_qc)}
         self.cv_scores_ = {"score": score, "values": scores,
-                           "best": {"l2": float(best_l2), "g": best_gname}}
+                           "best": dict(self.best_params)}
         return self.best_params
 
     # ------------------------------------------------------------- operational
@@ -3143,17 +3281,22 @@ class WAS_mme_ELR:
         """
         Operational ELR tercile forecast for a single target year.
 
-        Fits ELR on all available years and returns the tercile probabilities for
-        the target year (dims probability, T, Y, X). Only the PREDICTOR is
-        standardized (historical climatology, same stats applied to the forecast
-        year); the PREDICTAND is kept RAW so the thresholds and g(q) stay in
-        physical units (the fit is invariant to predictand scaling).
+        Fits ELR on all available years and returns the tercile probabilities
+        for the target year (dims probability, T, Y, X). Only the PREDICTOR is
+        transformed (predictor_transform) and standardized (historical
+        climatology, same stats applied to the forecast year); the PREDICTAND
+        is kept RAW so thresholds and g(q) stay in physical units.
+
+        After this call, `predictive_quantiles(p_levels)` returns the full
+        predictive distribution of the target year from the same fit.
         """
         if "M" in Predictant.dims:
             Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
         mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
 
+        Predictor = self._tx_predictor(Predictor)
+        Predictor_for_year = self._tx_predictor(Predictor_for_year)
         clim = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end)))
         mX = clim.mean("T")
         sX = clim.std("T")
@@ -3173,8 +3316,11 @@ class WAS_mme_ELR:
         prob = prob.assign_coords(T=xr.DataArray([new_T], dims=["T"]))
         prob["T"] = prob["T"].astype("datetime64[ns]")
 
-        return (prob * mask).transpose("probability", "T", "Y", "X")
+        # keep predictive_quantiles consistent with the relabelled target date
+        if self._last_coords_ is not None:
+            self._last_coords_ = {"T": prob["T"], "cell": self._last_coords_["cell"]}
 
+        return (prob * mask).transpose("probability", "T", "Y", "X")
 
 class WAS_mme_gaussian_process:
     """
