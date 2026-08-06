@@ -58,9 +58,7 @@ This Code of Conduct applies to all WASS2S community spaces, including but not l
 
 If you experience or witness unacceptable behavior, please report it to the project maintainers.
 
-Reports may be submitted by opening a private GitHub discussion or by contacting:
-
-**Email:** conduct@wass2s.org
+Reports may be submitted by opening a private GitHub discussion or by contacting: @hmandela
 
 All reports will be handled promptly, fairly, and confidentially. Project maintainers are committed to respecting the privacy and security of everyone involved.
 
