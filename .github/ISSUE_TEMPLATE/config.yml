@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Questions and Discussions
+    url: https://github.com/hmandela/WASS2S/discussions
+    about: Ask questions, share ideas, or discuss WASS2S with the community.
+
+  - name: Documentation
+    url: https://wass2s.readthedocs.io
+    about: Read the user guide, tutorials, and API reference before opening an issue.

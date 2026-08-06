@@ -1,0 +1,26 @@
+name: Documentation
+description: Report missing or incorrect documentation.
+title: "[Docs]: "
+labels:
+  - documentation
+
+body:
+  - type: textarea
+    id: page
+    attributes:
+      label: Documentation affected
+      description: Which page, notebook, or section needs improvement?
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue
+    attributes:
+      label: What needs to be improved?
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested improvement

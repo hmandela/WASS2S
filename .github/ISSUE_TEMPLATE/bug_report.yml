@@ -1,0 +1,89 @@
+name: Bug report
+description: Report a bug or unexpected behavior in WASS2S.
+title: "[Bug]: "
+labels:
+  - bug
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve WASS2S!
+
+        Before submitting a bug report, please search the existing issues to avoid duplicates.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of the problem.
+      placeholder: Tell us what happened.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Describe the steps needed to reproduce the issue.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error message or traceback
+      description: Paste the complete error message if available.
+      render: shell
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12"
+
+  - type: input
+    id: version
+    attributes:
+      label: WASS2S version
+      placeholder: "0.x.x"
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation method
+      options:
+        - pixi
+        - pip
+        - conda
+        - source
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional information
+      description: Include anything else that may help us understand the issue.
