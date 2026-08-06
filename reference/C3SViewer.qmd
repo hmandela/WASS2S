@@ -1,0 +1,42 @@
+# C3SViewer { #wass2s.C3SViewer }
+
+```python
+C3SViewer()
+```
+
+Interactive Jupyter widget for Copernicus C3S seasonal forecast maps.
+
+Displays C3S probabilistic seasonal forecast products (SST, MSLP,
+precipitation, temperature, wind, and Niño plumes) inside an IFrame,
+with dropdown controls for product, start year/month, area, and map type.
+
+## Examples {.doc-section .doc-section-examples}
+
+```python
+>>> viewer = C3SViewer()
+>>> viewer.show()
+```
+
+## Notes {.doc-section .doc-section-notes}
+
+The area selector previously became unresponsive because
+``_update_chart`` observed the Area/Type dropdowns *while* the product
+handler swapped their options — ipywidgets auto-resets a dropdown's value
+during an options swap, firing the observer in an inconsistent state and
+(on some ipywidgets versions) raising inside the observer chain.  The
+options are now swapped with those observers detached, and the user's zone
+is preserved when switching between two spatial map products.
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [show](#wass2s.C3SViewer.show) | Display the widget interface in the current Jupyter cell. |
+
+### show { #wass2s.C3SViewer.show }
+
+```python
+C3SViewer.show()
+```
+
+Display the widget interface in the current Jupyter cell.

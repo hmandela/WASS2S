@@ -1,0 +1,194 @@
+# WAS_LogisticRegression_Model { #wass2s.WAS_LogisticRegression_Model }
+
+```python
+WAS_LogisticRegression_Model(
+    nb_cores=1,
+    dist_method='nonparam',
+    n_clusters=5,
+    param_grid=None,
+    optimization_method='grid',
+    n_trials=20,
+    cv=5,
+    random_state=42,
+    x_scaler=None,
+)
+```
+
+Logistic Regression model for **tercile classification** (Below/Normal/Above = 0/1/2)
+on spatiotemporal seasonal climate data (typically rainfall or temperature anomalies).
+
+Workflow overview:
+1. **Tercile classification**: Compute spatial map of classes (0=Below, 1=Normal, 2=Above)
+   based on climatological terciles (33rd and 67th percentiles).
+2. **Spatial clustering** (KMeans) on a summary statistic of the predictand
+   (default: mean over time).
+3. **Per-cluster hyperparameter optimization** of LogisticRegression using
+   grid/random/Bayesian search.
+4. **Broadcast best hyperparameters** to every grid cell (Y, X).
+5. **Parallel per-grid-cell classification** using local hyperparameters.
+6. **Direct probabilistic output**: model.predict_proba() gives
+   [P(Below), P(Normal), P(Above)] per grid cell and time step.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name                | Type                     | Description                                                                                                                                                                                                                                                | Default     |
+|---------------------|--------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|
+| nb_cores            | int                      | Number of CPU cores for parallel processing (dask + joblib).                                                                                                                                                                                               | `1`         |
+| dist_method         | (bestfit, nonparam)      | Kept for API consistency with other models; unused in this class.                                                                                                                                                                                          | `'bestfit'` |
+| n_clusters          | int                      | Number of spatial clusters for KMeans grouping of the predictand field.                                                                                                                                                                                    | `5`         |
+| param_grid          | dict or None             | Hyperparameter search space for LogisticRegression. If None, a safe default grid is used (compatible with multinomial + lbfgs):     C: [0.1, 0.5, 1.0, 2.0, 5.0]     class_weight: [None, 'balanced']     max_iter: [300, 600, 1000]     solver: ['lbfgs'] | `None`      |
+| optimization_method | (grid, random, bayesian) | Strategy for hyperparameter search.                                                                                                                                                                                                                        | `'grid'`    |
+| n_trials            | int                      | Number of trials for 'random' or 'bayesian' optimization.                                                                                                                                                                                                  | `20`        |
+| cv                  | int                      | Number of cross-validation folds during tuning.                                                                                                                                                                                                            | `5`         |
+| random_state        | int                      | Random seed for reproducibility (KMeans, CV splits, optimizer).                                                                                                                                                                                            | `42`        |
+| x_scaler            | (None, standard, robust) | Feature scaling applied before the logistic estimator: - None       : no scaling - 'standard' : StandardScaler (zero mean, unit variance) - 'robust'   : RobustScaler (median-centred, IQR-scaled)                                                         | `None`      |
+
+## Functions {.doc-section .doc-section-functions}
+
+* **compute_class**: Compute tercile class map (T, Y, X) + climatological tercile thresholds.
+* **compute_hyperparameters**: Cluster predictand → optimize hyperparameters per cluster →
+broadcast arrays of best C, class_weight (coded), max_iter, solver.
+* **fit_predict**: Fit logistic model on one grid cell, return [P(B), P(N), P(A)].
+* **compute_model**: Parallel classification across the full spatial domain.
+Returns xr.DataArray with dims (probability=['PB','PN','PA'], T, Y, X).
+* **forecast**: Predictor_for_year, C_da, cw_code_da, maxiter_da, solver_da)
+End-to-end forecast for one target year.
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute_class](#wass2s.WAS_LogisticRegression_Model.compute_class) | Compute tercile class map (T, Y, X) and climatological tercile thresholds. |
+| [compute_hyperparameters](#wass2s.WAS_LogisticRegression_Model.compute_hyperparameters) | Cluster predictand spatially → optimise LogisticRegression hyperparameters |
+| [compute_model](#wass2s.WAS_LogisticRegression_Model.compute_model) | Parallel tercile classification across the full spatial domain. |
+| [fit_predict](#wass2s.WAS_LogisticRegression_Model.fit_predict) | Fit logistic model on one grid cell using broadcast hyperparameters |
+| [forecast](#wass2s.WAS_LogisticRegression_Model.forecast) | Classify historical data → fit on full history → predict_proba for one year. |
+
+### compute_class { #wass2s.WAS_LogisticRegression_Model.compute_class }
+
+```python
+WAS_LogisticRegression_Model.compute_class(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+)
+```
+
+Compute tercile class map (T, Y, X) and climatological tercile thresholds.
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name    | Type                                                | Description   |
+|---------|-----------------------------------------------------|---------------|
+| y_class | xr.DataArray (T, Y, X)  — integer codes {0, 1, 2}   |               |
+| terc33  | xr.DataArray (Y, X)     — 33rd-percentile threshold |               |
+| terc67  | xr.DataArray (Y, X)     — 67th-percentile threshold |               |
+
+### compute_hyperparameters { #wass2s.WAS_LogisticRegression_Model.compute_hyperparameters }
+
+```python
+WAS_LogisticRegression_Model.compute_hyperparameters(
+    predictand,
+    predictor,
+    clim_year_start,
+    clim_year_end,
+    scoring='neg_log_loss',
+)
+```
+
+Cluster predictand spatially → optimise LogisticRegression hyperparameters
+per cluster → broadcast best params to every (Y, X) cell.
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name       | Type                                                             | Description   |
+|------------|------------------------------------------------------------------|---------------|
+| C_da       | xr.DataArray (Y, X) — best C per cell                            |               |
+| cw_code_da | xr.DataArray (Y, X) — class_weight code (0=None, 1=\'balanced\') |               |
+| maxiter_da | xr.DataArray (Y, X) — best max_iter per cell                     |               |
+| solver_da  | xr.DataArray (Y, X) — best solver per cell                       |               |
+| cluster_da | xr.DataArray (Y, X) — KMeans cluster labels                      |               |
+
+### compute_model { #wass2s.WAS_LogisticRegression_Model.compute_model }
+
+```python
+WAS_LogisticRegression_Model.compute_model(
+    X_train,
+    y_train,
+    X_test,
+    C_da,
+    cw_code_da,
+    maxiter_da,
+    solver_da,
+)
+```
+
+Parallel tercile classification across the full spatial domain.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name       | Type               | Description                                                   | Default    |
+|------------|--------------------|---------------------------------------------------------------|------------|
+| X_train    |                    |                                                               | _required_ |
+| y_train    |                    |                                                               | _required_ |
+| X_test     |                    |                                                               | _required_ |
+| C_da       | xr.DataArray(Y, X) | Broadcast hyperparameter arrays from compute_hyperparameters. | _required_ |
+| cw_code_da | xr.DataArray(Y, X) | Broadcast hyperparameter arrays from compute_hyperparameters. | _required_ |
+| maxiter_da | xr.DataArray(Y, X) | Broadcast hyperparameter arrays from compute_hyperparameters. | _required_ |
+| solver_da  | xr.DataArray(Y, X) | Broadcast hyperparameter arrays from compute_hyperparameters. | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type                                                                          | Description                                                 |
+|--------|-------------------------------------------------------------------------------|-------------------------------------------------------------|
+|        | xr.DataArray  dims (probability=\[\'PB\',\'PN\',\'PA\'\], T, Y, X)            |                                                             |
+|        | FIX C – squeeze() replaced by explicit T=1 handling so that single-step       | CV folds do not silently drop the T dimension.              |
+|        | FIX D – transpose to (\'probability\',\'T\',\'Y\',\'X\') added before return, | consistent with all other classifier compute_model methods. |
+
+### fit_predict { #wass2s.WAS_LogisticRegression_Model.fit_predict }
+
+```python
+WAS_LogisticRegression_Model.fit_predict(
+    x,
+    y,
+    x_test,
+    C,
+    cw_code,
+    max_iter,
+    solver,
+)
+```
+
+Fit logistic model on one grid cell using broadcast hyperparameters
+and return probability vector [P(Below), P(Normal), P(Above)].
+
+FIX A – single-class degenerate: zero-initialise out so missing classes
+         get P=0 (not NaN), keeping sum-to-1 invariant.
+FIX B – classes_ extraction: robust Pipeline-unwrapping loop instead of
+         hard-coded named_steps['logit'] lookup.
+
+### forecast { #wass2s.WAS_LogisticRegression_Model.forecast }
+
+```python
+WAS_LogisticRegression_Model.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictor,
+    Predictor_for_year,
+    C_da,
+    cw_code_da,
+    maxiter_da,
+    solver_da,
+)
+```
+
+Classify historical data → fit on full history → predict_proba for one year.
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type                                                                   | Description                    |
+|--------|------------------------------------------------------------------------|--------------------------------|
+|        | xr.DataArray  dims (probability=\[\'PB\',\'PN\',\'PA\'\], T=1, Y, X)   |                                |
+|        | FIX E – chunksize_y / chunksize_x now defined locally (were undefined, | causing NameError at runtime). |
+|        | FIX F – T-dim check now uses proba_.dims (computed array) instead of   | proba.dims (lazy dask graph).  |

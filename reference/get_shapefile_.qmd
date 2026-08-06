@@ -1,0 +1,7 @@
+# get_shapefile_ { #wass2s.get_shapefile_ }
+
+```python
+get_shapefile_(country_code, admin_level=0, source='naturalearth')
+```
+
+Downloads or loads shapefiles based on country ISO3 code.

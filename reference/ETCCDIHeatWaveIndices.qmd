@@ -1,0 +1,7 @@
+# ETCCDIHeatWaveIndices { #wass2s.ETCCDIHeatWaveIndices }
+
+```python
+ETCCDIHeatWaveIndices()
+```
+
+Factory helpers for standard configurations.

@@ -1,0 +1,1207 @@
+# WAS_Verification { #wass2s.WAS_Verification }
+
+```python
+WAS_Verification(dist_method='nonparam', mae_rmse_crps_thrsd=100)
+```
+
+Verification class for evaluating weather and climate forecasts.
+
+Provides methods to compute deterministic, probabilistic, and ensemble-based metrics,
+as well as visualization tools for model performance assessment.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type   | Description                                                                                              | Default      |
+|-------------|--------|----------------------------------------------------------------------------------------------------------|--------------|
+| dist_method | str    | Distribution method for tercile probability calculations ('bestfit', 'nonparam'). Default is 'nonparam'. | `'nonparam'` |
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [brier_score](#wass2s.WAS_Verification.brier_score) | BS for a single tercile event (PB/PN/PA). y_probs has shape (3, N). |
+| [brier_skill_score](#wass2s.WAS_Verification.brier_skill_score) | Event-wise Brier Skill Score (BSS) for tercile forecasts. |
+| [calculate_groc](#wass2s.WAS_Verification.calculate_groc) | Compute Generalized Discrimination (GROC) score according to Weigel and Mason (2011). |
+| [calculate_groc_](#wass2s.WAS_Verification.calculate_groc_) | Compute Generalized Discrimination (GROC) score. |
+| [calculate_groc_fixed](#wass2s.WAS_Verification.calculate_groc_fixed) | Fixed from version calculate_groc_ of GROC calculation. |
+| [calculate_groc_weighted](#wass2s.WAS_Verification.calculate_groc_weighted) | Compute Generalized Discrimination (GROC) score with category weighting. |
+| [calculate_rpss](#wass2s.WAS_Verification.calculate_rpss) | Compute Ranked Probability Skill Score (RPSS). |
+| [calculate_rpss_](#wass2s.WAS_Verification.calculate_rpss_) | Compute Ranked Probability Skill Score (RPSS) for a single grid point or sample. |
+| [calculate_tercile_probabilities_bestfit](#wass2s.WAS_Verification.calculate_tercile_probabilities_bestfit) | Generic tercile probabilities using best-fit family per grid cell. |
+| [calculate_tercile_probabilities_nonparametric](#wass2s.WAS_Verification.calculate_tercile_probabilities_nonparametric) | Non-parametric method using historical error samples. |
+| [classify](#wass2s.WAS_Verification.classify) | Classify data into terciles based on climatological thresholds. |
+| [classify_data_into_terciles](#wass2s.WAS_Verification.classify_data_into_terciles) | Classify data into terciles based on given thresholds. |
+| [classify_percent](#wass2s.WAS_Verification.classify_percent) | Classify a percentage value into predefined categories based on thresholds. |
+| [compute_class](#wass2s.WAS_Verification.compute_class) | Compute tercile class labels for observed data. |
+| [compute_crps](#wass2s.WAS_Verification.compute_crps) | Compute Continuous Ranked Probability Score (CRPS) for ensemble forecasts. |
+| [compute_deterministic_score](#wass2s.WAS_Verification.compute_deterministic_score) | Apply a deterministic scoring function over xarray DataArrays. |
+| [compute_one_year_rpss](#wass2s.WAS_Verification.compute_one_year_rpss) | Compute RPSS and display the percentage of skillful grids (RPSS > 0) in the title. |
+| [compute_one_year_rpss_](#wass2s.WAS_Verification.compute_one_year_rpss_) | Compute and visualize the Ranked Probability Skill Score (RPSS) for a specific year. |
+| [compute_probabilistic_score](#wass2s.WAS_Verification.compute_probabilistic_score) | Apply a probabilistic scoring function over xarray DataArrays. |
+| [gcm_compute_prob](#wass2s.WAS_Verification.gcm_compute_prob) | Compute tercile probabilities for deterministic hindcasts. |
+| [gcm_validation_compute](#wass2s.WAS_Verification.gcm_validation_compute) | Validate multiple General Circulation Model (GCM) forecasts using specified metrics. |
+| [get_scores_metadata](#wass2s.WAS_Verification.get_scores_metadata) | Retrieve metadata for all available scoring metrics. |
+| [ignorance_score](#wass2s.WAS_Verification.ignorance_score) | Compute Ignorance Score based on Weijs (2010). |
+| [index_of_agreement](#wass2s.WAS_Verification.index_of_agreement) | Compute Index of Agreement (IOA). |
+| [kling_gupta_efficiency](#wass2s.WAS_Verification.kling_gupta_efficiency) | Compute Kling-Gupta Efficiency (KGE) metric. |
+| [mean_absolute_error](#wass2s.WAS_Verification.mean_absolute_error) | Compute Mean Absolute Error (MAE). |
+| [nash_sutcliffe_efficiency](#wass2s.WAS_Verification.nash_sutcliffe_efficiency) | Compute Nash-Sutcliffe Efficiency (NSE). |
+| [pearson_corr](#wass2s.WAS_Verification.pearson_corr) | Compute Pearson Correlation Coefficient. |
+| [plot_model_score](#wass2s.WAS_Verification.plot_model_score) | Plot a deterministic score on a map. |
+| [plot_models_score](#wass2s.WAS_Verification.plot_models_score) | Plot multiple model scores on a grid of maps. |
+| [plot_roc_curves](#wass2s.WAS_Verification.plot_roc_curves) | Plot ROC Curves with Confidence Intervals for probabilistic forecasts. |
+| [ratio_to_average](#wass2s.WAS_Verification.ratio_to_average) | Compute and visualize the ratio of a specific year's data to the climatological mean. |
+| [reliability_diagram](#wass2s.WAS_Verification.reliability_diagram) | Plot Reliability Diagrams for probabilistic forecasts. |
+| [reliability_score_grid](#wass2s.WAS_Verification.reliability_score_grid) | Compute Reliability Score on a grid based on Weijs (2010). |
+| [resolution_and_reliability_over_all_grid](#wass2s.WAS_Verification.resolution_and_reliability_over_all_grid) | Compute Resolution and Reliability scores over all grid points. |
+| [resolution_and_reliability_over_all_grid_per_category](#wass2s.WAS_Verification.resolution_and_reliability_over_all_grid_per_category) | Assumes y_true_class already contains valid category labels (0, 1, 2). |
+| [resolution_and_reliability_per_category_grid](#wass2s.WAS_Verification.resolution_and_reliability_per_category_grid) | Compute Resolution and Reliability scores per category based on Weijs (2010). |
+| [resolution_score_grid](#wass2s.WAS_Verification.resolution_score_grid) | Compute Resolution Score on a grid based on Weijs (2010). |
+| [root_mean_square_error](#wass2s.WAS_Verification.root_mean_square_error) | Compute Root Mean Square Error (RMSE). |
+| [spearman_corr](#wass2s.WAS_Verification.spearman_corr) | Compute Spearman rank correlation coefficient. |
+| [taylor_diagram](#wass2s.WAS_Verification.taylor_diagram) | Plot a Taylor diagram comparing one or more model series against observations. |
+| [weibull_shape_solver](#wass2s.WAS_Verification.weibull_shape_solver) | Function to find the root of the Weibull shape parameter 'k'. |
+| [weighted_gcm_forecasts](#wass2s.WAS_Verification.weighted_gcm_forecasts) | Generate weighted ensemble forecasts from selected GCMs based on their performance scores. |
+
+### brier_score { #wass2s.WAS_Verification.brier_score }
+
+```python
+WAS_Verification.brier_score(
+    y_true,
+    y_probs,
+    index_start,
+    index_end,
+    event='PA',
+)
+```
+
+BS for a single tercile event (PB/PN/PA). y_probs has shape (3, N).
+
+### brier_skill_score { #wass2s.WAS_Verification.brier_skill_score }
+
+```python
+WAS_Verification.brier_skill_score(
+    y_true,
+    y_probs,
+    index_start,
+    index_end,
+    event='PA',
+    reference='uniform',
+)
+```
+
+Event-wise Brier Skill Score (BSS) for tercile forecasts.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type                        | Description                                                                                        | Default                 |
+|-------------|-----------------------------|----------------------------------------------------------------------------------------------------|-------------------------|
+| y_true      | 1D array-like               | Observed values (time series for one grid point).                                                  | _required_              |
+| y_probs     | 2D array-like, shape (3, N) | Forecast probabilities for PB/PN/PA over time.                                                     | _required_              |
+| index_start | int                         | Indices delimiting the calibration slice inside the *masked* series.                               | _required_              |
+| index_end   | int                         | Indices delimiting the calibration slice inside the *masked* series.                               | _required_              |
+| event       | (PB, PN, PA, 0, 1, 2)       | Event to score (default "PA" = above-normal).                                                      | `"PB","PN","PA",0,1,2`  |
+| reference   | (uniform, empirical)        | - "uniform": climatology is [1/3,1/3,1/3] - "empirical": base rate computed from calibration slice | `"uniform","empirical"` |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                       |
+|--------|--------|---------------------------------------------------|
+|        | float  | BSS = 1 - BS / BS_ref (np.nan if not computable). |
+
+### calculate_groc { #wass2s.WAS_Verification.calculate_groc }
+
+```python
+WAS_Verification.calculate_groc(
+    y_true,
+    y_probs,
+    index_start,
+    index_end,
+    n_classes=3,
+)
+```
+
+Compute Generalized Discrimination (GROC) score according to Weigel and Mason (2011).
+
+The GROC score averages the Area Under the ROC Curve (AUC) for each category,
+measuring the ability to distinguish occurrences from non-occurrences of each category.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type         | Description                                                   | Default    |
+|-------------|--------------|---------------------------------------------------------------|------------|
+| y_true      | array - like | Observed values.                                              | _required_ |
+| y_probs     | array - like | Forecast probabilities with shape (n_classes, n_samples).     | _required_ |
+| index_start | int          | Start index of the climatology period for computing terciles. | _required_ |
+| index_end   | int          | End index of the climatology period for computing terciles.   | _required_ |
+| n_classes   | int          | Number of classes (default is 3 for terciles).                | `3`        |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                  |
+|--------|--------|------------------------------------------------------------------------------|
+|        | float  | GROC score, ranging from 0 to 1.  Returns np.nan if insufficient valid data. |
+
+#### Reference {.doc-section .doc-section-reference}
+
+Weigel, A. P. and Mason, S. J. (2011). 
+The generalized discrimination score for ensemble forecasts.
+Monthly Weather Review, 139(9):3069-3074.
+
+### calculate_groc_ { #wass2s.WAS_Verification.calculate_groc_ }
+
+```python
+WAS_Verification.calculate_groc_(
+    y_true,
+    y_probs,
+    index_start,
+    index_end,
+    n_classes=3,
+)
+```
+
+Compute Generalized Discrimination (GROC) score.
+
+Averages the Area Under the Curve (AUC) for each tercile category.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type         | Description                                               | Default    |
+|-------------|--------------|-----------------------------------------------------------|------------|
+| y_true      | array - like | Observed values.                                          | _required_ |
+| y_probs     | array - like | Forecast probabilities with shape (n_classes, n_samples). | _required_ |
+| index_start | int          | Start index of the climatology period.                    | _required_ |
+| index_end   | int          | End index of the climatology period.                      | _required_ |
+| n_classes   | int          | Number of classes (default is 3 for terciles).            | `3`        |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                 |
+|--------|--------|-----------------------------------------------------------------------------|
+|        | float  | GROC score, ranging from 0 to 1. Returns np.nan if insufficient valid data. |
+
+### calculate_groc_fixed { #wass2s.WAS_Verification.calculate_groc_fixed }
+
+```python
+WAS_Verification.calculate_groc_fixed(
+    y_true,
+    y_probs,
+    index_start,
+    index_end,
+    n_classes=3,
+)
+```
+
+Fixed from version calculate_groc_ of GROC calculation.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type         | Description                                               | Default    |
+|-------------|--------------|-----------------------------------------------------------|------------|
+| y_true      | array - like | Observed values.                                          | _required_ |
+| y_probs     | array - like | Forecast probabilities with shape (n_classes, n_samples). | _required_ |
+| index_start | int          | Start index of the climatology period.                    | _required_ |
+| index_end   | int          | End index of the climatology period.                      | _required_ |
+| n_classes   | int          | Number of classes (default is 3 for terciles).            | `3`        |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                      |
+|--------|--------|----------------------------------|
+|        | float  | GROC score, ranging from 0 to 1. |
+
+### calculate_groc_weighted { #wass2s.WAS_Verification.calculate_groc_weighted }
+
+```python
+WAS_Verification.calculate_groc_weighted(
+    y_true,
+    y_probs,
+    index_start,
+    index_end,
+    n_classes=3,
+)
+```
+
+Compute Generalized Discrimination (GROC) score with category weighting.
+
+Weighted average of AUCs by climatological frequency of each category.
+Alternative: Weighted by climatological frequency as in some applications
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type         | Description                                               | Default    |
+|-------------|--------------|-----------------------------------------------------------|------------|
+| y_true      | array - like | Observed values.                                          | _required_ |
+| y_probs     | array - like | Forecast probabilities with shape (n_classes, n_samples). | _required_ |
+| index_start | int          | Start index of the climatology period.                    | _required_ |
+| index_end   | int          | End index of the climatology period.                      | _required_ |
+| n_classes   | int          | Number of classes (default is 3 for terciles).            | `3`        |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                               |
+|--------|--------|-------------------------------------------|
+|        | float  | Weighted GROC score, ranging from 0 to 1. |
+
+### calculate_rpss { #wass2s.WAS_Verification.calculate_rpss }
+
+```python
+WAS_Verification.calculate_rpss(y_true, y_probs, index_start, index_end)
+```
+
+Compute Ranked Probability Skill Score (RPSS).
+
+Compares the Ranked Probability Score (RPS) of the forecast to a climatological reference.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type         | Description                                               | Default    |
+|-------------|--------------|-----------------------------------------------------------|------------|
+| y_true      | array - like | Observed values.                                          | _required_ |
+| y_probs     | array - like | Forecast probabilities with shape (n_classes, n_samples). | _required_ |
+| index_start | int          | Start index of the climatology period.                    | _required_ |
+| index_end   | int          | End index of the climatology period.                      | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                    |
+|--------|--------|--------------------------------------------------------------------------------|
+|        | float  | RPSS score, ranging from -Inf to 1. Returns np.nan if insufficient valid data. |
+
+### calculate_rpss_ { #wass2s.WAS_Verification.calculate_rpss_ }
+
+```python
+WAS_Verification.calculate_rpss_(y_true, y_probs)
+```
+
+Compute Ranked Probability Skill Score (RPSS) for a single grid point or sample.
+
+Compares the Ranked Probability Score (RPS) of the forecast to a climatological
+reference with uniform probabilities (1/3 for each tercile).
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name    | Type                               | Description                                                                                             | Default    |
+|---------|------------------------------------|---------------------------------------------------------------------------------------------------------|------------|
+| y_true  | array-like of shape (n_samples,)   | True class labels, already classified into terciles (0: below-normal, 1: near-normal, 2: above-normal). | _required_ |
+| y_probs | array-like of shape (3, n_samples) | Forecast probabilities for each tercile category.                                                       | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                                         |
+|--------|--------|---------------------------------------------------------------------------------------------------------------------|
+|        | float  | RPSS score, ranging from -Inf to 1 (1 indicates perfect forecast skill). Returns np.nan if insufficient valid data. |
+
+### calculate_tercile_probabilities_bestfit { #wass2s.WAS_Verification.calculate_tercile_probabilities_bestfit }
+
+```python
+WAS_Verification.calculate_tercile_probabilities_bestfit(
+    best_guess,
+    error_variance,
+    T1,
+    T2,
+    dist_code,
+    dof,
+)
+```
+
+Generic tercile probabilities using best-fit family per grid cell.
+
+Inputs (per grid cell):
+- best_guess : 1D array over T (hindcast_det or forecast_det)
+- T1, T2     : scalar terciles from climatological best-fit distribution
+- dist_code  : int, as in _ppf_terciles_from_code
+- shape, loc, scale : scalars from climatology fit
+
+Strategy:
+- For each time step, build a predictive distribution of the same family:
+    * Use best_guess[t] to adjust mean / location;
+    * Keep shape parameters from climatology.
+- Then compute probabilities:
+    P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).
+
+### calculate_tercile_probabilities_nonparametric { #wass2s.WAS_Verification.calculate_tercile_probabilities_nonparametric }
+
+```python
+WAS_Verification.calculate_tercile_probabilities_nonparametric(
+    best_guess,
+    error_samples,
+    first_tercile,
+    second_tercile,
+)
+```
+
+Non-parametric method using historical error samples.
+
+### classify { #wass2s.WAS_Verification.classify }
+
+```python
+WAS_Verification.classify(y, index_start, index_end)
+```
+
+Classify data into terciles based on climatological thresholds.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type         | Description                            | Default    |
+|-------------|--------------|----------------------------------------|------------|
+| y           | array - like | Input data to classify.                | _required_ |
+| index_start | int          | Start index of the climatology period. | _required_ |
+| index_end   | int          | End index of the climatology period.   | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                                                                                                                            |
+|--------|--------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|        | tuple  | - y_class : array-like     Classified data (0: below-normal, 1: near-normal, 2: above-normal). - tercile_33 : float     33rd percentile threshold. - tercile_67 : float     67th percentile threshold. |
+
+### classify_data_into_terciles { #wass2s.WAS_Verification.classify_data_into_terciles }
+
+```python
+WAS_Verification.classify_data_into_terciles(y, T1, T2)
+```
+
+Classify data into terciles based on given thresholds.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type         | Description                                 | Default    |
+|--------|--------------|---------------------------------------------|------------|
+| y      | array - like | Input data to classify.                     | _required_ |
+| T1     | float        | First tercile threshold (33rd percentile).  | _required_ |
+| T2     | float        | Second tercile threshold (67th percentile). | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description                                                         |
+|--------|--------------|---------------------------------------------------------------------|
+|        | array - like | Classified data (0: below-normal, 1: near-normal, 2: above-normal). |
+
+### classify_percent { #wass2s.WAS_Verification.classify_percent }
+
+```python
+WAS_Verification.classify_percent(p)
+```
+
+Classify a percentage value into predefined categories based on thresholds.
+
+Maps a percentage ratio to one of five categories representing deviation from average.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type                  | Description                                                                    | Default    |
+|--------|-----------------------|--------------------------------------------------------------------------------|------------|
+| p      | float or array - like | Percentage value(s) to classify, typically representing a ratio to normal (%). | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type                | Description                                                                                                                                                          |
+|--------|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|        | int or array - like | Category code: - 1: Well Above Average (>= 150%) - 2: Above Average (>= 110%) - 3: Near Average (>= 90%) - 4: Below Average (>= 50%) - 5: Well Below Average (< 50%) |
+
+### compute_class { #wass2s.WAS_Verification.compute_class }
+
+```python
+WAS_Verification.compute_class(Predictant, clim_year_start, clim_year_end)
+```
+
+Compute tercile class labels for observed data.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                              | Default    |
+|-----------------|------------------|------------------------------------------|------------|
+| Predictant      | xarray.DataArray | Observed data with dimensions (T, Y, X). | _required_ |
+| clim_year_start | int or str       | Start year of the climatology period.    | _required_ |
+| clim_year_end   | int or str       | End year of the climatology period.      | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                                                                                                         |
+|--------|------------------|---------------------------------------------------------------------------------------------------------------------|
+|        | xarray.DataArray | Classified data with dimensions (T, Y, X), where values are 0 (below-normal), 1 (near-normal), or 2 (above-normal). |
+
+### compute_crps { #wass2s.WAS_Verification.compute_crps }
+
+```python
+WAS_Verification.compute_crps(y_true, y_pred, member_dim='number', dim='T')
+```
+
+Compute Continuous Ranked Probability Score (CRPS) for ensemble forecasts.
+
+Measures the difference between the forecast ensemble distribution and observations.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name       | Type             | Description                                                      | Default    |
+|------------|------------------|------------------------------------------------------------------|------------|
+| y_true     | xarray.DataArray | Observed data with dimensions (T, Y, X).                         | _required_ |
+| y_pred     | xarray.DataArray | Ensemble forecast data with dimensions (T, number, Y, X).        | _required_ |
+| member_dim | str              | Dimension name for ensemble members. Default is 'number'.        | `'number'` |
+| dim        | str              | Dimension to compute CRPS over (typically time). Default is 'T'. | `'T'`      |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                         |
+|--------|------------------|-------------------------------------|
+|        | xarray.DataArray | CRPS values with dimensions (Y, X). |
+
+### compute_deterministic_score { #wass2s.WAS_Verification.compute_deterministic_score }
+
+```python
+WAS_Verification.compute_deterministic_score(score_func, obs, pred)
+```
+
+Apply a deterministic scoring function over xarray DataArrays.
+
+Computes the specified metric across the time dimension for each grid point.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name       | Type             | Description                                                             | Default    |
+|------------|------------------|-------------------------------------------------------------------------|------------|
+| score_func | callable         | Scoring function to apply (e.g., pearson_corr, kling_gupta_efficiency). | _required_ |
+| obs        | xarray.DataArray | Observed data with dimensions (T, Y, X).                                | _required_ |
+| pred       | xarray.DataArray | Predicted data with dimensions (T, Y, X).                               | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                          |
+|--------|------------------|--------------------------------------|
+|        | xarray.DataArray | Score values with dimensions (Y, X). |
+
+### compute_one_year_rpss { #wass2s.WAS_Verification.compute_one_year_rpss }
+
+```python
+WAS_Verification.compute_one_year_rpss(
+    obs,
+    prob_pred,
+    clim_year_start,
+    clim_year_end,
+    year,
+    shapefile_path=None,
+)
+```
+
+Compute RPSS and display the percentage of skillful grids (RPSS > 0) in the title.
+
+### compute_one_year_rpss_ { #wass2s.WAS_Verification.compute_one_year_rpss_ }
+
+```python
+WAS_Verification.compute_one_year_rpss_(
+    obs,
+    prob_pred,
+    clim_year_start,
+    clim_year_end,
+    year,
+)
+```
+
+Compute and visualize the Ranked Probability Skill Score (RPSS) for a specific year.
+
+Applies the RPSS calculation across a gridded dataset for a single year, using
+tercile classifications based on a climatology period, and plots the results on a map.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                                                                                                                                             | Default    |
+|-----------------|------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|------------|
+| obs             | xarray.DataArray | Observed data with dimensions (T, Y, X), where T is time, Y is latitude, and X is longitude.                                                            | _required_ |
+| prob_pred       | xarray.DataArray | Forecast probabilities with dimensions (probability, T, Y, X), where probability includes ['PB', 'PN', 'PA'] (below-normal, near-normal, above-normal). | _required_ |
+| clim_year_start | int or str       | Start year of the climatology period for tercile classification.                                                                                        | _required_ |
+| clim_year_end   | int or str       | End year of the climatology period for tercile classification.                                                                                          | _required_ |
+| year            | int or str       | Specific year to compute the RPSS for.                                                                                                                  | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                      |
+|--------|--------|------------------------------------------------------------------|
+|        | None   | Displays a geographical plot of the RPSS values with a colorbar. |
+
+### compute_probabilistic_score { #wass2s.WAS_Verification.compute_probabilistic_score }
+
+```python
+WAS_Verification.compute_probabilistic_score(
+    score_func,
+    obs,
+    prob_pred,
+    clim_year_start,
+    clim_year_end,
+    **score_kwargs,
+)
+```
+
+Apply a probabilistic scoring function over xarray DataArrays.
+
+Computes the specified probabilistic metric across the time dimension for each grid point.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                                                                     | Default    |
+|-----------------|------------------|---------------------------------------------------------------------------------|------------|
+| score_func      | callable         | Probabilistic scoring function to apply (e.g., calculate_rpss, calculate_groc). | _required_ |
+| obs             | xarray.DataArray | Observed data with dimensions (T, Y, X).                                        | _required_ |
+| prob_pred       | xarray.DataArray | Forecast probabilities with dimensions (probability, T, Y, X).                  | _required_ |
+| clim_year_start | int or str       | Start year of the climatology period.                                           | _required_ |
+| clim_year_end   | int or str       | End year of the climatology period.                                             | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                          |
+|--------|------------------|--------------------------------------|
+|        | xarray.DataArray | Score values with dimensions (Y, X). |
+
+### gcm_compute_prob { #wass2s.WAS_Verification.gcm_compute_prob }
+
+```python
+WAS_Verification.gcm_compute_prob(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Compute tercile probabilities for deterministic hindcasts.
+
+If dist_method == 'bestfit':
+    - Use cluster-based best-fit distributions to:
+        * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
+        * compute predictive probabilities using the same family.
+
+Otherwise:
+    - Use empirical terciles from Predictant climatology and the selected
+      parametric / nonparametric method.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                                                                       | Default    |
+|-----------------|------------------|-----------------------------------------------------------------------------------|------------|
+| Predictant      | xarray.DataArray | Observed data (T, Y, X) or (T, Y, X, M).                                          | _required_ |
+| clim_year_start | int or str       | Climatology period (inclusive) for thresholds.                                    | _required_ |
+| clim_year_end   | int or str       | Climatology period (inclusive) for thresholds.                                    | _required_ |
+| hindcast_det    | xarray.DataArray | Deterministic hindcast (T, Y, X).                                                 | _required_ |
+| best_code_da    | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_shape_da   | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_loc_da     | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_scale_da   | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name          | Type             | Description                                                      |
+|---------------|------------------|------------------------------------------------------------------|
+| hindcast_prob | xarray.DataArray | Probabilities with dims (probability=['PB','PN','PA'], T, Y, X). |
+
+### gcm_validation_compute { #wass2s.WAS_Verification.gcm_validation_compute }
+
+```python
+WAS_Verification.gcm_validation_compute(
+    models_files_path,
+    Obs,
+    score,
+    month_of_initialization,
+    clim_year_start,
+    clim_year_end,
+    dir_to_save_roc_reliability,
+    lead_time=None,
+    ensemble_mean=None,
+    gridded=True,
+)
+```
+
+Validate multiple General Circulation Model (GCM) forecasts using specified metrics.
+
+Computes deterministic, probabilistic, or ensemble-based scores for GCM hindcasts
+by processing model data from provided file paths and comparing against observations.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name                        | Type             | Description                                                                                                                                         | Default    |
+|-----------------------------|------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|------------|
+| models_files_path           | dict             | Dictionary mapping model identifiers (e.g., model names) to file paths of hindcast NetCDF files.                                                    | _required_ |
+| Obs                         | xarray.DataArray | Observed data with dimensions (T, Y, X), where T is time, Y is latitude, and X is longitude.                                                        | _required_ |
+| score                       | str              | Score to compute, must be a key in self.scores (e.g., 'Pearson', 'RPSS', 'ROC_CURVE', 'RELIABILITY_DIAGRAM').                                       | _required_ |
+| month_of_initialization     | int              | Month of forecast initialization (1-12).                                                                                                            | _required_ |
+| clim_year_start             | int or str       | Start year of the climatology period for computing tercile thresholds.                                                                              | _required_ |
+| clim_year_end               | int or str       | End year of the climatology period for computing tercile thresholds.                                                                                | _required_ |
+| dir_to_save_roc_reliability | str or Path      | Directory to save ROC curves and reliability diagram plots.                                                                                         | _required_ |
+| lead_time                   | list of int      | Lead times in months to define the forecast season (e.g., [1, 2, 3] for a 3-month season). If None, no season is specified.                         | `None`     |
+| ensemble_mean               | str              | Ensemble statistic to use for deterministic or probabilistic scores (e.g., 'mean'). If None, ensemble mean is computed automatically when required. | `None`     |
+| gridded                     | bool             | Whether to perform gridded validation (True) or non-gridded (not implemented). Default is True.                                                     | `True`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description                                                                                                                                                                                                                                                                                                                                                           |
+|--------|--------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|        | dict or None | If score_type is 'det_score', 'prob_score', or 'ensemble_score':     Dictionary with model identifiers as keys and xarray.DataArray of scores (dimensions Y, X) as values. If score_type is 'all_grid_prob_score' (e.g., ROC_CURVE, RELIABILITY_DIAGRAM):     None, as results are saved as plots. If score_type is 'all_grid_det_score':     None (not implemented). |
+
+#### Raises {.doc-section .doc-section-raises}
+
+| Name   | Type       | Description                                                                                 |
+|--------|------------|---------------------------------------------------------------------------------------------|
+|        | ValueError | If the score is not recognized or if non-gridded validation is attempted (not implemented). |
+
+### get_scores_metadata { #wass2s.WAS_Verification.get_scores_metadata }
+
+```python
+WAS_Verification.get_scores_metadata()
+```
+
+Retrieve metadata for all available scoring metrics.
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                                                                     |
+|--------|--------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+|        | dict   | Dictionary containing score names as keys and tuples of metadata (description, min_value, max_value, score_type, colormap, function) as values. |
+
+### ignorance_score { #wass2s.WAS_Verification.ignorance_score }
+
+```python
+WAS_Verification.ignorance_score(y_true, y_probs, index_start, index_end)
+```
+
+Compute Ignorance Score based on Weijs (2010).
+
+Measures the logarithmic loss of forecast probabilities for the true category.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type         | Description                                               | Default    |
+|-------------|--------------|-----------------------------------------------------------|------------|
+| y_true      | array - like | Observed values.                                          | _required_ |
+| y_probs     | array - like | Forecast probabilities with shape (n_classes, n_samples). | _required_ |
+| index_start | int          | Start index of the climatology period.                    | _required_ |
+| index_end   | int          | End index of the climatology period.                      | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                               |
+|--------|--------|---------------------------------------------------------------------------|
+|        | float  | Ignorance score, non-negative. Returns np.nan if insufficient valid data. |
+
+### index_of_agreement { #wass2s.WAS_Verification.index_of_agreement }
+
+```python
+WAS_Verification.index_of_agreement(y_true, y_pred)
+```
+
+Compute Index of Agreement (IOA).
+
+Measures the degree of model prediction accuracy relative to observed variability.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type         | Description       | Default    |
+|--------|--------------|-------------------|------------|
+| y_true | array - like | Observed values.  | _required_ |
+| y_pred | array - like | Predicted values. | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                               |
+|--------|--------|-------------------------------------------------------------------------------------------|
+|        | float  | IOA score, ranging from 0 to 1 (1 is perfect). Returns np.nan if insufficient valid data. |
+
+### kling_gupta_efficiency { #wass2s.WAS_Verification.kling_gupta_efficiency }
+
+```python
+WAS_Verification.kling_gupta_efficiency(y_true, y_pred)
+```
+
+Compute Kling-Gupta Efficiency (KGE) metric.
+
+KGE combines correlation, bias, and variability ratios to assess model performance.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type         | Description       | Default    |
+|--------|--------------|-------------------|------------|
+| y_true | array - like | Observed values.  | _required_ |
+| y_pred | array - like | Predicted values. | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                  |
+|--------|--------|----------------------------------------------------------------------------------------------|
+|        | float  | KGE score, ranging from -Inf to 1 (1 is perfect). Returns np.nan if insufficient valid data. |
+
+### mean_absolute_error { #wass2s.WAS_Verification.mean_absolute_error }
+
+```python
+WAS_Verification.mean_absolute_error(y_true, y_pred)
+```
+
+Compute Mean Absolute Error (MAE).
+
+Measures the average magnitude of errors in predictions.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type         | Description       | Default    |
+|--------|--------------|-------------------|------------|
+| y_true | array - like | Observed values.  | _required_ |
+| y_pred | array - like | Predicted values. | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                         |
+|--------|--------|---------------------------------------------------------------------|
+|        | float  | MAE value, non-negative. Returns np.nan if insufficient valid data. |
+
+### nash_sutcliffe_efficiency { #wass2s.WAS_Verification.nash_sutcliffe_efficiency }
+
+```python
+WAS_Verification.nash_sutcliffe_efficiency(y_true, y_pred)
+```
+
+Compute Nash-Sutcliffe Efficiency (NSE).
+
+Measures the predictive skill of the model compared to the mean of observations.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type         | Description       | Default    |
+|--------|--------------|-------------------|------------|
+| y_true | array - like | Observed values.  | _required_ |
+| y_pred | array - like | Predicted values. | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                  |
+|--------|--------|----------------------------------------------------------------------------------------------|
+|        | float  | NSE score, ranging from -Inf to 1 (1 is perfect). Returns np.nan if insufficient valid data. |
+
+### pearson_corr { #wass2s.WAS_Verification.pearson_corr }
+
+```python
+WAS_Verification.pearson_corr(y_true, y_pred)
+```
+
+Compute Pearson Correlation Coefficient.
+
+Measures the linear correlation between observed and predicted values.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type         | Description       | Default    |
+|--------|--------------|-------------------|------------|
+| y_true | array - like | Observed values.  | _required_ |
+| y_pred | array - like | Predicted values. | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                       |
+|--------|--------|---------------------------------------------------------------------------------------------------|
+|        | float  | Pearson correlation coefficient, ranging from -1 to 1. Returns np.nan if insufficient valid data. |
+
+### plot_model_score { #wass2s.WAS_Verification.plot_model_score }
+
+```python
+WAS_Verification.plot_model_score(
+    model_metric,
+    score,
+    dir_save_score,
+    figure_name='WAS_MLR',
+)
+```
+
+Plot a deterministic score on a map.
+
+Creates a geographical plot of the specified metric for a single model.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name           | Type             | Description                                           | Default     |
+|----------------|------------------|-------------------------------------------------------|-------------|
+| model_metric   | xarray.DataArray | Score values with dimensions (Y, X).                  | _required_  |
+| score          | str              | Name of the score to plot (e.g., 'Pearson', 'MAE').   | _required_  |
+| dir_save_score | str or Path      | Directory to save the plot.                           | _required_  |
+| figure_name    | str              | Prefix for the figure filename. Default is 'WAS_MLR'. | `'WAS_MLR'` |
+
+### plot_models_score { #wass2s.WAS_Verification.plot_models_score }
+
+```python
+WAS_Verification.plot_models_score(model_metrics, score, dir_save_score)
+```
+
+Plot multiple model scores on a grid of maps.
+
+Creates a subplot grid with geographical plots for each model's score.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name           | Type        | Description                                                                | Default    |
+|----------------|-------------|----------------------------------------------------------------------------|------------|
+| model_metrics  | dict        | Dictionary of model names and their corresponding score DataArrays (Y, X). | _required_ |
+| score          | str         | Name of the score to plot (e.g., 'Pearson', 'MAE').                        | _required_ |
+| dir_save_score | str or Path | Directory to save the plot.                                                | _required_ |
+
+### plot_roc_curves { #wass2s.WAS_Verification.plot_roc_curves }
+
+```python
+WAS_Verification.plot_roc_curves(
+    modelname,
+    dir_to_save_score,
+    y_true_class,
+    y_probs,
+    n_bootstraps=200,
+    ci=0.95,
+)
+```
+
+Plot ROC Curves with Confidence Intervals for probabilistic forecasts.
+
+Visualizes the Receiver Operating Characteristic for each tercile category.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name              | Type             | Description                                                           | Default    |
+|-------------------|------------------|-----------------------------------------------------------------------|------------|
+| modelname         | str              | Name of the model for labeling the plot.                              | _required_ |
+| dir_to_save_score | str or Path      | Directory to save the plot.                                           | _required_ |
+| y_true_class      | xarray.DataArray | Observed data with dimensions (T, Y, X).                              | _required_ |
+| y_probs           | xarray.DataArray | Forecast probabilities with dimensions (probability, T, Y, X).        | _required_ |
+| clim_year_start   | int or str       | Start year of the climatology period.                                 | _required_ |
+| clim_year_end     | int or str       | End year of the climatology period.                                   | _required_ |
+| n_bootstraps      | int              | Number of bootstrap samples for confidence intervals. Default is 200. | `200`      |
+| ci                | float            | Confidence interval level (e.g., 0.95 for 95%). Default is 0.95.      | `0.95`     |
+
+### ratio_to_average { #wass2s.WAS_Verification.ratio_to_average }
+
+```python
+WAS_Verification.ratio_to_average(
+    predictant,
+    clim_year_start,
+    clim_year_end,
+    year,
+)
+```
+
+Compute and visualize the ratio of a specific year's data to the climatological mean.
+
+Calculates the percentage ratio of the predictand for a given year relative to
+the mean over a climatology period, classifies it into categories, and plots the
+result on a geographical map.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                                                                                  | Default    |
+|-----------------|------------------|----------------------------------------------------------------------------------------------|------------|
+| predictant      | xarray.DataArray | Observed data with dimensions (T, Y, X), where T is time, Y is latitude, and X is longitude. | _required_ |
+| clim_year_start | int or str       | Start year of the climatology period.                                                        | _required_ |
+| clim_year_end   | int or str       | End year of the climatology period.                                                          | _required_ |
+| year            | int or str       | Specific year to compute the ratio for.                                                      | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                              |
+|--------|--------|------------------------------------------------------------------------------------------|
+|        | None   | Displays a geographical plot of the classified ratios with a custom colormap and legend. |
+
+### reliability_diagram { #wass2s.WAS_Verification.reliability_diagram }
+
+```python
+WAS_Verification.reliability_diagram(
+    modelname,
+    dir_to_save_score,
+    y_true_class,
+    y_probs,
+    bins=np.array([0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67]),
+)
+```
+
+Plot Reliability Diagrams for probabilistic forecasts.
+
+Visualizes the calibration of forecast probabilities against observed frequencies.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name              | Type             | Description                                                    | Default                                                                              |
+|-------------------|------------------|----------------------------------------------------------------|--------------------------------------------------------------------------------------|
+| modelname         | str              | Name of the model for labeling the plot.                       | _required_                                                                           |
+| dir_to_save_score | str or Path      | Directory to save the plot.                                    | _required_                                                                           |
+| y_true            | xarray.DataArray | Observed data with dimensions (T, Y, X).                       | _required_                                                                           |
+| y_probs           | xarray.DataArray | Forecast probabilities with dimensions (probability, T, Y, X). | _required_                                                                           |
+| clim_year_start   | int or str       | Start year of the climatology period.                          | _required_                                                                           |
+| clim_year_end     | int or str       | End year of the climatology period.                            | _required_                                                                           |
+| bins              | array - like     | Probability bins for discretizing forecast probabilities.      | `np.array([0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67])` |
+
+### reliability_score_grid { #wass2s.WAS_Verification.reliability_score_grid }
+
+```python
+WAS_Verification.reliability_score_grid(
+    y_true,
+    y_probs,
+    index_start,
+    index_end,
+    bins=np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0]),
+)
+```
+
+Compute Reliability Score on a grid based on Weijs (2010).
+
+Measures the calibration of forecast probabilities against observed frequencies.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type         | Description                                               | Default                                                                                                                                         |
+|-------------|--------------|-----------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| y_true      | array - like | Observed values.                                          | _required_                                                                                                                                      |
+| y_probs     | array - like | Forecast probabilities with shape (n_classes, n_samples). | _required_                                                                                                                                      |
+| index_start | int          | Start index of the climatology period.                    | _required_                                                                                                                                      |
+| index_end   | int          | End index of the climatology period.                      | _required_                                                                                                                                      |
+| bins        | array - like | Probability bins for discretizing forecast probabilities. | `np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0])` |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                   |
+|--------|--------|---------------------------------------------------------------|
+|        | float  | Reliability score. Returns np.nan if insufficient valid data. |
+
+### resolution_and_reliability_over_all_grid { #wass2s.WAS_Verification.resolution_and_reliability_over_all_grid }
+
+```python
+WAS_Verification.resolution_and_reliability_over_all_grid(
+    y_true_class,
+    y_probs,
+    bins=np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0]),
+)
+```
+
+Compute Resolution and Reliability scores over all grid points.
+
+Based on Weijs (2010), computes scores by aggregating across all grid points.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name         | Type             | Description                                                    | Default                                                                                                                                         |
+|--------------|------------------|----------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| y_true_class | xarray.DataArray | Observed data with dimensions (T, Y, X).                       | _required_                                                                                                                                      |
+| y_probs      | xarray.DataArray | Forecast probabilities with dimensions (probability, T, Y, X). | _required_                                                                                                                                      |
+| bins         | array - like     | Probability bins for discretizing forecast probabilities.      | `np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0])` |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                                           |
+|--------|--------|-----------------------------------------------------------------------------------------------------------------------|
+|        | tuple  | - resolution_sum : float     Aggregated resolution score. - reliability_sum : float     Aggregated reliability score. |
+
+### resolution_and_reliability_over_all_grid_per_category { #wass2s.WAS_Verification.resolution_and_reliability_over_all_grid_per_category }
+
+```python
+WAS_Verification.resolution_and_reliability_over_all_grid_per_category(
+    y_true_class,
+    y_probs,
+    bins=np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0]),
+)
+```
+
+Assumes y_true_class already contains valid category labels (0, 1, 2).
+
+### resolution_and_reliability_per_category_grid { #wass2s.WAS_Verification.resolution_and_reliability_per_category_grid }
+
+```python
+WAS_Verification.resolution_and_reliability_per_category_grid(
+    y_true,
+    y_probs,
+    index_start,
+    index_end,
+    bins=np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0]),
+)
+```
+
+Compute Resolution and Reliability scores per category based on Weijs (2010).
+
+Returns both total scores and per-category breakdowns.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type         | Description                                               | Default                                                                                                                                         |
+|-------------|--------------|-----------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| y_true      | array - like | Observed values.                                          | _required_                                                                                                                                      |
+| y_probs     | array - like | Forecast probabilities with shape (n_classes, n_samples). | _required_                                                                                                                                      |
+| index_start | int          | Start index of the climatology period.                    | _required_                                                                                                                                      |
+| index_end   | int          | End index of the climatology period.                      | _required_                                                                                                                                      |
+| bins        | array - like | Probability bins for discretizing forecast probabilities. | `np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0])` |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                                                                                                                                                                                               |
+|--------|--------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|        | dict   | Dictionary containing: - 'total_resolution': float - 'total_reliability': float - 'category_resolution': list of floats for each category - 'category_reliability': list of floats for each category - 'category_base_rates': list of floats (climatological frequencies) |
+
+### resolution_score_grid { #wass2s.WAS_Verification.resolution_score_grid }
+
+```python
+WAS_Verification.resolution_score_grid(
+    y_true,
+    y_probs,
+    index_start,
+    index_end,
+    bins=np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0]),
+)
+```
+
+Compute Resolution Score on a grid based on Weijs (2010).
+
+Measures the ability of the forecast to distinguish between different outcomes.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type         | Description                                               | Default                                                                                                                                         |
+|-------------|--------------|-----------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| y_true      | array - like | Observed values.                                          | _required_                                                                                                                                      |
+| y_probs     | array - like | Forecast probabilities with shape (n_classes, n_samples). | _required_                                                                                                                                      |
+| index_start | int          | Start index of the climatology period.                    | _required_                                                                                                                                      |
+| index_end   | int          | End index of the climatology period.                      | _required_                                                                                                                                      |
+| bins        | array - like | Probability bins for discretizing forecast probabilities. | `np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0])` |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                |
+|--------|--------|----------------------------------------------------------------------------|
+|        | float  | Resolution score, non-negative. Returns np.nan if insufficient valid data. |
+
+### root_mean_square_error { #wass2s.WAS_Verification.root_mean_square_error }
+
+```python
+WAS_Verification.root_mean_square_error(y_true, y_pred)
+```
+
+Compute Root Mean Square Error (RMSE).
+
+Measures the square root of the average squared errors in predictions.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type         | Description       | Default    |
+|--------|--------------|-------------------|------------|
+| y_true | array - like | Observed values.  | _required_ |
+| y_pred | array - like | Predicted values. | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                          |
+|--------|--------|----------------------------------------------------------------------|
+|        | float  | RMSE value, non-negative. Returns np.nan if insufficient valid data. |
+
+### spearman_corr { #wass2s.WAS_Verification.spearman_corr }
+
+```python
+WAS_Verification.spearman_corr(y_true, y_pred)
+```
+
+Compute Spearman rank correlation coefficient.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type         | Description            | Default    |
+|--------|--------------|------------------------|------------|
+| y_true | array - like | Observed values (1D).  | _required_ |
+| y_pred | array - like | Predicted values (1D). | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                   |
+|--------|--------|---------------------------------------------------------------|
+|        | float  | Spearman's rho in [-1, 1]; np.nan if insufficient valid data. |
+
+### taylor_diagram { #wass2s.WAS_Verification.taylor_diagram }
+
+```python
+WAS_Verification.taylor_diagram(
+    obs,
+    models,
+    *,
+    normalize=True,
+    correlation='pearson',
+    labels=None,
+    title='Taylor diagram',
+    figsize=(7, 6),
+    savepath=None,
+    hide_rms_numbers=True,
+)
+```
+
+Plot a Taylor diagram comparing one or more model series against observations.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type                                        | Description                                                                   | Default                |
+|-------------|---------------------------------------------|-------------------------------------------------------------------------------|------------------------|
+| obs         | xarray.DataArray or np.ndarray              | Observations. If xarray, can be (T), (T,Y,X), etc.                            | _required_             |
+| models      | dict\[str, xarray.DataArray \| np.ndarray\] | Mapping of model name -> forecast array (same shape as obs or broadcastable). | _required_             |
+| normalize   | bool                                        | If True (default), normalize std and CRMSD by std(obs).                       | `True`                 |
+| correlation | (pearson, spearman)                         | Correlation metric used on paired, finite values.                             | `"pearson","spearman"` |
+| labels      | dict\[str, str\]                            | Custom display labels for model markers. Defaults to model keys.              | `None`                 |
+| title       | str or None                                 | Figure title.                                                                 | `'Taylor diagram'`     |
+| figsize     | tuple                                       | Matplotlib figure size.                                                       | `(7, 6)`               |
+| savepath    | str or None                                 | If provided, save figure to this path.                                        | `None`                 |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type                                   | Description   |
+|--------|----------------------------------------|---------------|
+|        | (fig, ax) : matplotlib Figure and Axes |               |
+
+### weibull_shape_solver { #wass2s.WAS_Verification.weibull_shape_solver }
+
+```python
+WAS_Verification.weibull_shape_solver(k, M, V)
+```
+
+Function to find the root of the Weibull shape parameter 'k'.
+We find 'k' such that the theoretical variance/mean^2 ratio
+matches the observed V/M^2 ratio.
+
+### weighted_gcm_forecasts { #wass2s.WAS_Verification.weighted_gcm_forecasts }
+
+```python
+WAS_Verification.weighted_gcm_forecasts(
+    Obs,
+    best_models,
+    scores,
+    lead_time,
+    model_dir,
+    clim_year_start,
+    clim_year_end,
+    variable='PRCP',
+)
+```
+
+Generate weighted ensemble forecasts from selected GCMs based on their performance scores.
+
+Combines hindcasts and forecasts from multiple models using weights derived from
+the GROC score, scales the results to match observed climatology, and computes
+tercile probabilities.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                                                                               | Default    |
+|-----------------|------------------|-------------------------------------------------------------------------------------------|------------|
+| Obs             | xarray.DataArray | Observed data with dimensions (T, Y, X), used for scaling and probability calculations.   | _required_ |
+| best_models     | dict             | Dictionary of model identifiers (keys) to be included in the ensemble.                    | _required_ |
+| scores          | dict             | Dictionary containing scores (e.g., GROC) for each model, with model identifiers as keys. | _required_ |
+| lead_time       | list of int      | Lead times in months for the forecast season (e.g., [1, 2, 3] for a 3-month season).      | _required_ |
+| model_dir       | str or Path      | Directory containing hindcast and forecast NetCDF files.                                  | _required_ |
+| clim_year_start | int or str       | Start year of the climatology period for computing tercile thresholds.                    | _required_ |
+| clim_year_end   | int or str       | End year of the climatology period for computing tercile thresholds.                      | _required_ |
+| variable        | str              | Variable name in the NetCDF files (e.g., 'PRCP' for precipitation). Default is 'PRCP'.    | `'PRCP'`   |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                                                                                                                                                                                                                                                         |
+|--------|--------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|        | tuple  | - hindcast_det : xarray.DataArray     Weighted deterministic hindcast with dimensions (T, Y, X). - hindcast_prob : xarray.DataArray     Tercile probabilities for hindcasts with dimensions (probability, T, Y, X). - forecast_prob : xarray.DataArray     Tercile probabilities for forecasts with dimensions (probability, Y, X). |
+
+#### Notes {.doc-section .doc-section-notes}
+
+- Model files are expected to follow a naming convention like
+  'hindcast_{center}_{variable}_{init_month}_{season}_{lead}.nc'.
+- The GROC score is used as the weighting metric.
+- A scaling factor is applied based on the ratio of observed to hindcast mean.

@@ -1,0 +1,389 @@
+# WAS_LassoLars_Model { #wass2s.WAS_LassoLars_Model }
+
+```python
+WAS_LassoLars_Model(
+    alpha_range=None,
+    n_clusters=5,
+    nb_cores=1,
+    dist_method='nonparam',
+    hyperparam_optimizer='bayesian',
+    n_trials=50,
+    n_iter=50,
+    mode='grid',
+)
+```
+
+LassoLars regression model for spatial rainfall (or continuous climate variable) prediction.
+
+LassoLars implements **Lasso** (L1 regularization) using the **Least-Angle Regression (LARS)** algorithm,
+which computes the full regularization path efficiently. It is particularly well-suited when:
+
+- Number of samples (time steps) is small per grid cell/cluster
+- High numerical stability is required (LARS is less prone to convergence issues than coordinate descent)
+- Predictors are highly correlated (common in climate/teleconnection data)
+- You want precise control over the regularization path
+
+Compared to standard Lasso (coordinate descent), LassoLars is:
+- **More stable** for small/noisy datasets
+- **Slightly slower** (especially for many features)
+- **Better behaved** near the sparse solution
+
+Two spatial optimization strategies are supported:
+- **'cluster'** (recommended): One optimal alpha per spatial cluster → fast, robust, excellent generalization
+- **'grid'**: Independent alpha optimization per grid cell → maximum spatial detail, very computationally expensive
+
+Hyperparameter search methods:
+- 'bayesian' → Optuna Bayesian optimization (recommended — best quality/speed trade-off)
+- 'random'   → scikit-learn RandomizedSearchCV
+- 'lassolars_cv' → scikit-learn LassoLarsCV (fastest, uses full LARS path)
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name                 | Type                             | Description                                                                                                                                                                                           | Default      |
+|----------------------|----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------|
+| alpha_range          | array - like                     | Range of regularization strength (alpha) values to search. Default: np.logspace(-6, 2, 100) — well-suited for standardized rainfall data.                                                             | `None`       |
+| n_clusters           | int                              | Number of spatial clusters (only used when mode='cluster').                                                                                                                                           | `5`          |
+| nb_cores             | int                              | Number of CPU cores for parallel computation (mainly used in grid mode).                                                                                                                              | `1`          |
+| dist_method          | str                              | Method for computing tercile probabilities (PB/PN/PA). Currently only 'nonparam' fully implemented; 'bestfit' requires additional inputs.                                                             | `'nonparam'` |
+| hyperparam_optimizer | (bayesian, random, lassolars_cv) | Strategy for finding optimal alpha: - 'bayesian' → Optuna Bayesian optimization (recommended) - 'random'   → Randomized search - 'lassolars_cv' → Built-in LassoLarsCV (fastest, uses full LARS path) | `'bayesian'` |
+| n_trials             | int                              | Number of trials for Bayesian optimization (Optuna).                                                                                                                                                  | `50`         |
+| n_iter               | int                              | Number of parameter settings sampled in randomized search.                                                                                                                                            | `50`         |
+| mode                 | (cluster, grid)                  | Optimization approach: - 'cluster' → one alpha per spatial cluster (fast & robust — recommended) - 'grid'    → independent alpha per grid cell (slow, maximally local)                                | `'cluster'`  |
+
+## Notes {.doc-section .doc-section-notes}
+
+- **Cluster mode** is the recommended default for most rainfall/climate applications:
+  - Much faster
+  - More robust to noise, short time series, and data sparsity
+  - Excellent generalization
+- **Grid mode** should only be used when maximum spatial detail is critical and
+  sufficient computing resources are available.
+- LassoLars is more stable than coordinate-descent Lasso for small datasets,
+  but may be slower for many features.
+- Requires at least 10 valid time steps per location/cluster to attempt optimization.
+- Negative predictions are automatically clipped to zero (useful for rainfall).
+- Large domains in 'grid' mode benefit greatly from higher `nb_cores`.
+
+## Functions {.doc-section .doc-section-functions}
+
+* **compute_hyperparameters**: Computes spatially varying optimal alpha values (and cluster map if mode='cluster').
+* **fit_predict**: Fits LassoLars model on one grid cell using given alpha and makes prediction.
+* **compute_model**: Parallel LassoLars regression across entire spatial domain using provided alpha map.
+* **compute_prob**: best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+Computes tercile probabilities for hindcast predictions.
+* **forecast**: Predictor_for_year, alpha, best_code_da=None, best_shape_da=None,
+     best_loc_da=None, best_scale_da=None)
+Full end-to-end forecast pipeline for one target year:
+- deterministic LassoLars prediction
+- tercile probabilities (PB, PN, PA)
+
+## Examples {.doc-section .doc-section-examples}
+
+Recommended workflow (cluster mode with Bayesian optimization):
+
+```python
+>>> lars_model = WAS_LassoLars_Model(
+...     mode='cluster',
+...     n_clusters=8,
+...     hyperparam_optimizer='bayesian',
+...     n_trials=80,
+...     nb_cores=12
+... )
+```
+
+# 1. Compute spatially varying alpha (one per cluster)
+
+```python
+>>> alpha_map, cluster_map = lars_model.compute_hyperparameters(
+...     seasonal_rainfall, predictors, 1991, 2020)
+```
+
+# 2. Train & predict on hindcast period
+
+```python
+>>> hindcast_pred = lars_model.compute_model(
+...     X_train=predictors,
+...     y_train=seasonal_rainfall,
+...     X_test=predictors_hindcast,
+...     y_test=None,
+...     alpha=alpha_map
+... )
+```
+
+# 3. Compute probabilistic hindcast (terciles)
+
+```python
+>>> hindcast_prob = lars_model.compute_prob(
+...     seasonal_rainfall, 1991, 2020, hindcast_pred,
+...     best_code_da=dist_code_da, best_shape_da=shape_da,
+...     best_loc_da=loc_da, best_scale_da=scale_da
+... )
+```
+
+# 4. Forecast next year (e.g. 2025)
+
+```python
+>>> forecast_det, forecast_prob = lars_model.forecast(
+...     seasonal_rainfall, 1991, 2020,
+...     predictors, hindcast_pred,
+...     predictor_2025,
+...     alpha=alpha_map,
+...     best_code_da=dist_code_da, best_shape_da=shape_da,
+...     best_loc_da=loc_da, best_scale_da=scale_da
+... )
+```
+
+## Warnings {.doc-section .doc-section-warnings}
+
+- Very high alpha can eliminate all predictors → monitor selected features.
+- Small training sets per cell/cluster may still lead to unstable results.
+- For heavy-tailed rainfall, consider log-transformation before modeling.
+- Use 'bayesian' optimizer for best quality; 'lassolars_cv' is fastest but least flexible.
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [calculate_tercile_probabilities_bestfit](#wass2s.WAS_LassoLars_Model.calculate_tercile_probabilities_bestfit) | Generic tercile probabilities using best-fit family per grid cell. |
+| [calculate_tercile_probabilities_nonparametric](#wass2s.WAS_LassoLars_Model.calculate_tercile_probabilities_nonparametric) | Non-parametric method using historical error samples. |
+| [compute_hyperparameters](#wass2s.WAS_LassoLars_Model.compute_hyperparameters) | Compute spatially varying optimal LassoLars regularization parameter (alpha). |
+| [compute_model](#wass2s.WAS_LassoLars_Model.compute_model) | Fits and predicts the LassoLars model using Dask for parallel execution. |
+| [compute_prob](#wass2s.WAS_LassoLars_Model.compute_prob) | Compute tercile probabilities for deterministic hindcasts. |
+| [forecast](#wass2s.WAS_LassoLars_Model.forecast) | Generates a forecast for a single time step using LassoLars with alpha, |
+| [weibull_shape_solver](#wass2s.WAS_LassoLars_Model.weibull_shape_solver) | Function to find the root of the Weibull shape parameter 'k'. |
+
+### calculate_tercile_probabilities_bestfit { #wass2s.WAS_LassoLars_Model.calculate_tercile_probabilities_bestfit }
+
+```python
+WAS_LassoLars_Model.calculate_tercile_probabilities_bestfit(
+    best_guess,
+    error_variance,
+    T1,
+    T2,
+    dist_code,
+    dof,
+)
+```
+
+Generic tercile probabilities using best-fit family per grid cell.
+
+Inputs (per grid cell):
+- ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+- ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+- ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+- ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+
+Strategy:
+- For each time step, build a predictive distribution of the same family:
+    * Use ``best_guess[t]`` to adjust mean / location;
+    * Keep shape parameters from climatology.
+- Then compute probabilities:
+    * P(B) = F(T1)
+    * P(N) = F(T2) - F(T1)
+    * P(A) = 1 - F(T2)
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name           | Type         | Description                       | Default    |
+|----------------|--------------|-----------------------------------|------------|
+| best_guess     | array - like | Forecast/hindcast best estimates. | _required_ |
+| error_variance | float        | Variance of prediction errors.    | _required_ |
+| T1             | float        | Lower tercile threshold.          | _required_ |
+| T2             | float        | Upper tercile threshold.          | _required_ |
+| dist_code      | int          | Distribution code (1-8).          | _required_ |
+| shape          | float        | Shape parameter.                  | _required_ |
+| loc            | float        | Location parameter.               | _required_ |
+| scale          | float        | Scale parameter.                  | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description                       |
+|--------|--------------|-----------------------------------|
+|        | array - like | Probabilities [P(B), P(N), P(A)]. |
+
+#### Notes {.doc-section .doc-section-notes}
+
+- Uses :math:`F` as the CDF of the predictive distribution.
+
+### calculate_tercile_probabilities_nonparametric { #wass2s.WAS_LassoLars_Model.calculate_tercile_probabilities_nonparametric }
+
+```python
+WAS_LassoLars_Model.calculate_tercile_probabilities_nonparametric(
+    best_guess,
+    error_samples,
+    first_tercile,
+    second_tercile,
+)
+```
+
+Non-parametric method using historical error samples.
+
+### compute_hyperparameters { #wass2s.WAS_LassoLars_Model.compute_hyperparameters }
+
+```python
+WAS_LassoLars_Model.compute_hyperparameters(
+    predictand,
+    predictor,
+    clim_year_start,
+    clim_year_end,
+)
+```
+
+Compute spatially varying optimal LassoLars regularization parameter (alpha).
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                                                                            | Default    |
+|-----------------|------------------|----------------------------------------------------------------------------------------|------------|
+| predictand      | xarray.DataArray | Target variable (typically rainfall) Expected dimensions: ('T', 'Y', 'X')              | _required_ |
+| predictor       | xarray.DataArray | Predictor fields Expected dimensions: ('T', 'Y', 'X', 'features') or ('T', 'features') | _required_ |
+| clim_year_start | int              | Start year of the climatological standardization period                                | _required_ |
+| clim_year_end   | int              | End year of the climatological standardization period                                  | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name       | Type             | Description                                                                                                                                   |
+|------------|------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| alpha_map  | xarray.DataArray | Spatial field (Y, X) containing optimal alpha value(s) - Different value per cell when mode='grid' - Constant per cluster when mode='cluster' |
+| cluster_da | xarray.DataArray | Cluster labels (integers) when mode='cluster' Dummy array filled with 1s when mode='grid' (for API consistency)                               |
+
+#### Raises {.doc-section .doc-section-raises}
+
+| Name   | Type         | Description                                    |
+|--------|--------------|------------------------------------------------|
+|        | ValueError   | If mode is neither 'cluster' nor 'grid'        |
+|        | RuntimeError | If dask parallel computation fails (grid mode) |
+
+#### Notes {.doc-section .doc-section-notes}
+
+- Time series with fewer than 10 valid points are automatically skipped (return NaN)
+- All NaN values in input are properly masked
+- Progress messages are printed during long computations
+- LassoLarsCV does **not** require pre-defined alpha grid (uses full LARS path)
+
+### compute_model { #wass2s.WAS_LassoLars_Model.compute_model }
+
+```python
+WAS_LassoLars_Model.compute_model(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    alpha=None,
+    clim_year_start=None,
+    clim_year_end=None,
+)
+```
+
+Fits and predicts the LassoLars model using Dask for parallel execution.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name    | Type             | Description                                                       | Default    |
+|---------|------------------|-------------------------------------------------------------------|------------|
+| X_train | xarray.DataArray | Training predictor data (dims: T, features).                      | _required_ |
+| y_train | xarray.DataArray | Training response variable (dims: T, Y, X).                       | _required_ |
+| X_test  | xarray.DataArray | Test predictor data (dims: features,) or broadcastable to (Y, X). | _required_ |
+| y_test  | xarray.DataArray | Test response variable (dims: Y, X).                              | _required_ |
+| alpha   | xarray.DataArray | Cluster-wise optimal alpha values (dims: Y, X).                   | `None`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                                   |
+|--------|------------------|-----------------------------------------------|
+|        | xarray.DataArray | dims (output=2, Y, X) => [error, prediction]. |
+
+### compute_prob { #wass2s.WAS_LassoLars_Model.compute_prob }
+
+```python
+WAS_LassoLars_Model.compute_prob(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Compute tercile probabilities for deterministic hindcasts.
+
+If dist_method == 'bestfit':
+    - Use cluster-based best-fit distributions to:
+        * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
+        * compute predictive probabilities using the same family.
+
+Otherwise:
+    - Use empirical terciles from Predictant climatology and the selected
+      parametric / nonparametric method.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                                                                       | Default    |
+|-----------------|------------------|-----------------------------------------------------------------------------------|------------|
+| Predictant      | xarray.DataArray | Observed data (T, Y, X) or (T, Y, X, M).                                          | _required_ |
+| clim_year_start | int or str       | Climatology period (inclusive) for thresholds.                                    | _required_ |
+| clim_year_end   | int or str       | Climatology period (inclusive) for thresholds.                                    | _required_ |
+| hindcast_det    | xarray.DataArray | Deterministic hindcast (T, Y, X).                                                 | _required_ |
+| best_code_da    | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_shape_da   | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_loc_da     | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_scale_da   | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name          | Type             | Description                                                      |
+|---------------|------------------|------------------------------------------------------------------|
+| hindcast_prob | xarray.DataArray | Probabilities with dims (probability=['PB','PN','PA'], T, Y, X). |
+
+### forecast { #wass2s.WAS_LassoLars_Model.forecast }
+
+```python
+WAS_LassoLars_Model.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictor,
+    hindcast_det,
+    Predictor_for_year,
+    alpha,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Generates a forecast for a single time step using LassoLars with alpha,
+then computes tercile probabilities based on the chosen distribution method.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name               | Type             | Description                                                      | Default    |
+|--------------------|------------------|------------------------------------------------------------------|------------|
+| Predictant         | xarray.DataArray | Observed data (T, Y, X).                                         | _required_ |
+| clim_year_start    | int              | Start year for the climatological reference period.              | _required_ |
+| clim_year_end      | int              | End year for the climatological reference period.                | _required_ |
+| Predictor          | xarray.DataArray | Historical predictor data (T, features).                         | _required_ |
+| hindcast_det       | xarray.DataArray | Historical deterministic forecast with dims (output=2, T, Y, X). | _required_ |
+| Predictor_for_year | xarray.DataArray | Single-year predictor data (features,) or shape (1, features).   | _required_ |
+| alpha              | xarray.DataArray | Spatial map of alpha values (Y, X) for LassoLars.                | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name          | Type             | Description                                                                                             |
+|---------------|------------------|---------------------------------------------------------------------------------------------------------|
+| result_       | xarray.DataArray | dims (output=2, Y, X) => [error, prediction]. For a true forecast scenario, the error is typically NaN. |
+| hindcast_prob | xarray.DataArray | dims (probability=3, Y, X) => [PB, PN, PA] for tercile categories.                                      |
+
+### weibull_shape_solver { #wass2s.WAS_LassoLars_Model.weibull_shape_solver }
+
+```python
+WAS_LassoLars_Model.weibull_shape_solver(k, M, V)
+```
+
+Function to find the root of the Weibull shape parameter 'k'.
+We find 'k' such that the theoretical variance/mean^2 ratio
+matches the observed V/M^2 ratio.

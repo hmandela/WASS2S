@@ -1,0 +1,16 @@
+# WAS_mme_xcELR { #wass2s.WAS_mme_xcELR }
+
+```python
+WAS_mme_xcELR(
+    elm_kwargs=None,
+    apply_drymask=True,
+    dry_threshold=10.0,
+    quantile_threshold=0.2,
+)
+```
+
+xcast MELR wrapper producing direct tercile probabilities.
+
+``apply_drymask`` should be True for precipitation and False for temperature.
+Extra positional/keyword arguments are accepted so the class remains
+compatible with the cross-validator's broader model contract.

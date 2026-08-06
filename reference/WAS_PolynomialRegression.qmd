@@ -1,0 +1,141 @@
+# WAS_PolynomialRegression { #wass2s.WAS_PolynomialRegression }
+
+```python
+WAS_PolynomialRegression(nb_cores=1, degree=2, dist_method='nonparam')
+```
+
+Polynomial Regression model for spatiotemporal climate prediction.
+
+Implements polynomial feature expansion (PolynomialFeatures + LinearRegression)
+to capture non-linear relationships between predictors and a continuous predictand.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type                | Description                                                    | Default     |
+|-------------|---------------------|----------------------------------------------------------------|-------------|
+| nb_cores    | int                 | Number of CPU cores for parallel Dask computation.             | `1`         |
+| degree      | int                 | Degree of the polynomial expansion (2 = quadratic, 3 = cubic). | `2`         |
+| dist_method | (bestfit, nonparam) | Tercile probability method.                                    | `'bestfit'` |
+
+## Warnings {.doc-section .doc-section-warnings}
+
+- degree ≥ 4 with many features causes numerical instability; prefer degree 2–3.
+- Predictors should be normalised externally before calling this class.
+- Negative predictions are clipped to zero (suitable for rainfall / non-negative
+  variables; remove the clip for temperature or anomalies).
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [calculate_tercile_probabilities_bestfit](#wass2s.WAS_PolynomialRegression.calculate_tercile_probabilities_bestfit) | Tercile probabilities using best-fit climatological distribution family. |
+| [calculate_tercile_probabilities_nonparametric](#wass2s.WAS_PolynomialRegression.calculate_tercile_probabilities_nonparametric) | Non-parametric tercile probabilities from historical error samples. |
+| [compute_model](#wass2s.WAS_PolynomialRegression.compute_model) | Parallel polynomial regression across the full (Y, X) domain. |
+| [compute_prob](#wass2s.WAS_PolynomialRegression.compute_prob) | Tercile probabilities for a deterministic hindcast. |
+| [fit_predict](#wass2s.WAS_PolynomialRegression.fit_predict) | Fit polynomial regression on one grid cell, return [error, prediction]. |
+| [forecast](#wass2s.WAS_PolynomialRegression.forecast) | End-to-end single-year forecast: deterministic prediction + tercile probabilities. |
+| [weibull_shape_solver](#wass2s.WAS_PolynomialRegression.weibull_shape_solver) | Root function for the Weibull shape parameter k given mean M and variance V. |
+
+### calculate_tercile_probabilities_bestfit { #wass2s.WAS_PolynomialRegression.calculate_tercile_probabilities_bestfit }
+
+```python
+WAS_PolynomialRegression.calculate_tercile_probabilities_bestfit(
+    best_guess,
+    error_variance,
+    T1,
+    T2,
+    dist_code,
+    dof,
+)
+```
+
+Tercile probabilities using best-fit climatological distribution family.
+
+### calculate_tercile_probabilities_nonparametric { #wass2s.WAS_PolynomialRegression.calculate_tercile_probabilities_nonparametric }
+
+```python
+WAS_PolynomialRegression.calculate_tercile_probabilities_nonparametric(
+    best_guess,
+    error_samples,
+    first_tercile,
+    second_tercile,
+)
+```
+
+Non-parametric tercile probabilities from historical error samples.
+
+### compute_model { #wass2s.WAS_PolynomialRegression.compute_model }
+
+```python
+WAS_PolynomialRegression.compute_model(X_train, y_train, X_test, y_test)
+```
+
+Parallel polynomial regression across the full (Y, X) domain.
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type                                                               | Description   |
+|--------|--------------------------------------------------------------------|---------------|
+|        | xr.DataArray (Y, X) or (T, Y, X) — deterministic prediction field. |               |
+
+### compute_prob { #wass2s.WAS_PolynomialRegression.compute_prob }
+
+```python
+WAS_PolynomialRegression.compute_prob(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Tercile probabilities for a deterministic hindcast.
+
+### fit_predict { #wass2s.WAS_PolynomialRegression.fit_predict }
+
+```python
+WAS_PolynomialRegression.fit_predict(x, y, x_test, y_test)
+```
+
+Fit polynomial regression on one grid cell, return [error, prediction].
+
+FIX 1 – scalar clip: use np.maximum instead of item-assignment on a
+         potentially 0-d array (IndexError after squeeze() for T=1 folds).
+
+### forecast { #wass2s.WAS_PolynomialRegression.forecast }
+
+```python
+WAS_PolynomialRegression.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictor,
+    hindcast_det,
+    Predictor_for_year,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+End-to-end single-year forecast: deterministic prediction + tercile probabilities.
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name              | Type                                              | Description   |
+|-------------------|---------------------------------------------------|---------------|
+| forecast_expanded | xr.DataArray (T=1, Y, X) — deterministic forecast |               |
+| forecast_prob     | xr.DataArray (probability=3, T=1, Y, X)           |               |
+
+### weibull_shape_solver { #wass2s.WAS_PolynomialRegression.weibull_shape_solver }
+
+```python
+WAS_PolynomialRegression.weibull_shape_solver(k, M, V)
+```
+
+Root function for the Weibull shape parameter k given mean M and variance V.

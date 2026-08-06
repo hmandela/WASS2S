@@ -1,0 +1,15 @@
+# WAS_ZINB_Model { #wass2s.WAS_ZINB_Model }
+
+```python
+WAS_ZINB_Model(
+    nb_cores=1,
+    dist_method='nonparam',
+    alpha_init=0.2,
+    add_intercept=True,
+)
+```
+
+Zero-Inflated Negative Binomial (two-part, Dask-safe).
+
+P(Y=0|X) = pi(X) + (1-pi(X)) * NB(y=0 | mu(X), alpha)
+E[Y|X]   = (1 - pi(X)) * mu(X)

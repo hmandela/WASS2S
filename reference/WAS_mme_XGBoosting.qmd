@@ -1,0 +1,184 @@
+# WAS_mme_XGBoosting { #wass2s.WAS_mme_XGBoosting }
+
+```python
+WAS_mme_XGBoosting(
+    search_method='random',
+    n_estimators_range=[50, 100, 150, 200],
+    learning_rate_range=[0.005, 0.01, 0.03, 0.05, 0.1],
+    max_depth_range=[3, 5, 7],
+    min_child_weight_range=[1, 3, 5],
+    subsample_range=[0.6, 0.8, 1.0],
+    colsample_bytree_range=[0.6, 0.8, 1.0],
+    gamma_range=[0, 0.1, 0.2, 0.5, 1],
+    reg_alpha_range=[0, 0.01, 0.1],
+    reg_lambda_range=[1, 1.5, 2],
+    early_stopping_rounds_range=[None, 10, 20],
+    es_validation_fraction=0.15,
+    random_state=42,
+    dist_method='nonparam',
+    n_iter_search=10,
+    cv_folds=3,
+    n_clusters=4,
+    leave_one_year_out=False,
+    optuna_n_jobs=None,
+    optuna_timeout=None,
+    verbose=0,
+    n_jobs=-1,
+    cv_n_jobs=-1,
+    tuning_model_n_jobs=1,
+)
+```
+
+XGBoost-based Multi-Model Ensemble (MME) forecasting for seasonal rainfall.
+Enhanced with additional regularization hyperparameters and time-series CV.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name                   | Type                                      | Description                                                                                                                                                                                                                         | Default                          |
+|------------------------|-------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------|
+| search_method          | str                                       | Hyperparameter optimization method: 'grid', 'random', or 'bayesian' (default: 'random').                                                                                                                                            | `'random'`                       |
+| n_estimators_range     | list of int or scipy.stats distribution   | List of n_estimators values to tune (optimized for climate data).                                                                                                                                                                   | `[50, 100, 150, 200]`            |
+| learning_rate_range    | list of float or scipy.stats distribution | List of learning rates to tune (optimized for climate data).                                                                                                                                                                        | `[0.005, 0.01, 0.03, 0.05, 0.1]` |
+| max_depth_range        | list of int or scipy.stats distribution   | List of max depths to tune (optimized for climate data).                                                                                                                                                                            | `[3, 5, 7]`                      |
+| min_child_weight_range | list of float or scipy.stats distribution | List of minimum child weights to tune (optimized for climate data).                                                                                                                                                                 | `[1, 3, 5]`                      |
+| subsample_range        | list of float or scipy.stats distribution | List of subsample ratios to tune.                                                                                                                                                                                                   | `[0.6, 0.8, 1.0]`                |
+| colsample_bytree_range | list of float or scipy.stats distribution | List of column sampling ratios to tune.                                                                                                                                                                                             | `[0.6, 0.8, 1.0]`                |
+| gamma_range            | list of float or scipy.stats distribution | List of gamma (min_split_loss) values for regularization.                                                                                                                                                                           | `[0, 0.1, 0.2, 0.5, 1]`          |
+| reg_alpha_range        | list of float or scipy.stats distribution | List of L1 regularization (alpha) values.                                                                                                                                                                                           | `[0, 0.01, 0.1]`                 |
+| reg_lambda_range       | list of float or scipy.stats distribution | List of L2 regularization (lambda) values.                                                                                                                                                                                          | `[1, 1.5, 2]`                    |
+| random_state           | int                                       | Seed for reproducibility (default is 42).                                                                                                                                                                                           | `42`                             |
+| dist_method            | str                                       | Distribution method for tercile probabilities ('bestfit', 'nonparam', etc.) (default is 'nonparam').                                                                                                                                | `'nonparam'`                     |
+| n_iter_search          | int                                       | Number of iterations for randomized/bayesian search or points to sample for grid search (default is 10).                                                                                                                            | `10`                             |
+| cv_folds               | int                                       | Number of cross-validation folds (default is 3).                                                                                                                                                                                    | `3`                              |
+| cv_method              | str                                       | Cross-validation method: 'timeseries' or 'kfold' (default: 'timeseries'). Use 'timeseries' for temporal data to prevent data leakage.                                                                                               | _required_                       |
+| n_clusters             | int                                       | Number of clusters for homogenized zones (default is 4).                                                                                                                                                                            | `4`                              |
+| optuna_n_jobs          | int                                       | Optional Optuna-specific worker count. When ``None``, it inherits ``n_jobs`` (default is None).                                                                                                                                     | `None`                           |
+| optuna_timeout         | int                                       | Timeout in seconds for Optuna optimization (default is None).                                                                                                                                                                       | `None`                           |
+| n_jobs                 | int                                       | Maximum number of parallel workers. ``-1`` uses all available CPUs. Search CV/trials run in parallel at the outer level; inner XGBoost fits use one thread during tuning. Final zone models use ``n_jobs`` directly (default is 4). | `-1`                             |
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [calculate_tercile_probabilities_bestfit](#wass2s.WAS_mme_XGBoosting.calculate_tercile_probabilities_bestfit) | Generic tercile probabilities using best-fit family per grid cell. |
+| [calculate_tercile_probabilities_nonparametric](#wass2s.WAS_mme_XGBoosting.calculate_tercile_probabilities_nonparametric) | Non-parametric method using historical error samples. |
+| [compute_hyperparameters](#wass2s.WAS_mme_XGBoosting.compute_hyperparameters) | Best hyperparameters per zone. |
+| [compute_model](#wass2s.WAS_mme_XGBoosting.compute_model) | Deterministic hindcast with one XGBRegressor per zone. |
+| [compute_prob](#wass2s.WAS_mme_XGBoosting.compute_prob) | Tercile probabilities for deterministic hindcasts. |
+| [forecast](#wass2s.WAS_mme_XGBoosting.forecast) | Operational forecast for a target year (deterministic + tercile probabilities). |
+| [weibull_shape_solver](#wass2s.WAS_mme_XGBoosting.weibull_shape_solver) | Root function for the Weibull shape parameter k (match V/M^2). |
+
+### calculate_tercile_probabilities_bestfit { #wass2s.WAS_mme_XGBoosting.calculate_tercile_probabilities_bestfit }
+
+```python
+WAS_mme_XGBoosting.calculate_tercile_probabilities_bestfit(
+    best_guess,
+    error_variance,
+    T1,
+    T2,
+    dist_code,
+    dof,
+)
+```
+
+Generic tercile probabilities using best-fit family per grid cell.
+
+### calculate_tercile_probabilities_nonparametric { #wass2s.WAS_mme_XGBoosting.calculate_tercile_probabilities_nonparametric }
+
+```python
+WAS_mme_XGBoosting.calculate_tercile_probabilities_nonparametric(
+    best_guess,
+    error_samples,
+    first_tercile,
+    second_tercile,
+)
+```
+
+Non-parametric method using historical error samples.
+
+### compute_hyperparameters { #wass2s.WAS_mme_XGBoosting.compute_hyperparameters }
+
+```python
+WAS_mme_XGBoosting.compute_hyperparameters(
+    Predictors,
+    Predictand,
+    clim_year_start=None,
+    clim_year_end=None,
+)
+```
+
+Best hyperparameters per zone.
+
+Regionalization: KMeans on the predictand VALUES (kept by preference).
+Standardization is applied here only if clim years are given; when None,
+the inputs are assumed already standardized (framework path).
+
+### compute_model { #wass2s.WAS_mme_XGBoosting.compute_model }
+
+```python
+WAS_mme_XGBoosting.compute_model(
+    X_train,
+    y_train,
+    X_test,
+    y_test=None,
+    clim_year_start=None,
+    clim_year_end=None,
+    best_params=None,
+    cluster_da=None,
+)
+```
+
+Deterministic hindcast with one XGBRegressor per zone.
+
+>>> A: clim years are now in the signature and tuning runs in dual
+mode when best_params/cluster_da are not supplied.
+
+### compute_prob { #wass2s.WAS_mme_XGBoosting.compute_prob }
+
+```python
+WAS_mme_XGBoosting.compute_prob(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Tercile probabilities for deterministic hindcasts.
+
+For honest calibration pass the CROSS-VALIDATED hindcast as hindcast_det
+(out-of-sample residuals); the in-sample hindcast yields over-confident
+probabilities.
+
+### forecast { #wass2s.WAS_mme_XGBoosting.forecast }
+
+```python
+WAS_mme_XGBoosting.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    hindcast_det_cross,
+    Predictor_for_year,
+    best_params=None,
+    cluster_da=None,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Operational forecast for a target year (deterministic + tercile probabilities).
+
+### weibull_shape_solver { #wass2s.WAS_mme_XGBoosting.weibull_shape_solver }
+
+```python
+WAS_mme_XGBoosting.weibull_shape_solver(k, M, V)
+```
+
+Root function for the Weibull shape parameter k (match V/M^2).

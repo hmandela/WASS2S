@@ -1,0 +1,96 @@
+# WAS_CCA { #wass2s.WAS_CCA }
+
+```python
+WAS_CCA(
+    n_modes=4,
+    n_pca_modes=8,
+    standardize=False,
+    use_coslat=True,
+    use_pca=True,
+    dist_method='nonparam',
+)
+```
+
+
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [calculate_tercile_probabilities_bestfit](#wass2s.WAS_CCA.calculate_tercile_probabilities_bestfit) | Compute PB/PN/PA for the requested predictive distribution. |
+| [calculate_tercile_probabilities_nonparametric](#wass2s.WAS_CCA.calculate_tercile_probabilities_nonparametric) | Non-parametric probabilities from the historical residual sample. |
+| [compute_prob](#wass2s.WAS_CCA.compute_prob) | Compute hindcast tercile probabilities with guaranteed output order. |
+| [plot_cca_results](#wass2s.WAS_CCA.plot_cca_results) | Plots the CCA modes and scores. |
+| [weibull_shape_solver](#wass2s.WAS_CCA.weibull_shape_solver) | Compatibility wrapper for the historical public helper. |
+
+### calculate_tercile_probabilities_bestfit { #wass2s.WAS_CCA.calculate_tercile_probabilities_bestfit }
+
+```python
+WAS_CCA.calculate_tercile_probabilities_bestfit(
+    best_guess,
+    error_variance,
+    T1,
+    T2,
+    dist_code,
+    dof,
+)
+```
+
+Compute PB/PN/PA for the requested predictive distribution.
+
+### calculate_tercile_probabilities_nonparametric { #wass2s.WAS_CCA.calculate_tercile_probabilities_nonparametric }
+
+```python
+WAS_CCA.calculate_tercile_probabilities_nonparametric(
+    best_guess,
+    error_samples,
+    first_tercile,
+    second_tercile,
+)
+```
+
+Non-parametric probabilities from the historical residual sample.
+
+### compute_prob { #wass2s.WAS_CCA.compute_prob }
+
+```python
+WAS_CCA.compute_prob(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Compute hindcast tercile probabilities with guaranteed output order.
+
+### plot_cca_results { #wass2s.WAS_CCA.plot_cca_results }
+
+```python
+WAS_CCA.plot_cca_results(
+    X=None,
+    Y=None,
+    n_modes=None,
+    clim_year_start=None,
+    clim_year_end=None,
+)
+```
+
+Plots the CCA modes and scores.
+
+Parameters:
+- X: Optional xarray DataArray for predictors. If provided, the model will be fitted using X and Y.
+- Y: Optional xarray DataArray for predictands.
+- n_modes: Number of modes to plot. If None, plots all modes.
+
+### weibull_shape_solver { #wass2s.WAS_CCA.weibull_shape_solver }
+
+```python
+WAS_CCA.weibull_shape_solver(k, M, V)
+```
+
+Compatibility wrapper for the historical public helper.

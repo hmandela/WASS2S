@@ -1,0 +1,16 @@
+# prepare_predictand { #wass2s.prepare_predictand }
+
+```python
+prepare_predictand(
+    dir_to_save_Obs,
+    variables_obs,
+    year_start,
+    year_end,
+    season=None,
+    ds=True,
+    daily=False,
+    param='prcp',
+)
+```
+
+Prepare the predictand dataset from observational data.

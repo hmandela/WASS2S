@@ -1,0 +1,198 @@
+# Reference {.doc .doc-index}
+
+## wass2s
+
+wass2s — West Africa Seasonal Forecasting System.
+
+This package exposes the full WASS2S modelling pipeline under a single
+namespace.  Every public symbol from the sub-modules listed below is
+re-exported here so that users only need::
+
+    from wass2s import *
+
+or::
+
+    import wass2s as w2s
+
+| | |
+| --- | --- |
+| [WAS_Verification](WAS_Verification.qmd#wass2s.WAS_Verification) | Verification class for evaluating weather and climate forecasts. |
+| [decode_cf](decode_cf.qmd#wass2s.decode_cf) | Decode time dimension to CFTime standards. |
+| [to_iridl_lat](to_iridl_lat.qmd#wass2s.to_iridl_lat) | Convert numeric latitude to IRIDL latitude string format. |
+| [to_iridl_lon](to_iridl_lon.qmd#wass2s.to_iridl_lon) | Convert numeric longitude to IRIDL longitude string format. |
+| [build_iridl_url_ersst](build_iridl_url_ersst.qmd#wass2s.build_iridl_url_ersst) | Build a parameterized IRIDL URL for NOAA ERSST dataset. |
+| [fix_time_coord](fix_time_coord.qmd#wass2s.fix_time_coord) | Fix time coordinates by extracting year and assigning a fixed month/day. |
+| [download_file](download_file.qmd#wass2s.download_file) | Download a file from a URL to a local path with progress tracking. |
+| [parse_variable](parse_variable.qmd#wass2s.parse_variable) | Extract center and variable names from a variable string. |
+| [standardize_timeseries](standardize_timeseries.qmd#wass2s.standardize_timeseries) | Standardize a dataset over a specified climatology period. |
+| [reverse_standardize](reverse_standardize.qmd#wass2s.reverse_standardize) | Reverse standardization of a dataset to original units. |
+| [anomalize_timeseries](anomalize_timeseries.qmd#wass2s.anomalize_timeseries) | Compute anomalies by subtracting the climatological mean. |
+| [predictant_mask](predictant_mask.qmd#wass2s.predictant_mask) | Create a mask for predictand data based on rainfall thresholds and latitude. |
+| [extract_leading_eeof_component](extract_leading_eeof_component.qmd#wass2s.extract_leading_eeof_component) | extract leading eeof component using ExtendedEOF. |
+| [detrended_data](detrended_data.qmd#wass2s.detrended_data) |  |
+| [apply_detrend_data](apply_detrend_data.qmd#wass2s.apply_detrend_data) |  |
+| [prepare_predictand](prepare_predictand.qmd#wass2s.prepare_predictand) | Prepare the predictand dataset from observational data. |
+| [load_gridded_predictor](load_gridded_predictor.qmd#wass2s.load_gridded_predictor) | Load gridded predictor data for reanalysis or model. |
+| [compute_sst_indices](compute_sst_indices.qmd#wass2s.compute_sst_indices) | Compute Sea Surface Temperature (SST) indices for reanalysis or model data. |
+| [compute_other_indices](compute_other_indices.qmd#wass2s.compute_other_indices) | Compute indices for non-SST variables. |
+| [retrieve_several_zones_for_PCR](retrieve_several_zones_for_PCR.qmd#wass2s.retrieve_several_zones_for_PCR) | Retrieve data for multiple zones for Principal Component Regression (PCR). |
+| [retrieve_single_zone_for_PCR](retrieve_single_zone_for_PCR.qmd#wass2s.retrieve_single_zone_for_PCR) |     Retrieve data for a single zone for Principal Component Regression (PCR) with interpolation. |
+| [plot_map](plot_map.qmd#wass2s.plot_map) | Plot a map with specified geographic extent and optional SST index boxes. |
+| [get_best_models](get_best_models.qmd#wass2s.get_best_models) |  |
+| [get_shapefile_](get_shapefile_.qmd#wass2s.get_shapefile_) | Downloads or loads shapefiles based on country ISO3 code. |
+| [get_shapefile](get_shapefile.qmd#wass2s.get_shapefile) | Downloads or loads shapefiles based on country ISO3 code. |
+| [plot_prob_forecastsAlpha](plot_prob_forecastsAlpha.qmd#wass2s.plot_prob_forecastsAlpha) |  |
+| [plot_prob_forecasts](plot_prob_forecasts.qmd#wass2s.plot_prob_forecasts) |  |
+| [plot_prob_forecasts_](plot_prob_forecasts_.qmd#wass2s.plot_prob_forecasts_) | Plot probabilistic forecasts with tercile categories using discrete block colorbars. |
+| [plot_det_forecasts](plot_det_forecasts.qmd#wass2s.plot_det_forecasts) | Plot a 2D field (Y, X) on a PlateCarree map. |
+| [plot_tercile](plot_tercile.qmd#wass2s.plot_tercile) | Plot a tercile map with categories: Below, Normal, Above. |
+| [polygons_to_prob_ds](polygons_to_prob_ds.qmd#wass2s.polygons_to_prob_ds) | Rasterize polygon forecasts onto the (Y,X) grid of `da_like` and return: |
+| [plot_georeferenced_forecast_map](plot_georeferenced_forecast_map.qmd#wass2s.plot_georeferenced_forecast_map) |  |
+| [process_model_for_other_params](process_model_for_other_params.qmd#wass2s.process_model_for_other_params) | Process model hindcast and forecast data for agrometeorological parameters. |
+| [plot_date](plot_date.qmd#wass2s.plot_date) | Plot a map of dates, interpreting values as offsets from 2024-01-01. |
+| [verify_station_network](verify_station_network.qmd#wass2s.verify_station_network) | Plot station locations on a map to verify the station network. |
+| [sst_indices_name](sst_indices_name.qmd#wass2s.sst_indices_name) |  |
+| [onset_criteria](onset_criteria.qmd#wass2s.onset_criteria) |  |
+| [onset_dryspell_criteria](onset_dryspell_criteria.qmd#wass2s.onset_dryspell_criteria) |  |
+| [cessation_criteria](cessation_criteria.qmd#wass2s.cessation_criteria) |  |
+| [cessation_dryspell_criteria](cessation_dryspell_criteria.qmd#wass2s.cessation_dryspell_criteria) |  |
+| [qmap](qmap.qmd#wass2s.qmap) |  |
+| [qmap_](qmap_.qmd#wass2s.qmap_) |  |
+| [proceed_seasonal_daily_bias_correction](proceed_seasonal_daily_bias_correction.qmd#wass2s.proceed_seasonal_daily_bias_correction) |  |
+| [pre_process_biophysical_model](pre_process_biophysical_model.qmd#wass2s.pre_process_biophysical_model) | Process model hindcasts and forecasts data for extended seasonal forecasts with biophysical models (Hype, SARRAO). |
+| [extraterrestrial_radiation](extraterrestrial_radiation.qmd#wass2s.extraterrestrial_radiation) | Calculate daily extraterrestrial radiation (Ra) following FAO-56 equations (21–23). |
+| [svp](svp.qmd#wass2s.svp) | Calculate saturated vapor pressure (es) using FAO-56 Equation 3. |
+| [et0_fao56_daily](et0_fao56_daily.qmd#wass2s.et0_fao56_daily) | Compute daily reference evapotranspiration (ET₀) using the FAO-56 Penman-Monteith equation. |
+| [WAS_compute_onset](WAS_compute_onset.qmd#wass2s.WAS_compute_onset) | Class for computing agricultural seasonal onset dates based on cumulative rainfall criteria. |
+| [WAS_compute_onset_dry_spell](WAS_compute_onset_dry_spell.qmd#wass2s.WAS_compute_onset_dry_spell) | Class for computing the **longest dry spell length after the onset** of the rainy season. |
+| [WAS_compute_cessation](WAS_compute_cessation.qmd#wass2s.WAS_compute_cessation) | Class for computing the **cessation date** (end of rainy season) based on **soil moisture balance**. |
+| [WAS_compute_cessation_dry_spell](WAS_compute_cessation_dry_spell.qmd#wass2s.WAS_compute_cessation_dry_spell) | Class for computing the **longest dry spell length** between the onset and cessation |
+| [WAS_count_dry_spells](WAS_count_dry_spells.qmd#wass2s.WAS_count_dry_spells) | Class for computing the **number of dry spells** of a specified length |
+| [WAS_count_wet_spells](WAS_count_wet_spells.qmd#wass2s.WAS_count_wet_spells) | Class for computing the **number of wet spells** of a specified length |
+| [WAS_count_rainy_days](WAS_count_rainy_days.qmd#wass2s.WAS_count_rainy_days) | Class for computing the **number of rainy days** (days with precipitation ≥ a threshold) |
+| [ExtremeType](ExtremeType.qmd#wass2s.ExtremeType) | Type of temperature extreme. |
+| [WAS_TempPercentileIndices](WAS_TempPercentileIndices.qmd#wass2s.WAS_TempPercentileIndices) | Implementation of ETCCDI temperature percentile-based extreme indices. |
+| [ETCCDITempIndices](ETCCDITempIndices.qmd#wass2s.ETCCDITempIndices) | Factory for creating standard ETCCDI temperature indices. |
+| [WAS_PrecipIndices](WAS_PrecipIndices.qmd#wass2s.WAS_PrecipIndices) | Implementation of ETCCDI extreme precipitation indices, specifically R95p and R99p. |
+| [HeatWaveMetric](HeatWaveMetric.qmd#wass2s.HeatWaveMetric) | Heat wave / warm spell metrics (ETCCDI-style). |
+| [HeatWaveDefinition](HeatWaveDefinition.qmd#wass2s.HeatWaveDefinition) |  |
+| [WAS_HeatWaveIndices](WAS_HeatWaveIndices.qmd#wass2s.WAS_HeatWaveIndices) | ETCCDI-like warm spell / heat wave indices for daily temperature. |
+| [ETCCDIHeatWaveIndices](ETCCDIHeatWaveIndices.qmd#wass2s.ETCCDIHeatWaveIndices) | Factory helpers for standard configurations. |
+| [WAS_Qmap](WAS_Qmap.qmd#wass2s.WAS_Qmap) | Bias correction methods using quantile mapping techniques, adapted from |
+| [WAS_bias_correction](WAS_bias_correction.qmd#wass2s.WAS_bias_correction) | Bias correction methods for continuous climate variables (e.g. temperature, |
+| [WAS_Analog](WAS_Analog.qmd#wass2s.WAS_Analog) | Analog-based forecasting toolkit for seasonal climate applications. |
+| [WAS_Analog__](WAS_Analog__.qmd#wass2s.WAS_Analog__) | Analog-based forecasting toolkit for seasonal climate applications. |
+| [WAS_CCA](WAS_CCA.qmd#wass2s.WAS_CCA) |  |
+| [WAS_CCA_base](WAS_CCA_base.qmd#wass2s.WAS_CCA_base) | Canonical Correlation Analysis model based on xeofs.cross.CCA. |
+| [WAS_CCA_op](WAS_CCA_op.qmd#wass2s.WAS_CCA_op) |  |
+| [WAS_CCA_strict](WAS_CCA_strict.qmd#wass2s.WAS_CCA_strict) |  |
+| [WAS_Download](WAS_Download.qmd#wass2s.WAS_Download) |  |
+| [WAS_EOF](WAS_EOF.qmd#wass2s.WAS_EOF) | EOF analysis with leakage-free preprocessing. |
+| [WAS_LinearRegression_Model](WAS_LinearRegression_Model.qmd#wass2s.WAS_LinearRegression_Model) | Simple Linear Regression model for spatiotemporal climate prediction. |
+| [WAS_Ridge_Model](WAS_Ridge_Model.qmd#wass2s.WAS_Ridge_Model) | Ridge regression model for spatial rainfall (or continuous climate variable) prediction. |
+| [WAS_Lasso_Model](WAS_Lasso_Model.qmd#wass2s.WAS_Lasso_Model) | Lasso regression model for spatial rainfall (or continuous climate variable) prediction. |
+| [WAS_ElasticNet_Model](WAS_ElasticNet_Model.qmd#wass2s.WAS_ElasticNet_Model) | ElasticNet regression model for spatial rainfall (or continuous climate variable) prediction. |
+| [WAS_LassoLars_Model](WAS_LassoLars_Model.qmd#wass2s.WAS_LassoLars_Model) | LassoLars regression model for spatial rainfall (or continuous climate variable) prediction. |
+| [BaseOptimizer](BaseOptimizer.qmd#wass2s.BaseOptimizer) | Unified Optimizer. Supports SVR (multi-grid), MLP, and Stacking architectures. |
+| [WAS_LogisticRegression_Model](WAS_LogisticRegression_Model.qmd#wass2s.WAS_LogisticRegression_Model) | Logistic Regression model for **tercile classification** (Below/Normal/Above = 0/1/2) |
+| [WAS_PolynomialRegression](WAS_PolynomialRegression.qmd#wass2s.WAS_PolynomialRegression) | Polynomial Regression model for spatiotemporal climate prediction. |
+| [WAS_PoissonRegression](WAS_PoissonRegression.qmd#wass2s.WAS_PoissonRegression) | Poisson Regression model for spatiotemporal count-data prediction |
+| [MARS](MARS.qmd#wass2s.MARS) | Multivariate Adaptive Regression Splines with corrected forward/backward passes. |
+| [WAS_MARS_Model](WAS_MARS_Model.qmd#wass2s.WAS_MARS_Model) | Multivariate Adaptive Regression Splines (MARS) model for spatiotemporal climate prediction. |
+| [WAS_NegativeBinomial_Model](WAS_NegativeBinomial_Model.qmd#wass2s.WAS_NegativeBinomial_Model) | Negative Binomial (NB2) regression for spatiotemporal count prediction. |
+| [WAS_ZINB_Model](WAS_ZINB_Model.qmd#wass2s.WAS_ZINB_Model) | Zero-Inflated Negative Binomial (two-part, Dask-safe). |
+| [WAS_HurdleNB_Model](WAS_HurdleNB_Model.qmd#wass2s.WAS_HurdleNB_Model) | Hurdle Negative Binomial (two-part, Dask-safe). |
+| [WAS_RandomForest_Model](WAS_RandomForest_Model.qmd#wass2s.WAS_RandomForest_Model) | Random Forest regressor (sklearn). ``max_features`` is a fraction in (0, 1]. |
+| [WAS_ExtraTrees_Model](WAS_ExtraTrees_Model.qmd#wass2s.WAS_ExtraTrees_Model) | Extremely Randomized Trees regressor (sklearn). |
+| [WAS_GradientBoosting_Model](WAS_GradientBoosting_Model.qmd#wass2s.WAS_GradientBoosting_Model) | Gradient Boosting regressor (sklearn). |
+| [WAS_AdaBoost_Model](WAS_AdaBoost_Model.qmd#wass2s.WAS_AdaBoost_Model) | AdaBoost regressor (sklearn). |
+| [WAS_XGBoost_Model](WAS_XGBoost_Model.qmd#wass2s.WAS_XGBoost_Model) | XGBoost regressor. Requires the ``xgboost`` package. |
+| [WAS_LightGBM_Model](WAS_LightGBM_Model.qmd#wass2s.WAS_LightGBM_Model) | LightGBM regressor. Requires the ``lightgbm`` package. |
+| [WAS_SVR_Model](WAS_SVR_Model.qmd#wass2s.WAS_SVR_Model) | Support Vector Regression (RBF kernel), auto-scaled with StandardScaler. |
+| [WAS_KNN_Model](WAS_KNN_Model.qmd#wass2s.WAS_KNN_Model) | K-Nearest-Neighbours regressor, auto-scaled with StandardScaler. |
+| [WAS_KNN_Classifier_Model](WAS_KNN_Classifier_Model.qmd#wass2s.WAS_KNN_Classifier_Model) | K-Nearest-Neighbours tercile classifier (auto-scaled with StandardScaler). |
+| [WAS_SVC_Classifier_Model](WAS_SVC_Classifier_Model.qmd#wass2s.WAS_SVC_Classifier_Model) | Support Vector Classifier (RBF kernel) for tercile classification. |
+| [WAS_RandomForest_Classifier_Model](WAS_RandomForest_Classifier_Model.qmd#wass2s.WAS_RandomForest_Classifier_Model) | Random Forest tercile classifier. |
+| [WAS_XGBoost_Classifier_Model](WAS_XGBoost_Classifier_Model.qmd#wass2s.WAS_XGBoost_Classifier_Model) | XGBoost multi-class tercile classifier.  Requires ``xgboost`` package. |
+| [WAS_ExtraTrees_Classifier_Model](WAS_ExtraTrees_Classifier_Model.qmd#wass2s.WAS_ExtraTrees_Classifier_Model) | Extremely Randomized Trees (Extra-Trees) tercile classifier. |
+| [WAS_GradientBoosting_Classifier_Model](WAS_GradientBoosting_Classifier_Model.qmd#wass2s.WAS_GradientBoosting_Classifier_Model) | Gradient Boosting tercile classifier (sklearn sequential trees). |
+| [WAS_AdaBoost_Classifier_Model](WAS_AdaBoost_Classifier_Model.qmd#wass2s.WAS_AdaBoost_Classifier_Model) | Adaptive Boosting (AdaBoost) tercile classifier. |
+| [WAS_LightGBM_Classifier_Model](WAS_LightGBM_Classifier_Model.qmd#wass2s.WAS_LightGBM_Classifier_Model) | LightGBM leaf-wise boosting tercile classifier. |
+| [WAS_NaiveBayes_Classifier_Model](WAS_NaiveBayes_Classifier_Model.qmd#wass2s.WAS_NaiveBayes_Classifier_Model) | Gaussian Naive Bayes tercile classifier. |
+| [WAS_LinearDiscriminant_Classifier_Model](WAS_LinearDiscriminant_Classifier_Model.qmd#wass2s.WAS_LinearDiscriminant_Classifier_Model) | Linear Discriminant Analysis (LDA) tercile classifier with automatic |
+| [WAS_QuadraticDiscriminant_Classifier_Model](WAS_QuadraticDiscriminant_Classifier_Model.qmd#wass2s.WAS_QuadraticDiscriminant_Classifier_Model) | Quadratic Discriminant Analysis (QDA) tercile classifier. |
+| [WAS_Merging](WAS_Merging.qmd#wass2s.WAS_Merging) |  |
+| [WAS_Merging_Extended](WAS_Merging_Extended.qmd#wass2s.WAS_Merging_Extended) | Merging class for station observations with gridded estimates, |
+| [JOBLIB_AVAILABLE](JOBLIB_AVAILABLE.qmd#wass2s.JOBLIB_AVAILABLE) |  |
+| [OPTUNA_AVAILABLE](OPTUNA_AVAILABLE.qmd#wass2s.OPTUNA_AVAILABLE) |  |
+| [HAS_OPTUNA](HAS_OPTUNA.qmd#wass2s.HAS_OPTUNA) |  |
+| [HAS_PYMC](HAS_PYMC.qmd#wass2s.HAS_PYMC) |  |
+| [process_datasets_for_mme](process_datasets_for_mme.qmd#wass2s.process_datasets_for_mme) | Prepare deterministic or probabilistic fields for an MME. |
+| [myfill](myfill.qmd#wass2s.myfill) | Fill missing values in forecast data using random samples from observations. |
+| [WAS_mme_Weighted](WAS_mme_Weighted.qmd#wass2s.WAS_mme_Weighted) | Equal- or skill-weighted deterministic MME with tercile probabilities. |
+| [WAS_ProbWeighted](WAS_ProbWeighted.qmd#wass2s.WAS_ProbWeighted) | Skill-weighted combination of multi-model tercile probabilities. |
+| [WAS_Min2009_ProbWeighted](WAS_Min2009_ProbWeighted.qmd#wass2s.WAS_Min2009_ProbWeighted) | Min et al. (2009) Probability-Weighted Multi-Model Ensemble (PMME). |
+| [WAS_mme_xcELR](WAS_mme_xcELR.qmd#wass2s.WAS_mme_xcELR) | xcast MELR wrapper producing direct tercile probabilities. |
+| [WAS_mme_logistic](WAS_mme_logistic.qmd#wass2s.WAS_mme_logistic) | Multinomial Logistic Regression MME with spatial clustering and three |
+| [WAS_mme_ELR](WAS_mme_ELR.qmd#wass2s.WAS_mme_ELR) | Extended Logistic Regression (ELR) multi-model-ensemble tercile forecaster, |
+| [WAS_mme_gaussian_process](WAS_mme_gaussian_process.qmd#wass2s.WAS_mme_gaussian_process) | Gaussian Process Classifier MME (multiclass via One-vs-Rest in sklearn). |
+| [WAS_mme_xcELM](WAS_mme_xcELM.qmd#wass2s.WAS_mme_xcELM) | xcast ELM deterministic MME with shared, dimension-safe probabilities. |
+| [censored_normal_mean_var](censored_normal_mean_var.qmd#wass2s.censored_normal_mean_var) | Mean and variance of Y = max(X, c) with X ~ N(mu, var), c = dry_threshold. |
+| [truncated_normal_mean_var](truncated_normal_mean_var.qmd#wass2s.truncated_normal_mean_var) | Mean and variance of X \| X > c, X ~ N(mu, sigma^2). (Unchanged from your |
+| [crps_gaussian](crps_gaussian.qmd#wass2s.crps_gaussian) | Analytic CRPS for N(mu, sigma^2) (Gneiting et al. 2005). Validated to |
+| [crps_censored_normal](crps_censored_normal.qmd#wass2s.crps_censored_normal) | CRPS for Y = max(X, c), X ~ N(mu, sigma^2), observation y >= c. |
+| [crps_truncated_normal](crps_truncated_normal.qmd#wass2s.crps_truncated_normal) | CRPS for X \| X > c, X ~ N(mu, sigma^2), observation y > c. |
+| [fit_one_grid_min_crps](fit_one_grid_min_crps.qmd#wass2s.fit_one_grid_min_crps) | Minimum-CRPS EMOS fit at a single grid point. |
+| [WAS_mme_NGR_Gaussian](WAS_mme_NGR_Gaussian.qmd#wass2s.WAS_mme_NGR_Gaussian) | Canonical Gaussian EMOS / NGR with gridwise fitting. |
+| [WAS_mme_NGR_NonGaussian](WAS_mme_NGR_NonGaussian.qmd#wass2s.WAS_mme_NGR_NonGaussian) | Precipitation-oriented EMOS-style postprocessor with optional predictive families: |
+| [WAS_mme_MVA](WAS_mme_MVA.qmd#wass2s.WAS_mme_MVA) | Torralba et al. (2017) mean/variance adjustment for ensemble forecasts. |
+| [WAS_mme_FastBMA](WAS_mme_FastBMA.qmd#wass2s.WAS_mme_FastBMA) | Grid-based Bayesian Model Averaging — SLSQP maximum-likelihood fitting. |
+| [WAS_mme_FullBMA](WAS_mme_FullBMA.qmd#wass2s.WAS_mme_FullBMA) | Hybrid Bayesian seasonal ensemble postprocessor — per-gridpoint fitting. |
+| [WAS_mme_RF](WAS_mme_RF.qmd#wass2s.WAS_mme_RF) | Enhanced Random Forest-based Multi-Model Ensemble (MME) forecasting for West Africa. |
+| [WAS_mme_XGBoosting](WAS_mme_XGBoosting.qmd#wass2s.WAS_mme_XGBoosting) | XGBoost-based Multi-Model Ensemble (MME) forecasting for seasonal rainfall. |
+| [HPELMWrapper](HPELMWrapper.qmd#wass2s.HPELMWrapper) | Wrapper for HPELM to make it compatible with scikit-learn's hyperparameter optimization. |
+| [WAS_mme_hpELM](WAS_mme_hpELM.qmd#wass2s.WAS_mme_hpELM) | Extreme Learning Machine (ELM) based Multi-Model Ensemble (MME) forecasting using hpelm library. |
+| [WAS_mme_MLP](WAS_mme_MLP.qmd#wass2s.WAS_mme_MLP) | Multi-Layer Perceptron (MLPRegressor) MME forecaster with per-zone |
+| [WAS_mme_PCR](WAS_mme_PCR.qmd#wass2s.WAS_mme_PCR) | Principal-component-regression MME baseline. |
+| [WAS_mme_ExpertKnowledge](WAS_mme_ExpertKnowledge.qmd#wass2s.WAS_mme_ExpertKnowledge) | Expert-bounded, RPS-optimal multi-model tercile-probability blend. |
+| [WAS_mme_CCA](WAS_mme_CCA.qmd#wass2s.WAS_mme_CCA) | Canonical Correlation Analysis MME. |
+| [WAS_mme_CCA_eeof](WAS_mme_CCA_eeof.qmd#wass2s.WAS_mme_CCA_eeof) | Canonical Correlation Analysis MME, legacy WAS_CCA ideology (EEOF detrend). |
+| [WAS_PCR](WAS_PCR.qmd#wass2s.WAS_PCR) | Spatial principal-component regression wrapping a WAS regression model. |
+| [CustomTimeSeriesSplit](CustomTimeSeriesSplit.qmd#wass2s.CustomTimeSeriesSplit) | Custom time series cross-validator for splitting data into training and test sets. |
+| [WAS_Cross_Validator](WAS_Cross_Validator.qmd#wass2s.WAS_Cross_Validator) | Performs cross-validation for time series forecasting models using a custom time series split. |
+| [HAS_CCA_ZOO](HAS_CCA_ZOO.qmd#wass2s.HAS_CCA_ZOO) |  |
+| [HAS_XEOFS](HAS_XEOFS.qmd#wass2s.HAS_XEOFS) |  |
+| [WAS_KernelCCA_base](WAS_KernelCCA_base.qmd#wass2s.WAS_KernelCCA_base) | Shared base for kernel CCA seasonal-forecast models (KCCA, KGCCA). |
+| [WAS_KCCA](WAS_KCCA.qmd#wass2s.WAS_KCCA) | Kernel Canonical Correlation Analysis (cca-zoo KCCA / LinearCCA). |
+| [WAS_KGCCA](WAS_KGCCA.qmd#wass2s.WAS_KGCCA) | Kernel Generalized CCA (cca-zoo KGCCA / GCCA). |
+| [WAS_EOF_KCCA](WAS_EOF_KCCA.qmd#wass2s.WAS_EOF_KCCA) |  |
+| [inv_boxcox](inv_boxcox.qmd#wass2s.inv_boxcox) | Inverse Box-Cox transformation. |
+| [inv_yeojohnson](inv_yeojohnson.qmd#wass2s.inv_yeojohnson) | Inverse Yeo-Johnson transformation. |
+| [WAS_TransformData](WAS_TransformData.qmd#wass2s.WAS_TransformData) | Optimized class for geospatial Time-Series analysis:  |
+| [PRECIP_SOURCES](PRECIP_SOURCES.qmd#wass2s.PRECIP_SOURCES) |  |
+| [SST_SOURCES](SST_SOURCES.qmd#wass2s.SST_SOURCES) |  |
+| [AGERA5_DATASET](AGERA5_DATASET.qmd#wass2s.AGERA5_DATASET) |  |
+| [ERSSTV6_BASE_URL](ERSSTV6_BASE_URL.qmd#wass2s.ERSSTV6_BASE_URL) |  |
+| [VAR_CONFIG](VAR_CONFIG.qmd#wass2s.VAR_CONFIG) | dict: Per-variable ERA5 download and plotting configuration. |
+| [DAILY_UNIT](DAILY_UNIT.qmd#wass2s.DAILY_UNIT) | dict: Per-variable ``(unit_func, unit_label)`` for the daily pipeline. |
+| [DAILY_STATISTIC](DAILY_STATISTIC.qmd#wass2s.DAILY_STATISTIC) | dict: CDS daily statistic requested for each configured variable. |
+| [download_data](download_data.qmd#wass2s.download_data) | Download monthly data for the six complete months before target month. |
+| [plot_hovmoller](plot_hovmoller.qmd#wass2s.plot_hovmoller) | Plot a time–longitude Hovmöller diagram for a supported variable. |
+| [plot_maps](plot_maps.qmd#wass2s.plot_maps) | Render a 6-row map panel for the six preceding months. |
+| [process_variable](process_variable.qmd#wass2s.process_variable) | Compute and plot monthly anomalies or precipitation ratios. |
+| [main_driver](main_driver.qmd#wass2s.main_driver) | Run monthly diagnostics with optional AgERA5 and NOAA ERSSTv6. |
+| [download_daily_data](download_daily_data.qmd#wass2s.download_daily_data) | Download daily data, optionally using AgERA5 for precipitation. |
+| [download_daily_climatology](download_daily_climatology.qmd#wass2s.download_daily_climatology) | Download per-year analog windows for daily climatological diagnostics. |
+| [plot_period_map](plot_period_map.qmd#wass2s.plot_period_map) | Single-panel map of a period aggregate, styled from :data:`VAR_CONFIG`. |
+| [process_daily](process_daily.qmd#wass2s.process_daily) | Download, aggregate, and plot the last *n_days* up to the target date. |
+| [main_daily_driver](main_daily_driver.qmd#wass2s.main_daily_driver) | Run daily diagnostics, optionally sourcing precipitation from AgERA5. |
+| [C3SViewer](C3SViewer.qmd#wass2s.C3SViewer) | Interactive Jupyter widget for Copernicus C3S seasonal forecast maps. |
+| [BOMViewer](BOMViewer.qmd#wass2s.BOMViewer) | Interactive Jupyter widget for BOM MJO monitoring charts. |
+| [DEFAULT_CRITERIA](DEFAULT_CRITERIA.qmd#wass2s.DEFAULT_CRITERIA) |  |
+| [CAF_AgroClimateBase](CAF_AgroClimateBase.qmd#wass2s.CAF_AgroClimateBase) |  |
+| [CEAC_compute_onset](CEAC_compute_onset.qmd#wass2s.CEAC_compute_onset) |  |
+| [CEAC_compute_cessation](CEAC_compute_cessation.qmd#wass2s.CEAC_compute_cessation) |  |
+| [CEAC_compute_onset_dry_spell](CEAC_compute_onset_dry_spell.qmd#wass2s.CEAC_compute_onset_dry_spell) |  |
+| [CEAC_compute_cessation_dry_spell](CEAC_compute_cessation_dry_spell.qmd#wass2s.CEAC_compute_cessation_dry_spell) |  |
+| [CEAC_count_dry_spells](CEAC_count_dry_spells.qmd#wass2s.CEAC_count_dry_spells) |  |
+| [CEAC_count_wet_spells](CEAC_count_wet_spells.qmd#wass2s.CEAC_count_wet_spells) |  |

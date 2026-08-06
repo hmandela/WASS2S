@@ -1,0 +1,27 @@
+# reverse_standardize { #wass2s.reverse_standardize }
+
+```python
+reverse_standardize(ds_st, ds, clim_year_start=None, clim_year_end=None)
+```
+
+Reverse standardization of a dataset to original units.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type                               | Description                                                              | Default    |
+|-----------------|------------------------------------|--------------------------------------------------------------------------|------------|
+| ds_st           | xarray.Dataset or xarray.DataArray | Standardized dataset or data array (z-scores).                           | _required_ |
+| ds              | xarray.Dataset or xarray.DataArray | Original dataset used to compute standardization parameters.             | _required_ |
+| clim_year_start | int                                | Start year of the climatology period. If None, uses the full time range. | `None`     |
+| clim_year_end   | int                                | End year of the climatology period. If None, uses the full time range.   | `None`     |
+
+## Returns {.doc-section .doc-section-returns}
+
+| Name   | Type                               | Description                              |
+|--------|------------------------------------|------------------------------------------|
+|        | xarray.Dataset or xarray.DataArray | Dataset or data array in original units. |
+
+## Notes {.doc-section .doc-section-notes}
+
+Reverses standardization using ds_st * std + mean, where mean and std are
+computed from the original dataset over the specified period.

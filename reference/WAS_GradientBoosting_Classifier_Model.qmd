@@ -1,0 +1,37 @@
+# WAS_GradientBoosting_Classifier_Model { #wass2s.WAS_GradientBoosting_Classifier_Model }
+
+```python
+WAS_GradientBoosting_Classifier_Model(
+    n_clusters=5,
+    nb_cores=1,
+    hyperparam_optimizer='bayesian',
+    n_trials=50,
+    n_iter=50,
+    scoring='neg_log_loss',
+    random_state=42,
+)
+```
+
+Gradient Boosting tercile classifier (sklearn sequential trees).
+
+Builds an additive ensemble of shallow decision trees by minimising
+cross-entropy (``loss='log_loss'``) stage by stage.  Each tree corrects
+the residual pseudo-errors of the previous ensemble, which aggressively
+reduces bias — a key advantage over bagging methods when the training
+record is short (~30 years).
+
+## Hyperparameters tuned {.doc-section .doc-section-hyperparameters-tuned}
+
+n_estimators     : int    in [50, 500]
+learning_rate    : float  in [1e-3, 0.3]  (log scale) — shrinkage per stage
+max_depth        : int    in [2, 8]        — shallow trees control variance
+subsample        : float  in [0.5, 1.0]   — stochastic gradient boosting
+min_samples_leaf : int    in [1, 20]
+
+## Notes {.doc-section .doc-section-notes}
+
+- ``loss='log_loss'`` is the multi-class cross-entropy, directly targeting
+  the calibration of tercile probabilities.
+- Stochastic subsampling (``subsample < 1``) acts as additional
+  regularisation and is especially helpful for ~30-sample records.
+- No feature scaling needed (tree-based).

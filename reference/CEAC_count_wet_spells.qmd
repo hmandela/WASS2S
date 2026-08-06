@@ -1,0 +1,6 @@
+# CEAC_count_wet_spells { #wass2s.CEAC_count_wet_spells }
+
+```python
+CEAC_count_wet_spells(user_criteria=None)
+```
+

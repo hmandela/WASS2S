@@ -1,0 +1,179 @@
+# WAS_count_rainy_days { #wass2s.WAS_count_rainy_days }
+
+```python
+WAS_count_rainy_days()
+```
+
+Class for computing the **number of rainy days** (days with precipitation ≥ a threshold)
+between the onset and cessation dates of the rainy season.
+
+This is a key agro-meteorological indicator used in West Africa to assess seasonal
+moisture availability during the growing period — directly relevant for crop water
+requirements, yield estimation, and drought/vulnerability assessments.
+
+Key Features:
+- Counts days where daily rainfall ≥ ``rain_threshold`` (default 0.85 mm)
+- Uses pre-computed onset and cessation dates (xarray DataArrays or CPT DataFrames)
+- Supports both station-based (CDT format) and gridded (xarray) daily rainfall data
+- Efficient parallel computation with Dask for large-scale gridded analysis
+- Outputs in CPT-compatible wide format for station data
+
+Typical Use Case:
+After calculating onset (e.g., via ``WAS_compute_onset``) and cessation
+(e.g., via ``WAS_compute_cessation``), use this class to quantify the total number
+of rainy days available to crops during the growing window.
+
+References:
+- AGRHYMET Regional Centre seasonal rainfall monitoring
+- Sivakumar (1991): Rainfall characteristics and agricultural planning in West Africa
+- Common practice in Sahelian and Sudanian national meteorological services
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type   | Description   | Default    |
+|--------|--------|---------------|------------|
+| None   |        |               | _required_ |
+
+## Functions {.doc-section .doc-section-functions}
+
+* **compute_insitu**: Compute number of rainy days for station data (CDT input, CPT output).
+* **compute**: Compute number of rainy days for gridded xarray data (parallelized).
+
+## Examples {.doc-section .doc-section-examples}
+
+Count rainy days (≥ 0.85 mm) between onset and cessation (gridded):
+
+```python
+>>> rainy_calc = WAS_count_rainy_days()
+>>> rainy_days_count = rainy_calc.compute(
+...     daily_pr,           # xarray.DataArray daily rainfall (mm)
+...     onset_da,           # xarray.DataArray of onset dates (day-of-year)
+...     cessation_da,       # xarray.DataArray of cessation dates
+...     rain_threshold=0.85,
+...     nb_cores=8
+... )
+```
+
+For station data (CDT rainfall, CPT onset/cessation):
+
+```python
+>>> rainy_cpt = rainy_calc.compute_insitu(
+...     daily_cdt_df,
+...     onset_cpt_df,
+...     cessation_cpt_df,
+...     rain_threshold=1.0
+... )
+```
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute](#wass2s.WAS_count_rainy_days.compute) | Compute the number of rainy days for each pixel between onset and cessation dates. |
+| [compute_insitu](#wass2s.WAS_count_rainy_days.compute_insitu) | Compute, for in-situ stations (CDT data), the number of rainy days between |
+| [count_rainy_days](#wass2s.WAS_count_rainy_days.count_rainy_days) | Count the number of rainy days between onset and cessation dates. |
+| [transform_cdt](#wass2s.WAS_count_rainy_days.transform_cdt) | Transform a DataFrame in CDT format into a standardized long DataFrame. |
+
+### compute { #wass2s.WAS_count_rainy_days.compute }
+
+```python
+WAS_count_rainy_days.compute(
+    daily_data,
+    onset_date,
+    cessation_date,
+    rain_threshold,
+    nb_cores,
+)
+```
+
+Compute the number of rainy days for each pixel between onset and cessation dates.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name           | Type             | Description                                          | Default    |
+|----------------|------------------|------------------------------------------------------|------------|
+| daily_data     | xarray.DataArray | Daily rainfall data, coords = (T, Y, X).             | _required_ |
+| onset_date     | xarray.DataArray | DataArray containing onset dates for each pixel.     | _required_ |
+| cessation_date | xarray.DataArray | DataArray containing cessation dates for each pixel. | _required_ |
+| rain_threshold | float            | Rainfall threshold to classify a day as "rainy."     | _required_ |
+| nb_cores       | int              | Number of parallel processes to use.                 | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                                   |
+|--------|------------------|-----------------------------------------------|
+|        | xarray.DataArray | Array with the count of rainy days per pixel. |
+
+### compute_insitu { #wass2s.WAS_count_rainy_days.compute_insitu }
+
+```python
+WAS_count_rainy_days.compute_insitu(
+    daily_df,
+    onset_df_cpt,
+    cessation_df_cpt,
+    rain_threshold=0.85,
+)
+```
+
+Compute, for in-situ stations (CDT data), the number of rainy days between
+onset and cessation, for each station and year.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name             | Type         | Description                                                                                     | Default    |
+|------------------|--------------|-------------------------------------------------------------------------------------------------|------------|
+| daily_df         | pd.DataFrame | CDT precipitation data (ID column = date; columns = stations). Follows the standard CDT format. | _required_ |
+| onset_df_cpt     | pd.DataFrame | Result of ``WAS_compute_onset.compute_insitu(...)`` for onset (CPT format).                     | _required_ |
+| cessation_df_cpt | pd.DataFrame | Same format for cessation (CPT format).                                                         | _required_ |
+| rain_threshold   | float        | Precipitation threshold for counting a day as "rainy," by default 0.85 mm.                      | `0.85`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name     | Type         | Description                                  |
+|----------|--------------|----------------------------------------------|
+| df_final | pd.DataFrame | The count of rainy days in CPT pivot format. |
+
+### count_rainy_days { #wass2s.WAS_count_rainy_days.count_rainy_days }
+
+```python
+WAS_count_rainy_days.count_rainy_days(
+    x,
+    onset_date,
+    cessation_date,
+    rain_threshold,
+)
+```
+
+Count the number of rainy days between onset and cessation dates.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name           | Type         | Description                                      | Default    |
+|----------------|--------------|--------------------------------------------------|------------|
+| x              | array - like | Daily rainfall values.                           | _required_ |
+| onset_date     | int          | Start index for the calculation (onset date).    | _required_ |
+| cessation_date | int          | End index for the calculation (cessation date).  | _required_ |
+| rain_threshold | float        | Rainfall threshold to classify a day as "rainy." | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description                                            |
+|--------|--------------|--------------------------------------------------------|
+|        | int or float | Number of rainy days (returns NaN if data is invalid). |
+
+### transform_cdt { #wass2s.WAS_count_rainy_days.transform_cdt }
+
+```python
+WAS_count_rainy_days.transform_cdt(df)
+```
+
+Transform a DataFrame in CDT format into a standardized long DataFrame.
+
+CDT format assumptions:
+ - Row 0 = LON
+ - Row 1 = LAT
+ - Row 2 = ELEV
+ - Rows 3+ = daily data with 'ID' column holding dates in YYYYMMDD format.
+
+This method returns a DataFrame with columns:
+    DATE, STATION, VALUE, LON, LAT, ELEV, (optional) MEAN_ANNUAL_RAINFALL, zonename

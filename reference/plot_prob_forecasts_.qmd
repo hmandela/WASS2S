@@ -1,0 +1,19 @@
+# plot_prob_forecasts_ { #wass2s.plot_prob_forecasts_ }
+
+```python
+plot_prob_forecasts_(
+    dir_to_save,
+    forecast_prob,
+    model_name,
+    labels=['Below-Normal', 'Near-Normal', 'Above-Normal'],
+    reverse_cmap=True,
+    hspace=None,
+    logo=None,
+    logo_size=(None, None),
+    logo_position='lower left',
+    sigma=None,
+    res=None,
+)
+```
+
+Plot probabilistic forecasts with tercile categories using discrete block colorbars.

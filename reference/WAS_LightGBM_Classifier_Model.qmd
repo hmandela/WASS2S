@@ -1,0 +1,41 @@
+# WAS_LightGBM_Classifier_Model { #wass2s.WAS_LightGBM_Classifier_Model }
+
+```python
+WAS_LightGBM_Classifier_Model(
+    n_clusters=5,
+    nb_cores=1,
+    hyperparam_optimizer='bayesian',
+    n_trials=50,
+    n_iter=50,
+    scoring='neg_log_loss',
+    random_state=42,
+)
+```
+
+LightGBM leaf-wise boosting tercile classifier.
+
+Requires the ``lightgbm`` package (``pip install lightgbm``).
+
+LightGBM grows trees **leaf-wise** (best-leaf-first) rather than
+depth-wise like sklearn GBC.  This can find deeper structures in a single
+tree with fewer total leaves, often outperforming XGBoost on datasets
+with a moderate number of features and short records.
+
+## Hyperparameters tuned {.doc-section .doc-section-hyperparameters-tuned}
+
+n_estimators       : int    in [50, 600]
+num_leaves         : int    in [15, 127]   — controls model complexity
+max_depth          : int    in [3, 12]
+learning_rate      : float  in [1e-3, 0.3]  (log scale)
+subsample          : float  in [0.5, 1.0]   — row subsampling per tree
+colsample_bytree   : float  in [0.5, 1.0]   — feature subsampling per tree
+reg_alpha          : float  in [1e-8, 10.0] (log scale) — L1 regularisation
+reg_lambda         : float  in [1e-8, 10.0] (log scale) — L2 regularisation
+min_child_samples  : int    in [5, 50]      — minimum samples per leaf
+
+## Notes {.doc-section .doc-section-notes}
+
+- ``objective='multiclass'`` + ``num_class=3`` gives calibrated soft-max
+  probabilities equivalent to sklearn's ``predict_proba``.
+- ``class_weight='balanced'`` handles tercile imbalance.
+- ``verbosity=-1`` suppresses LightGBM's verbose stdout output.

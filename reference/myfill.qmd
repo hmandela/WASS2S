@@ -1,0 +1,23 @@
+# myfill { #wass2s.myfill }
+
+```python
+myfill(all_model_fcst, obs)
+```
+
+Fill missing values in forecast data using random samples from observations.
+
+This function fills NaN values in the forecast data by randomly sampling values from the observed 
+rainfall data along the time dimension.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name           | Type             | Description                                                                | Default    |
+|----------------|------------------|----------------------------------------------------------------------------|------------|
+| all_model_fcst | xarray.DataArray | Forecast data with dimensions (T, M, Y, X) containing possible NaN values. | _required_ |
+| obs            | xarray.DataArray | Observed rainfall data with dimensions (T, Y, X) used for filling NaNs.    | _required_ |
+
+## Returns {.doc-section .doc-section-returns}
+
+| Name             | Type             | Description                                                                  |
+|------------------|------------------|------------------------------------------------------------------------------|
+| da_filled_random | xarray.DataArray | Forecast data with NaN values filled using random samples from observations. |

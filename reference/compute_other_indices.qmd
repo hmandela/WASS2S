@@ -1,0 +1,43 @@
+# compute_other_indices { #wass2s.compute_other_indices }
+
+```python
+compute_other_indices(
+    dir_to_data,
+    indices_dict,
+    variables_list,
+    year_start,
+    year_end,
+    season,
+    clim_year_start=None,
+    clim_year_end=None,
+    model=False,
+    month_of_initialization=None,
+    lead_time=None,
+    year_forecast=None,
+)
+```
+
+Compute indices for non-SST variables.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name                    | Type   | Description                                                                                | Default    |
+|-------------------------|--------|--------------------------------------------------------------------------------------------|------------|
+| dir_to_data             | str    | Directory path where data is stored.                                                       | _required_ |
+| indices_dict            | dict   | Dictionary mapping index names to coordinates (label, lon_min, lon_max, lat_min, lat_max). | _required_ |
+| variables_list          | str    | Variable string in the format 'center.variable'.                                           | _required_ |
+| year_start              | int    | Start year of the data.                                                                    | _required_ |
+| year_end                | int    | End year of the data.                                                                      | _required_ |
+| season                  | list   | List of month numbers defining the season.                                                 | _required_ |
+| clim_year_start         | int    | Start year for climatology period.                                                         | `None`     |
+| clim_year_end           | int    | End year for climatology period.                                                           | `None`     |
+| model                   | bool   | If True, load model data; otherwise, load reanalysis data (default is False).              | `False`    |
+| month_of_initialization | int    | Month of model initialization.                                                             | `None`     |
+| lead_time               | list   | List of lead times in months.                                                              | `None`     |
+| year_forecast           | int    | Forecast year.                                                                             | `None`     |
+
+## Returns {.doc-section .doc-section-returns}
+
+| Name   | Type           | Description                                       |
+|--------|----------------|---------------------------------------------------|
+|        | xarray.Dataset | Dataset containing computed indices as variables. |

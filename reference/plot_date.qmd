@@ -1,0 +1,17 @@
+# plot_date { #wass2s.plot_date }
+
+```python
+plot_date(A)
+```
+
+Plot a map of dates, interpreting values as offsets from 2024-01-01.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type             | Description                                                                         | Default    |
+|--------|------------------|-------------------------------------------------------------------------------------|------------|
+| A      | xarray.DataArray | Data array with values representing days since 2024-01-01, and dimensions 'Y', 'X'. | _required_ |
+
+## Notes {.doc-section .doc-section-notes}
+
+Converts colorbar ticks to calendar dates (e.g., '01-Jan') for readability.

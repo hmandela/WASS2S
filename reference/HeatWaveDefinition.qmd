@@ -1,0 +1,6 @@
+# HeatWaveDefinition { #wass2s.HeatWaveDefinition }
+
+```python
+HeatWaveDefinition(start_date, end_date, duration, max_temp, mean_temp)
+```
+

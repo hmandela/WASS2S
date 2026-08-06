@@ -1,0 +1,6 @@
+# CAF_AgroClimateBase { #wass2s.CAF_AgroClimateBase }
+
+```python
+CAF_AgroClimateBase(user_criteria=None)
+```
+

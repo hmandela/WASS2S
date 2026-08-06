@@ -1,0 +1,30 @@
+# extract_leading_eeof_component { #wass2s.extract_leading_eeof_component }
+
+```python
+extract_leading_eeof_component(data)
+```
+
+extract leading eeof component using ExtendedEOF.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type             | Description                               | Default    |
+|--------|------------------|-------------------------------------------|------------|
+| data   | xarray.DataArray | Input data array with time dimension 'T'. | _required_ |
+
+## Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                                                |
+|--------|------------------|------------------------------------------------------------|
+|        | xarray.DataArray | Trended data array based on the first mode of ExtendedEOF. |
+
+## Raises {.doc-section .doc-section-raises}
+
+| Name   | Type         | Description                   |
+|--------|--------------|-------------------------------|
+|        | RuntimeError | If ExtendedEOF fitting fails. |
+
+## Notes {.doc-section .doc-section-notes}
+
+Missing values are filled with the time mean before fitting.
+Uses ExtendedEOF with specified parameters (n_modes=2, tau=1, embedding=3, n_pca_modes=20).

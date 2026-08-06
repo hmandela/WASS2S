@@ -1,0 +1,25 @@
+# decode_cf { #wass2s.decode_cf }
+
+```python
+decode_cf(ds, time_var)
+```
+
+Decode time dimension to CFTime standards.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name     | Type           | Description                                           | Default    |
+|----------|----------------|-------------------------------------------------------|------------|
+| ds       | xarray.Dataset | Input dataset containing the time variable to decode. | _required_ |
+| time_var | str            | Name of the time variable in the dataset.             | _required_ |
+
+## Returns {.doc-section .doc-section-returns}
+
+| Name   | Type           | Description                                                       |
+|--------|----------------|-------------------------------------------------------------------|
+|        | xarray.Dataset | Dataset with decoded time dimension adhering to CFTime standards. |
+
+## Notes {.doc-section .doc-section-notes}
+
+If the calendar attribute of the time variable is '360', it is converted to '360_day'
+to ensure compatibility with CFTime decoding.

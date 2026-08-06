@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.9.37">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>was_mme_elr – wass2s</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-7f8f88aac4f3542376d5c11b86a4c14d.css" rel="stylesheet" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-26d9cc88ab9604001aabd73cb1ea1d8f.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+</head>
+
+<body class="nav-fixed fullcontent quarto-light">
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">wass2s</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="../get_started.html"> 
+<span class="menu-text">Get Started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../reference/index.html"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://hmandela.github.io/WAS_S2S_Training/" target="_blank"> 
+<span class="menu-text">Training Docs</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/hmandela/WASS2S"> <i class="bi bi-github" role="img" aria-label="wass2s GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+<!-- margin-sidebar -->
+    
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"></header>
+
+
+
+
+<section id="wass2s.WAS_mme_ELR" class="level1">
+<h1>WAS_mme_ELR</h1>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>WAS_mme_ELR(</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    predictors<span class="op">=</span><span class="st">'mean'</span>,</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    threshold_transform<span class="op">=</span><span class="st">'cbrt'</span>,</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    fit_quantiles<span class="op">=</span>(<span class="fl">0.1</span>, <span class="fl">0.25</span>, <span class="fl">1.0</span> <span class="op">/</span> <span class="fl">3.0</span>, <span class="fl">0.5</span>, <span class="fl">2.0</span> <span class="op">/</span> <span class="fl">3.0</span>, <span class="fl">0.75</span>, <span class="fl">0.9</span>),</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    l2<span class="op">=</span><span class="fl">0.001</span>,</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    alpha_min<span class="op">=</span><span class="fl">0.001</span>,</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    n_iter<span class="op">=</span><span class="dv">50</span>,</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    tol<span class="op">=</span><span class="fl">1e-07</span>,</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    min_obs<span class="op">=</span><span class="dv">5</span>,</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    predictor_transform<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    random_state<span class="op">=</span><span class="dv">42</span>,</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Extended Logistic Regression (ELR) multi-model-ensemble tercile forecaster, aligned with Wilks (2009, <em>Meteorol. Appl.</em> 16, 361-368).</p>
+<p>Single unified equation for every threshold q:</p>
+<pre><code>P(Y &lt;= q | x) = sigmoid( b0 + beta . x + alpha * g(q) )</code></pre>
+<section id="what-is-implemented-from-the-paper-vs-the-previous-two-threshold-version" class="level2 doc-section doc-section-what-is-implemented-from-the-paper-vs-the-previous-two-threshold-version">
+<h2 class="doc-section doc-section-what-is-implemented-from-the-paper-vs-the-previous-two-threshold-version anchored" data-anchor-id="what-is-implemented-from-the-paper-vs-the-previous-two-threshold-version">What is implemented FROM THE PAPER (vs the previous two-threshold version)</h2>
+<ol type="1">
+<li>MULTI-THRESHOLD FIT. Wilks fits ONE equation to SEVERAL climatological quantiles simultaneously (not just the two needed at output time), which constrains alpha much better and yields coherent probabilities at ANY threshold – including thresholds never used in fitting. Here the design is stacked over <code>fit_quantiles</code> (default a Wilks-style 7-quantile set containing the terciles); the tercile probabilities PB/PN/PA are then read off the same fitted equation.</li>
+<li>GUARANTEED MONOTONE CDF. Monotonicity of P(Y&lt;=q) in q requires alpha&gt;0. Instead of the previous post-hoc min/max reordering of the two cumulative probabilities, the Newton solver PROJECTS alpha onto [alpha_min, inf) at every iteration, so pup &gt;= plo holds by construction and no crossing can occur at any threshold.</li>
+<li>THRESHOLD TRANSFORM g(q). Wilks found g(q) = sqrt(q) clearly superior to g(q) = q for (non-negative, raw) precipitation. ‘sqrt’ is offered for raw precip; ‘cbrt’ (default) is the negative-safe analogue for signed predictands; the choice can be tuned by CV (see compute_hyperparameters, which also tunes the fitted-quantile set).</li>
+<li>PREDICTOR TRANSFORM. Wilks’ best single predictor was the SQUARE ROOT of the ensemble-mean precipitation. <code>predictor_transform='sqrt'</code> applies it to the raw predictor before standardization in compute_hyperparameters / forecast. (The framework CV branch feeds already-standardized predictors to compute_model; for exact consistency, apply the same transform to the raw hindcast before the framework standardizes it.)</li>
+<li>FULL-DISTRIBUTION OUTPUT. The point of the paper: the same fit gives the whole predictive distribution. <code>predictive_quantiles(p_levels)</code> inverts the fitted equation analytically, q_p = g^{-1}( (logit(p) - b0 - beta.x) / alpha ), returning predictive quantiles (quantile, T, Y, X) after any compute_model / forecast call.</li>
+</ol>
+<p>For tercile forecasts the two output thresholds are the climatological lower and upper terciles T1 &lt; T2 of the predictand, and</p>
+<pre><code>PB = P(Y &lt;= T1),
+PN = P(Y &lt;= T2) - P(Y &lt;= T1),
+PA = 1 - P(Y &lt;= T2).</code></pre>
+</section>
+<section id="predictor-at-each-grid-cell" class="level2 doc-section doc-section-predictor-at-each-grid-cell">
+<h2 class="doc-section doc-section-predictor-at-each-grid-cell anchored" data-anchor-id="predictor-at-each-grid-cell">Predictor at each grid cell</h2>
+<p>The (T, Y, X, M) predictor cube is reduced per cell to: predictors=‘mean’ -&gt; multi-model mean (1 feature) [default] predictors=‘mean_std’ -&gt; multi-model mean and spread (2 features) predictors=‘models’ -&gt; every model kept as its own feature (M features)</p>
+</section>
+<section id="thresholds" class="level2 doc-section doc-section-thresholds">
+<h2 class="doc-section doc-section-thresholds anchored" data-anchor-id="thresholds">Thresholds</h2>
+<p>Output terciles are estimated fold-safe from the TRAINING predictand by default; pass <code>clim_terciles=(t1, t2)</code> (DataArrays on Y, X, same units as y_train) to pin them to the boundaries your verification uses (WAS_Verification.compute_class). The EXTRA fitting quantiles are always taken fold-safe from the training predictand.</p>
+</section>
+<section id="fitting" class="level2 doc-section doc-section-fitting">
+<h2 class="doc-section doc-section-fitting anchored" data-anchor-id="fitting">Fitting</h2>
+<p>One equation per cell, all cells fitted simultaneously with a vectorized, ridge-stabilized projected-Newton/IRLS solver. Rows with missing predictor/predictand are zero-weighted; cells with fewer than <code>min_obs</code> valid years fall back to climatology [1/3, 1/3, 1/3]. With K fitting quantiles the stacked-binary objective is a composite likelihood (the K indicator responses per year are correlated) – exactly Wilks’ fitting strategy. In dry cells several low quantiles may coincide (ties at 0); the duplicated rows are harmless, they only re-weight that threshold.</p>
+</section>
+<section id="parameters" class="level2 doc-section doc-section-parameters">
+<h2 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters">Parameters</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 7%">
+<col style="width: 18%">
+<col style="width: 55%">
+<col style="width: 18%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>predictors</td>
+<td>(mean, mean_std, models)</td>
+<td></td>
+<td><code>'mean'</code></td>
+</tr>
+<tr class="even">
+<td>threshold_transform</td>
+<td>(identity, cbrt, sqrt)</td>
+<td>g(q). Default ‘cbrt’. ‘sqrt’ only for non-negative predictands (raw precipitation) – Wilks’ empirically best choice there.</td>
+<td><code>'identity','cbrt','sqrt'</code></td>
+</tr>
+<tr class="odd">
+<td>fit_quantiles</td>
+<td>sequence of float in (0, 1)</td>
+<td>Climatological quantiles whose thresholds enter the fit. The terciles 1/3 and 2/3 are always included. Default (0.10, 0.25, 1/3, 0.50, 2/3, 0.75, 0.90).</td>
+<td><code>(0.1, 0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 0.9)</code></td>
+</tr>
+<tr class="even">
+<td>l2</td>
+<td>float</td>
+<td>Ridge penalty on the coefficients (NOT the intercept), default 1e-3.</td>
+<td><code>0.001</code></td>
+</tr>
+<tr class="odd">
+<td>alpha_min</td>
+<td>float</td>
+<td>Positivity floor for the threshold coefficient alpha (monotone CDF), default 1e-3.</td>
+<td><code>0.001</code></td>
+</tr>
+<tr class="even">
+<td>predictor_transform</td>
+<td>(identity, sqrt, cbrt)</td>
+<td>Transform applied to the RAW predictor before standardization in compute_hyperparameters / forecast (Wilks: ‘sqrt’ for raw precip).</td>
+<td><code>'identity','sqrt','cbrt'</code></td>
+</tr>
+<tr class="odd">
+<td>n_iter</td>
+<td>Newton controls (default 50, 1e-7).</td>
+<td></td>
+<td><code>50</code></td>
+</tr>
+<tr class="even">
+<td>tol</td>
+<td>Newton controls (default 50, 1e-7).</td>
+<td></td>
+<td><code>50</code></td>
+</tr>
+<tr class="odd">
+<td>min_obs</td>
+<td>minimum valid training years per cell (default 5).</td>
+<td></td>
+<td><code>5</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="methods" class="level2">
+<h2 class="anchored" data-anchor-id="methods">Methods</h2>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><a href="#wass2s.WAS_mme_ELR.compute_hyperparameters">compute_hyperparameters</a></td>
+<td>Jointly tune the ridge penalty l2, the threshold transform g(q) AND the</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_mme_ELR.compute_model">compute_model</a></td>
+<td>Fit ELR on the training fold and return the test-fold tercile</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_mme_ELR.forecast">forecast</a></td>
+<td>Operational ELR tercile forecast for a single target year.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_mme_ELR.predictive_quantiles">predictive_quantiles</a></td>
+<td>Predictive quantiles of the LAST fitted forecast – Wilks (2009)’s</td>
+</tr>
+</tbody>
+</table>
+<section id="wass2s.WAS_mme_ELR.compute_hyperparameters" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_mme_ELR.compute_hyperparameters">compute_hyperparameters</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>WAS_mme_ELR.compute_hyperparameters(</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    Predictor,</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    Predictand,</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    clim_terciles<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    l2_grid<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    g_grid<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    quantile_grid<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    score<span class="op">=</span><span class="st">'rps'</span>,</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    cv_folds<span class="op">=</span><span class="dv">5</span>,</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    leave_one_year_out<span class="op">=</span><span class="va">False</span>,</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Jointly tune the ridge penalty l2, the threshold transform g(q) AND the fitting-quantile set by year-grouped cross-validation. Winners are stored in self.l2 / self.threshold_transform / self.fit_quantiles (and self.best_params) so the existing CV branch / compute_model use them with no further plumbing.</p>
+<p>Why tune g(q) and the quantile set: Wilks (2009) shows the FORM of g(q) drives ELR quality (g(q)=sqrt(q) was substantially better than g(q)=q for raw precipitation), and fits one equation to several climatological quantiles at once. Here the data pick both, among non-decreasing g options, so p(q)=Pr{V&lt;=q} stays monotone.</p>
+<p>Observed truth = tercile CLASSES: forecast probabilities are scored against WAS_Verification.compute_class (0=below, 1=normal, 2=above), the categorical target the RPSS verification uses. RPS by default, or multiclass log-loss.</p>
+<p>Standardization: only the PREDICTOR is standardized over the clim window (after predictor_transform, if set); the PREDICTAND stays RAW so thresholds and g(q) act in physical units.</p>
+<section id="parameters-1" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-1">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 9%">
+<col style="width: 29%">
+<col style="width: 55%">
+<col style="width: 5%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>l2_grid</td>
+<td>sequence of float, optional. Default np.logspace(-4, 1, 6).</td>
+<td></td>
+<td><code>None</code></td>
+</tr>
+<tr class="even">
+<td>g_grid</td>
+<td></td>
+<td>Default [‘identity’, ‘cbrt’] (+ ‘sqrt’ only when all thresholds are non-negative, i.e.&nbsp;raw precipitation).</td>
+<td><code>None</code></td>
+</tr>
+<tr class="odd">
+<td>quantile_grid</td>
+<td>sequence of quantile tuples, optional. Default</td>
+<td>[terciles only, self.fit_quantiles] – i.e.&nbsp;two-threshold vs Wilks-style multi-threshold fit.</td>
+<td><code>None</code></td>
+</tr>
+<tr class="even">
+<td>score</td>
+<td></td>
+<td></td>
+<td><code>'rps'</code></td>
+</tr>
+<tr class="odd">
+<td>cv_folds</td>
+<td>year-grouped CV controls.</td>
+<td></td>
+<td><code>5</code></td>
+</tr>
+<tr class="even">
+<td>leave_one_year_out</td>
+<td>year-grouped CV controls.</td>
+<td></td>
+<td><code>5</code></td>
+</tr>
+<tr class="odd">
+<td>clim_terciles</td>
+<td>optional (t1, t2) in PHYSICAL units – same fixed</td>
+<td>boundaries your CV branch passes to compute_model.</td>
+<td><code>None</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 16%">
+<col style="width: 63%">
+<col style="width: 19%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>best_params</td>
+<td>dict {'l2':…, 'g':…, 'quantiles':…}</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_mme_ELR.compute_model" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_mme_ELR.compute_model">compute_model</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>WAS_mme_ELR.compute_model(</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    X_train,</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    y_train,</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    X_test,</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    y_test<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    clim_year_start<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    clim_year_end<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    clim_terciles<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    best_params<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">**</span>kwargs,</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Fit ELR on the training fold and return the test-fold tercile probabilities (dims probability, T, Y, X; probability=[‘PB’,‘PN’,‘PA’]).</p>
+<p>X_train / X_test : standardized predictor cubes (T, Y, X[, M]). y_train : predictand (T, Y, X), kept RAW (un-standardized): the fit is invariant to predictand scaling and raw values let g(q) act in physical units (so g=‘sqrt’ is valid for precipitation, per Wilks). clim_terciles : optional (t1, t2) DataArrays (Y, X) of fixed climatological boundaries in the SAME units as y_train – pass the same terciles your verification uses (WAS_Verification.compute_class). best_params : optional {‘l2’:…, ‘g’:…, ‘quantiles’:…}. Overrides for this call; otherwise self.l2 / self.threshold_transform / self.fit_quantiles are used (which compute_hyperparameters updates in place).</p>
+</section>
+<section id="wass2s.WAS_mme_ELR.forecast" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_mme_ELR.forecast">forecast</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>WAS_mme_ELR.forecast(</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    Predictant,</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    Predictor,</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    Predictor_for_year,</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    clim_terciles<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">**</span>kwargs,</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Operational ELR tercile forecast for a single target year.</p>
+<p>Fits ELR on all available years and returns the tercile probabilities for the target year (dims probability, T, Y, X). Only the PREDICTOR is transformed (predictor_transform) and standardized (historical climatology, same stats applied to the forecast year); the PREDICTAND is kept RAW so thresholds and g(q) stay in physical units.</p>
+<p>After this call, <code>predictive_quantiles(p_levels)</code> returns the full predictive distribution of the target year from the same fit.</p>
+</section>
+<section id="wass2s.WAS_mme_ELR.predictive_quantiles" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_mme_ELR.predictive_quantiles">predictive_quantiles</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>WAS_mme_ELR.predictive_quantiles(p_levels<span class="op">=</span>(<span class="fl">0.1</span>, <span class="fl">0.25</span>, <span class="fl">0.5</span>, <span class="fl">0.75</span>, <span class="fl">0.9</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Predictive quantiles of the LAST fitted forecast – Wilks (2009)’s central result: the single fitted equation delivers the full predictive distribution, so any quantile is available in closed form,</p>
+<pre><code>q_p = g^{-1}( (logit(p) - b0 - beta.x) / alpha ).</code></pre>
+<p>Call after compute_model / forecast. Requires a named invertible g (‘identity’, ‘cbrt’, ‘sqrt’). With g=‘sqrt’ negative arguments (i.e. p below the probability of zero precip) map to q_p = 0.</p>
+<section id="returns-1" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-1">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 8%">
+<col style="width: 74%">
+<col style="width: 16%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>DataArray (quantile, T, Y, X) in the predictand's physical units.</td>
+<td></td>
+</tr>
+<tr class="even">
+<td></td>
+<td>Cells that fell back to climatology or lack thresholds are NaN.</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+
+
+</section>
+</section>
+</section>
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp('/' + window.location.host + '/');
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+      &nbsp;
+    </div>   
+    <div class="nav-footer-center">
+<p>Developed to support the WMO guidelines for objective, operational seasonal forecasting.</p>
+</div>
+    <div class="nav-footer-right">
+      &nbsp;
+    </div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

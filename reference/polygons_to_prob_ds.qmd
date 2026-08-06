@@ -1,0 +1,17 @@
+# polygons_to_prob_ds { #wass2s.polygons_to_prob_ds }
+
+```python
+polygons_to_prob_ds(
+    da_like,
+    gdf,
+    forecast_col='Forecast',
+    categories=('PB', 'PN', 'PA'),
+    time_dim='T',
+    y_dim='Y',
+    x_dim='X',
+)
+```
+
+Rasterize polygon forecasts onto the (Y,X) grid of `da_like` and return:
+  xr.Dataset with dims (probability, T, Y, X) and coords probability=['PB','PN','PA'].
+`da_like` is only used for its coords (1 time step expected).

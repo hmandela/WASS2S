@@ -1,0 +1,7 @@
+# HeatWaveMetric { #wass2s.HeatWaveMetric }
+
+```python
+HeatWaveMetric()
+```
+
+Heat wave / warm spell metrics (ETCCDI-style).

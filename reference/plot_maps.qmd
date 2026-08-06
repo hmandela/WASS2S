@@ -1,0 +1,27 @@
+# plot_maps { #wass2s.plot_maps }
+
+```python
+plot_maps(data_main, data_overlay, var_key, title_prefix='Monthly')
+```
+
+Render a 6-row map panel for the six preceding months.
+
+Each row displays one month.  The rendering strategy is controlled by
+``VAR_CONFIG[var_key]["plot_type"]``:
+
+- ``"anomaly_only"`` — filled contours of the anomaly (SST).
+- ``"contour_overlay"`` — filled anomaly + absolute contour lines with
+  optional highlighted isopleths (SLP, OLR).
+- ``"ratio"`` — precipitation ratio relative to climatology.
+- ``"vector"`` — quiver plot of wind vectors.
+- ``"streamlines"`` / ``"stream_humidity"`` — streamlines with specific
+  humidity (850 hPa) or wind speed (surface) as the colour background.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name         | Type                               | Description                                                                                                          | Default         |
+|--------------|------------------------------------|----------------------------------------------------------------------------------------------------------------------|-----------------|
+| data_main    | xarray.DataArray or xarray.Dataset | Primary data field (anomaly, ratio, or absolute for vector fields).                                                  | _required_      |
+| data_overlay | xarray.DataArray or None           | Absolute field used for overlaid contour lines; ``None`` for types that do not need it (ratio, vector, streamlines). | _required_      |
+| var_key      | str                                | Variable key defined in :data:`VAR_CONFIG`.                                                                          | _required_      |
+| title_prefix | str                                | String prepended to the figure super-title.                                                                          | ```"Monthly"``` |

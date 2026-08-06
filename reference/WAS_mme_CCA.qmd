@@ -1,0 +1,73 @@
+# WAS_mme_CCA { #wass2s.WAS_mme_CCA }
+
+```python
+WAS_mme_CCA(
+    n_modes=4,
+    n_pca_modes=8,
+    standardize=False,
+    use_coslat=True,
+    use_pca=True,
+    combine='mean',
+    detrend=True,
+    dist_method='nonparam',
+    positive_support=True,
+)
+```
+
+Canonical Correlation Analysis MME.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type                | Description                                                                                                                                                                          | Default      |
+|-------------|---------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------|
+| n_modes     | int                 | Number of canonical modes for xeofs.cross.CCA (default 4).                                                                                                                           | `4`          |
+| n_pca_modes | int                 | PCA modes kept before CCA when ``use_pca`` is True (default 8).                                                                                                                      | `8`          |
+| standardize | bool                | Passed to xeofs.cross.CCA. Keep False; the framework already standardizes (default False).                                                                                           | `False`      |
+| use_coslat  | bool                | Cosine-latitude weighting inside the CCA (default True).                                                                                                                             | `True`       |
+| use_pca     | bool                | Pre-filter each field with PCA before the CCA (default True).                                                                                                                        | `True`       |
+| combine     | (mean, meof)        | How the M models enter the CCA predictor field.                                                                                                                                      | `'mean'`     |
+| detrend     | bool                | Apply ``detrended_data`` to both predictor and predictand in ``forecast``, exactly like ``WAS_CCA_op`` does unconditionally (default True). Set False only for ablation comparisons. | `True`       |
+| dist_method | (nonparam, bestfit) | Tercile-probability strategy (default 'nonparam').                                                                                                                                   | `'nonparam'` |
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute_model](#wass2s.WAS_mme_CCA.compute_model) | Deterministic CCA hindcast for one CV fold, in the standardized space |
+| [forecast](#wass2s.WAS_mme_CCA.forecast) | Operational CCA forecast for a single target year. |
+
+### compute_model { #wass2s.WAS_mme_CCA.compute_model }
+
+```python
+WAS_mme_CCA.compute_model(X_train, y_train, X_test, y_test=None, **kwargs)
+```
+
+Deterministic CCA hindcast for one CV fold, in the standardized space
+the framework hands in. No detrend here — matches WAS_CCA_op.compute_model
+which is also detrend-free. The same_kind_model2 branch reverse-standardizes
+the output afterwards.
+
+### forecast { #wass2s.WAS_mme_CCA.forecast }
+
+```python
+WAS_mme_CCA.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictor,
+    hindcast_det,
+    Predictor_for_year,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Operational CCA forecast for a single target year.
+
+  predictor →  standardize  →  detrended_data()                 (raw, not pre-standardized)
+  predictand →  standardize  →  detrended_data() (always unconditional)
+  forecast-year predictor  →  apply_detrend_data()
+  fit CCA on (predictor_dt, predictand_st_dt)
+  result  →  + apply_detrend_data()  →  reverse_standardize()

@@ -1,0 +1,152 @@
+# WAS_compute_cessation_dry_spell { #wass2s.WAS_compute_cessation_dry_spell }
+
+```python
+WAS_compute_cessation_dry_spell(user_criteria=None)
+```
+
+Class for computing the **longest dry spell length** between the onset and cessation
+of the rainy season, using a two-stage approach:
+
+1. Detect **onset** (start of rainy season) using cumulative rainfall criteria
+2. Detect **cessation** (end of rainy season) using soil water balance
+3. Calculate the maximum consecutive dry days (≤ thrd_rain_day mm) within that window
+
+This is a critical agro-meteorological indicator in West Africa, especially for assessing
+drought risk during the growing season after planting.
+
+Key Features:
+- Uses zone-specific criteria for both onset and cessation
+- Automatic agro-climatic zone assignment based on mean annual rainfall and latitude
+- Supports station (CDT format) and gridded (xarray) daily rainfall data
+- Parallel computation with Dask for large domains
+- Returns the longest dry spell length (in days) between onset and cessation
+
+Default Zones & Criteria:
+0. Sahel100_0mm     → onset: 01-May → 15-Aug | cessation: 01-Sep → 30-Sep
+1. Sahel200_100mm   → onset: 15-May → 15-Aug | cessation: 01-Sep → 05-Oct
+2. Sahel400_200mm   → onset: 01-May → 31-Jul | cessation: 01-Sep → 10-Nov
+3. Sahel600_400mm   → onset: 15-Mar → 31-Jul | cessation: 15-Sep → 15-Nov
+4. Soudan           → onset: 15-Mar → 31-Jul | cessation: 01-Oct → 30-Nov
+5. Golfe of Guinea  → onset: 01-Feb → 15-Jun | cessation: 15-Oct → 01-Dec
+
+References:
+- AGRHYMET Regional Centre operational methodologies
+- Sivakumar (1991): Methodology for onset, cessation, and dry spell analysis
+- Common practice in West African national meteorological and agricultural services
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name          | Type   | Description                                                                                                                                                                                                                                                                                                                                                         | Default   |
+|---------------|--------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|
+| user_criteria | dict   | Custom zone-specific criteria. If None, uses default dictionary. Expected keys: zone_id → {"zone_name": str, "start_search1": "MM-DD", "cumulative": float, "number_dry_days": int, "thrd_rain_day": float, "end_search1": "MM-DD", "nbjour": int, "date_dry_soil": "MM-DD", "start_search2": "MM-DD", "ETP": float, "Cap_ret_maxi": float, "end_search2": "MM-DD"} | `None`    |
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [adjust_duplicates](#wass2s.WAS_compute_cessation_dry_spell.adjust_duplicates) | If any values in the Series repeat, nudge them by a tiny increment |
+| [compute](#wass2s.WAS_compute_cessation_dry_spell.compute) | Compute the longest dry spell length after the rainy season onset  |
+| [day_of_year](#wass2s.WAS_compute_cessation_dry_spell.day_of_year) | Convert year i and MM-DD string dem_rech1 (e.g., '07-23')  |
+| [dry_spell_cessation_function](#wass2s.WAS_compute_cessation_dry_spell.dry_spell_cessation_function) | Computes the longest dry spell length after the onset and |
+| [transform_cdt](#wass2s.WAS_compute_cessation_dry_spell.transform_cdt) | Transform a DataFrame with: |
+
+### adjust_duplicates { #wass2s.WAS_compute_cessation_dry_spell.adjust_duplicates }
+
+```python
+WAS_compute_cessation_dry_spell.adjust_duplicates(series, increment=1e-05)
+```
+
+If any values in the Series repeat, nudge them by a tiny increment
+so that all are unique (to avoid indexing collisions).
+
+### compute { #wass2s.WAS_compute_cessation_dry_spell.compute }
+
+```python
+WAS_compute_cessation_dry_spell.compute(daily_data, nb_cores)
+```
+
+Compute the longest dry spell length after the rainy season onset 
+for each pixel in the given daily rainfall DataArray, using different 
+criteria (both for onset and cessation) based on isohyet zones.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name       | Type             | Description                                    | Default    |
+|------------|------------------|------------------------------------------------|------------|
+| daily_data | xarray.DataArray | Daily rainfall data, coords = (T, Y, X).       | _required_ |
+| nb_cores   | int              | Number of parallel processes (workers) to use. | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                                        |
+|--------|------------------|----------------------------------------------------|
+|        | xarray.DataArray | Array with the longest dry spell length per pixel. |
+
+### day_of_year { #wass2s.WAS_compute_cessation_dry_spell.day_of_year }
+
+```python
+WAS_compute_cessation_dry_spell.day_of_year(i, dem_rech1)
+```
+
+Convert year i and MM-DD string dem_rech1 (e.g., '07-23') 
+into a 1-based day of the year.
+
+### dry_spell_cessation_function { #wass2s.WAS_compute_cessation_dry_spell.dry_spell_cessation_function }
+
+```python
+WAS_compute_cessation_dry_spell.dry_spell_cessation_function(
+    x,
+    idebut1,
+    cumul,
+    nbsec,
+    jour_pluvieux,
+    irch_fin1,
+    idebut2,
+    ijour_dem_cal,
+    ETP,
+    Cap_ret_maxi,
+    irch_fin2,
+    nbjour,
+)
+```
+
+Computes the longest dry spell length after the onset and
+determines the cessation date (when soil water returns to 0)
+based on water balance, then checks for a dry spell.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name          | Type         | Description                                             | Default    |
+|---------------|--------------|---------------------------------------------------------|------------|
+| x             | array - like | Daily rainfall or similar values.                       | _required_ |
+| idebut1       | int          | Start index to begin searching for the onset.           | _required_ |
+| cumul         | float        | Cumulative rainfall threshold to trigger onset.         | _required_ |
+| nbsec         | int          | Maximum number of dry days allowed in the sequence.     | _required_ |
+| jour_pluvieux | float        | Minimum rainfall to consider a day as rainy.            | _required_ |
+| irch_fin1     | int          | Maximum index limit for the onset search.               | _required_ |
+| idebut2       | int          | Start index for the cessation search.                   | _required_ |
+| ijour_dem_cal | int          | Start index from which the water balance is calculated. | _required_ |
+| ETP           | float        | Daily evapotranspiration (mm).                          | _required_ |
+| Cap_ret_maxi  | float        | Maximum soil water retention capacity (mm).             | _required_ |
+| irch_fin2     | int          | Maximum index limit for the cessation search.           | _required_ |
+| nbjour        | int          | Number of days after onset to check for the dry spell.  | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                                      |
+|--------|--------|------------------------------------------------------------------------------------------------------------------|
+|        | float  | Length of the longest dry spell sequence after onset and before soil water returns to zero, or NaN if not found. |
+
+### transform_cdt { #wass2s.WAS_compute_cessation_dry_spell.transform_cdt }
+
+```python
+WAS_compute_cessation_dry_spell.transform_cdt(df)
+```
+
+Transform a DataFrame with:
+  - Row 0 = LON
+  - Row 1 = LAT
+  - Row 2 = ELEV
+  - Rows 3+ = daily data (or any date) with 'ID' column containing dates.
+
+Returns an xarray DataArray with coords = (T, Y, X), variable = 'Observation'.

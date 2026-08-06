@@ -1,0 +1,8 @@
+# truncated_normal_mean_var { #wass2s.truncated_normal_mean_var }
+
+```python
+truncated_normal_mean_var(mu, sigma, dry_threshold=0.0)
+```
+
+Mean and variance of X | X > c, X ~ N(mu, sigma^2). (Unchanged from your
+code — it was already correct; included for completeness.)

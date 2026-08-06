@@ -1,0 +1,103 @@
+# WAS_compute_cessation { #wass2s.WAS_compute_cessation }
+
+```python
+WAS_compute_cessation(user_criteria=None)
+```
+
+Class for computing the **cessation date** (end of rainy season) based on **soil moisture balance**.
+
+This class uses a simple water balance model to determine when soil moisture is depleted,
+marking the end of the rainy season. It is widely used in West African agrometeorology
+(AGRHYMET, national services) for Sahel, Sudanian, and Guinean zones.
+
+Key Features:
+- Soil water balance: rainfall - ETP (evapotranspiration), capped at soil retention capacity
+- Cessation date: first day when soil moisture reaches zero after the search start
+- Zone-specific criteria (start search, ETP, retention capacity, end search)
+- Supports station (CDT format) and gridded (xarray) daily rainfall data
+- Automatic agro-climatic zone assignment based on mean annual rainfall and latitude
+- Parallel computation with Dask for large grids
+
+Default Zones & Criteria:
+0. Sahel100_0mm     → start search 01-Sep, ETP 5.0 mm/day, capacity 70 mm, end 30-Sep
+1. Sahel200_100mm   → start search 01-Sep, ETP 5.0 mm/day, capacity 70 mm, end 05-Oct
+2. Sahel400_200mm   → start search 01-Sep, ETP 5.0 mm/day, capacity 70 mm, end 10-Nov
+3. Sahel600_400mm   → start search 15-Sep, ETP 5.0 mm/day, capacity 70 mm, end 15-Nov
+4. Soudan           → start search 01-Oct, ETP 4.5 mm/day, capacity 70 mm, end 30-Nov
+5. Golfe of Guinea  → start search 15-Oct, ETP 4.0 mm/day, capacity 70 mm, end 01-Dec
+
+References:
+- AGRHYMET Regional Centre operational methodologies
+- Sivakumar (1991): Soil water balance and cessation prediction in West Africa
+- Common practice in Sahelian and Sudanian national meteorological services
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name          | Type   | Description                                                                                                                                                                                                                           | Default   |
+|---------------|--------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|
+| user_criteria | dict   | Custom zone-specific cessation criteria. If None, uses default dictionary. Expected keys: zone_id → {"zone_name": str, "date_dry_soil": "MM-DD", "start_search": "MM-DD", "ETP": float, "Cap_ret_maxi": float, "end_search": "MM-DD"} | `None`    |
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [adjust_duplicates](#wass2s.WAS_compute_cessation.adjust_duplicates) | If any values in the Series repeat, nudge them by a tiny increment |
+| [cessation_function](#wass2s.WAS_compute_cessation.cessation_function) | Compute cessation date using soil moisture balance criteria. |
+| [compute](#wass2s.WAS_compute_cessation.compute) | Compute cessation dates for each pixel using criteria based on regions. |
+| [day_of_year](#wass2s.WAS_compute_cessation.day_of_year) | Given a year 'i' and a month-day string 'dem_rech1' (e.g., '07-23'), |
+| [transform_cdt](#wass2s.WAS_compute_cessation.transform_cdt) | Transform a DataFrame with: |
+
+### adjust_duplicates { #wass2s.WAS_compute_cessation.adjust_duplicates }
+
+```python
+WAS_compute_cessation.adjust_duplicates(series, increment=1e-05)
+```
+
+If any values in the Series repeat, nudge them by a tiny increment
+so that all are unique (to avoid indexing collisions).
+
+### cessation_function { #wass2s.WAS_compute_cessation.cessation_function }
+
+```python
+WAS_compute_cessation.cessation_function(
+    x,
+    ijour_dem_cal,
+    idebut,
+    ETP,
+    Cap_ret_maxi,
+    irch_fin,
+)
+```
+
+Compute cessation date using soil moisture balance criteria.
+
+### compute { #wass2s.WAS_compute_cessation.compute }
+
+```python
+WAS_compute_cessation.compute(daily_data, nb_cores)
+```
+
+Compute cessation dates for each pixel using criteria based on regions.
+
+### day_of_year { #wass2s.WAS_compute_cessation.day_of_year }
+
+```python
+WAS_compute_cessation.day_of_year(i, dem_rech1)
+```
+
+Given a year 'i' and a month-day string 'dem_rech1' (e.g., '07-23'),
+return the 1-based day of the year.
+
+### transform_cdt { #wass2s.WAS_compute_cessation.transform_cdt }
+
+```python
+WAS_compute_cessation.transform_cdt(df)
+```
+
+Transform a DataFrame with:
+  - Row 0 = LON
+  - Row 1 = LAT
+  - Row 2 = ELEV
+  - Rows 3+ = daily data (or any date) with 'ID' column containing dates.
+
+Returns an xarray DataArray with coords = (T, Y, X), variable = 'Observation'.

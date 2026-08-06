@@ -1,0 +1,85 @@
+# WAS_ProbWeighted { #wass2s.WAS_ProbWeighted }
+
+```python
+WAS_ProbWeighted(
+    metric='GROC',
+    threshold=0.5,
+    moderate_break=0.6,
+    high_break=0.8,
+    moderate_weight=0.6,
+    high_weight=0.8,
+    top_weight=1.0,
+    missing_score='zero',
+    normalize_probabilities=True,
+)
+```
+
+Skill-weighted combination of multi-model tercile probabilities.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name                    | Type                   | Description                                                                                                                                   | Default   |
+|-------------------------|------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|-----------|
+| metric                  | str                    | Skill metric represented by ``scores``. The stepwise transformation is designed for higher-is-better scores bounded approximately by 0 and 1. | `"GROC"`  |
+| threshold               | float                  | Scores less than or equal to this value receive zero weight.                                                                                  | `0.5`     |
+| moderate_break          | float                  | Upper score boundary of the moderate-skill class.                                                                                             | `0.6`     |
+| high_break              | float                  | Upper score boundary of the high-skill class.                                                                                                 | `0.8`     |
+| moderate_weight         | float                  | Weight assigned when ``threshold < score <= moderate_break``.                                                                                 | `0.6`     |
+| high_weight             | float                  | Weight assigned when ``moderate_break < score <= high_break``.                                                                                | `0.8`     |
+| top_weight              | float                  | Weight assigned when ``score > high_break``.                                                                                                  | `1.0`     |
+| missing_score           | (zero, one, \'raise\') | Behaviour when no score can be associated with a model. ``"zero"`` excludes it, ``"one"`` assigns full weight, and ``"raise"`` stops.         | `"zero"`  |
+| normalize_probabilities | bool                   | Normalize every complete probability vector before and after the MME. This also converts percentage inputs summing to 100 into fractions.     | `True`    |
+
+## Notes {.doc-section .doc-section-notes}
+
+Expected ensemble dimensions are ``(probability, T, M, Y, X)``. Public
+outputs are always ``(probability, T, Y, X)``. A score is always reduced to
+``(Y, X)`` before weighting, preventing an accidental ``M`` dimension from
+leaking into the result.
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute](#wass2s.WAS_ProbWeighted.compute) | Compute a skill-weighted MME of tercile probabilities. |
+| [transform_score](#wass2s.WAS_ProbWeighted.transform_score) | Convert a GROC-like skill field into stepwise non-negative weights. |
+
+### compute { #wass2s.WAS_ProbWeighted.compute }
+
+```python
+WAS_ProbWeighted.compute(
+    rainfall,
+    hdcst,
+    fcst,
+    scores,
+    threshold=None,
+    complete=False,
+)
+```
+
+Compute a skill-weighted MME of tercile probabilities.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name      | Type                     | Description                                                                                                                         | Default    |
+|-----------|--------------------------|-------------------------------------------------------------------------------------------------------------------------------------|------------|
+| rainfall  | xarray.DataArray         | Observation field with dimensions ``(T, Y, X)``. A singleton or multi-valued ``M`` dimension is accepted; the first member is used. | _required_ |
+| hdcst     | xarray.DataArray         | Probabilistic model ensembles with dimensions ``(probability, T, M, Y, X)`` in any order.                                           | _required_ |
+| fcst      | xarray.DataArray         | Probabilistic model ensembles with dimensions ``(probability, T, M, Y, X)`` in any order.                                           | _required_ |
+| scores    | dict or xarray.DataArray | Model skill fields. Every selected score is reduced to ``(Y, X)``.                                                                  | _required_ |
+| threshold | float                    | Runtime override of the instance exclusion threshold.                                                                               | `None`     |
+| complete  | bool                     | Fill cells with no positively weighted model using the unweighted multi-model probability mean.                                     | `False`    |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type                                                    | Description                                   |
+|--------|---------------------------------------------------------|-----------------------------------------------|
+|        | hindcast_weighted, forecast_weighted : xarray.DataArray | Arrays ordered as ``(probability, T, Y, X)``. |
+
+### transform_score { #wass2s.WAS_ProbWeighted.transform_score }
+
+```python
+WAS_ProbWeighted.transform_score(score_array, threshold=None)
+```
+
+Convert a GROC-like skill field into stepwise non-negative weights.

@@ -1,0 +1,15 @@
+# VAR_CONFIG { #wass2s.VAR_CONFIG }
+
+`VAR_CONFIG`
+
+dict: Per-variable ERA5 download and plotting configuration.
+
+Each key is a short variable identifier.  The associated dict contains:
+
+- ``cds_name`` — CDS variable name(s).
+- ``level_type`` — ``"single"`` or ``"pressure"``.
+- ``unit_func`` — callable that converts raw ERA5 *monthly* units.
+- ``unit_label`` — axis / colorbar label.
+- ``plot_type`` — rendering strategy used by :func:`plot_maps`.
+- ``cmap``, ``levels``, ``extent`` — Matplotlib / Cartopy parameters.
+- ``hov_band``, ``hov_cmap``, ``hov_levels`` — Hovmöller parameters (OLR only).

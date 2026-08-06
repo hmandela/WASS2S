@@ -1,0 +1,39 @@
+# process_datasets_for_mme { #wass2s.process_datasets_for_mme }
+
+```python
+process_datasets_for_mme(
+    rainfall,
+    hdcsted=None,
+    fcsted=None,
+    gcm=False,
+    agroparam=False,
+    Prob=False,
+    hydro=False,
+    ELM_ELR=False,
+    dir_to_save_model=None,
+    best_models=None,
+    scores=None,
+    year_start=None,
+    year_end=None,
+    model=False,
+    month_of_initialization=None,
+    lead_time=None,
+    year_forecast=None,
+    score_metric='GROC',
+    var='PRCP',
+)
+```
+
+Prepare deterministic or probabilistic fields for an MME.
+
+The function guarantees the following output conventions:
+
+* deterministic fields: ``(T, M, Y, X)``;
+* probabilistic fields: ``(probability, T, M, Y, X)``;
+* xcast ELM/ELR fields: ``(S, M, Y, X)``;
+* observations: ``(T, M, Y, X)`` with a singleton ``M`` dimension;
+* score fields: one strictly spatial ``(Y, X)`` array per model.
+
+In particular, a score carrying an ``M`` dimension is explicitly reduced
+to the requested model before it can be used. This prevents accidental
+xarray broadcasting from reintroducing ``M`` into a deterministic MME.

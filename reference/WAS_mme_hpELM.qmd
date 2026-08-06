@@ -1,0 +1,129 @@
+# WAS_mme_hpELM { #wass2s.WAS_mme_hpELM }
+
+```python
+WAS_mme_hpELM(
+    neurons_range=[10, 20, 50, 100],
+    activation_options=['sigm', 'tanh', 'lin', 'rbf_l1', 'rbf_l2', 'rbf_linf'],
+    norm_range=[0.1, 1.0, 10.0, 100.0],
+    random_state=42,
+    dist_method='nonparam',
+    search_method='random',
+    n_iter_search=10,
+    cv_folds=3,
+    n_clusters=4,
+    leave_one_year_out=False,
+    n_trials_bayesian=50,
+    bayesian_sampler='tpe',
+    scoring='neg_mean_squared_error',
+    verbose=0,
+    n_jobs=-1,
+    optuna_n_jobs=None,
+    cv_n_jobs=-1,
+)
+```
+
+Extreme Learning Machine (ELM) based Multi-Model Ensemble (MME) forecasting using hpelm library.
+This class implements a single-model forecasting approach using HPELM for deterministic predictions,
+with optional tercile probability calculations using various statistical distributions.
+Implements hyperparameter optimization via multiple methods.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name               | Type          | Description                                                                                                                                                                                               | Default                                                   |
+|--------------------|---------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------|
+| neurons_range      | list of int   | List of neuron counts to tune for HPELM (default is [10, 20, 50, 100]).                                                                                                                                   | `[10, 20, 50, 100]`                                       |
+| activation_options | list of str   | Activation functions to tune for HPELM (default is ['sigm', 'tanh', 'lin', 'rbf_l1', 'rbf_l2', 'rbf_linf']).                                                                                              | `['sigm', 'tanh', 'lin', 'rbf_l1', 'rbf_l2', 'rbf_linf']` |
+| norm_range         | list of float | Regularization parameters to tune for HPELM (default is [0.1, 1.0, 10.0, 100.0]).                                                                                                                         | `[0.1, 1.0, 10.0, 100.0]`                                 |
+| random_state       | int           | Seed for reproducibility (default is 42).                                                                                                                                                                 | `42`                                                      |
+| dist_method        | str           | Distribution method for tercile probabilities.                                                                                                                                                            | `'nonparam'`                                              |
+| search_method      | str           | Hyperparameter optimization method: 'grid', 'random', or 'bayesian' (default: 'random').                                                                                                                  | `'random'`                                                |
+| n_iter_search      | int           | Number of iterations for randomized search (default is 10).                                                                                                                                               | `10`                                                      |
+| cv_folds           | int           | Number of cross-validation folds (default is 3).                                                                                                                                                          | `3`                                                       |
+| n_clusters         | int           | Number of clusters for homogenized zones (default is 4).                                                                                                                                                  | `4`                                                       |
+| n_trials_bayesian  | int           | Number of trials for Bayesian optimization (default=50).                                                                                                                                                  | `50`                                                      |
+| bayesian_sampler   | str           | Sampler for Bayesian optimization: 'tpe' or 'random' (default='tpe').                                                                                                                                     | `'tpe'`                                                   |
+| scoring            | str           | Scoring metric for optimization (default='neg_mean_squared_error').                                                                                                                                       | `'neg_mean_squared_error'`                                |
+| n_jobs             | int           | Maximum number of parallel workers for grid/random search and Optuna. ``-1`` uses all available CPUs. Inner CV is serial during parallel Optuna trials to prevent nested oversubscription (default is 4). | `-1`                                                      |
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute_hyperparameters](#wass2s.WAS_mme_hpELM.compute_hyperparameters) | Best hyperparameters per zone. |
+| [compute_model](#wass2s.WAS_mme_hpELM.compute_model) | Deterministic hindcast with one HPELM per zone. |
+| [compute_prob](#wass2s.WAS_mme_hpELM.compute_prob) | Tercile probabilities for deterministic hindcasts (pass the CV hindcast for calibration). |
+| [forecast](#wass2s.WAS_mme_hpELM.forecast) | Operational forecast for a target year (deterministic + tercile probabilities). |
+
+### compute_hyperparameters { #wass2s.WAS_mme_hpELM.compute_hyperparameters }
+
+```python
+WAS_mme_hpELM.compute_hyperparameters(
+    Predictors,
+    Predictand,
+    clim_year_start=None,
+    clim_year_end=None,
+)
+```
+
+Best hyperparameters per zone.
+
+Regionalization: KMeans on the predictand VALUES (kept by preference).
+Standardization is applied here only if clim years are given (dual mode).
+
+### compute_model { #wass2s.WAS_mme_hpELM.compute_model }
+
+```python
+WAS_mme_hpELM.compute_model(
+    X_train,
+    y_train,
+    X_test,
+    y_test=None,
+    clim_year_start=None,
+    clim_year_end=None,
+    best_params=None,
+    cluster_da=None,
+)
+```
+
+Deterministic hindcast with one HPELM per zone.
+
+>>> A: clim years now in the signature; tuning runs in dual mode when
+best_params/cluster_da are not supplied.
+
+### compute_prob { #wass2s.WAS_mme_hpELM.compute_prob }
+
+```python
+WAS_mme_hpELM.compute_prob(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Tercile probabilities for deterministic hindcasts (pass the CV hindcast for calibration).
+
+### forecast { #wass2s.WAS_mme_hpELM.forecast }
+
+```python
+WAS_mme_hpELM.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    hindcast_det_cross,
+    Predictor_for_year,
+    best_params=None,
+    cluster_da=None,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Operational forecast for a target year (deterministic + tercile probabilities).

@@ -1,0 +1,8 @@
+# crps_gaussian { #wass2s.crps_gaussian }
+
+```python
+crps_gaussian(y, mu, sigma)
+```
+
+Analytic CRPS for N(mu, sigma^2) (Gneiting et al. 2005). Validated to
+<1e-4 vs quadrature.

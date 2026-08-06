@@ -1,0 +1,40 @@
+project:
+  type: website
+  output-dir: docs
+  render:
+    - index.qmd
+    - get_started.qmd
+    - reference/*.qmd
+
+website:
+  title: "wass2s"
+  description: "A Python-based tool for seasonal climate forecasting in West Africa and the Sahel"
+  page-navigation: true
+  page-footer:
+    center: |
+      Developed to support the WMO guidelines for objective, operational seasonal forecasting.
+  navbar:
+    background: light
+    pinned: true
+    left:
+      - text: "Get Started"
+        file: get_started.qmd
+      - text: "Reference"
+        file: reference/index.qmd
+      - text: "Training Docs"
+        href: https://hmandela.github.io/WAS_S2S_Training/
+        target: _blank
+    right:
+      - icon: github
+        href: https://github.com/hmandela/WASS2S
+        aria-label: wass2s GitHub
+
+format:
+  html:
+    theme: cosmo
+    sidebar: false
+
+quartodoc:
+  title: Reference
+  package: wass2s
+  renderer: _renderer.py

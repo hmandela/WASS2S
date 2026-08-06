@@ -1,0 +1,108 @@
+# WAS_KernelCCA_base { #wass2s.WAS_KernelCCA_base }
+
+```python
+WAS_KernelCCA_base(
+    n_modes=4,
+    kernel='linear',
+    dist_method='nonparam',
+    standardize=True,
+    cv_folds=3,
+    random_state=42,
+    search_method='grid',
+    reg=1e-06,
+    pca_explained_variance=0.8,
+    pca_min_components=None,
+    pca_whiten=False,
+    pca_backend='xeofs',
+    pca_use_coslat=False,
+    pca_solver='auto',
+)
+```
+
+Shared base for kernel CCA seasonal-forecast models (KCCA, KGCCA).
+
+Subclasses only need to implement the model-construction hooks:
+    _build_model(params)      -> a fitted-ready cca-zoo estimator
+    _grid_estimator()         -> estimator used by GridSearchCV
+    _prepare_param_grid()     -> dict for grid search
+    _objective(trial, X, Y)   -> float for Optuna (optional)
+    _is_linear_kernel()       -> whether interpretable feature weights exist
+
+Conventions identical to WAS_CCA_base:
+    WAS dims:  T, Y, X
+    Predictand standardized before CCA, returned in original scale.
+    Missing values filled with training-period means (no leakage).
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute_hyperparameters](#wass2s.WAS_KernelCCA_base.compute_hyperparameters) | Find best kernel hyperparameters; stores them in self.best_params. |
+| [compute_model](#wass2s.WAS_KernelCCA_base.compute_model) | Fit on the training fold and predict the test fold. Returns the |
+| [fit_cca](#wass2s.WAS_KernelCCA_base.fit_cca) | Fit the kernel CCA model and build the (X canonical scores -> Y field) |
+| [get_components](#wass2s.WAS_KernelCCA_base.get_components) | Spatial patterns (linear kernel only). |
+| [plot_cca_results](#wass2s.WAS_KernelCCA_base.plot_cca_results) | Plot canonical scores (always) and spatial modes (linear kernel). |
+
+### compute_hyperparameters { #wass2s.WAS_KernelCCA_base.compute_hyperparameters }
+
+```python
+WAS_KernelCCA_base.compute_hyperparameters(
+    Predictors,
+    Predictand,
+    clim_year_start=None,
+    clim_year_end=None,
+)
+```
+
+Find best kernel hyperparameters; stores them in self.best_params.
+
+### compute_model { #wass2s.WAS_KernelCCA_base.compute_model }
+
+```python
+WAS_KernelCCA_base.compute_model(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    best_params=None,
+)
+```
+
+Fit on the training fold and predict the test fold. Returns the
+deterministic hindcast in the original predictand scale (T, Y, X).
+
+### fit_cca { #wass2s.WAS_KernelCCA_base.fit_cca }
+
+```python
+WAS_KernelCCA_base.fit_cca(X_train, y_train, best_params=None)
+```
+
+Fit the kernel CCA model and build the (X canonical scores -> Y field)
+regression used for deterministic prediction.
+
+`y_train` is used *as given* as the regression target, so callers that
+want predictions in standardized space should pass a standardized
+predictand (see compute_model / forecast).
+
+### get_components { #wass2s.WAS_KernelCCA_base.get_components }
+
+```python
+WAS_KernelCCA_base.get_components()
+```
+
+Spatial patterns (linear kernel only).
+
+### plot_cca_results { #wass2s.WAS_KernelCCA_base.plot_cca_results }
+
+```python
+WAS_KernelCCA_base.plot_cca_results(
+    X=None,
+    Y=None,
+    n_modes=None,
+    clim_year_start=None,
+    clim_year_end=None,
+    best_params=None,
+)
+```
+
+Plot canonical scores (always) and spatial modes (linear kernel).

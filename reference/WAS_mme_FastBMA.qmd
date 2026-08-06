@@ -1,0 +1,122 @@
+# WAS_mme_FastBMA { #wass2s.WAS_mme_FastBMA }
+
+```python
+WAS_mme_FastBMA(model_type='normal', tol=0.001)
+```
+
+Grid-based Bayesian Model Averaging — SLSQP maximum-likelihood fitting.
+
+## Supported ``model_type`` values {.doc-section .doc-section-supported-modeltype-values}
+
+``'normal'``
+    Gaussian BMA (Raftery et al. 2005).  Component: N(f_k, σ²) where f_k
+    is the k-th raw ensemble member and σ is a single shared standard
+    deviation fitted by maximum likelihood.
+
+``'gamma'``
+    Gamma mixture for strictly positive quantities (wind speed, etc.).
+    Parameterisation: Γ(shape, scale = f_k / shape) so that
+    E[Y | k] = f_k.  A single shared shape parameter is estimated.
+
+``'gamma0'``
+    Zero-adjusted Gamma mixture for precipitation
+    (Sloughter et al. 2007, §2).  The marginal model is
+
+        P(Y = 0)  = 1 − POP
+        P(Y > 0)  = POP · Γ-mixture(shape, f_k / shape)
+
+    where POP is estimated via logistic regression on three predictors:
+    intercept, ∛ens_mean, and fraction of wet ensemble members
+    (Sloughter et al. 2007 Eq. 1).
+
+## Tercile thresholds {.doc-section .doc-section-tercile-thresholds}
+
+Provide either ``clim_terciles`` (dims: ``('tercile', Y, X)``) or
+``obs_for_terciles`` (dims include ``time_dim, Y, X``); terciles are then
+computed per gridpoint.
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute_gridpoint_terciles_from_obs](#wass2s.WAS_mme_FastBMA.compute_gridpoint_terciles_from_obs) | Compute per-gridpoint tercile thresholds from a climatological sample. |
+| [fit](#wass2s.WAS_mme_FastBMA.fit) | Fit BMA parameters at every gridpoint via SLSQP maximum-likelihood. |
+| [predict_probabilistic](#wass2s.WAS_mme_FastBMA.predict_probabilistic) | Generate probabilistic forecasts from the fitted BMA mixture. |
+
+### compute_gridpoint_terciles_from_obs { #wass2s.WAS_mme_FastBMA.compute_gridpoint_terciles_from_obs }
+
+```python
+WAS_mme_FastBMA.compute_gridpoint_terciles_from_obs(
+    obs,
+    *,
+    time_dim='T',
+    lat_dim='Y',
+    lon_dim='X',
+    q=(1 / 3, 2 / 3),
+)
+```
+
+Compute per-gridpoint tercile thresholds from a climatological sample.
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description                                                            |
+|--------|--------------|------------------------------------------------------------------------|
+|        | xr.DataArray | dims: ``('tercile', lat_dim, lon_dim)``; tercile ∈ ['lower', 'upper']. |
+
+### fit { #wass2s.WAS_mme_FastBMA.fit }
+
+```python
+WAS_mme_FastBMA.fit(
+    hcst_grid,
+    obs_grid,
+    *,
+    member_dim='M',
+    time_dim='T',
+    lat_dim='Y',
+    lon_dim='X',
+    min_samples=10,
+)
+```
+
+Fit BMA parameters at every gridpoint via SLSQP maximum-likelihood.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name      | Type                                         | Description   | Default    |
+|-----------|----------------------------------------------|---------------|------------|
+| hcst_grid | dims(member_dim, time_dim, lat_dim, lon_dim) |               | _required_ |
+| obs_grid  | xr.DataArray                                 |               | _required_ |
+
+### predict_probabilistic { #wass2s.WAS_mme_FastBMA.predict_probabilistic }
+
+```python
+WAS_mme_FastBMA.predict_probabilistic(
+    new_forecasts,
+    *,
+    clim_terciles=None,
+    obs_for_terciles=None,
+    tercile_q=(1 / 3, 2 / 3),
+    quantiles=(0.1, 0.5, 0.9),
+    member_dim='M',
+    time_dim='T',
+    lat_dim='Y',
+    lon_dim='X',
+)
+```
+
+Generate probabilistic forecasts from the fitted BMA mixture.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name             | Type                                         | Description   | Default    |
+|------------------|----------------------------------------------|---------------|------------|
+| new_forecasts    | xr.DataArray                                 |               | _required_ |
+| clim_terciles    | Optional\[xr.DataArray\]                     |               | `None`     |
+| obs_for_terciles | dims(time_dim, lat_dim, lon_dim)\[optional\] |               | `None`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type        | Description                                                                                                                                                                                                                                  |
+|--------|-------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|        | xr.Dataset: | ``predictive_mean``       — (T, Y, X) ``predictive_quantiles``  — ('quantile', T, Y, X) ``tercile_probability``   — ('probability', T, Y, X)  [if terciles given] ``tercile_thresholds``    — ('tercile', Y, X)          [if terciles given] |

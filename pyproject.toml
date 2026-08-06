@@ -172,3 +172,20 @@ properscoring = "*"
 xgboost = "==2.1.*"
 lightgbm = "==4.6.0"
 xskillscore = "==0.0.26"
+
+# --- Docs website (quartodoc generates reference/*.qmd; render with a
+# system-installed `quarto` CLI — see https://quarto.org/docs/get-started/.
+# The conda-forge `quarto` package's bundled dart-sass fails to compile
+# themes on at least some machines, so it's deliberately not pixi-managed. ---
+[tool.pixi.feature.docs.dependencies]
+quartodoc = "*"
+griffe = "1.14.*"
+
+[tool.pixi.feature.docs.tasks]
+docs-build = "quartodoc build"
+docs-render = { cmd = "quarto render", depends-on = ["docs-build"] }
+docs-preview = { cmd = "quarto preview", depends-on = ["docs-build"] }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+docs = { features = ["docs"], solve-group = "default" }

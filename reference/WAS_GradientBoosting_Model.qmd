@@ -1,0 +1,16 @@
+# WAS_GradientBoosting_Model { #wass2s.WAS_GradientBoosting_Model }
+
+```python
+WAS_GradientBoosting_Model(
+    param_space=None,
+    n_clusters=5,
+    nb_cores=1,
+    dist_method='nonparam',
+    hyperparam_optimizer='bayesian',
+    n_trials=50,
+    n_iter=50,
+    mode='cluster',
+)
+```
+
+Gradient Boosting regressor (sklearn).

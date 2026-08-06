@@ -1,0 +1,5 @@
+# DAILY_UNIT { #wass2s.DAILY_UNIT }
+
+`DAILY_UNIT`
+
+dict: Per-variable ``(unit_func, unit_label)`` for the daily pipeline.
