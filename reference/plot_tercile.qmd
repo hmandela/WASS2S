@@ -1,0 +1,17 @@
+# plot_tercile { #wass2s.plot_tercile }
+
+```python
+plot_tercile(A, save_dir=None, colors=None, year=None)
+```
+
+Plot a tercile map with categories: Below, Normal, Above.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type             | Description                                                                                      | Default    |
+|--------|------------------|--------------------------------------------------------------------------------------------------|------------|
+| A      | xarray.DataArray | Data array with tercile categories (0: Below, 1: Normal, 2: Above) and dimensions 'T', 'Y', 'X'. | _required_ |
+
+## Notes {.doc-section .doc-section-notes}
+
+Uses a custom colormap and displays a legend for tercile categories.

@@ -16,34 +16,33 @@ It helps forecaster to download data, build models, verify the models, and forec
 - 🤖 **Exploration of AI and Machine Learning**: Investigates the use of advanced technologies to further improve forecasting accuracy.
 
 ## 📥 Installation
-1.  Download and Install miniconda
 
--   For Windows, download the executable [here](https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe)
+### Option A: pixi (recommended)
+[pixi](https://pixi.sh) manages the full environment (all forecasting, geospatial, and ML dependencies) for Linux, Windows, and macOS from this repo's `pyproject.toml` — no separate conda install needed.
 
--   For Linux (Ubuntu), in the terminal run:
-
-    ``` bash
-    sudo apt-get update
-    sudo apt-get upgrade
-    sudo apt-get install wget
-    wget -c -r https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh --no-check-certificate
-    bash Miniconda3-latest-Linux-x86_64.sh
-    ```
-2. Create an environment and activate
-- For Windows: download yaml [here](https://github.com/hmandela/WASS2S/blob/main/WAS_S2S_windows.yml) and run
+1. Install pixi:
 ```bash
-conda env create -f WAS_S2S_windows.yml
-conda activate WASS2S
+curl -fsSL https://pixi.sh/install.sh | sh
 ```
-- For Linux: download yaml [here](https://github.com/hmandela/WASS2S/blob/main/WAS_S2S_linux.yml) and run
+2. Clone the repository and install the environment:
 ```bash
-conda env create -f WAS_S2S_linux.yml
-conda activate WASS2S
+git clone https://github.com/hmandela/WASS2S.git
+cd WASS2S
+pixi install
+pixi shell
 ```
+`pixi shell` drops you into an activated shell with `wass2s` and all its dependencies available.
 
-3. Install wass2s
+### Option B: pip (lightweight, core dependencies only)
 ```bash
 pip install wass2s
+```
+
+### Legacy: conda
+The original conda environment files (`WAS_S2S_linux.yml`, `WAS_S2S_windows.yml`) are still available in the repo root:
+```bash
+conda env create -f WAS_S2S_linux.yml   # or WAS_S2S_windows.yml on Windows
+conda activate WASS2S
 ```
 
 4. Download notebooks for simulation
@@ -78,10 +77,11 @@ if not os.path.exists(path_to_home):
 print("Configuration file created successfully!")
 ```
 ### Upgrade wass2s
-If you want to upgrade wass2s to a newer version, use the following command:
-```bash
-pip install --upgrade wass2s
-```
+- With pixi: `pixi update` refreshes all pinned dependencies to the latest versions allowed by `pyproject.toml`.
+- With pip: 
+    ```bash
+    pip install --upgrade wass2s
+    ```
 
 ### Potential Issues
 If you encounter matplotlib errors, try the following steps:
@@ -93,6 +93,7 @@ If you encounter matplotlib errors, try the following steps:
     ```bash
     conda install -c conda-forge -c hallkjc01 xcast
     ```
+    (pixi users get a compatible `xcast` build automatically from the `hallkjc01` channel configured in `pyproject.toml`.)
 If you encounter other issues during installation or usage, please refer to the [Troubleshooting Guide](https://github.com/hmandela/WASS2S/blob/main/TROUBLESHOOTING.md).
 
 ## ⚙️ Usage

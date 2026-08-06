@@ -1,0 +1,6 @@
+.pixi/
+__pycache__/
+*.egg-info/
+
+/.quarto/
+**/*.quarto_ipynb

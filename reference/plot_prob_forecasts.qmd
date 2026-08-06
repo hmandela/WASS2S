@@ -1,0 +1,29 @@
+# plot_prob_forecasts { #wass2s.plot_prob_forecasts }
+
+```python
+plot_prob_forecasts(
+    dir_to_save,
+    forecast_prob,
+    model_name,
+    title='Seasonal Forecast for Gulf of Guinea Countries \n Valid for March-April-May 2026, Issued February 27, 2026',
+    country_code='GHA',
+    admin_level=0,
+    source='naturalearth',
+    labels=['Below-Normal', 'Near-Normal', 'Above-Normal'],
+    reverse_cmap=True,
+    hspace=None,
+    logo=None,
+    logo_size=('10%', '10%'),
+    logo_position='lower left',
+    logo_left=None,
+    logo_left_size=('12%', '12%'),
+    logo_right=None,
+    logo_right_size=('12%', '12%'),
+    sigma=None,
+    res=None,
+    stations_df=None,
+    out='pdf',
+    dynamic_scalebar=False,
+)
+```
+

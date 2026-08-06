@@ -1,0 +1,24 @@
+# predictant_mask { #wass2s.predictant_mask }
+
+```python
+predictant_mask(data)
+```
+
+Create a mask for predictand data based on rainfall thresholds and latitude.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type             | Description                                                                 | Default    |
+|--------|------------------|-----------------------------------------------------------------------------|------------|
+| data   | xarray.DataArray | Input data array with a time dimension 'T' and spatial dimensions 'Y', 'X'. | _required_ |
+
+## Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                                          |
+|--------|------------------|------------------------------------------------------|
+|        | xarray.DataArray | Mask with 1 where conditions are met, NaN elsewhere. |
+
+## Notes {.doc-section .doc-section-notes}
+
+The mask is set to 1 where mean rainfall > 20 mm and latitude is within ±19.5 degrees,
+otherwise NaN.

@@ -1,0 +1,286 @@
+# WAS_LinearRegression_Model { #wass2s.WAS_LinearRegression_Model }
+
+```python
+WAS_LinearRegression_Model(nb_cores=1, dist_method='nonparam')
+```
+
+Simple Linear Regression model for spatiotemporal climate prediction.
+
+This class implements ordinary least squares linear regression (via scikit-learn's
+`LinearRegression`) to model linear relationships between predictors and a continuous
+predictand (e.g., seasonal rainfall totals, temperature anomalies, agro-climatic indices).
+
+Key features:
+- Basic linear modeling (no polynomial features or regularization by default)
+- Spatially parallel fitting and prediction across large grids using dask + xarray
+- Deterministic point predictions with optional error computation
+- Probabilistic tercile forecasting (Below/Normal/Above = PB/PN/PA) using either:
+  - Parametric best-fit distributions per grid cell ('bestfit')
+  - Non-parametric sampling of historical forecast errors ('nonparam')
+
+Ideal as a baseline model or when relationships are expected to be approximately linear.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type                | Description                                                                                                                                                                                            | Default     |
+|-------------|---------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|
+| nb_cores    | int                 | Number of CPU cores for parallel processing (dask workers).                                                                                                                                            | `1`         |
+| dist_method | (bestfit, nonparam) | Method for computing tercile probabilities: - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs) - 'nonparam' → empirical sampling of historical forecast errors | `'bestfit'` |
+
+## Attributes {.doc-section .doc-section-attributes}
+
+| Name                  | Type   | Description                       |
+|-----------------------|--------|-----------------------------------|
+| nb_cores, dist_method |        | Stored initialization parameters. |
+
+## Functions {.doc-section .doc-section-functions}
+
+* **fit_predict**: Fits linear regression on one grid cell and returns [error, prediction] or just prediction.
+* **compute_model**: Parallel linear regression across the entire spatial domain.
+Returns xarray.DataArray with dims ('output'=['error','prediction'], Y, X).
+* **compute_prob**: best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+Computes tercile probabilities for deterministic hindcasts.
+* **forecast**: Predictor_for_year, best_code_da=None, best_shape_da=None,
+     best_loc_da=None, best_scale_da=None)
+Full end-to-end forecast pipeline for one target year:
+- deterministic linear prediction
+- tercile probabilities (PB, PN, PA)
+
+## Notes {.doc-section .doc-section-notes}
+
+- **Input data requirements**:
+  - Target (y) should be continuous (rainfall, temperature, etc.).
+  - Predictors (X) should be continuous or properly encoded.
+- Negative predictions are automatically clipped to zero (useful for rainfall or non-negative variables).
+- Linear regression assumes linear relationships; for non-linear patterns, consider higher-degree
+  polynomial, tree-based models (XGBoost, RF), or neural approaches (MLP).
+- Large spatial domains benefit significantly from higher `nb_cores`.
+- For `dist_method='bestfit'`, distribution fit results from `WAS_TransformData` must be provided.
+- No explicit feature or target scaling is applied (linear regression coefficients adjust automatically,
+  but centering/scaling predictors can improve numerical stability when features have very different scales).
+
+## Warnings {.doc-section .doc-section-warnings}
+
+- Linear regression can produce unrealistic negative predictions for non-negative variables
+  (e.g., rainfall); clipping is applied automatically but may bias results.
+- Assumes homoscedasticity and no strong multicollinearity; check residuals and VIF if needed.
+- Small per-grid-cell training sets can lead to unstable coefficient estimates.
+- For very non-linear relationships, performance will be poor compared to tree-based or spline models.
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [calculate_tercile_probabilities_bestfit](#wass2s.WAS_LinearRegression_Model.calculate_tercile_probabilities_bestfit) | Generic tercile probabilities using best-fit family per grid cell. |
+| [calculate_tercile_probabilities_nonparametric](#wass2s.WAS_LinearRegression_Model.calculate_tercile_probabilities_nonparametric) | Non-parametric method using historical error samples. |
+| [compute_model](#wass2s.WAS_LinearRegression_Model.compute_model) | Applies linear regression across a spatiotemporal dataset in parallel. |
+| [compute_prob](#wass2s.WAS_LinearRegression_Model.compute_prob) | Compute tercile probabilities for deterministic hindcasts. |
+| [fit_predict](#wass2s.WAS_LinearRegression_Model.fit_predict) | Fits a linear regression model to the provided training data, makes predictions  |
+| [forecast](#wass2s.WAS_LinearRegression_Model.forecast) | Generates a single-year forecast using linear regression, then computes  |
+| [weibull_shape_solver](#wass2s.WAS_LinearRegression_Model.weibull_shape_solver) | Function to find the root of the Weibull shape parameter 'k'. |
+
+### calculate_tercile_probabilities_bestfit { #wass2s.WAS_LinearRegression_Model.calculate_tercile_probabilities_bestfit }
+
+```python
+WAS_LinearRegression_Model.calculate_tercile_probabilities_bestfit(
+    best_guess,
+    error_variance,
+    T1,
+    T2,
+    dist_code,
+    dof,
+)
+```
+
+Generic tercile probabilities using best-fit family per grid cell.
+
+Inputs (per grid cell):
+- ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+- ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+- ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+- ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+
+Strategy:
+- For each time step, build a predictive distribution of the same family:
+    * Use ``best_guess[t]`` to adjust mean / location;
+    * Keep shape parameters from climatology.
+- Then compute probabilities:
+    * P(B) = F(T1)
+    * P(N) = F(T2) - F(T1)
+    * P(A) = 1 - F(T2)
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name           | Type         | Description                       | Default    |
+|----------------|--------------|-----------------------------------|------------|
+| best_guess     | array - like | Forecast/hindcast best estimates. | _required_ |
+| error_variance | float        | Variance of prediction errors.    | _required_ |
+| T1             | float        | Lower tercile threshold.          | _required_ |
+| T2             | float        | Upper tercile threshold.          | _required_ |
+| dist_code      | int          | Distribution code (1-8).          | _required_ |
+| shape          | float        | Shape parameter.                  | _required_ |
+| loc            | float        | Location parameter.               | _required_ |
+| scale          | float        | Scale parameter.                  | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description                       |
+|--------|--------------|-----------------------------------|
+|        | array - like | Probabilities [P(B), P(N), P(A)]. |
+
+#### Notes {.doc-section .doc-section-notes}
+
+- Uses :math:`F` as the CDF of the predictive distribution.
+
+### calculate_tercile_probabilities_nonparametric { #wass2s.WAS_LinearRegression_Model.calculate_tercile_probabilities_nonparametric }
+
+```python
+WAS_LinearRegression_Model.calculate_tercile_probabilities_nonparametric(
+    best_guess,
+    error_samples,
+    first_tercile,
+    second_tercile,
+)
+```
+
+Non-parametric method using historical error samples.
+
+### compute_model { #wass2s.WAS_LinearRegression_Model.compute_model }
+
+```python
+WAS_LinearRegression_Model.compute_model(X_train, y_train, X_test, y_test)
+```
+
+Applies linear regression across a spatiotemporal dataset in parallel.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name    | Type             | Description                                            | Default    |
+|---------|------------------|--------------------------------------------------------|------------|
+| X_train | xarray.DataArray | Training predictors with dims ('T','features').        | _required_ |
+| y_train | xarray.DataArray | Training targets with dims ('T','Y','X').              | _required_ |
+| X_test  | xarray.DataArray | Test predictors, shape ('features',) or (T, features). | _required_ |
+| y_test  | xarray.DataArray | Test targets with dims ('Y','X'), or broadcastable.    | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                                                  |
+|--------|------------------|--------------------------------------------------------------|
+|        | xarray.DataArray | dims ('output','Y','X'), where 'output'=[error, prediction]. |
+
+### compute_prob { #wass2s.WAS_LinearRegression_Model.compute_prob }
+
+```python
+WAS_LinearRegression_Model.compute_prob(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Compute tercile probabilities for deterministic hindcasts.
+
+If dist_method == 'bestfit':
+    - Use cluster-based best-fit distributions to:
+        * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
+        * compute predictive probabilities using the same family.
+
+Otherwise:
+    - Use empirical terciles from Predictant climatology and the selected
+      parametric / nonparametric method.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                                                                       | Default    |
+|-----------------|------------------|-----------------------------------------------------------------------------------|------------|
+| Predictant      | xarray.DataArray | Observed data (T, Y, X) or (T, Y, X, M).                                          | _required_ |
+| clim_year_start | int or str       | Climatology period (inclusive) for thresholds.                                    | _required_ |
+| clim_year_end   | int or str       | Climatology period (inclusive) for thresholds.                                    | _required_ |
+| hindcast_det    | xarray.DataArray | Deterministic hindcast (T, Y, X).                                                 | _required_ |
+| best_code_da    | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_shape_da   | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_loc_da     | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_scale_da   | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name          | Type             | Description                                                      |
+|---------------|------------------|------------------------------------------------------------------|
+| hindcast_prob | xarray.DataArray | Probabilities with dims (probability=['PB','PN','PA'], T, Y, X). |
+
+### fit_predict { #wass2s.WAS_LinearRegression_Model.fit_predict }
+
+```python
+WAS_LinearRegression_Model.fit_predict(x, y, x_test, y_test=None)
+```
+
+Fits a linear regression model to the provided training data, makes predictions 
+on the test data, and calculates the prediction error (if y_test is provided).
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type                                                 | Description                                       | Default    |
+|--------|------------------------------------------------------|---------------------------------------------------|------------|
+| x      | (array - like, shape(n_samples, n_features))         | Training data (predictors).                       | _required_ |
+| y      | (array - like, shape(n_samples))                     | Training targets.                                 | _required_ |
+| x_test | (array - like, shape(n_features) or (1, n_features)) | Test data (predictors).                           | _required_ |
+| y_test | float or None                                        | Test target value. If None, no error is computed. | `None`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type       | Description                                                                                  |
+|--------|------------|----------------------------------------------------------------------------------------------|
+|        | np.ndarray | If y_test is not None, returns [error, prediction]. If y_test is None, returns [prediction]. |
+
+### forecast { #wass2s.WAS_LinearRegression_Model.forecast }
+
+```python
+WAS_LinearRegression_Model.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictor,
+    hindcast_det,
+    Predictor_for_year,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Generates a single-year forecast using linear regression, then computes 
+tercile probabilities using self.dist_method.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name               | Type             | Description                                                                       | Default    |
+|--------------------|------------------|-----------------------------------------------------------------------------------|------------|
+| Predictant         | xarray.DataArray | Observed data with dims (T, Y, X).                                                | _required_ |
+| clim_year_start    | int              | Start year for climatology                                                        | _required_ |
+| clim_year_end      | int              | End year for climatology                                                          | _required_ |
+| Predictor          | xarray.DataArray | Historical predictor data with dims (T, features).                                | _required_ |
+| hindcast_det       | xarray.DataArray | Historical deterministic forecast with dims (output=[error,prediction], T, Y, X). | _required_ |
+| Predictor_for_year | xarray.DataArray | Single-year predictor with shape (features,) or (1, features).                    | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name          | Type             | Description                                                                                 |
+|---------------|------------------|---------------------------------------------------------------------------------------------|
+| result_       | xarray.DataArray | dims (output=2, Y, X) => [error, prediction].  For a true forecast, error is typically NaN. |
+| hindcast_prob | xarray.DataArray | dims (probability=3, Y, X) => [PB, PN, PA].                                                 |
+
+### weibull_shape_solver { #wass2s.WAS_LinearRegression_Model.weibull_shape_solver }
+
+```python
+WAS_LinearRegression_Model.weibull_shape_solver(k, M, V)
+```
+
+Function to find the root of the Weibull shape parameter 'k'.
+We find 'k' such that the theoretical variance/mean^2 ratio
+matches the observed V/M^2 ratio.

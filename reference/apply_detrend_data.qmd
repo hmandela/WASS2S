@@ -1,0 +1,6 @@
+# apply_detrend_data { #wass2s.apply_detrend_data }
+
+```python
+apply_detrend_data(da, coeffs, meta)
+```
+

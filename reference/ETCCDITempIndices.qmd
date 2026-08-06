@@ -1,0 +1,48 @@
+# ETCCDITempIndices { #wass2s.ETCCDITempIndices }
+
+```python
+ETCCDITempIndices()
+```
+
+Factory for creating standard ETCCDI temperature indices.
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [cold_days](#wass2s.ETCCDITempIndices.cold_days) | Create calculator for cold days (TX10p). |
+| [cold_nights](#wass2s.ETCCDITempIndices.cold_nights) | Create calculator for cold nights (TN10p). |
+| [hot_days](#wass2s.ETCCDITempIndices.hot_days) | Create calculator for hot days (TX90p). |
+| [hot_nights](#wass2s.ETCCDITempIndices.hot_nights) | Create calculator for hot nights (TN90p). |
+
+### cold_days { #wass2s.ETCCDITempIndices.cold_days }
+
+```python
+ETCCDITempIndices.cold_days(base_period, season=None, percentile=10)
+```
+
+Create calculator for cold days (TX10p).
+
+### cold_nights { #wass2s.ETCCDITempIndices.cold_nights }
+
+```python
+ETCCDITempIndices.cold_nights(base_period, season=None, percentile=10)
+```
+
+Create calculator for cold nights (TN10p).
+
+### hot_days { #wass2s.ETCCDITempIndices.hot_days }
+
+```python
+ETCCDITempIndices.hot_days(base_period, season=None, percentile=90)
+```
+
+Create calculator for hot days (TX90p).
+
+### hot_nights { #wass2s.ETCCDITempIndices.hot_nights }
+
+```python
+ETCCDITempIndices.hot_nights(base_period, season=None, percentile=90)
+```
+
+Create calculator for hot nights (TN90p).

@@ -1,0 +1,28 @@
+# WAS_mme_NGR_Gaussian { #wass2s.WAS_mme_NGR_Gaussian }
+
+```python
+WAS_mme_NGR_Gaussian(
+    apply_to='all',
+    alpha=0.1,
+    test_direction='two-sided',
+    bounds=None,
+)
+```
+
+Canonical Gaussian EMOS / NGR with gridwise fitting.
+
+## Model {.doc-section .doc-section-model}
+
+Y_t | f_t ~ N(mu_t, sigma_t^2)
+
+mu_t      = a + b * fbar_t
+sigma_t^2 = c + d * s_t^2
+
+where
+    fbar_t = ensemble mean
+    s_t^2  = ensemble variance
+
+This class is intended for predictands that are approximately Gaussian
+after anomaly/standardization preprocessing. For nonnegative or
+zero-inflated variables such as precipitation totals, prefer a truncated,
+censored, gamma, or transformed variant instead of plain Gaussian EMOS.

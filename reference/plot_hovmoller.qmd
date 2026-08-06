@@ -1,0 +1,19 @@
+# plot_hovmoller { #wass2s.plot_hovmoller }
+
+```python
+plot_hovmoller(data_anom, data_abs, var_key)
+```
+
+Plot a time–longitude Hovmöller diagram for a supported variable.
+
+The diagram is only produced for variables that define a ``hov_band`` in
+:data:`VAR_CONFIG` (currently OLR).  For vector fields the U-component
+is used.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name      | Type                               | Description                                                        | Default    |
+|-----------|------------------------------------|--------------------------------------------------------------------|------------|
+| data_anom | xarray.Dataset or xarray.DataArray | Anomaly field, already averaged over the configured latitude band. | _required_ |
+| data_abs  | xarray.Dataset or xarray.DataArray | Absolute (non-anomaly) field for overlaid contours.                | _required_ |
+| var_key   | str                                | Variable key defined in :data:`VAR_CONFIG`.                        | _required_ |

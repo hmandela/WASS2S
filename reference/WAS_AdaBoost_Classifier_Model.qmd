@@ -1,0 +1,34 @@
+# WAS_AdaBoost_Classifier_Model { #wass2s.WAS_AdaBoost_Classifier_Model }
+
+```python
+WAS_AdaBoost_Classifier_Model(
+    n_clusters=5,
+    nb_cores=1,
+    hyperparam_optimizer='bayesian',
+    n_trials=50,
+    n_iter=50,
+    scoring='neg_log_loss',
+    random_state=42,
+)
+```
+
+Adaptive Boosting (AdaBoost) tercile classifier.
+
+Combines a sequence of weighted decision-tree stumps (``max_depth=1``),
+up-weighting misclassified samples at each stage.  AdaBoost uses a
+different sample-reweighting scheme than Gradient Boosting, making it
+complementary in an ensemble-of-models context.
+
+## Hyperparameters tuned {.doc-section .doc-section-hyperparameters-tuned}
+
+n_estimators  : int    in [50, 500]
+learning_rate : float  in [1e-3, 1.0]  (log scale) — contribution per stage
+
+## Notes {.doc-section .doc-section-notes}
+
+- Base estimator is a ``DecisionTreeClassifier(max_depth=1)`` (stump),
+  which is the standard and most regularised AdaBoost configuration.
+- AdaBoost is sensitive to noisy labels; with tercile data derived from
+  ~30 years, mild label noise is expected — keep ``n_estimators`` moderate.
+- Multi-class support is handled natively by sklearn's AdaBoostClassifier
+  via the internal one-vs-one reduction.

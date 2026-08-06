@@ -1,0 +1,7 @@
+# WAS_mme_MVA { #wass2s.WAS_mme_MVA }
+
+```python
+WAS_mme_MVA(dist_method='nonparam')
+```
+
+Torralba et al. (2017) mean/variance adjustment for ensemble forecasts.

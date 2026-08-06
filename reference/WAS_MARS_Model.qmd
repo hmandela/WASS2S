@@ -1,0 +1,317 @@
+# WAS_MARS_Model { #wass2s.WAS_MARS_Model }
+
+```python
+WAS_MARS_Model(
+    nb_cores=1,
+    dist_method='nonparam',
+    max_terms=21,
+    max_degree=2,
+    c=3,
+)
+```
+
+Multivariate Adaptive Regression Splines (MARS) model for spatiotemporal climate prediction.
+
+MARS is a non-parametric regression technique that builds flexible models by fitting piecewise
+linear or cubic basis functions with knots automatically determined via a forward-backward
+selection process, regularized by Generalized Cross-Validation (GCV).
+
+This class implements:
+- MARS regression using the pyearth library (or compatible MARS implementation)
+- Spatially parallel fitting and prediction across large grids using dask + xarray
+- Deterministic point predictions with optional error computation
+- Probabilistic tercile forecasting (Below/Normal/Above = PB/PN/PA) using either:
+  - Parametric best-fit distributions per grid cell ('bestfit')
+  - Non-parametric sampling of historical forecast errors ('nonparam')
+
+Ideal for modeling non-linear relationships in seasonal climate variables (rainfall, temperature,
+agro-climatic indices) with good interpretability through selected basis functions.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type                | Description                                                                                                                                                                                            | Default     |
+|-------------|---------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|
+| nb_cores    | int                 | Number of CPU cores for parallel processing (dask workers).                                                                                                                                            | `1`         |
+| dist_method | (bestfit, nonparam) | Method for computing tercile probabilities: - 'bestfit'  → uses best-fit distribution per grid cell (requires distribution fit inputs) - 'nonparam' → empirical sampling of historical forecast errors | `'bestfit'` |
+| max_terms   | int                 | Maximum number of basis functions (terms) allowed in the MARS model.                                                                                                                                   | `21`        |
+| max_degree  | int                 | Maximum degree of interaction (number of variables in a single hinge function).                                                                                                                        | `2`         |
+| c           | float               | Penalty cost parameter for effective number of parameters in GCV score (higher values → stronger regularization, fewer terms).                                                                         | `3.0`       |
+
+## Attributes {.doc-section .doc-section-attributes}
+
+| Name                                            | Type   | Description                       |
+|-------------------------------------------------|--------|-----------------------------------|
+| nb_cores, dist_method, max_terms, max_degree, c |        | Stored initialization parameters. |
+
+## Functions {.doc-section .doc-section-functions}
+
+* **fit_predict**: Fits MARS on one grid cell and returns [error, prediction] or just prediction.
+* **compute_model**: Parallel MARS regression across the entire spatial domain.
+Returns xarray.DataArray with dims ('output'=['error','prediction'], Y, X).
+* **compute_prob**: best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None)
+Computes tercile probabilities for deterministic hindcasts.
+* **forecast**: Predictor_for_year, best_code_da=None, best_shape_da=None,
+     best_loc_da=None, best_scale_da=None)
+Full end-to-end forecast pipeline for one target year:
+- deterministic MARS prediction
+- tercile probabilities (PB, PN, PA)
+
+## Notes {.doc-section .doc-section-notes}
+
+- **Input data requirements**:
+  - Target (y) should be continuous (rainfall, temperature, etc.).
+  - Predictors (X) can be continuous or categorical (MARS handles both).
+- Negative predictions are clipped to zero (useful for rainfall or non-negative variables).
+- MARS models are interpretable: final model consists of selected hinge functions.
+- Large spatial domains benefit significantly from higher `nb_cores`.
+- For `dist_method='bestfit'`, distribution fit results from `WAS_TransformData` must be provided.
+- No explicit feature or target scaling is applied (MARS is invariant to monotonic transformations).
+
+## Warnings {.doc-section .doc-section-warnings}
+
+- Very small training sets per grid cell may lead to overfitting or degenerate models.
+- Extremely skewed targets (e.g., heavy-tailed rainfall) may benefit from transformation
+  before modeling (not done automatically).
+- MARS can produce piecewise-linear behavior; for very smooth functions, consider higher
+  max_degree or compare with other models (e.g., XGBoost, MLP).
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [calculate_tercile_probabilities_bestfit](#wass2s.WAS_MARS_Model.calculate_tercile_probabilities_bestfit) | Generic tercile probabilities using best-fit family per grid cell. |
+| [calculate_tercile_probabilities_nonparametric](#wass2s.WAS_MARS_Model.calculate_tercile_probabilities_nonparametric) | Non-parametric method using historical error samples. |
+| [compute_model](#wass2s.WAS_MARS_Model.compute_model) | Applies MARS regression across a spatiotemporal dataset in parallel. |
+| [compute_prob](#wass2s.WAS_MARS_Model.compute_prob) | Compute tercile probabilities for deterministic hindcasts. |
+| [fit_predict](#wass2s.WAS_MARS_Model.fit_predict) | Fits a MARS model to the provided training data, makes predictions  |
+| [forecast](#wass2s.WAS_MARS_Model.forecast) | Generate a single-year deterministic forecast using the MARS model, |
+| [weibull_shape_solver](#wass2s.WAS_MARS_Model.weibull_shape_solver) | Function to find the root of the Weibull shape parameter 'k'. |
+
+### calculate_tercile_probabilities_bestfit { #wass2s.WAS_MARS_Model.calculate_tercile_probabilities_bestfit }
+
+```python
+WAS_MARS_Model.calculate_tercile_probabilities_bestfit(
+    best_guess,
+    error_variance,
+    T1,
+    T2,
+    dist_code,
+    dof,
+)
+```
+
+Generic tercile probabilities using best-fit family per grid cell.
+
+Inputs (per grid cell):
+- ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
+- ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
+- ``dist_code`` : int, as in ``_ppf_terciles_from_code``
+- ``shape``, ``loc``, ``scale`` : scalars from climatology fit
+
+Strategy:
+- For each time step, build a predictive distribution of the same family:
+    * Use ``best_guess[t]`` to adjust mean / location;
+    * Keep shape parameters from climatology.
+- Then compute probabilities:
+    * P(B) = F(T1)
+    * P(N) = F(T2) - F(T1)
+    * P(A) = 1 - F(T2)
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name           | Type         | Description                       | Default    |
+|----------------|--------------|-----------------------------------|------------|
+| best_guess     | array - like | Forecast/hindcast best estimates. | _required_ |
+| error_variance | float        | Variance of prediction errors.    | _required_ |
+| T1             | float        | Lower tercile threshold.          | _required_ |
+| T2             | float        | Upper tercile threshold.          | _required_ |
+| dist_code      | int          | Distribution code (1-8).          | _required_ |
+| shape          | float        | Shape parameter.                  | _required_ |
+| loc            | float        | Location parameter.               | _required_ |
+| scale          | float        | Scale parameter.                  | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description                       |
+|--------|--------------|-----------------------------------|
+|        | array - like | Probabilities [P(B), P(N), P(A)]. |
+
+#### Notes {.doc-section .doc-section-notes}
+
+- Uses :math:`F` as the CDF of the predictive distribution.
+
+### calculate_tercile_probabilities_nonparametric { #wass2s.WAS_MARS_Model.calculate_tercile_probabilities_nonparametric }
+
+```python
+WAS_MARS_Model.calculate_tercile_probabilities_nonparametric(
+    best_guess,
+    error_samples,
+    first_tercile,
+    second_tercile,
+)
+```
+
+Non-parametric method using historical error samples.
+
+### compute_model { #wass2s.WAS_MARS_Model.compute_model }
+
+```python
+WAS_MARS_Model.compute_model(X_train, y_train, X_test, y_test)
+```
+
+Applies MARS regression across a spatiotemporal dataset in parallel.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name    | Type             | Description                                            | Default    |
+|---------|------------------|--------------------------------------------------------|------------|
+| X_train | xarray.DataArray | Training predictors with dims ('T','features').        | _required_ |
+| y_train | xarray.DataArray | Training targets with dims ('T','Y','X').              | _required_ |
+| X_test  | xarray.DataArray | Test predictors, shape ('features',) or (T, features). | _required_ |
+| y_test  | xarray.DataArray | Test targets with dims ('Y','X'), or broadcastable.    | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                                                  |
+|--------|------------------|--------------------------------------------------------------|
+|        | xarray.DataArray | dims ('output','Y','X'), where 'output'=[error, prediction]. |
+
+### compute_prob { #wass2s.WAS_MARS_Model.compute_prob }
+
+```python
+WAS_MARS_Model.compute_prob(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Compute tercile probabilities for deterministic hindcasts.
+
+If dist_method == 'bestfit':
+    - Use cluster-based best-fit distributions to:
+        * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
+        * compute predictive probabilities using the same family.
+
+Otherwise:
+    - Use empirical terciles from Predictant climatology and the selected
+      parametric / nonparametric method.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                                                                       | Default    |
+|-----------------|------------------|-----------------------------------------------------------------------------------|------------|
+| Predictant      | xarray.DataArray | Observed data (T, Y, X) or (T, Y, X, M).                                          | _required_ |
+| clim_year_start | int or str       | Climatology period (inclusive) for thresholds.                                    | _required_ |
+| clim_year_end   | int or str       | Climatology period (inclusive) for thresholds.                                    | _required_ |
+| hindcast_det    | xarray.DataArray | Deterministic hindcast (T, Y, X).                                                 | _required_ |
+| best_code_da    | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_shape_da   | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_loc_da     | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+| best_scale_da   | xarray.DataArray | Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'. | `None`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name          | Type             | Description                                                      |
+|---------------|------------------|------------------------------------------------------------------|
+| hindcast_prob | xarray.DataArray | Probabilities with dims (probability=['PB','PN','PA'], T, Y, X). |
+
+### fit_predict { #wass2s.WAS_MARS_Model.fit_predict }
+
+```python
+WAS_MARS_Model.fit_predict(x, y, x_test, y_test=None)
+```
+
+Fits a MARS model to the provided training data, makes predictions 
+on the test data, and calculates the prediction error (if y_test is provided).
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type                                                 | Description                                       | Default    |
+|--------|------------------------------------------------------|---------------------------------------------------|------------|
+| x      | (array - like, shape(n_samples, n_features))         | Training data (predictors).                       | _required_ |
+| y      | (array - like, shape(n_samples))                     | Training targets.                                 | _required_ |
+| x_test | (array - like, shape(n_features) or (1, n_features)) | Test data (predictors).                           | _required_ |
+| y_test | float or None                                        | Test target value. If None, no error is computed. | `None`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type       | Description                                                                                  |
+|--------|------------|----------------------------------------------------------------------------------------------|
+|        | np.ndarray | If y_test is not None, returns [error, prediction]. If y_test is None, returns [prediction]. |
+
+### forecast { #wass2s.WAS_MARS_Model.forecast }
+
+```python
+WAS_MARS_Model.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictor,
+    hindcast_det,
+    Predictor_for_year,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Generate a single-year deterministic forecast using the MARS model,
+then compute tercile probabilities (PB, PN, PA) based on the selected
+distribution method (``self.dist_method``).
+
+The forecast is computed by:
+- Standardizing the predictand over the climatology period
+- Fitting the MARS model on historical data and predicting for the target year
+- Reversing standardization to get raw-scale forecast values
+- Computing probabilities using either best-fit distributions or nonparametric methods
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name               | Type         | Description                                                                                                                                           | Default    |
+|--------------------|--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|------------|
+| Predictant         | xr.DataArray | Observed target variable (e.g., rainfall) with dimensions (T, Y, X).                                                                                  | _required_ |
+| clim_year_start    | int          | Start year of climatology period for standardization and terciles.                                                                                    | _required_ |
+| clim_year_end      | int          | End year of climatology period.                                                                                                                       | _required_ |
+| Predictor          | xr.DataArray | Historical predictors with dimensions (T, features).                                                                                                  | _required_ |
+| hindcast_det       | xr.DataArray | Historical deterministic hindcasts with dimensions (output=[error, prediction], T, Y, X). Used for error variance estimation in nonparametric method. | _required_ |
+| Predictor_for_year | xr.DataArray | Predictors for the target forecast year, shape (features,) or (1, features).                                                                          | _required_ |
+| best_code_da       | xr.DataArray | Distribution codes per grid cell (required for "bestfit" method).                                                                                     | `None`     |
+| best_shape_da      | xr.DataArray | Shape parameters per grid cell (required for "bestfit").                                                                                              | `None`     |
+| best_loc_da        | xr.DataArray | Location parameters per grid cell (required for "bestfit").                                                                                           | `None`     |
+| best_scale_da      | xr.DataArray | Scale parameters per grid cell (required for "bestfit").                                                                                              | `None`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name              | Type         | Description                                                                                                         |
+|-------------------|--------------|---------------------------------------------------------------------------------------------------------------------|
+| forecast_expanded | xr.DataArray | Deterministic forecast values with dimensions (T=1, Y, X).                                                          |
+| forecast_prob     | xr.DataArray | Probabilities with dimensions (probability=3, T=1, Y, X): - probability: ['PB', 'PN', 'PA'] (Below, Normal, Above). |
+
+#### Raises {.doc-section .doc-section-raises}
+
+| Name   | Type       | Description                                                                                                          |
+|--------|------------|----------------------------------------------------------------------------------------------------------------------|
+|        | ValueError | If "bestfit" method is selected but required distribution parameters are missing. If invalid ``dist_method`` is set. |
+
+#### Notes {.doc-section .doc-section-notes}
+
+- For real forecasts, the "error" in the deterministic output is NaN (no verification available).
+- The forecast date is set to the first day of the month matching the predictand's time structure.
+- Uses Dask for parallel computation across spatial chunks.
+
+### weibull_shape_solver { #wass2s.WAS_MARS_Model.weibull_shape_solver }
+
+```python
+WAS_MARS_Model.weibull_shape_solver(k, M, V)
+```
+
+Function to find the root of the Weibull shape parameter 'k'.
+We find 'k' such that the theoretical variance/mean^2 ratio
+matches the observed V/M^2 ratio.

@@ -1,0 +1,16 @@
+# WAS_HurdleNB_Model { #wass2s.WAS_HurdleNB_Model }
+
+```python
+WAS_HurdleNB_Model(
+    nb_cores=1,
+    dist_method='nonparam',
+    alpha_init=0.2,
+    add_intercept=True,
+)
+```
+
+Hurdle Negative Binomial (two-part, Dask-safe).
+
+P(Y>0|X) = p+(X)  via logistic regression.
+Y|Y>0,X  ~ zero-truncated NB approximated by NB on positives.
+E[Y|X]   = p+(X) * mu(X) / (1 - NB_P(Y=0|mu, alpha))

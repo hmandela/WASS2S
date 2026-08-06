@@ -1,0 +1,3647 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.9.37">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>was_verification – wass2s</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-7f8f88aac4f3542376d5c11b86a4c14d.css" rel="stylesheet" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-26d9cc88ab9604001aabd73cb1ea1d8f.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+</head>
+
+<body class="nav-fixed fullcontent quarto-light">
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">wass2s</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="../get_started.html"> 
+<span class="menu-text">Get Started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../reference/index.html"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://hmandela.github.io/WAS_S2S_Training/" target="_blank"> 
+<span class="menu-text">Training Docs</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/hmandela/WASS2S"> <i class="bi bi-github" role="img" aria-label="wass2s GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+<!-- margin-sidebar -->
+    
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"></header>
+
+
+
+
+<section id="wass2s.WAS_Verification" class="level1">
+<h1>WAS_Verification</h1>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification(dist_method<span class="op">=</span><span class="st">'nonparam'</span>, mae_rmse_crps_thrsd<span class="op">=</span><span class="dv">100</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Verification class for evaluating weather and climate forecasts.</p>
+<p>Provides methods to compute deterministic, probabilistic, and ensemble-based metrics, as well as visualization tools for model performance assessment.</p>
+<section id="parameters" class="level2 doc-section doc-section-parameters">
+<h2 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters">Parameters</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 9%">
+<col style="width: 5%">
+<col style="width: 75%">
+<col style="width: 9%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>dist_method</td>
+<td>str</td>
+<td>Distribution method for tercile probability calculations (‘bestfit’, ‘nonparam’). Default is ‘nonparam’.</td>
+<td><code>'nonparam'</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="methods" class="level2">
+<h2 class="anchored" data-anchor-id="methods">Methods</h2>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.brier_score">brier_score</a></td>
+<td>BS for a single tercile event (PB/PN/PA). y_probs has shape (3, N).</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.brier_skill_score">brier_skill_score</a></td>
+<td>Event-wise Brier Skill Score (BSS) for tercile forecasts.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.calculate_groc">calculate_groc</a></td>
+<td>Compute Generalized Discrimination (GROC) score according to Weigel and Mason (2011).</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.calculate_groc_">calculate_groc_</a></td>
+<td>Compute Generalized Discrimination (GROC) score.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.calculate_groc_fixed">calculate_groc_fixed</a></td>
+<td>Fixed from version calculate_groc_ of GROC calculation.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.calculate_groc_weighted">calculate_groc_weighted</a></td>
+<td>Compute Generalized Discrimination (GROC) score with category weighting.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.calculate_rpss">calculate_rpss</a></td>
+<td>Compute Ranked Probability Skill Score (RPSS).</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.calculate_rpss_">calculate_rpss_</a></td>
+<td>Compute Ranked Probability Skill Score (RPSS) for a single grid point or sample.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.calculate_tercile_probabilities_bestfit">calculate_tercile_probabilities_bestfit</a></td>
+<td>Generic tercile probabilities using best-fit family per grid cell.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.calculate_tercile_probabilities_nonparametric">calculate_tercile_probabilities_nonparametric</a></td>
+<td>Non-parametric method using historical error samples.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.classify">classify</a></td>
+<td>Classify data into terciles based on climatological thresholds.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.classify_data_into_terciles">classify_data_into_terciles</a></td>
+<td>Classify data into terciles based on given thresholds.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.classify_percent">classify_percent</a></td>
+<td>Classify a percentage value into predefined categories based on thresholds.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.compute_class">compute_class</a></td>
+<td>Compute tercile class labels for observed data.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.compute_crps">compute_crps</a></td>
+<td>Compute Continuous Ranked Probability Score (CRPS) for ensemble forecasts.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.compute_deterministic_score">compute_deterministic_score</a></td>
+<td>Apply a deterministic scoring function over xarray DataArrays.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.compute_one_year_rpss">compute_one_year_rpss</a></td>
+<td>Compute RPSS and display the percentage of skillful grids (RPSS &gt; 0) in the title.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.compute_one_year_rpss_">compute_one_year_rpss_</a></td>
+<td>Compute and visualize the Ranked Probability Skill Score (RPSS) for a specific year.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.compute_probabilistic_score">compute_probabilistic_score</a></td>
+<td>Apply a probabilistic scoring function over xarray DataArrays.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.gcm_compute_prob">gcm_compute_prob</a></td>
+<td>Compute tercile probabilities for deterministic hindcasts.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.gcm_validation_compute">gcm_validation_compute</a></td>
+<td>Validate multiple General Circulation Model (GCM) forecasts using specified metrics.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.get_scores_metadata">get_scores_metadata</a></td>
+<td>Retrieve metadata for all available scoring metrics.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.ignorance_score">ignorance_score</a></td>
+<td>Compute Ignorance Score based on Weijs (2010).</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.index_of_agreement">index_of_agreement</a></td>
+<td>Compute Index of Agreement (IOA).</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.kling_gupta_efficiency">kling_gupta_efficiency</a></td>
+<td>Compute Kling-Gupta Efficiency (KGE) metric.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.mean_absolute_error">mean_absolute_error</a></td>
+<td>Compute Mean Absolute Error (MAE).</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.nash_sutcliffe_efficiency">nash_sutcliffe_efficiency</a></td>
+<td>Compute Nash-Sutcliffe Efficiency (NSE).</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.pearson_corr">pearson_corr</a></td>
+<td>Compute Pearson Correlation Coefficient.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.plot_model_score">plot_model_score</a></td>
+<td>Plot a deterministic score on a map.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.plot_models_score">plot_models_score</a></td>
+<td>Plot multiple model scores on a grid of maps.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.plot_roc_curves">plot_roc_curves</a></td>
+<td>Plot ROC Curves with Confidence Intervals for probabilistic forecasts.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.ratio_to_average">ratio_to_average</a></td>
+<td>Compute and visualize the ratio of a specific year’s data to the climatological mean.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.reliability_diagram">reliability_diagram</a></td>
+<td>Plot Reliability Diagrams for probabilistic forecasts.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.reliability_score_grid">reliability_score_grid</a></td>
+<td>Compute Reliability Score on a grid based on Weijs (2010).</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.resolution_and_reliability_over_all_grid">resolution_and_reliability_over_all_grid</a></td>
+<td>Compute Resolution and Reliability scores over all grid points.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.resolution_and_reliability_over_all_grid_per_category">resolution_and_reliability_over_all_grid_per_category</a></td>
+<td>Assumes y_true_class already contains valid category labels (0, 1, 2).</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.resolution_and_reliability_per_category_grid">resolution_and_reliability_per_category_grid</a></td>
+<td>Compute Resolution and Reliability scores per category based on Weijs (2010).</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.resolution_score_grid">resolution_score_grid</a></td>
+<td>Compute Resolution Score on a grid based on Weijs (2010).</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.root_mean_square_error">root_mean_square_error</a></td>
+<td>Compute Root Mean Square Error (RMSE).</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.spearman_corr">spearman_corr</a></td>
+<td>Compute Spearman rank correlation coefficient.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.taylor_diagram">taylor_diagram</a></td>
+<td>Plot a Taylor diagram comparing one or more model series against observations.</td>
+</tr>
+<tr class="even">
+<td><a href="#wass2s.WAS_Verification.weibull_shape_solver">weibull_shape_solver</a></td>
+<td>Function to find the root of the Weibull shape parameter ‘k’.</td>
+</tr>
+<tr class="odd">
+<td><a href="#wass2s.WAS_Verification.weighted_gcm_forecasts">weighted_gcm_forecasts</a></td>
+<td>Generate weighted ensemble forecasts from selected GCMs based on their performance scores.</td>
+</tr>
+</tbody>
+</table>
+<section id="wass2s.WAS_Verification.brier_score" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.brier_score">brier_score</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.brier_score(</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    y_true,</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    index_start,</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    index_end,</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    event<span class="op">=</span><span class="st">'PA'</span>,</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>BS for a single tercile event (PB/PN/PA). y_probs has shape (3, N).</p>
+</section>
+<section id="wass2s.WAS_Verification.brier_skill_score" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.brier_skill_score">brier_skill_score</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.brier_skill_score(</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    y_true,</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    index_start,</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    index_end,</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    event<span class="op">=</span><span class="st">'PA'</span>,</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    reference<span class="op">=</span><span class="st">'uniform'</span>,</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Event-wise Brier Skill Score (BSS) for tercile forecasts.</p>
+<section id="parameters-1" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-1">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 7%">
+<col style="width: 17%">
+<col style="width: 59%">
+<col style="width: 14%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>1D array-like</td>
+<td>Observed values (time series for one grid point).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>2D array-like, shape (3, N)</td>
+<td>Forecast probabilities for PB/PN/PA over time.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_start</td>
+<td>int</td>
+<td>Indices delimiting the calibration slice inside the <em>masked</em> series.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_end</td>
+<td>int</td>
+<td>Indices delimiting the calibration slice inside the <em>masked</em> series.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>event</td>
+<td>(PB, PN, PA, 0, 1, 2)</td>
+<td>Event to score (default “PA” = above-normal).</td>
+<td><code>"PB","PN","PA",0,1,2</code></td>
+</tr>
+<tr class="even">
+<td>reference</td>
+<td>(uniform, empirical)</td>
+<td>- “uniform”: climatology is [1/3,1/3,1/3] - “empirical”: base rate computed from calibration slice</td>
+<td><code>"uniform","empirical"</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns">Returns</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>BSS = 1 - BS / BS_ref (np.nan if not computable).</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.calculate_groc" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.calculate_groc">calculate_groc</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.calculate_groc(</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    y_true,</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    index_start,</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    index_end,</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    n_classes<span class="op">=</span><span class="dv">3</span>,</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Generalized Discrimination (GROC) score according to Weigel and Mason (2011).</p>
+<p>The GROC score averages the Area Under the ROC Curve (AUC) for each category, measuring the ability to distinguish occurrences from non-occurrences of each category.</p>
+<section id="parameters-2" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-2">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 12%">
+<col style="width: 13%">
+<col style="width: 61%">
+<col style="width: 11%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>array - like</td>
+<td>Forecast probabilities with shape (n_classes, n_samples).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_start</td>
+<td>int</td>
+<td>Start index of the climatology period for computing terciles.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_end</td>
+<td>int</td>
+<td>End index of the climatology period for computing terciles.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>n_classes</td>
+<td>int</td>
+<td>Number of classes (default is 3 for terciles).</td>
+<td><code>3</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-1" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-1">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 8%">
+<col style="width: 8%">
+<col style="width: 82%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>GROC score, ranging from 0 to 1. Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="reference" class="level4 doc-section doc-section-reference">
+<h4 class="doc-section doc-section-reference anchored" data-anchor-id="reference">Reference</h4>
+<p>Weigel, A. P. and Mason, S. J. (2011). The generalized discrimination score for ensemble forecasts. Monthly Weather Review, 139(9):3069-3074.</p>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.calculate_groc_" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.calculate_groc_">calculate_groc_</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.calculate_groc_(</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    y_true,</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    index_start,</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    index_end,</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    n_classes<span class="op">=</span><span class="dv">3</span>,</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Generalized Discrimination (GROC) score.</p>
+<p>Averages the Area Under the Curve (AUC) for each tercile category.</p>
+<section id="parameters-3" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-3">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 14%">
+<col style="width: 60%">
+<col style="width: 12%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>array - like</td>
+<td>Forecast probabilities with shape (n_classes, n_samples).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_start</td>
+<td>int</td>
+<td>Start index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_end</td>
+<td>int</td>
+<td>End index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>n_classes</td>
+<td>int</td>
+<td>Number of classes (default is 3 for terciles).</td>
+<td><code>3</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-2" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-2">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 8%">
+<col style="width: 8%">
+<col style="width: 82%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>GROC score, ranging from 0 to 1. Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.calculate_groc_fixed" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.calculate_groc_fixed">calculate_groc_fixed</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.calculate_groc_fixed(</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    y_true,</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    index_start,</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    index_end,</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    n_classes<span class="op">=</span><span class="dv">3</span>,</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Fixed from version calculate_groc_ of GROC calculation.</p>
+<section id="parameters-4" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-4">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 14%">
+<col style="width: 60%">
+<col style="width: 12%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>array - like</td>
+<td>Forecast probabilities with shape (n_classes, n_samples).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_start</td>
+<td>int</td>
+<td>Start index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_end</td>
+<td>int</td>
+<td>End index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>n_classes</td>
+<td>int</td>
+<td>Number of classes (default is 3 for terciles).</td>
+<td><code>3</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-3" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-3">Returns</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>GROC score, ranging from 0 to 1.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.calculate_groc_weighted" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.calculate_groc_weighted">calculate_groc_weighted</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.calculate_groc_weighted(</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    y_true,</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    index_start,</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    index_end,</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    n_classes<span class="op">=</span><span class="dv">3</span>,</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Generalized Discrimination (GROC) score with category weighting.</p>
+<p>Weighted average of AUCs by climatological frequency of each category. Alternative: Weighted by climatological frequency as in some applications</p>
+<section id="parameters-5" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-5">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 14%">
+<col style="width: 60%">
+<col style="width: 12%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>array - like</td>
+<td>Forecast probabilities with shape (n_classes, n_samples).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_start</td>
+<td>int</td>
+<td>Start index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_end</td>
+<td>int</td>
+<td>End index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>n_classes</td>
+<td>int</td>
+<td>Number of classes (default is 3 for terciles).</td>
+<td><code>3</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-4" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-4">Returns</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>Weighted GROC score, ranging from 0 to 1.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.calculate_rpss" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.calculate_rpss">calculate_rpss</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.calculate_rpss(y_true, y_probs, index_start, index_end)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Ranked Probability Skill Score (RPSS).</p>
+<p>Compares the Ranked Probability Score (RPS) of the forecast to a climatological reference.</p>
+<section id="parameters-6" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-6">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 14%">
+<col style="width: 60%">
+<col style="width: 12%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>array - like</td>
+<td>Forecast probabilities with shape (n_classes, n_samples).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_start</td>
+<td>int</td>
+<td>Start index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_end</td>
+<td>int</td>
+<td>End index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-5" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-5">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 8%">
+<col style="width: 8%">
+<col style="width: 83%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>RPSS score, ranging from -Inf to 1. Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.calculate_rpss_" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.calculate_rpss_">calculate_rpss_</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb9"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.calculate_rpss_(y_true, y_probs)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Ranked Probability Skill Score (RPSS) for a single grid point or sample.</p>
+<p>Compares the Ranked Probability Score (RPS) of the forecast to a climatological reference with uniform probabilities (1/3 for each tercile).</p>
+<section id="parameters-7" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-7">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 5%">
+<col style="width: 22%">
+<col style="width: 64%">
+<col style="width: 7%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array-like of shape (n_samples,)</td>
+<td>True class labels, already classified into terciles (0: below-normal, 1: near-normal, 2: above-normal).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>array-like of shape (3, n_samples)</td>
+<td>Forecast probabilities for each tercile category.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-6" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-6">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 6%">
+<col style="width: 6%">
+<col style="width: 87%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>RPSS score, ranging from -Inf to 1 (1 indicates perfect forecast skill). Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.calculate_tercile_probabilities_bestfit" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.calculate_tercile_probabilities_bestfit">calculate_tercile_probabilities_bestfit</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.calculate_tercile_probabilities_bestfit(</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    best_guess,</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    error_variance,</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    T1,</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    T2,</span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    dist_code,</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    dof,</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Generic tercile probabilities using best-fit family per grid cell.</p>
+<p>Inputs (per grid cell): - best_guess : 1D array over T (hindcast_det or forecast_det) - T1, T2 : scalar terciles from climatological best-fit distribution - dist_code : int, as in _ppf_terciles_from_code - shape, loc, scale : scalars from climatology fit</p>
+<p>Strategy: - For each time step, build a predictive distribution of the same family: * Use best_guess[t] to adjust mean / location; * Keep shape parameters from climatology. - Then compute probabilities: P(B) = F(T1), P(N) = F(T2) - F(T1), P(A) = 1 - F(T2).</p>
+</section>
+<section id="wass2s.WAS_Verification.calculate_tercile_probabilities_nonparametric" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.calculate_tercile_probabilities_nonparametric">calculate_tercile_probabilities_nonparametric</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb11"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.calculate_tercile_probabilities_nonparametric(</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    best_guess,</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    error_samples,</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    first_tercile,</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    second_tercile,</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Non-parametric method using historical error samples.</p>
+</section>
+<section id="wass2s.WAS_Verification.classify" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.classify">classify</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb12"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.classify(y, index_start, index_end)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Classify data into terciles based on climatological thresholds.</p>
+<section id="parameters-8" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-8">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 16%">
+<col style="width: 17%">
+<col style="width: 50%">
+<col style="width: 15%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y</td>
+<td>array - like</td>
+<td>Input data to classify.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_start</td>
+<td>int</td>
+<td>Start index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_end</td>
+<td>int</td>
+<td>End index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-7" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-7">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 3%">
+<col style="width: 3%">
+<col style="width: 92%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>tuple</td>
+<td>- y_class : array-like Classified data (0: below-normal, 1: near-normal, 2: above-normal). - tercile_33 : float 33rd percentile threshold. - tercile_67 : float 67th percentile threshold.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.classify_data_into_terciles" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.classify_data_into_terciles">classify_data_into_terciles</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb13"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.classify_data_into_terciles(y, T1, T2)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Classify data into terciles based on given thresholds.</p>
+<section id="parameters-9" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-9">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 10%">
+<col style="width: 17%">
+<col style="width: 56%">
+<col style="width: 15%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y</td>
+<td>array - like</td>
+<td>Input data to classify.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>T1</td>
+<td>float</td>
+<td>First tercile threshold (33rd percentile).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>T2</td>
+<td>float</td>
+<td>Second tercile threshold (67th percentile).</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-8" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-8">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 8%">
+<col style="width: 15%">
+<col style="width: 75%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>array - like</td>
+<td>Classified data (0: below-normal, 1: near-normal, 2: above-normal).</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.classify_percent" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.classify_percent">classify_percent</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb14"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.classify_percent(p)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Classify a percentage value into predefined categories based on thresholds.</p>
+<p>Maps a percentage ratio to one of five categories representing deviation from average.</p>
+<section id="parameters-10" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-10">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 6%">
+<col style="width: 18%">
+<col style="width: 65%">
+<col style="width: 9%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>p</td>
+<td>float or array - like</td>
+<td>Percentage value(s) to classify, typically representing a ratio to normal (%).</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-9" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-9">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 4%">
+<col style="width: 10%">
+<col style="width: 85%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>int or array - like</td>
+<td>Category code: - 1: Well Above Average (&gt;= 150%) - 2: Above Average (&gt;= 110%) - 3: Near Average (&gt;= 90%) - 4: Below Average (&gt;= 50%) - 5: Well Below Average (&lt; 50%)</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.compute_class" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.compute_class">compute_class</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb15"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.compute_class(Predictant, clim_year_start, clim_year_end)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute tercile class labels for observed data.</p>
+<section id="parameters-11" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-11">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 19%">
+<col style="width: 20%">
+<col style="width: 47%">
+<col style="width: 13%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Predictant</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>clim_year_start</td>
+<td>int or str</td>
+<td>Start year of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>clim_year_end</td>
+<td>int or str</td>
+<td>End year of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-10" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-10">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 5%">
+<col style="width: 12%">
+<col style="width: 81%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>xarray.DataArray</td>
+<td>Classified data with dimensions (T, Y, X), where values are 0 (below-normal), 1 (near-normal), or 2 (above-normal).</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.compute_crps" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.compute_crps">compute_crps</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb16"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.compute_crps(y_true, y_pred, member_dim<span class="op">=</span><span class="st">'number'</span>, dim<span class="op">=</span><span class="st">'T'</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Continuous Ranked Probability Score (CRPS) for ensemble forecasts.</p>
+<p>Measures the difference between the forecast ensemble distribution and observations.</p>
+<section id="parameters-12" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-12">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 11%">
+<col style="width: 16%">
+<col style="width: 61%">
+<col style="width: 11%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_pred</td>
+<td>xarray.DataArray</td>
+<td>Ensemble forecast data with dimensions (T, number, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>member_dim</td>
+<td>str</td>
+<td>Dimension name for ensemble members. Default is ‘number’.</td>
+<td><code>'number'</code></td>
+</tr>
+<tr class="even">
+<td>dim</td>
+<td>str</td>
+<td>Dimension to compute CRPS over (typically time). Default is ‘T’.</td>
+<td><code>'T'</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-11" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-11">Returns</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>xarray.DataArray</td>
+<td>CRPS values with dimensions (Y, X).</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.compute_deterministic_score" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.compute_deterministic_score">compute_deterministic_score</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb17"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.compute_deterministic_score(score_func, obs, pred)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Apply a deterministic scoring function over xarray DataArrays.</p>
+<p>Computes the specified metric across the time dimension for each grid point.</p>
+<section id="parameters-13" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-13">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 10%">
+<col style="width: 15%">
+<col style="width: 63%">
+<col style="width: 10%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>score_func</td>
+<td>callable</td>
+<td>Scoring function to apply (e.g., pearson_corr, kling_gupta_efficiency).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>obs</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>pred</td>
+<td>xarray.DataArray</td>
+<td>Predicted data with dimensions (T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-12" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-12">Returns</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>xarray.DataArray</td>
+<td>Score values with dimensions (Y, X).</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.compute_one_year_rpss" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.compute_one_year_rpss">compute_one_year_rpss</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb18"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.compute_one_year_rpss(</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>    obs,</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>    prob_pred,</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>    year,</span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>    shapefile_path<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute RPSS and display the percentage of skillful grids (RPSS &gt; 0) in the title.</p>
+</section>
+<section id="wass2s.WAS_Verification.compute_one_year_rpss_" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.compute_one_year_rpss_">compute_one_year_rpss_</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb19"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.compute_one_year_rpss_(</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a>    obs,</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>    prob_pred,</span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a>    year,</span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute and visualize the Ranked Probability Skill Score (RPSS) for a specific year.</p>
+<p>Applies the RPSS calculation across a gridded dataset for a single year, using tercile classifications based on a climatology period, and plots the results on a map.</p>
+<section id="parameters-14" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-14">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 8%">
+<col style="width: 9%">
+<col style="width: 76%">
+<col style="width: 6%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>obs</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X), where T is time, Y is latitude, and X is longitude.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>prob_pred</td>
+<td>xarray.DataArray</td>
+<td>Forecast probabilities with dimensions (probability, T, Y, X), where probability includes [‘PB’, ‘PN’, ‘PA’] (below-normal, near-normal, above-normal).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>clim_year_start</td>
+<td>int or str</td>
+<td>Start year of the climatology period for tercile classification.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>clim_year_end</td>
+<td>int or str</td>
+<td>End year of the climatology period for tercile classification.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>year</td>
+<td>int or str</td>
+<td>Specific year to compute the RPSS for.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-13" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-13">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 9%">
+<col style="width: 9%">
+<col style="width: 80%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>None</td>
+<td>Displays a geographical plot of the RPSS values with a colorbar.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.compute_probabilistic_score" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.compute_probabilistic_score">compute_probabilistic_score</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb20"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.compute_probabilistic_score(</span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>    score_func,</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>    obs,</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>    prob_pred,</span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">**</span>score_kwargs,</span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Apply a probabilistic scoring function over xarray DataArrays.</p>
+<p>Computes the specified probabilistic metric across the time dimension for each grid point.</p>
+<section id="parameters-15" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-15">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 14%">
+<col style="width: 63%">
+<col style="width: 9%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>score_func</td>
+<td>callable</td>
+<td>Probabilistic scoring function to apply (e.g., calculate_rpss, calculate_groc).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>obs</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>prob_pred</td>
+<td>xarray.DataArray</td>
+<td>Forecast probabilities with dimensions (probability, T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>clim_year_start</td>
+<td>int or str</td>
+<td>Start year of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>clim_year_end</td>
+<td>int or str</td>
+<td>End year of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-14" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-14">Returns</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>xarray.DataArray</td>
+<td>Score values with dimensions (Y, X).</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.gcm_compute_prob" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.gcm_compute_prob">gcm_compute_prob</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb21"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.gcm_compute_prob(</span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a>    Predictant,</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>    hindcast_det,</span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a>    best_code_da<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>    best_shape_da<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>    best_loc_da<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>    best_scale_da<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute tercile probabilities for deterministic hindcasts.</p>
+<p>If dist_method == ‘bestfit’: - Use cluster-based best-fit distributions to: * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da), * compute predictive probabilities using the same family.</p>
+<p>Otherwise: - Use empirical terciles from Predictant climatology and the selected parametric / nonparametric method.</p>
+<section id="parameters-16" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-16">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 13%">
+<col style="width: 63%">
+<col style="width: 9%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Predictant</td>
+<td>xarray.DataArray</td>
+<td>Observed data (T, Y, X) or (T, Y, X, M).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>clim_year_start</td>
+<td>int or str</td>
+<td>Climatology period (inclusive) for thresholds.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>clim_year_end</td>
+<td>int or str</td>
+<td>Climatology period (inclusive) for thresholds.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>hindcast_det</td>
+<td>xarray.DataArray</td>
+<td>Deterministic hindcast (T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>best_code_da</td>
+<td>xarray.DataArray</td>
+<td>Output from WAS_TransformData.fit_best_distribution_grid, required for ‘bestfit’.</td>
+<td><code>None</code></td>
+</tr>
+<tr class="even">
+<td>best_shape_da</td>
+<td>xarray.DataArray</td>
+<td>Output from WAS_TransformData.fit_best_distribution_grid, required for ‘bestfit’.</td>
+<td><code>None</code></td>
+</tr>
+<tr class="odd">
+<td>best_loc_da</td>
+<td>xarray.DataArray</td>
+<td>Output from WAS_TransformData.fit_best_distribution_grid, required for ‘bestfit’.</td>
+<td><code>None</code></td>
+</tr>
+<tr class="even">
+<td>best_scale_da</td>
+<td>xarray.DataArray</td>
+<td>Output from WAS_TransformData.fit_best_distribution_grid, required for ‘bestfit’.</td>
+<td><code>None</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-15" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-15">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 15%">
+<col style="width: 18%">
+<col style="width: 66%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>hindcast_prob</td>
+<td>xarray.DataArray</td>
+<td>Probabilities with dims (probability=[‘PB’,‘PN’,‘PA’], T, Y, X).</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.gcm_validation_compute" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.gcm_validation_compute">gcm_validation_compute</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb22"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.gcm_validation_compute(</span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a>    models_files_path,</span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a>    Obs,</span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a>    score,</span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a>    month_of_initialization,</span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a>    dir_to_save_roc_reliability,</span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a>    lead_time<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a>    ensemble_mean<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a>    gridded<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb22-12"><a href="#cb22-12" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Validate multiple General Circulation Model (GCM) forecasts using specified metrics.</p>
+<p>Computes deterministic, probabilistic, or ensemble-based scores for GCM hindcasts by processing model data from provided file paths and comparing against observations.</p>
+<section id="parameters-17" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-17">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 8%">
+<col style="width: 71%">
+<col style="width: 5%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>models_files_path</td>
+<td>dict</td>
+<td>Dictionary mapping model identifiers (e.g., model names) to file paths of hindcast NetCDF files.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>Obs</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X), where T is time, Y is latitude, and X is longitude.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>score</td>
+<td>str</td>
+<td>Score to compute, must be a key in self.scores (e.g., ‘Pearson’, ‘RPSS’, ‘ROC_CURVE’, ‘RELIABILITY_DIAGRAM’).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>month_of_initialization</td>
+<td>int</td>
+<td>Month of forecast initialization (1-12).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>clim_year_start</td>
+<td>int or str</td>
+<td>Start year of the climatology period for computing tercile thresholds.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>clim_year_end</td>
+<td>int or str</td>
+<td>End year of the climatology period for computing tercile thresholds.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>dir_to_save_roc_reliability</td>
+<td>str or Path</td>
+<td>Directory to save ROC curves and reliability diagram plots.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>lead_time</td>
+<td>list of int</td>
+<td>Lead times in months to define the forecast season (e.g., [1, 2, 3] for a 3-month season). If None, no season is specified.</td>
+<td><code>None</code></td>
+</tr>
+<tr class="odd">
+<td>ensemble_mean</td>
+<td>str</td>
+<td>Ensemble statistic to use for deterministic or probabilistic scores (e.g., ‘mean’). If None, ensemble mean is computed automatically when required.</td>
+<td><code>None</code></td>
+</tr>
+<tr class="even">
+<td>gridded</td>
+<td>bool</td>
+<td>Whether to perform gridded validation (True) or non-gridded (not implemented). Default is True.</td>
+<td><code>True</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-16" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-16">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 2%">
+<col style="width: 3%">
+<col style="width: 94%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>dict or None</td>
+<td>If score_type is ‘det_score’, ‘prob_score’, or ‘ensemble_score’: Dictionary with model identifiers as keys and xarray.DataArray of scores (dimensions Y, X) as values. If score_type is ‘all_grid_prob_score’ (e.g., ROC_CURVE, RELIABILITY_DIAGRAM): None, as results are saved as plots. If score_type is ‘all_grid_det_score’: None (not implemented).</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="raises" class="level4 doc-section doc-section-raises">
+<h4 class="doc-section doc-section-raises anchored" data-anchor-id="raises">Raises</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 7%">
+<col style="width: 10%">
+<col style="width: 82%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>ValueError</td>
+<td>If the score is not recognized or if non-gridded validation is attempted (not implemented).</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.get_scores_metadata" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.get_scores_metadata">get_scores_metadata</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb23"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.get_scores_metadata()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Retrieve metadata for all available scoring metrics.</p>
+<section id="returns-17" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-17">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 4%">
+<col style="width: 4%">
+<col style="width: 90%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>dict</td>
+<td>Dictionary containing score names as keys and tuples of metadata (description, min_value, max_value, score_type, colormap, function) as values.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.ignorance_score" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.ignorance_score">ignorance_score</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb24"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.ignorance_score(y_true, y_probs, index_start, index_end)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Ignorance Score based on Weijs (2010).</p>
+<p>Measures the logarithmic loss of forecast probabilities for the true category.</p>
+<section id="parameters-18" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-18">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 14%">
+<col style="width: 60%">
+<col style="width: 12%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>array - like</td>
+<td>Forecast probabilities with shape (n_classes, n_samples).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_start</td>
+<td>int</td>
+<td>Start index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_end</td>
+<td>int</td>
+<td>End index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-18" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-18">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 8%">
+<col style="width: 8%">
+<col style="width: 82%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>Ignorance score, non-negative. Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.index_of_agreement" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.index_of_agreement">index_of_agreement</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb25"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.index_of_agreement(y_true, y_pred)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Index of Agreement (IOA).</p>
+<p>Measures the degree of model prediction accuracy relative to observed variability.</p>
+<section id="parameters-19" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-19">Parameters</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_pred</td>
+<td>array - like</td>
+<td>Predicted values.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-19" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-19">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 7%">
+<col style="width: 7%">
+<col style="width: 85%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>IOA score, ranging from 0 to 1 (1 is perfect). Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.kling_gupta_efficiency" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.kling_gupta_efficiency">kling_gupta_efficiency</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb26"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.kling_gupta_efficiency(y_true, y_pred)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Kling-Gupta Efficiency (KGE) metric.</p>
+<p>KGE combines correlation, bias, and variability ratios to assess model performance.</p>
+<section id="parameters-20" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-20">Parameters</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_pred</td>
+<td>array - like</td>
+<td>Predicted values.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-20" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-20">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 7%">
+<col style="width: 7%">
+<col style="width: 85%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>KGE score, ranging from -Inf to 1 (1 is perfect). Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.mean_absolute_error" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.mean_absolute_error">mean_absolute_error</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb27"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.mean_absolute_error(y_true, y_pred)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Mean Absolute Error (MAE).</p>
+<p>Measures the average magnitude of errors in predictions.</p>
+<section id="parameters-21" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-21">Parameters</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_pred</td>
+<td>array - like</td>
+<td>Predicted values.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-21" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-21">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 9%">
+<col style="width: 9%">
+<col style="width: 81%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>MAE value, non-negative. Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.nash_sutcliffe_efficiency" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.nash_sutcliffe_efficiency">nash_sutcliffe_efficiency</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb28"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.nash_sutcliffe_efficiency(y_true, y_pred)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Nash-Sutcliffe Efficiency (NSE).</p>
+<p>Measures the predictive skill of the model compared to the mean of observations.</p>
+<section id="parameters-22" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-22">Parameters</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_pred</td>
+<td>array - like</td>
+<td>Predicted values.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-22" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-22">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 7%">
+<col style="width: 7%">
+<col style="width: 85%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>NSE score, ranging from -Inf to 1 (1 is perfect). Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.pearson_corr" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.pearson_corr">pearson_corr</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb29"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.pearson_corr(y_true, y_pred)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Pearson Correlation Coefficient.</p>
+<p>Measures the linear correlation between observed and predicted values.</p>
+<section id="parameters-23" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-23">Parameters</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_pred</td>
+<td>array - like</td>
+<td>Predicted values.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-23" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-23">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 6%">
+<col style="width: 6%">
+<col style="width: 86%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>Pearson correlation coefficient, ranging from -1 to 1. Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.plot_model_score" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.plot_model_score">plot_model_score</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb30"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.plot_model_score(</span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a>    model_metric,</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a>    score,</span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a>    dir_save_score,</span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a>    figure_name<span class="op">=</span><span class="st">'WAS_MLR'</span>,</span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Plot a deterministic score on a map.</p>
+<p>Creates a geographical plot of the specified metric for a single model.</p>
+<section id="parameters-24" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-24">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 15%">
+<col style="width: 17%">
+<col style="width: 53%">
+<col style="width: 12%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>model_metric</td>
+<td>xarray.DataArray</td>
+<td>Score values with dimensions (Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>score</td>
+<td>str</td>
+<td>Name of the score to plot (e.g., ‘Pearson’, ‘MAE’).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>dir_save_score</td>
+<td>str or Path</td>
+<td>Directory to save the plot.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>figure_name</td>
+<td>str</td>
+<td>Prefix for the figure filename. Default is ‘WAS_MLR’.</td>
+<td><code>'WAS_MLR'</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.plot_models_score" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.plot_models_score">plot_models_score</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb31"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.plot_models_score(model_metrics, score, dir_save_score)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Plot multiple model scores on a grid of maps.</p>
+<p>Creates a subplot grid with geographical plots for each model’s score.</p>
+<section id="parameters-25" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-25">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 11%">
+<col style="width: 64%">
+<col style="width: 10%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>model_metrics</td>
+<td>dict</td>
+<td>Dictionary of model names and their corresponding score DataArrays (Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>score</td>
+<td>str</td>
+<td>Name of the score to plot (e.g., ‘Pearson’, ‘MAE’).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>dir_save_score</td>
+<td>str or Path</td>
+<td>Directory to save the plot.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.plot_roc_curves" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.plot_roc_curves">plot_roc_curves</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb32"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.plot_roc_curves(</span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a>    modelname,</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a>    dir_to_save_score,</span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a>    y_true_class,</span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a>    n_bootstraps<span class="op">=</span><span class="dv">200</span>,</span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a>    ci<span class="op">=</span><span class="fl">0.95</span>,</span>
+<span id="cb32-8"><a href="#cb32-8" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Plot ROC Curves with Confidence Intervals for probabilistic forecasts.</p>
+<p>Visualizes the Receiver Operating Characteristic for each tercile category.</p>
+<section id="parameters-26" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-26">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 15%">
+<col style="width: 15%">
+<col style="width: 59%">
+<col style="width: 10%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>modelname</td>
+<td>str</td>
+<td>Name of the model for labeling the plot.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>dir_to_save_score</td>
+<td>str or Path</td>
+<td>Directory to save the plot.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>y_true_class</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>xarray.DataArray</td>
+<td>Forecast probabilities with dimensions (probability, T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>clim_year_start</td>
+<td>int or str</td>
+<td>Start year of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>clim_year_end</td>
+<td>int or str</td>
+<td>End year of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>n_bootstraps</td>
+<td>int</td>
+<td>Number of bootstrap samples for confidence intervals. Default is 200.</td>
+<td><code>200</code></td>
+</tr>
+<tr class="even">
+<td>ci</td>
+<td>float</td>
+<td>Confidence interval level (e.g., 0.95 for 95%). Default is 0.95.</td>
+<td><code>0.95</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.ratio_to_average" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.ratio_to_average">ratio_to_average</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb33"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.ratio_to_average(</span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a>    predictant,</span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a>    year,</span>
+<span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute and visualize the ratio of a specific year’s data to the climatological mean.</p>
+<p>Calculates the percentage ratio of the predictand for a given year relative to the mean over a climatology period, classifies it into categories, and plots the result on a geographical map.</p>
+<section id="parameters-27" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-27">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 12%">
+<col style="width: 12%">
+<col style="width: 66%">
+<col style="width: 8%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>predictant</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X), where T is time, Y is latitude, and X is longitude.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>clim_year_start</td>
+<td>int or str</td>
+<td>Start year of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>clim_year_end</td>
+<td>int or str</td>
+<td>End year of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>year</td>
+<td>int or str</td>
+<td>Specific year to compute the ratio for.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-24" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-24">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 7%">
+<col style="width: 7%">
+<col style="width: 84%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>None</td>
+<td>Displays a geographical plot of the classified ratios with a custom colormap and legend.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.reliability_diagram" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.reliability_diagram">reliability_diagram</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb34"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.reliability_diagram(</span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a>    modelname,</span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a>    dir_to_save_score,</span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a>    y_true_class,</span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a>    bins<span class="op">=</span>np.array([<span class="fl">0.1</span>, <span class="fl">0.15</span>, <span class="fl">0.2</span>, <span class="fl">0.25</span>, <span class="fl">0.3</span>, <span class="fl">0.35</span>, <span class="fl">0.4</span>, <span class="fl">0.45</span>, <span class="fl">0.5</span>, <span class="fl">0.55</span>, <span class="fl">0.6</span>, <span class="fl">0.65</span>, <span class="fl">0.67</span>]),</span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Plot Reliability Diagrams for probabilistic forecasts.</p>
+<p>Visualizes the calibration of forecast probabilities against observed frequencies.</p>
+<section id="parameters-28" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-28">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 10%">
+<col style="width: 9%">
+<col style="width: 34%">
+<col style="width: 45%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>modelname</td>
+<td>str</td>
+<td>Name of the model for labeling the plot.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>dir_to_save_score</td>
+<td>str or Path</td>
+<td>Directory to save the plot.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>y_true</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>xarray.DataArray</td>
+<td>Forecast probabilities with dimensions (probability, T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>clim_year_start</td>
+<td>int or str</td>
+<td>Start year of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>clim_year_end</td>
+<td>int or str</td>
+<td>End year of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>bins</td>
+<td>array - like</td>
+<td>Probability bins for discretizing forecast probabilities.</td>
+<td><code>np.array([0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67])</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.reliability_score_grid" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.reliability_score_grid">reliability_score_grid</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb35"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.reliability_score_grid(</span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a>    y_true,</span>
+<span id="cb35-3"><a href="#cb35-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb35-4"><a href="#cb35-4" aria-hidden="true" tabindex="-1"></a>    index_start,</span>
+<span id="cb35-5"><a href="#cb35-5" aria-hidden="true" tabindex="-1"></a>    index_end,</span>
+<span id="cb35-6"><a href="#cb35-6" aria-hidden="true" tabindex="-1"></a>    bins<span class="op">=</span>np.array([<span class="fl">0.0</span>, <span class="fl">0.025</span>, <span class="fl">0.05</span>, <span class="fl">0.1</span>, <span class="fl">0.15</span>, <span class="fl">0.2</span>, <span class="fl">0.25</span>, <span class="fl">0.3</span>, <span class="fl">0.35</span>, <span class="fl">0.4</span>, <span class="fl">0.45</span>, <span class="fl">0.5</span>, <span class="fl">0.55</span>, <span class="fl">0.6</span>, <span class="fl">0.65</span>, <span class="fl">0.67</span>, <span class="fl">0.675</span>, <span class="fl">0.8</span>, <span class="fl">0.85</span>, <span class="fl">0.9</span>, <span class="fl">0.95</span>, <span class="fl">0.975</span>, <span class="fl">1.0</span>]),</span>
+<span id="cb35-7"><a href="#cb35-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Reliability Score on a grid based on Weijs (2010).</p>
+<p>Measures the calibration of forecast probabilities against observed frequencies.</p>
+<section id="parameters-29" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-29">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 5%">
+<col style="width: 6%">
+<col style="width: 25%">
+<col style="width: 62%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>array - like</td>
+<td>Forecast probabilities with shape (n_classes, n_samples).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_start</td>
+<td>int</td>
+<td>Start index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_end</td>
+<td>int</td>
+<td>End index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>bins</td>
+<td>array - like</td>
+<td>Probability bins for discretizing forecast probabilities.</td>
+<td><code>np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0])</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-25" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-25">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 10%">
+<col style="width: 10%">
+<col style="width: 79%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>Reliability score. Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.resolution_and_reliability_over_all_grid" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.resolution_and_reliability_over_all_grid">resolution_and_reliability_over_all_grid</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb36"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.resolution_and_reliability_over_all_grid(</span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a>    y_true_class,</span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a>    bins<span class="op">=</span>np.array([<span class="fl">0.0</span>, <span class="fl">0.025</span>, <span class="fl">0.05</span>, <span class="fl">0.1</span>, <span class="fl">0.15</span>, <span class="fl">0.2</span>, <span class="fl">0.25</span>, <span class="fl">0.3</span>, <span class="fl">0.35</span>, <span class="fl">0.4</span>, <span class="fl">0.45</span>, <span class="fl">0.5</span>, <span class="fl">0.55</span>, <span class="fl">0.6</span>, <span class="fl">0.65</span>, <span class="fl">0.67</span>, <span class="fl">0.675</span>, <span class="fl">0.8</span>, <span class="fl">0.85</span>, <span class="fl">0.9</span>, <span class="fl">0.95</span>, <span class="fl">0.975</span>, <span class="fl">1.0</span>]),</span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Resolution and Reliability scores over all grid points.</p>
+<p>Based on Weijs (2010), computes scores by aggregating across all grid points.</p>
+<section id="parameters-30" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-30">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 5%">
+<col style="width: 7%">
+<col style="width: 26%">
+<col style="width: 60%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true_class</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>xarray.DataArray</td>
+<td>Forecast probabilities with dimensions (probability, T, Y, X).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>bins</td>
+<td>array - like</td>
+<td>Probability bins for discretizing forecast probabilities.</td>
+<td><code>np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0])</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-26" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-26">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 5%">
+<col style="width: 5%">
+<col style="width: 88%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>tuple</td>
+<td>- resolution_sum : float Aggregated resolution score. - reliability_sum : float Aggregated reliability score.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.resolution_and_reliability_over_all_grid_per_category" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.resolution_and_reliability_over_all_grid_per_category">resolution_and_reliability_over_all_grid_per_category</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb37"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.resolution_and_reliability_over_all_grid_per_category(</span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a>    y_true_class,</span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a>    bins<span class="op">=</span>np.array([<span class="fl">0.0</span>, <span class="fl">0.025</span>, <span class="fl">0.05</span>, <span class="fl">0.1</span>, <span class="fl">0.15</span>, <span class="fl">0.2</span>, <span class="fl">0.25</span>, <span class="fl">0.3</span>, <span class="fl">0.35</span>, <span class="fl">0.4</span>, <span class="fl">0.45</span>, <span class="fl">0.5</span>, <span class="fl">0.55</span>, <span class="fl">0.6</span>, <span class="fl">0.65</span>, <span class="fl">0.67</span>, <span class="fl">0.675</span>, <span class="fl">0.8</span>, <span class="fl">0.85</span>, <span class="fl">0.9</span>, <span class="fl">0.95</span>, <span class="fl">0.975</span>, <span class="fl">1.0</span>]),</span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Assumes y_true_class already contains valid category labels (0, 1, 2).</p>
+</section>
+<section id="wass2s.WAS_Verification.resolution_and_reliability_per_category_grid" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.resolution_and_reliability_per_category_grid">resolution_and_reliability_per_category_grid</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb38"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.resolution_and_reliability_per_category_grid(</span>
+<span id="cb38-2"><a href="#cb38-2" aria-hidden="true" tabindex="-1"></a>    y_true,</span>
+<span id="cb38-3"><a href="#cb38-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb38-4"><a href="#cb38-4" aria-hidden="true" tabindex="-1"></a>    index_start,</span>
+<span id="cb38-5"><a href="#cb38-5" aria-hidden="true" tabindex="-1"></a>    index_end,</span>
+<span id="cb38-6"><a href="#cb38-6" aria-hidden="true" tabindex="-1"></a>    bins<span class="op">=</span>np.array([<span class="fl">0.0</span>, <span class="fl">0.025</span>, <span class="fl">0.05</span>, <span class="fl">0.1</span>, <span class="fl">0.15</span>, <span class="fl">0.2</span>, <span class="fl">0.25</span>, <span class="fl">0.3</span>, <span class="fl">0.35</span>, <span class="fl">0.4</span>, <span class="fl">0.45</span>, <span class="fl">0.5</span>, <span class="fl">0.55</span>, <span class="fl">0.6</span>, <span class="fl">0.65</span>, <span class="fl">0.67</span>, <span class="fl">0.675</span>, <span class="fl">0.8</span>, <span class="fl">0.85</span>, <span class="fl">0.9</span>, <span class="fl">0.95</span>, <span class="fl">0.975</span>, <span class="fl">1.0</span>]),</span>
+<span id="cb38-7"><a href="#cb38-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Resolution and Reliability scores per category based on Weijs (2010).</p>
+<p>Returns both total scores and per-category breakdowns.</p>
+<section id="parameters-31" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-31">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 5%">
+<col style="width: 6%">
+<col style="width: 25%">
+<col style="width: 62%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>array - like</td>
+<td>Forecast probabilities with shape (n_classes, n_samples).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_start</td>
+<td>int</td>
+<td>Start index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_end</td>
+<td>int</td>
+<td>End index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>bins</td>
+<td>array - like</td>
+<td>Probability bins for discretizing forecast probabilities.</td>
+<td><code>np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0])</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-27" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-27">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 2%">
+<col style="width: 2%">
+<col style="width: 94%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>dict</td>
+<td>Dictionary containing: - ‘total_resolution’: float - ‘total_reliability’: float - ‘category_resolution’: list of floats for each category - ‘category_reliability’: list of floats for each category - ‘category_base_rates’: list of floats (climatological frequencies)</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.resolution_score_grid" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.resolution_score_grid">resolution_score_grid</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb39"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.resolution_score_grid(</span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a>    y_true,</span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a>    y_probs,</span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a>    index_start,</span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a>    index_end,</span>
+<span id="cb39-6"><a href="#cb39-6" aria-hidden="true" tabindex="-1"></a>    bins<span class="op">=</span>np.array([<span class="fl">0.0</span>, <span class="fl">0.025</span>, <span class="fl">0.05</span>, <span class="fl">0.1</span>, <span class="fl">0.15</span>, <span class="fl">0.2</span>, <span class="fl">0.25</span>, <span class="fl">0.3</span>, <span class="fl">0.35</span>, <span class="fl">0.4</span>, <span class="fl">0.45</span>, <span class="fl">0.5</span>, <span class="fl">0.55</span>, <span class="fl">0.6</span>, <span class="fl">0.65</span>, <span class="fl">0.67</span>, <span class="fl">0.675</span>, <span class="fl">0.8</span>, <span class="fl">0.85</span>, <span class="fl">0.9</span>, <span class="fl">0.95</span>, <span class="fl">0.975</span>, <span class="fl">1.0</span>]),</span>
+<span id="cb39-7"><a href="#cb39-7" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Resolution Score on a grid based on Weijs (2010).</p>
+<p>Measures the ability of the forecast to distinguish between different outcomes.</p>
+<section id="parameters-32" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-32">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 5%">
+<col style="width: 6%">
+<col style="width: 25%">
+<col style="width: 62%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_probs</td>
+<td>array - like</td>
+<td>Forecast probabilities with shape (n_classes, n_samples).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>index_start</td>
+<td>int</td>
+<td>Start index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>index_end</td>
+<td>int</td>
+<td>End index of the climatology period.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>bins</td>
+<td>array - like</td>
+<td>Probability bins for discretizing forecast probabilities.</td>
+<td><code>np.array([0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67, 0.675, 0.8, 0.85, 0.9, 0.95, 0.975, 1.0])</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-28" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-28">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 8%">
+<col style="width: 8%">
+<col style="width: 82%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>Resolution score, non-negative. Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.root_mean_square_error" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.root_mean_square_error">root_mean_square_error</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb40"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.root_mean_square_error(y_true, y_pred)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Root Mean Square Error (RMSE).</p>
+<p>Measures the square root of the average squared errors in predictions.</p>
+<section id="parameters-33" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-33">Parameters</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_pred</td>
+<td>array - like</td>
+<td>Predicted values.</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-29" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-29">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 9%">
+<col style="width: 9%">
+<col style="width: 81%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>RMSE value, non-negative. Returns np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.spearman_corr" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.spearman_corr">spearman_corr</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb41"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.spearman_corr(y_true, y_pred)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compute Spearman rank correlation coefficient.</p>
+<section id="parameters-34" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-34">Parameters</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>y_true</td>
+<td>array - like</td>
+<td>Observed values (1D).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>y_pred</td>
+<td>array - like</td>
+<td>Predicted values (1D).</td>
+<td><em>required</em></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-30" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-30">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 10%">
+<col style="width: 10%">
+<col style="width: 79%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>float</td>
+<td>Spearman’s rho in [-1, 1]; np.nan if insufficient valid data.</td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.taylor_diagram" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.taylor_diagram">taylor_diagram</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb42"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.taylor_diagram(</span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a>    obs,</span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a>    models,</span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>,</span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a>    normalize<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb42-6"><a href="#cb42-6" aria-hidden="true" tabindex="-1"></a>    correlation<span class="op">=</span><span class="st">'pearson'</span>,</span>
+<span id="cb42-7"><a href="#cb42-7" aria-hidden="true" tabindex="-1"></a>    labels<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb42-8"><a href="#cb42-8" aria-hidden="true" tabindex="-1"></a>    title<span class="op">=</span><span class="st">'Taylor diagram'</span>,</span>
+<span id="cb42-9"><a href="#cb42-9" aria-hidden="true" tabindex="-1"></a>    figsize<span class="op">=</span>(<span class="dv">7</span>, <span class="dv">6</span>),</span>
+<span id="cb42-10"><a href="#cb42-10" aria-hidden="true" tabindex="-1"></a>    savepath<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb42-11"><a href="#cb42-11" aria-hidden="true" tabindex="-1"></a>    hide_rms_numbers<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb42-12"><a href="#cb42-12" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Plot a Taylor diagram comparing one or more model series against observations.</p>
+<section id="parameters-35" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-35">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 8%">
+<col style="width: 27%">
+<col style="width: 49%">
+<col style="width: 14%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>obs</td>
+<td>xarray.DataArray or np.ndarray</td>
+<td>Observations. If xarray, can be (T), (T,Y,X), etc.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>models</td>
+<td>dict[str, xarray.DataArray | np.ndarray]</td>
+<td>Mapping of model name -&gt; forecast array (same shape as obs or broadcastable).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>normalize</td>
+<td>bool</td>
+<td>If True (default), normalize std and CRMSD by std(obs).</td>
+<td><code>True</code></td>
+</tr>
+<tr class="even">
+<td>correlation</td>
+<td>(pearson, spearman)</td>
+<td>Correlation metric used on paired, finite values.</td>
+<td><code>"pearson","spearman"</code></td>
+</tr>
+<tr class="odd">
+<td>labels</td>
+<td>dict[str, str]</td>
+<td>Custom display labels for model markers. Defaults to model keys.</td>
+<td><code>None</code></td>
+</tr>
+<tr class="even">
+<td>title</td>
+<td>str or None</td>
+<td>Figure title.</td>
+<td><code>'Taylor diagram'</code></td>
+</tr>
+<tr class="odd">
+<td>figsize</td>
+<td>tuple</td>
+<td>Matplotlib figure size.</td>
+<td><code>(7, 6)</code></td>
+</tr>
+<tr class="even">
+<td>savepath</td>
+<td>str or None</td>
+<td>If provided, save figure to this path.</td>
+<td><code>None</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-31" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-31">Returns</h4>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>(fig, ax) : matplotlib Figure and Axes</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="wass2s.WAS_Verification.weibull_shape_solver" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.weibull_shape_solver">weibull_shape_solver</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb43"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.weibull_shape_solver(k, M, V)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Function to find the root of the Weibull shape parameter ‘k’. We find ‘k’ such that the theoretical variance/mean^2 ratio matches the observed V/M^2 ratio.</p>
+</section>
+<section id="wass2s.WAS_Verification.weighted_gcm_forecasts" class="level3">
+<h3 class="anchored" data-anchor-id="wass2s.WAS_Verification.weighted_gcm_forecasts">weighted_gcm_forecasts</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb44"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a>WAS_Verification.weighted_gcm_forecasts(</span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a>    Obs,</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a>    best_models,</span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a>    scores,</span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a>    lead_time,</span>
+<span id="cb44-6"><a href="#cb44-6" aria-hidden="true" tabindex="-1"></a>    model_dir,</span>
+<span id="cb44-7"><a href="#cb44-7" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
+<span id="cb44-8"><a href="#cb44-8" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
+<span id="cb44-9"><a href="#cb44-9" aria-hidden="true" tabindex="-1"></a>    variable<span class="op">=</span><span class="st">'PRCP'</span>,</span>
+<span id="cb44-10"><a href="#cb44-10" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Generate weighted ensemble forecasts from selected GCMs based on their performance scores.</p>
+<p>Combines hindcasts and forecasts from multiple models using weights derived from the GROC score, scales the results to match observed climatology, and computes tercile probabilities.</p>
+<section id="parameters-36" class="level4 doc-section doc-section-parameters">
+<h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-36">Parameters</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 12%">
+<col style="width: 13%">
+<col style="width: 65%">
+<col style="width: 8%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Obs</td>
+<td>xarray.DataArray</td>
+<td>Observed data with dimensions (T, Y, X), used for scaling and probability calculations.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>best_models</td>
+<td>dict</td>
+<td>Dictionary of model identifiers (keys) to be included in the ensemble.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>scores</td>
+<td>dict</td>
+<td>Dictionary containing scores (e.g., GROC) for each model, with model identifiers as keys.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>lead_time</td>
+<td>list of int</td>
+<td>Lead times in months for the forecast season (e.g., [1, 2, 3] for a 3-month season).</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>model_dir</td>
+<td>str or Path</td>
+<td>Directory containing hindcast and forecast NetCDF files.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>clim_year_start</td>
+<td>int or str</td>
+<td>Start year of the climatology period for computing tercile thresholds.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="odd">
+<td>clim_year_end</td>
+<td>int or str</td>
+<td>End year of the climatology period for computing tercile thresholds.</td>
+<td><em>required</em></td>
+</tr>
+<tr class="even">
+<td>variable</td>
+<td>str</td>
+<td>Variable name in the NetCDF files (e.g., ‘PRCP’ for precipitation). Default is ‘PRCP’.</td>
+<td><code>'PRCP'</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="returns-32" class="level4 doc-section doc-section-returns">
+<h4 class="doc-section doc-section-returns anchored" data-anchor-id="returns-32">Returns</h4>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 2%">
+<col style="width: 2%">
+<col style="width: 95%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td></td>
+<td>tuple</td>
+<td>- hindcast_det : xarray.DataArray Weighted deterministic hindcast with dimensions (T, Y, X). - hindcast_prob : xarray.DataArray Tercile probabilities for hindcasts with dimensions (probability, T, Y, X). - forecast_prob : xarray.DataArray Tercile probabilities for forecasts with dimensions (probability, Y, X).</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="notes" class="level4 doc-section doc-section-notes">
+<h4 class="doc-section doc-section-notes anchored" data-anchor-id="notes">Notes</h4>
+<ul>
+<li>Model files are expected to follow a naming convention like ‘hindcast_{center}<em>{variable}</em>{init_month}<em>{season}</em>{lead}.nc’.</li>
+<li>The GROC score is used as the weighting metric.</li>
+<li>A scaling factor is applied based on the ratio of observed to hindcast mean.</li>
+</ul>
+
+
+</section>
+</section>
+</section>
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp('/' + window.location.host + '/');
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+      &nbsp;
+    </div>   
+    <div class="nav-footer-center">
+<p>Developed to support the WMO guidelines for objective, operational seasonal forecasting.</p>
+</div>
+    <div class="nav-footer-right">
+      &nbsp;
+    </div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

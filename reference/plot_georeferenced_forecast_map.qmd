@@ -1,0 +1,16 @@
+# plot_georeferenced_forecast_map { #wass2s.plot_georeferenced_forecast_map }
+
+```python
+plot_georeferenced_forecast_map(
+    shapefile_zip,
+    column='Forecast',
+    extent_obs=[12, -3.5, 4, 1.5],
+    title='Georeferenced Map of 2024 consensual Forecast',
+    figsize=(9, 7),
+    cmap='tab20',
+    outpath='georeferenced_map.pdf',
+    dpi=300,
+    show=True,
+)
+```
+

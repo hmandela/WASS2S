@@ -1,0 +1,188 @@
+# WAS_PCR { #wass2s.WAS_PCR }
+
+```python
+WAS_PCR(
+    regression_model,
+    n_modes=None,
+    use_coslat=True,
+    standardize=False,
+    detrend=True,
+    opti_explained_variance=None,
+    L2norm=False,
+    normalize=None,
+)
+```
+
+Spatial principal-component regression wrapping a WAS regression model.
+
+This class implements a two-stage pipeline:
+
+1. **EOF dimensionality reduction** — the spatial predictor field(s) are
+   decomposed into principal components (PCs) by :class:`~wass2s.was_eof.WAS_EOF`,
+   which handles NaN filling, optional linear detrending, and optional
+   per-field variance normalization entirely within each cross-validation
+   fold (no data leakage).
+2. **Regression** — the resulting PCs are passed to any compatible WAS
+   regression model (e.g. :class:`~wass2s.was_linear_models.WAS_MLR`,
+   :class:`~wass2s.was_machine_learning.WAS_RandomForest`, …).
+
+## Single-field and multivariate predictors {.doc-section .doc-section-single-field-and-multivariate-predictors}
+
+``Predictor`` may be a single :class:`xarray.DataArray` *or* a **list** of
+DataArrays representing different variables and/or grids (e.g. SST + SLP +
+rainfall indices).  A list triggers a **combined multivariate EOF**: each
+field is preprocessed and normalized independently on the training fold so
+that no single field dominates the joint covariance, then
+:class:`~wass2s.was_eof.WAS_EOF` builds one shared set of PCs that feed
+the regression.
+
+.. note::
+    When using this class inside :class:`~wass2s.was_cross_validate.WAS_Cross_Validator`,
+    pass the **raw** predictor (do *not* pre-detrend outside the fold loop).
+    For a list predictor, slice every field per fold::
+
+        X_train = [p.isel(T=train_idx) for p in Predictor]
+        X_test  = [p.isel(T=test_idx)  for p in Predictor]
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name                    | Type         | Description                                                                                                                                                                          | Default    |
+|-------------------------|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------|
+| regression_model        | object       | An instantiated WAS regression model exposing at least ``compute_model(X_train, y_train, X_test, ...)`` and, optionally, ``compute_prob(...)`` and ``forecast(...)``.                | _required_ |
+| n_modes                 | int          | Number of EOF modes to retain.  Ignored when ``opti_explained_variance`` is set.                                                                                                     | `None`     |
+| use_coslat              | bool         | Apply cosine-latitude area weighting in the EOF decomposition.                                                                                                                       | `True`     |
+| standardize             | bool         | Standardize each grid point before the EOF decomposition (useful when the predictor is not expressed as anomalies).                                                                  | `False`    |
+| detrend                 | bool         | Remove a linear trend from each grid point before the EOF decomposition.  The trend is estimated on the training fold and applied to the test fold to avoid leakage.                 | `True`     |
+| opti_explained_variance | float        | Target cumulative explained variance (%) used to select the optimal number of modes automatically (e.g. ``90.0`` for 90 %).                                                          | `None`     |
+| L2norm                  | bool         | Return L2-normalised EOF scores and components from :class:`~wass2s.was_eof.WAS_EOF`.                                                                                                | `False`    |
+| normalize               | bool or None | Per-field scalar rescaling so that no field dominates the joint covariance in a multivariate EOF.  ``None`` means *auto*: enabled for a list of fields, disabled for a single field. | `None`     |
+
+## Attributes {.doc-section .doc-section-attributes}
+
+| Name      | Type                                     | Description                                                                                         |
+|-----------|------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| eof_model | :class:`~wass2s.was_eof.WAS_EOF` or None | The fitted EOF object, available after the first call to :meth:`compute_model` or :meth:`forecast`. |
+
+## Examples {.doc-section .doc-section-examples}
+
+Single-field PCR with a Ridge regression back-end:
+
+```python
+>>> from wass2s import WAS_PCR, WAS_Ridge_Model
+>>> pcr = WAS_PCR(WAS_Ridge_Model(alpha=1.0), n_modes=10, detrend=True)
+>>> result = pcr.compute_model(X_train, y_train, X_test)
+```
+
+Multivariate PCR (SST + SLP):
+
+```python
+>>> pcr_mv = WAS_PCR(WAS_MLR(), opti_explained_variance=85.0)
+>>> result  = pcr_mv.compute_model([sst_train, slp_train], y_train,
+...                                 [sst_test,  slp_test])
+```
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute_model](#wass2s.WAS_PCR.compute_model) | Run the full PCR pipeline on a single train/test split. |
+| [compute_prob](#wass2s.WAS_PCR.compute_prob) | Compute tercile probability forecasts from a deterministic hindcast. |
+| [forecast](#wass2s.WAS_PCR.forecast) | Generate an operational forecast for a target year. |
+
+### compute_model { #wass2s.WAS_PCR.compute_model }
+
+```python
+WAS_PCR.compute_model(X_train, y_train, X_test, y_test=None, **kwargs)
+```
+
+Run the full PCR pipeline on a single train/test split.
+
+Performs EOF dimensionality reduction on the predictor, then delegates
+to the wrapped regression model.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name     | Type                                         | Description                                                                                                   | Default    |
+|----------|----------------------------------------------|---------------------------------------------------------------------------------------------------------------|------------|
+| X_train  | xarray.DataArray or list of xarray.DataArray | Training predictor field(s).                                                                                  | _required_ |
+| y_train  | xarray.DataArray                             | Training target (predictand).                                                                                 | _required_ |
+| X_test   | xarray.DataArray or list of xarray.DataArray | Test predictor field(s).                                                                                      | _required_ |
+| y_test   | xarray.DataArray                             | Test target.  Forwarded to the regression model only when its ``compute_model`` signature accepts ``y_test``. | `None`     |
+| **kwargs |                                              | Additional keyword arguments forwarded to the regression model.                                               | `{}`       |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                                       |
+|--------|--------|-------------------------------------------------------------------------------------------------------------------|
+|        | object | Whatever the wrapped regression model's ``compute_model`` returns (typically a deterministic hindcast DataArray). |
+
+### compute_prob { #wass2s.WAS_PCR.compute_prob }
+
+```python
+WAS_PCR.compute_prob(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    hindcast_det,
+    **kwargs,
+)
+```
+
+Compute tercile probability forecasts from a deterministic hindcast.
+
+Delegates directly to the wrapped regression model's ``compute_prob``
+method.  Returns ``None`` if the model does not implement it.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name            | Type             | Description                                                     | Default    |
+|-----------------|------------------|-----------------------------------------------------------------|------------|
+| Predictant      | xarray.DataArray | Observed predictand over the full hindcast period.              | _required_ |
+| clim_year_start | int              | First year of the climatological reference period.              | _required_ |
+| clim_year_end   | int              | Last year of the climatological reference period.               | _required_ |
+| hindcast_det    | xarray.DataArray | Deterministic hindcast produced by :meth:`compute_model`.       | _required_ |
+| **kwargs        |                  | Additional keyword arguments forwarded to the regression model. | `{}`       |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type                     | Description                                                                                                                                 |
+|--------|--------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+|        | xarray.DataArray or None | Tercile probabilities (below-normal, near-normal, above-normal), or ``None`` if the regression model does not support probabilistic output. |
+
+### forecast { #wass2s.WAS_PCR.forecast }
+
+```python
+WAS_PCR.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictor,
+    hindcast_det,
+    Predictor_for_year,
+    **kwargs,
+)
+```
+
+Generate an operational forecast for a target year.
+
+EOF patterns are fitted on the full hindcast predictor, and the
+target-year predictor is projected onto those patterns before being
+passed to the regression model.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name               | Type                                         | Description                                                     | Default    |
+|--------------------|----------------------------------------------|-----------------------------------------------------------------|------------|
+| Predictant         | xarray.DataArray                             | Observed predictand over the full hindcast period.              | _required_ |
+| clim_year_start    | int                                          | First year of the climatological reference period.              | _required_ |
+| clim_year_end      | int                                          | Last year of the climatological reference period.               | _required_ |
+| Predictor          | xarray.DataArray or list of xarray.DataArray | Full hindcast predictor field(s) used to fit the EOF model.     | _required_ |
+| hindcast_det       | xarray.DataArray                             | Deterministic hindcast produced during cross-validation.        | _required_ |
+| Predictor_for_year | xarray.DataArray or list of xarray.DataArray | Predictor field(s) for the target forecast year.                | _required_ |
+| **kwargs           |                                              | Additional keyword arguments forwarded to the regression model. | `{}`       |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                          |
+|--------|--------|--------------------------------------------------------------------------------------|
+|        | object | Operational forecast returned by the wrapped regression model's ``forecast`` method. |

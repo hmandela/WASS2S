@@ -1,0 +1,24 @@
+# fix_time_coord { #wass2s.fix_time_coord }
+
+```python
+fix_time_coord(ds, seas)
+```
+
+Fix time coordinates by extracting year and assigning a fixed month/day.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type           | Description                                                                                | Default    |
+|--------|----------------|--------------------------------------------------------------------------------------------|------------|
+| ds     | xarray.Dataset | Input dataset with time dimension 'T'.                                                     | _required_ |
+| seas   | tuple          | Tuple containing season information, where seas[1] is the month (e.g., '11' for November). | _required_ |
+
+## Returns {.doc-section .doc-section-returns}
+
+| Name   | Type           | Description                                                       |
+|--------|----------------|-------------------------------------------------------------------|
+|        | xarray.Dataset | Dataset with updated time coordinates in the format 'YYYY-MM-01'. |
+
+## Notes {.doc-section .doc-section-notes}
+
+Assumes the input dataset's time values can be converted to pandas datetime objects.

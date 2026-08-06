@@ -1,0 +1,28 @@
+# to_iridl_lon { #wass2s.to_iridl_lon }
+
+```python
+to_iridl_lon(lon)
+```
+
+Convert numeric longitude to IRIDL longitude string format.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type   | Description                                                        | Default    |
+|--------|--------|--------------------------------------------------------------------|------------|
+| lon    | float  | Longitude value in degrees (positive for East, negative for West). | _required_ |
+
+## Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                            |
+|--------|--------|------------------------------------------------------------------------|
+|        | str    | IRIDL-formatted longitude string (e.g., '15E' for +15, '15W' for -15). |
+
+## Examples {.doc-section .doc-section-examples}
+
+```python
+>>> to_iridl_lon(15)
+'15E'
+>>> to_iridl_lon(-15)
+'15W'
+```

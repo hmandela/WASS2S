@@ -1,0 +1,71 @@
+# WAS_mme_CCA_eeof { #wass2s.WAS_mme_CCA_eeof }
+
+```python
+WAS_mme_CCA_eeof(
+    n_modes=4,
+    n_pca_modes=8,
+    standardize=False,
+    use_coslat=True,
+    use_pca=True,
+    combine='mean',
+    eeof_detrend=True,
+    dist_method='nonparam',
+    positive_support=True,
+)
+```
+
+Canonical Correlation Analysis MME, legacy WAS_CCA ideology (EEOF detrend).
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name         | Type                | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Default      |
+|--------------|---------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------|
+| n_modes      | int                 | Number of canonical modes for xeofs.cross.CCA (default 4).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `4`          |
+| n_pca_modes  | int                 | PCA modes kept before CCA when ``use_pca`` (default 8).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | `8`          |
+| standardize  | bool                | Passed to xeofs.cross.CCA (default False; data are already prepared).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | `False`      |
+| use_coslat   | bool                | Cosine-latitude weighting inside the CCA (default True).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | `True`       |
+| use_pca      | bool                | Pre-filter each field with PCA before the CCA (default True).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `True`       |
+| combine      | (mean, meof)        | How the M models enter the CCA predictor field. 'mean' (default) collapses M to the multi-model mean before any processing. 'meof' keeps M as an extra channel so xeofs sees a joint (lat, lon, M) feature space at both the EEOF detrend stage and the CCA stage. This is scientifically richer but numerically fragile: the internal n_pca_modes=22 of ExtendedEOF may be too small to cover the enlarged feature space, and the CCA PCA pre-filter faces a far worse sample-to-feature ratio. Spatially coarsen the predictor and keep n_pca_modes conservative when using 'meof'. | `'mean'`     |
+| eeof_detrend | bool                | Apply the legacy EEOF detrend inside ``forecast`` (default True). Set False to fit CCA on the raw standardized fields without EEOF removal.                                                                                                                                                                                                                                                                                                                                                                                                                                           | `True`       |
+| dist_method  | (nonparam, bestfit) | Tercile-probability strategy (default 'nonparam').                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `'nonparam'` |
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute_model](#wass2s.WAS_mme_CCA_eeof.compute_model) | Deterministic CCA hindcast for one CV fold, in the space the framework |
+| [forecast](#wass2s.WAS_mme_CCA_eeof.forecast) | Operational CCA forecast for a single target year, legacy WAS_CCA style: |
+
+### compute_model { #wass2s.WAS_mme_CCA_eeof.compute_model }
+
+```python
+WAS_mme_CCA_eeof.compute_model(X_train, y_train, X_test, y_test=None, **kwargs)
+```
+
+Deterministic CCA hindcast for one CV fold, in the space the framework
+hands in (matches legacy WAS_CCA.compute_model: plain CCA, no EEOF
+detrend; the same_kind_model2 branch reverse-standardizes afterwards).
+
+### forecast { #wass2s.WAS_mme_CCA_eeof.forecast }
+
+```python
+WAS_mme_CCA_eeof.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictor,
+    hindcast_det,
+    Predictor_for_year,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Operational CCA forecast for a single target year, legacy WAS_CCA style:
+
+  * predictor field EEOF-detrended (NOT standardized),
+  * predictand standardized then EEOF-detrended,
+  * forecast-year predictor only gap-filled (NOT detrended),
+  * result reverse-standardized with NO trend added back.

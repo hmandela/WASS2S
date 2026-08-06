@@ -1,0 +1,143 @@
+# WAS_PrecipIndices { #wass2s.WAS_PrecipIndices }
+
+```python
+WAS_PrecipIndices(
+    base_period,
+    percentile=95,
+    season=None,
+    wet_day_threshold=1.0,
+    min_base_years=15,
+)
+```
+
+Implementation of ETCCDI extreme precipitation indices, specifically R95p and R99p.
+
+These indices measure the **annual total precipitation from very/extremely wet days**:
+
+- **R95p**: Total precipitation from days when precipitation ≥ 95th percentile of wet-day precipitation in the base period
+- **R99p**: Total precipitation from days when precipitation ≥ 99th percentile of wet-day precipitation in the base period
+
+A **wet day** is defined as precipitation ≥ ``wet_day_threshold`` (default 1.0 mm).
+
+Key Features:
+- Uses only **wet days** in the base period for percentile calculation (ETCCDI standard)
+- Supports seasonal filtering (e.g., JJAS season)
+- Handles both station-based (CDT format) and gridded (xarray) data
+- Proper leap-year handling and missing value treatment
+- Outputs in CDT-compatible format for station data
+
+References:
+- ETCCDI Climate Change Indices (2009)
+- Zhang et al. (2011): Indices for monitoring changes in extremes
+- Sillmann et al. (2013): Climate extremes indices in the CMIP5 multi-model ensemble
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name              | Type        | Description                                                               | Default    |
+|-------------------|-------------|---------------------------------------------------------------------------|------------|
+| base_period       | slice       | Base period for percentile calculation, e.g. slice("1991", "2020")        | _required_ |
+| percentile        | float       | Percentile threshold (95 → R95p, 99 → R99p)                               | `95`       |
+| season            | list of int | Months to include in analysis (e.g., [6,7,8,9] for JJAS)                  | `None`     |
+| wet_day_threshold | float       | Minimum precipitation amount (mm) to consider a wet day                   | `1.0`      |
+| min_base_years    | int         | Minimum number of years required in base period (warning issued if fewer) | `15`       |
+
+## Examples {.doc-section .doc-section-examples}
+
+Compute R95p for full year:
+
+```python
+>>> r95p_calc = WAS_PrecipIndices(
+...     base_period=slice("1991", "2020"),
+...     percentile=95
+... )
+>>> r95p = r95p_calc.compute(pr_da)  # pr_da is precipitation DataArray
+```
+
+Compute R99p for JJAS season only:
+
+```python
+>>> r99p_jjas = WAS_PrecipIndices(
+...     base_period=slice("1991", "2020"),
+...     percentile=99,
+...     season=[6,7,8,9]
+... ).compute(pr_da)
+```
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute](#wass2s.WAS_PrecipIndices.compute) | Compute index for xarray DataArray (gridded data). |
+| [compute_insitu](#wass2s.WAS_PrecipIndices.compute_insitu) | Compute index for in-situ (station) data in CDT format. |
+| [get_index_definition](#wass2s.WAS_PrecipIndices.get_index_definition) | Return index definition metadata. |
+| [transform_cdt](#wass2s.WAS_PrecipIndices.transform_cdt) | Transform CDT format to long format DataFrame. |
+
+### compute { #wass2s.WAS_PrecipIndices.compute }
+
+```python
+WAS_PrecipIndices.compute(da, parallel=True, nb_cores=4)
+```
+
+Compute index for xarray DataArray (gridded data).
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name       | Type         | Description                                                              | Default    |
+|------------|--------------|--------------------------------------------------------------------------|------------|
+| da         | xr.DataArray | Precipitation DataArray with dimensions (time, y, x) or (time, lat, lon) | _required_ |
+| chunk_size | dict         | Chunk sizes for parallel processing, e.g., {'y': 100, 'x': 100}          | _required_ |
+| parallel   | bool         | Whether to use Dask for parallel processing                              | `True`     |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description         |
+|--------|--------------|---------------------|
+|        | xr.DataArray | Annual index values |
+
+### compute_insitu { #wass2s.WAS_PrecipIndices.compute_insitu }
+
+```python
+WAS_PrecipIndices.compute_insitu(df_cdt)
+```
+
+Compute index for in-situ (station) data in CDT format.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type         | Description              | Default    |
+|--------|--------------|--------------------------|------------|
+| df_cdt | pd.DataFrame | Input data in CDT format | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description          |
+|--------|--------------|----------------------|
+|        | pd.DataFrame | Result in CDT format |
+
+### get_index_definition { #wass2s.WAS_PrecipIndices.get_index_definition }
+
+```python
+WAS_PrecipIndices.get_index_definition()
+```
+
+Return index definition metadata.
+
+### transform_cdt { #wass2s.WAS_PrecipIndices.transform_cdt }
+
+```python
+WAS_PrecipIndices.transform_cdt(df)
+```
+
+Transform CDT format to long format DataFrame.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type         | Description                   | Default    |
+|--------|--------------|-------------------------------|------------|
+| df     | pd.DataFrame | Input DataFrame in CDT format | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description                                                        |
+|--------|--------------|--------------------------------------------------------------------|
+|        | pd.DataFrame | Long format DataFrame with columns: DATE, STATION, VALUE, LAT, LON |

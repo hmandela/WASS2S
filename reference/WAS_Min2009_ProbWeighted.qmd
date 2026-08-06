@@ -1,0 +1,111 @@
+# WAS_Min2009_ProbWeighted { #wass2s.WAS_Min2009_ProbWeighted }
+
+```python
+WAS_Min2009_ProbWeighted(
+    distribution='gaussian',
+    cv_method=None,
+    rolling_window_size=15,
+    n_samples_for_chisq='total_ensemble',
+    eps_lognormal=0.01,
+    sigma_floor=1e-12,
+)
+```
+
+Min et al. (2009) Probability-Weighted Multi-Model Ensemble (PMME).
+
+## What this class does {.doc-section .doc-section-what-this-class-does}
+
+1) For each model compute tercile probabilities (PB / PN / PA) at every
+   grid point from its ensemble forecast using one of three distributions:
+
+   * 'gaussian'  : Gaussian approximation.
+                   Boundaries  : T_lo/hi = mu_hcst ± 0.4307 * sigma_hcst
+                   Probability : Phi( (T_lo/hi - f_mean) / sigma_FORECAST )
+                   sigma_FORECAST = std of the current forecast ensemble.
+
+   * 'lognormal' : Same logic in log-space (better for precipitation).
+                   eps_lognormal is added before taking logs.
+
+   * 'empirical' : Category boundaries are the hindcast q33/q66.
+                   Probability = fraction of forecast ensemble members
+                   below q33 / above q66.
+
+2) Combine per-model probabilities with weights w_m ∝ sqrt(N_m) (Min 2009
+   eq. 1), normalised to sum to 1.
+
+3) Optionally compute a combined categorical map with a chi-square
+   significance test (Min 2009 section 3b, df = 2).
+
+## Assumed dims {.doc-section .doc-section-assumed-dims}
+
+forecasts[m] : at minimum dim 'M' (ensemble members); spatial dims optional.
+hindcasts[m] : dims 'T' (years) and 'M' (members); same spatial dims.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name                | Type                                                         | Description                                                                                                                | Default            |
+|---------------------|--------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------|--------------------|
+| distribution        | gaussian \| lognormal \| empirical                           |                                                                                                                            | `'gaussian'`       |
+| cv_method           | Optional\[Literal\[\'leave_one_out\', \'rolling_window\'\]\] | How to compute climatological mu / sigma from the hindcast pool. None -> use the full hindcast pool (no cross-validation). | `None`             |
+| rolling_window_size | int                                                          | Half-width of the rolling window when cv_method='rolling_window'.                                                          | `15`               |
+| n_samples_for_chisq | total_ensemble \| effective_sample_size \| float             | How to compute N for the chi-square test.                                                                                  | `'total_ensemble'` |
+| eps_lognormal       | float                                                        | Small offset added before log transform (lognormal path only).                                                             | `0.01`             |
+| sigma_floor         | float                                                        | Any sigma <= this value is replaced by the full-hindcast raw sigma.                                                        | `1e-12`            |
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute_combined_map](#wass2s.WAS_Min2009_ProbWeighted.compute_combined_map) | Combined categorical map with chi-square significance test. |
+| [compute_pmme_probabilities](#wass2s.WAS_Min2009_ProbWeighted.compute_pmme_probabilities) | Compute PMME probabilities (PB / PN / PA) across models. |
+
+### compute_combined_map { #wass2s.WAS_Min2009_ProbWeighted.compute_combined_map }
+
+```python
+WAS_Min2009_ProbWeighted.compute_combined_map(
+    pmme_probs,
+    ensemble_sizes,
+    model_names,
+    significance_level=0.05,
+)
+```
+
+Combined categorical map with chi-square significance test.
+[Min 2009, section 3b]
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name         | Type      | Description                                                                                                 |
+|--------------|-----------|-------------------------------------------------------------------------------------------------------------|
+| combined_map | DataArray | 0 = no significant deviation from equal probabilities, 1 = PB dominant,  2 = PN dominant,  3 = PA dominant. |
+| chi_square   | DataArray | chi-square statistic (df = 2).                                                                              |
+
+### compute_pmme_probabilities { #wass2s.WAS_Min2009_ProbWeighted.compute_pmme_probabilities }
+
+```python
+WAS_Min2009_ProbWeighted.compute_pmme_probabilities(
+    forecasts,
+    hindcasts,
+    climatology=None,
+    ensemble_sizes=None,
+    strict_models=True,
+)
+```
+
+Compute PMME probabilities (PB / PN / PA) across models.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name           | Type                      | Description   | Default           |
+|----------------|---------------------------|---------------|-------------------|
+| forecasts      | Dict\[str, xr.DataArray\] |               | _required_        |
+| hindcasts      | Dict\[str, xr.DataArray\] |               | _required_        |
+| climatology    | Optional\[xr.DataArray\]  |               | `None`            |
+| ensemble_sizes | model_name: int           |               | `model_name: int` |
+| strict_models  | bool                      | same keys.    | `True`            |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type                                                                         | Description   |
+|--------|------------------------------------------------------------------------------|---------------|
+|        | dict with keys \'PB\', \'PN\', \'PA\'  (each a DataArray over spatial dims). |               |

@@ -1,0 +1,18 @@
+# WAS_mme_xcELM { #wass2s.WAS_mme_xcELM }
+
+```python
+WAS_mme_xcELM(
+    elm_kwargs=None,
+    dist_method='nonparam',
+    apply_drymask=True,
+    dry_threshold=10.0,
+    quantile_threshold=0.2,
+)
+```
+
+xcast ELM deterministic MME with shared, dimension-safe probabilities.
+
+The previous implementation exposed unsupported defaults, undefined names,
+noisy per-cell prints and a T/S collision in operational probabilities.
+This wrapper delegates probability dressing to :class:`WAS_mme_Weighted`,
+which is already used and tested elsewhere in the module.

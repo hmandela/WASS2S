@@ -1,0 +1,30 @@
+# fit_one_grid_min_crps { #wass2s.fit_one_grid_min_crps }
+
+```python
+fit_one_grid_min_crps(
+    fbar,
+    svar,
+    y,
+    family='censored_normal',
+    dry_threshold=0.0,
+    var_link='linear',
+    init=None,
+    bounds=None,
+)
+```
+
+Minimum-CRPS EMOS fit at a single grid point.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name          | Type                                                        | Description   | Default             |
+|---------------|-------------------------------------------------------------|---------------|---------------------|
+| fbar          | 1D arrays over time (ensemble mean, ensemble variance, obs) |               | _required_          |
+| svar          | 1D arrays over time (ensemble mean, ensemble variance, obs) |               | _required_          |
+| y             | 1D arrays over time (ensemble mean, ensemble variance, obs) |               | _required_          |
+| family        |                                                             |               | `'censored_normal'` |
+| dry_threshold | censoring/truncation point c (precip families)              |               | `0.0`               |
+| var_link      |                                                             |               | `'linear'`          |
+| Returns       |                                                             |               | _required_          |
+| observations  |                                                             |               | _required_          |
+| used          |                                                             |               | _required_          |

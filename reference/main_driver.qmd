@@ -1,0 +1,36 @@
+# main_driver { #wass2s.main_driver }
+
+```python
+main_driver(
+    dir_save,
+    clim_start,
+    clim_end,
+    target_date_str,
+    variables_list=None,
+    ratio_mode='monthly',
+    precip_source='era5',
+    agera5_version='2_0',
+    sst_source='era5',
+    force_download=False,
+)
+```
+
+Run monthly diagnostics with optional AgERA5 and NOAA ERSSTv6.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name           | Type            | Description                                                                                                              | Default   |
+|----------------|-----------------|--------------------------------------------------------------------------------------------------------------------------|-----------|
+| precip_source  | (era5, agera5)  | Source used only for precipitation. SST is controlled independently by ``sst_source``; the remaining variables use ERA5. | `"era5"`  |
+| agera5_version | str             | AgERA5 version requested from the CDS when ``precip_source="agera5"``.                                                   | `"2_0"`   |
+| sst_source     | (era5, ersstv6) | Monthly SST source. ``"ersst"``, ``"noaa"`` and ``"noaa-ersstv6"`` are accepted aliases for ``"ersstv6"``.               | `"era5"`  |
+| force_download | bool            | Re-download the selected monthly data even when a cached output exists.                                                  | `False`   |
+
+## Examples {.doc-section .doc-section-examples}
+
+```python
+>>> main_driver(
+...     "./data", 1991, 2020, "2026-07-01",
+...     variables_list=["sst"], sst_source="ersstv6",
+... )
+```

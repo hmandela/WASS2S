@@ -1,0 +1,17 @@
+# proceed_seasonal_daily_bias_correction { #wass2s.proceed_seasonal_daily_bias_correction }
+
+```python
+proceed_seasonal_daily_bias_correction(
+    dir_to_save_model,
+    observation,
+    hindcast_files,
+    forecast_files,
+    varname='PRCP',
+    method='QUANT',
+    wet_day=True,
+    qstep=0.01,
+    distr=None,
+    transfun=None,
+)
+```
+

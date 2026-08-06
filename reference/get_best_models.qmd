@@ -1,0 +1,15 @@
+# get_best_models { #wass2s.get_best_models }
+
+```python
+get_best_models(
+    center_variable,
+    scores,
+    metric='MAE',
+    threshold=None,
+    top_n=6,
+    gcm=False,
+    agroparam=False,
+    hydro=False,
+)
+```
+

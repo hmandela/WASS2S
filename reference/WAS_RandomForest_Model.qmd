@@ -1,0 +1,16 @@
+# WAS_RandomForest_Model { #wass2s.WAS_RandomForest_Model }
+
+```python
+WAS_RandomForest_Model(
+    param_space=None,
+    n_clusters=5,
+    nb_cores=1,
+    dist_method='nonparam',
+    hyperparam_optimizer='bayesian',
+    n_trials=50,
+    n_iter=50,
+    mode='cluster',
+)
+```
+
+Random Forest regressor (sklearn). ``max_features`` is a fraction in (0, 1].

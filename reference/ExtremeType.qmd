@@ -1,0 +1,7 @@
+# ExtremeType { #wass2s.ExtremeType }
+
+```python
+ExtremeType()
+```
+
+Type of temperature extreme.

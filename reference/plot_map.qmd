@@ -1,0 +1,20 @@
+# plot_map { #wass2s.plot_map }
+
+```python
+plot_map(extent, title='Map', sst_indices=None, fig_size=(10, 8))
+```
+
+Plot a map with specified geographic extent and optional SST index boxes.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type   | Description                                                                                                                    | Default    |
+|-------------|--------|--------------------------------------------------------------------------------------------------------------------------------|------------|
+| extent      | list   | Geographic extent in the format [west, east, south, north].                                                                    | _required_ |
+| title       | str    | Title of the map (default is 'Map').                                                                                           | `'Map'`    |
+| sst_indices | dict   | Dictionary containing SST index information with keys as index names and values as tuples (label, lon_w, lon_e, lat_s, lat_n). | `None`     |
+| fig_size    | tuple  | Figure size as (width, height) in inches (default is (10, 8)).                                                                 | `(10, 8)`  |
+
+## Notes {.doc-section .doc-section-notes}
+
+Uses Cartopy for map projection and Matplotlib for plotting.

@@ -1,0 +1,216 @@
+# WAS_count_dry_spells { #wass2s.WAS_count_dry_spells }
+
+```python
+WAS_count_dry_spells()
+```
+
+Class for computing the **number of dry spells** of a specified length
+occurring between the onset and cessation dates of the rainy season.
+
+This class is designed to quantify intra-seasonal dry spell risk — a critical
+indicator for agriculture in West Africa, where consecutive dry days after
+planting can severely impact crop establishment and yield.
+
+Key Features:
+- Counts dry spells (consecutive days ≤ ``dry_threshold`` mm) between onset and cessation
+- Accepts onset and cessation dates as pre-computed xarray DataArrays or CPT DataFrames
+- Supports both station-based (CDT format) and gridded (xarray) daily rainfall data
+- Efficient parallel computation using Dask for large domains
+- Outputs in CPT-compatible wide format for station data
+
+Typical Use Case:
+After computing onset (e.g., via ``WAS_compute_onset``) and cessation
+(e.g., via ``WAS_compute_cessation``), use this class to count risky dry spells
+(e.g., 10-day, 15-day) during the growing window.
+
+References:
+- AGRHYMET Regional Centre operational dry spell monitoring
+- Sivakumar (1991): Methodology for dry spell analysis in Sahelian agriculture
+- Common practice in West African national meteorological and agricultural services
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name   | Type   | Description   | Default    |
+|--------|--------|---------------|------------|
+| None   |        |               | _required_ |
+
+## Functions {.doc-section .doc-section-functions}
+
+* **compute_insitu**: Compute number of dry spells for station data (CDT input, CPT output).
+* **compute**: Compute number of dry spells for gridded xarray data (parallelized).
+
+## Examples {.doc-section .doc-section-examples}
+
+Count number of 10-day dry spells between onset and cessation (gridded):
+
+```python
+>>> count_calc = WAS_count_dry_spells()
+>>> dry_spell_count = count_calc.compute(
+...     daily_pr,           # xarray.DataArray daily rainfall
+...     onset_da,           # xarray.DataArray of onset dates
+...     cessation_da,       # xarray.DataArray of cessation dates
+...     dry_spell_length=10,
+...     dry_threshold=1.0,
+...     nb_cores=8
+... )
+```
+
+For station data (CDT rainfall, CPT onset/cessation):
+
+```python
+>>> count_cpt = count_calc.compute_insitu(
+...     daily_cdt_df,
+...     onset_cpt_df,
+...     cessation_cpt_df,
+...     dry_spell_length=15,
+...     dry_threshold=0.5
+... )
+```
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [adjust_duplicates](#wass2s.WAS_count_dry_spells.adjust_duplicates) | If any values in the Series repeat, nudge them by a tiny increment |
+| [compute](#wass2s.WAS_count_dry_spells.compute) | Compute the number of dry spells for each pixel within the onset and cessation period |
+| [compute_insitu](#wass2s.WAS_count_dry_spells.compute_insitu) | Compute the number of dry spells (of length = dry_spell_length) between the |
+| [count_dry_spells](#wass2s.WAS_count_dry_spells.count_dry_spells) | Count the number of dry spells of a specific length between onset and cessation dates. |
+| [transform_cdt](#wass2s.WAS_count_dry_spells.transform_cdt) | Transform a DataFrame with: |
+| [transform_cpt](#wass2s.WAS_count_dry_spells.transform_cpt) | Transform a DataFrame in CPT format with: |
+
+### adjust_duplicates { #wass2s.WAS_count_dry_spells.adjust_duplicates }
+
+```python
+WAS_count_dry_spells.adjust_duplicates(series, increment=1e-05)
+```
+
+If any values in the Series repeat, nudge them by a tiny increment
+so that all are unique (to avoid indexing collisions).
+
+### compute { #wass2s.WAS_count_dry_spells.compute }
+
+```python
+WAS_count_dry_spells.compute(
+    daily_data,
+    onset_date,
+    cessation_date,
+    dry_spell_length,
+    dry_threshold,
+    nb_cores,
+)
+```
+
+Compute the number of dry spells for each pixel within the onset and cessation period
+in a daily xarray DataArray.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name             | Type             | Description                                          | Default    |
+|------------------|------------------|------------------------------------------------------|------------|
+| daily_data       | xarray.DataArray | Daily rainfall data, coords = (T, Y, X).             | _required_ |
+| onset_date       | xarray.DataArray | DataArray containing onset dates for each pixel.     | _required_ |
+| cessation_date   | xarray.DataArray | DataArray containing cessation dates for each pixel. | _required_ |
+| dry_spell_length | int              | The length of a dry spell to count.                  | _required_ |
+| dry_threshold    | float            | Rainfall threshold to classify a day as "dry."       | _required_ |
+| nb_cores         | int              | Number of parallel processes to use.                 | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type             | Description                                      |
+|--------|------------------|--------------------------------------------------|
+|        | xarray.DataArray | An array with the count of dry spells per pixel. |
+
+### compute_insitu { #wass2s.WAS_count_dry_spells.compute_insitu }
+
+```python
+WAS_count_dry_spells.compute_insitu(
+    daily_df,
+    onset_df_cpt,
+    cessation_df_cpt,
+    dry_spell_length,
+    dry_threshold=1.0,
+)
+```
+
+Compute the number of dry spells (of length = dry_spell_length) between the
+onset and cessation dates for in-situ stations (CDT format).
+
+Returns a DataFrame in CPT format:
+ - Row 0: ["LAT", lat_stn1, lat_stn2, ...]
+ - Row 1: ["LON", lon_stn1, lon_stn2, ...]
+ - Subsequent rows: [year, station1_value, station2_value, ...]
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name             | Type         | Description                                                                   | Default    |
+|------------------|--------------|-------------------------------------------------------------------------------|------------|
+| daily_df         | pd.DataFrame | CDT rainfall data (ID column = date, station columns).                        | _required_ |
+| onset_df_cpt     | pd.DataFrame | CPT-format DataFrame containing onset dates (as returned by some method).     | _required_ |
+| cessation_df_cpt | pd.DataFrame | CPT-format DataFrame containing cessation dates.                              | _required_ |
+| dry_spell_length | int          | The length of the dry spell to look for.                                      | _required_ |
+| dry_threshold    | float        | Rainfall threshold below which a day is considered "dry." Defaults to 1.0 mm. | `1.0`      |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description                                 |
+|--------|--------------|---------------------------------------------|
+|        | pd.DataFrame | Final dry-spell counts in CPT pivot format. |
+
+### count_dry_spells { #wass2s.WAS_count_dry_spells.count_dry_spells }
+
+```python
+WAS_count_dry_spells.count_dry_spells(
+    x,
+    onset,
+    cessation,
+    dry_spell_length,
+    dry_threshold,
+)
+```
+
+Count the number of dry spells of a specific length between onset and cessation dates.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name             | Type         | Description                                     | Default    |
+|------------------|--------------|-------------------------------------------------|------------|
+| x                | array - like | Daily rainfall values.                          | _required_ |
+| onset            | int          | Start index for the calculation (onset date).   | _required_ |
+| cessation        | int          | End index for the calculation (cessation date). | _required_ |
+| dry_spell_length | int          | The length of a dry spell to count.             | _required_ |
+| dry_threshold    | float        | Rainfall threshold to classify a day as "dry."  | _required_ |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type         | Description                                                        |
+|--------|--------------|--------------------------------------------------------------------|
+|        | int or float | The number of dry spells of the specified length (NaN if invalid). |
+
+### transform_cdt { #wass2s.WAS_count_dry_spells.transform_cdt }
+
+```python
+WAS_count_dry_spells.transform_cdt(df)
+```
+
+Transform a DataFrame with:
+  - Row 0 = LON
+  - Row 1 = LAT
+  - Row 2 = ELEV
+  - Rows 3+ = daily data with 'ID' column containing dates.
+
+Returns a DataFrame with columns like:
+  DATE | STATION | VALUE | LON | LAT | ELEV | MEAN_ANNUAL_RAINFALL | zonename
+
+### transform_cpt { #wass2s.WAS_count_dry_spells.transform_cpt }
+
+```python
+WAS_count_dry_spells.transform_cpt(df, missing_value=None)
+```
+
+Transform a DataFrame in CPT format with:
+ - Row 0 = LAT
+ - Row 1 = LON
+ - Rows 2+ = numeric year data in wide format (stations in columns).
+
+Returns a DataFrame with columns like:
+  YEAR | STATION | VALUE | LAT | LON

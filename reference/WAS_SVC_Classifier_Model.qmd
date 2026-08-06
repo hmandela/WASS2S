@@ -1,0 +1,29 @@
+# WAS_SVC_Classifier_Model { #wass2s.WAS_SVC_Classifier_Model }
+
+```python
+WAS_SVC_Classifier_Model(
+    n_clusters=5,
+    nb_cores=1,
+    hyperparam_optimizer='bayesian',
+    n_trials=50,
+    n_iter=50,
+    scoring='neg_log_loss',
+    random_state=42,
+)
+```
+
+Support Vector Classifier (RBF kernel) for tercile classification.
+
+``probability=True`` enables ``predict_proba`` via Platt scaling (logistic
+regression fit on SVM decision values).  Wrapped in StandardScaler.
+
+## Hyperparameters tuned {.doc-section .doc-section-hyperparameters-tuned}
+
+C     : float  in [1e-2, 1e3]  (log scale) — misclassification penalty
+gamma : float  in [1e-4, 1e1]  (log scale) — RBF kernel bandwidth
+
+## Notes {.doc-section .doc-section-notes}
+
+- ``class_weight='balanced'`` handles the roughly uniform, but occasionally
+  skewed, class distribution in tercile data.
+- Platt scaling adds a negligible overhead for seasonal grid sizes.

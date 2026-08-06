@@ -1,0 +1,6 @@
+# CEAC_compute_onset { #wass2s.CEAC_compute_onset }
+
+```python
+CEAC_compute_onset(user_criteria=None)
+```
+

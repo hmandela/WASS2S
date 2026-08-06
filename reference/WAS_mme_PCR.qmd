@@ -1,0 +1,61 @@
+# WAS_mme_PCR { #wass2s.WAS_mme_PCR }
+
+```python
+WAS_mme_PCR(
+    n_modes=5,
+    use_coslat=True,
+    combine='mean',
+    detrend=False,
+    dist_method='nonparam',
+    L2norm=False,
+    random_state=42,
+    positive_support=True,
+)
+```
+
+Principal-component-regression MME baseline.
+
+Predictor field = the multi-model mean (over M) on the predictand grid.
+EOFs are fitted on the training fold (via the fold-safe WAS_EOF), the
+predictand is regressed on the leading PCs, and the held-out fold is
+projected out-of-sample before applying the regression. The deterministic
+output is in the same (standardized) space the framework hands in, so
+WAS_Cross_Validator's `same_kind_model2` branch reverse-standardizes it and
+calls compute_prob exactly as it does for WAS_mme_RF.
+
+Register it: add WAS_mme_PCR to the `same_kind_model2` list.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name        | Type   | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Default      |
+|-------------|--------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------|
+| n_modes     | int    | Number of principal components retained (default 5).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `5`          |
+| use_coslat  | bool   | Cosine-latitude weighting in the EOF (default True).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `True`       |
+| detrend     | bool   | Detrend the predictor field inside each fold (default False; the framework already standardizes, and the RF baseline does not detrend, so leave False for a like-for-like comparison).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `False`      |
+| dist_method | str    | 'nonparam' (default) or 'bestfit'.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `'nonparam'` |
+| combine     | str    | How the M models enter the EOF:   'mean' (default) -- predictor field = multi-model mean (one channel).   'meof'           -- keep every model as its own channel and run a                       single combined / multivariate EOF over the joint                       (Y, X, M) feature space. Because the framework has                       already standardized each (cell, model) to unit                       variance, the channels share a scale, so the                       stacked EOF is a proper MEOF (no per-field                       normalization needed). The leading PCs then encode                       the joint inter-model variability, and the                       predictand is regressed on them. | `'mean'`     |
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [forecast](#wass2s.WAS_mme_PCR.forecast) | Operational PCR forecast for a single target year. |
+
+### forecast { #wass2s.WAS_mme_PCR.forecast }
+
+```python
+WAS_mme_PCR.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictor,
+    hindcast_det,
+    Predictor_for_year,
+    best_code_da=None,
+    best_shape_da=None,
+    best_loc_da=None,
+    best_scale_da=None,
+)
+```
+
+Operational PCR forecast for a single target year.

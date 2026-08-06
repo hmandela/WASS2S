@@ -1,0 +1,23 @@
+# download_data { #wass2s.download_data }
+
+```python
+download_data(
+    dir_to_save,
+    clim_start,
+    clim_end,
+    var_key,
+    extent,
+    target_date,
+    precip_source='era5',
+    agera5_version='2_0',
+    sst_source='era5',
+    force_download=False,
+)
+```
+
+Download monthly data for the six complete months before target month.
+
+For ``var_key="precip"``, ``precip_source="agera5"`` downloads daily
+AgERA5 precipitation and aggregates it to monthly totals. For
+``var_key="sst"``, ``sst_source="ersstv6"`` directly downloads NOAA's
+monthly ERSSTv6 product. ERA5 remains the default for both variables.

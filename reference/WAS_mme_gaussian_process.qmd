@@ -1,0 +1,82 @@
+# WAS_mme_gaussian_process { #wass2s.WAS_mme_gaussian_process }
+
+```python
+WAS_mme_gaussian_process(
+    random_state=42,
+    cv_folds=5,
+    n_clusters=4,
+    kernel_options=None,
+    n_restarts_optimizer_options=(0, 2),
+    max_iter_predict_options=(100, 200),
+    max_train_samples=1500,
+    hpo_method='grid',
+    n_random_iter=10,
+    n_trials=20,
+    timeout=None,
+    n_jobs=-1,
+    optuna_n_jobs=None,
+    cv_n_jobs=-1,
+    warm_start=False,
+)
+```
+
+Gaussian Process Classifier MME (multiclass via One-vs-Rest in sklearn).
+
+Rigorous scientific implementation:
+  - Spatial clustering based on historical predictand coherence.
+  - Spatio-temporal subsampling.
+  - **Grouped Cross-Validation (by Time)** to prevent spatial-autocorrelation data leakage.
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute_hyperparameters](#wass2s.WAS_mme_gaussian_process.compute_hyperparameters) | Computes best hyperparameters. Uses rigorous GroupKFold by Time. |
+| [compute_model](#wass2s.WAS_mme_gaussian_process.compute_model) | Fit models on train set and predict on test set. |
+| [forecast](#wass2s.WAS_mme_gaussian_process.forecast) | Train on entire history, forecast for 1 new time slice. |
+
+### compute_hyperparameters { #wass2s.WAS_mme_gaussian_process.compute_hyperparameters }
+
+```python
+WAS_mme_gaussian_process.compute_hyperparameters(
+    Predictors,
+    Predictand,
+    clim_year_start,
+    clim_year_end,
+)
+```
+
+Computes best hyperparameters. Uses rigorous GroupKFold by Time.
+
+### compute_model { #wass2s.WAS_mme_gaussian_process.compute_model }
+
+```python
+WAS_mme_gaussian_process.compute_model(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    clim_year_start,
+    clim_year_end,
+    best_params=None,
+    cluster_da=None,
+)
+```
+
+Fit models on train set and predict on test set.
+
+### forecast { #wass2s.WAS_mme_gaussian_process.forecast }
+
+```python
+WAS_mme_gaussian_process.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictors_train,
+    Predictor_for_year,
+    best_params=None,
+    cluster_da=None,
+)
+```
+
+Train on entire history, forecast for 1 new time slice.

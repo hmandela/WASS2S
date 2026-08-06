@@ -1,0 +1,251 @@
+# WAS_mme_ELR { #wass2s.WAS_mme_ELR }
+
+```python
+WAS_mme_ELR(
+    predictors='mean',
+    threshold_transform='cbrt',
+    fit_quantiles=(0.1, 0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 0.9),
+    l2=0.001,
+    alpha_min=0.001,
+    n_iter=50,
+    tol=1e-07,
+    min_obs=5,
+    predictor_transform=None,
+    random_state=42,
+)
+```
+
+Extended Logistic Regression (ELR) multi-model-ensemble tercile forecaster,
+aligned with Wilks (2009, *Meteorol. Appl.* 16, 361-368).
+
+Single unified equation for every threshold q:
+
+    P(Y <= q | x) = sigmoid( b0 + beta . x + alpha * g(q) )
+
+## What is implemented FROM THE PAPER (vs the previous two-threshold version) {.doc-section .doc-section-what-is-implemented-from-the-paper-vs-the-previous-two-threshold-version}
+
+1. MULTI-THRESHOLD FIT. Wilks fits ONE equation to SEVERAL climatological
+   quantiles simultaneously (not just the two needed at output time), which
+   constrains alpha much better and yields coherent probabilities at ANY
+   threshold -- including thresholds never used in fitting. Here the design
+   is stacked over `fit_quantiles` (default a Wilks-style 7-quantile set
+   containing the terciles); the tercile probabilities PB/PN/PA are then
+   read off the same fitted equation.
+2. GUARANTEED MONOTONE CDF. Monotonicity of P(Y<=q) in q requires alpha>0.
+   Instead of the previous post-hoc min/max reordering of the two
+   cumulative probabilities, the Newton solver PROJECTS alpha onto
+   [alpha_min, inf) at every iteration, so pup >= plo holds by
+   construction and no crossing can occur at any threshold.
+3. THRESHOLD TRANSFORM g(q). Wilks found g(q) = sqrt(q) clearly superior
+   to g(q) = q for (non-negative, raw) precipitation. 'sqrt' is offered
+   for raw precip; 'cbrt' (default) is the negative-safe analogue for
+   signed predictands; the choice can be tuned by CV (see
+   compute_hyperparameters, which also tunes the fitted-quantile set).
+4. PREDICTOR TRANSFORM. Wilks' best single predictor was the SQUARE ROOT
+   of the ensemble-mean precipitation. `predictor_transform='sqrt'`
+   applies it to the raw predictor before standardization in
+   compute_hyperparameters / forecast. (The framework CV branch feeds
+   already-standardized predictors to compute_model; for exact
+   consistency, apply the same transform to the raw hindcast before the
+   framework standardizes it.)
+5. FULL-DISTRIBUTION OUTPUT. The point of the paper: the same fit gives
+   the whole predictive distribution. `predictive_quantiles(p_levels)`
+   inverts the fitted equation analytically,
+       q_p = g^{-1}( (logit(p) - b0 - beta.x) / alpha ),
+   returning predictive quantiles (quantile, T, Y, X) after any
+   compute_model / forecast call.
+
+For tercile forecasts the two output thresholds are the climatological
+lower and upper terciles T1 < T2 of the predictand, and
+
+    PB = P(Y <= T1),
+    PN = P(Y <= T2) - P(Y <= T1),
+    PA = 1 - P(Y <= T2).
+
+## Predictor at each grid cell {.doc-section .doc-section-predictor-at-each-grid-cell}
+
+The (T, Y, X, M) predictor cube is reduced per cell to:
+  predictors='mean'      -> multi-model mean                 (1 feature)  [default]
+  predictors='mean_std'  -> multi-model mean and spread      (2 features)
+  predictors='models'    -> every model kept as its own feature (M features)
+
+## Thresholds {.doc-section .doc-section-thresholds}
+
+Output terciles are estimated fold-safe from the TRAINING predictand by
+default; pass `clim_terciles=(t1, t2)` (DataArrays on Y, X, same units as
+y_train) to pin them to the boundaries your verification uses
+(WAS_Verification.compute_class). The EXTRA fitting quantiles are always
+taken fold-safe from the training predictand.
+
+## Fitting {.doc-section .doc-section-fitting}
+
+One equation per cell, all cells fitted simultaneously with a vectorized,
+ridge-stabilized projected-Newton/IRLS solver. Rows with missing
+predictor/predictand are zero-weighted; cells with fewer than `min_obs`
+valid years fall back to climatology [1/3, 1/3, 1/3]. With K fitting
+quantiles the stacked-binary objective is a composite likelihood (the K
+indicator responses per year are correlated) -- exactly Wilks' fitting
+strategy. In dry cells several low quantiles may coincide (ties at 0);
+the duplicated rows are harmless, they only re-weight that threshold.
+
+## Parameters {.doc-section .doc-section-parameters}
+
+| Name                | Type                                               | Description                                                                                                                                              | Default                                             |
+|---------------------|----------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------|
+| predictors          | (mean, mean_std, models)                           |                                                                                                                                                          | `'mean'`                                            |
+| threshold_transform | (identity, cbrt, sqrt)                             | g(q). Default 'cbrt'. 'sqrt' only for non-negative predictands (raw precipitation) -- Wilks' empirically best choice there.                              | `'identity','cbrt','sqrt'`                          |
+| fit_quantiles       | sequence of float in (0, 1)                        | Climatological quantiles whose thresholds enter the fit. The terciles 1/3 and 2/3 are always included. Default (0.10, 0.25, 1/3, 0.50, 2/3, 0.75, 0.90). | `(0.1, 0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 0.9)` |
+| l2                  | float                                              | Ridge penalty on the coefficients (NOT the intercept), default 1e-3.                                                                                     | `0.001`                                             |
+| alpha_min           | float                                              | Positivity floor for the threshold coefficient alpha (monotone CDF), default 1e-3.                                                                       | `0.001`                                             |
+| predictor_transform | (identity, sqrt, cbrt)                             | Transform applied to the RAW predictor before standardization in compute_hyperparameters / forecast (Wilks: 'sqrt' for raw precip).                      | `'identity','sqrt','cbrt'`                          |
+| n_iter              | Newton controls (default 50, 1e-7).                |                                                                                                                                                          | `50`                                                |
+| tol                 | Newton controls (default 50, 1e-7).                |                                                                                                                                                          | `50`                                                |
+| min_obs             | minimum valid training years per cell (default 5). |                                                                                                                                                          | `5`                                                 |
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [compute_hyperparameters](#wass2s.WAS_mme_ELR.compute_hyperparameters) | Jointly tune the ridge penalty l2, the threshold transform g(q) AND the |
+| [compute_model](#wass2s.WAS_mme_ELR.compute_model) | Fit ELR on the training fold and return the test-fold tercile |
+| [forecast](#wass2s.WAS_mme_ELR.forecast) | Operational ELR tercile forecast for a single target year. |
+| [predictive_quantiles](#wass2s.WAS_mme_ELR.predictive_quantiles) | Predictive quantiles of the LAST fitted forecast -- Wilks (2009)'s |
+
+### compute_hyperparameters { #wass2s.WAS_mme_ELR.compute_hyperparameters }
+
+```python
+WAS_mme_ELR.compute_hyperparameters(
+    Predictor,
+    Predictand,
+    clim_year_start,
+    clim_year_end,
+    clim_terciles=None,
+    l2_grid=None,
+    g_grid=None,
+    quantile_grid=None,
+    score='rps',
+    cv_folds=5,
+    leave_one_year_out=False,
+)
+```
+
+Jointly tune the ridge penalty l2, the threshold transform g(q) AND the
+fitting-quantile set by year-grouped cross-validation. Winners are
+stored in self.l2 / self.threshold_transform / self.fit_quantiles (and
+self.best_params) so the existing CV branch / compute_model use them
+with no further plumbing.
+
+Why tune g(q) and the quantile set: Wilks (2009) shows the FORM of g(q)
+drives ELR quality (g(q)=sqrt(q) was substantially better than
+g(q)=q for raw precipitation), and fits one equation to several
+climatological quantiles at once. Here the data pick both, among
+non-decreasing g options, so p(q)=Pr{V<=q} stays monotone.
+
+Observed truth = tercile CLASSES: forecast probabilities are scored
+against WAS_Verification.compute_class (0=below, 1=normal, 2=above),
+the categorical target the RPSS verification uses. RPS by default, or
+multiclass log-loss.
+
+Standardization: only the PREDICTOR is standardized over the clim
+window (after predictor_transform, if set); the PREDICTAND stays RAW so
+thresholds and g(q) act in physical units.
+
+#### Parameters {.doc-section .doc-section-parameters}
+
+| Name               | Type                                                        | Description                                                                                                      | Default   |
+|--------------------|-------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|-----------|
+| l2_grid            | sequence of float, optional. Default np.logspace(-4, 1, 6). |                                                                                                                  | `None`    |
+| g_grid             |                                                             | Default ['identity', 'cbrt'] (+ 'sqrt' only when all       thresholds are non-negative, i.e. raw precipitation). | `None`    |
+| quantile_grid      | sequence of quantile tuples, optional. Default              | [terciles only, self.fit_quantiles] -- i.e. two-threshold       vs Wilks-style multi-threshold fit.              | `None`    |
+| score              |                                                             |                                                                                                                  | `'rps'`   |
+| cv_folds           | year-grouped CV controls.                                   |                                                                                                                  | `5`       |
+| leave_one_year_out | year-grouped CV controls.                                   |                                                                                                                  | `5`       |
+| clim_terciles      | optional (t1, t2) in PHYSICAL units -- same fixed           | boundaries your CV branch passes to compute_model.                                                               | `None`    |
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name        | Type                                            | Description   |
+|-------------|-------------------------------------------------|---------------|
+| best_params | dict {\'l2\':..., \'g\':..., \'quantiles\':...} |               |
+
+### compute_model { #wass2s.WAS_mme_ELR.compute_model }
+
+```python
+WAS_mme_ELR.compute_model(
+    X_train,
+    y_train,
+    X_test,
+    y_test=None,
+    clim_year_start=None,
+    clim_year_end=None,
+    clim_terciles=None,
+    best_params=None,
+    **kwargs,
+)
+```
+
+Fit ELR on the training fold and return the test-fold tercile
+probabilities (dims probability, T, Y, X; probability=['PB','PN','PA']).
+
+X_train / X_test : standardized predictor cubes (T, Y, X[, M]).
+y_train          : predictand (T, Y, X), kept RAW (un-standardized):
+                   the fit is invariant to predictand scaling and raw
+                   values let g(q) act in physical units (so g='sqrt'
+                   is valid for precipitation, per Wilks).
+clim_terciles    : optional (t1, t2) DataArrays (Y, X) of fixed
+                   climatological boundaries in the SAME units as
+                   y_train -- pass the same terciles your verification
+                   uses (WAS_Verification.compute_class).
+best_params      : optional {'l2':..., 'g':..., 'quantiles':...}.
+                   Overrides for this call; otherwise self.l2 /
+                   self.threshold_transform / self.fit_quantiles are
+                   used (which compute_hyperparameters updates in
+                   place).
+
+### forecast { #wass2s.WAS_mme_ELR.forecast }
+
+```python
+WAS_mme_ELR.forecast(
+    Predictant,
+    clim_year_start,
+    clim_year_end,
+    Predictor,
+    Predictor_for_year,
+    clim_terciles=None,
+    **kwargs,
+)
+```
+
+Operational ELR tercile forecast for a single target year.
+
+Fits ELR on all available years and returns the tercile probabilities
+for the target year (dims probability, T, Y, X). Only the PREDICTOR is
+transformed (predictor_transform) and standardized (historical
+climatology, same stats applied to the forecast year); the PREDICTAND
+is kept RAW so thresholds and g(q) stay in physical units.
+
+After this call, `predictive_quantiles(p_levels)` returns the full
+predictive distribution of the target year from the same fit.
+
+### predictive_quantiles { #wass2s.WAS_mme_ELR.predictive_quantiles }
+
+```python
+WAS_mme_ELR.predictive_quantiles(p_levels=(0.1, 0.25, 0.5, 0.75, 0.9))
+```
+
+Predictive quantiles of the LAST fitted forecast -- Wilks (2009)'s
+central result: the single fitted equation delivers the full predictive
+distribution, so any quantile is available in closed form,
+
+    q_p = g^{-1}( (logit(p) - b0 - beta.x) / alpha ).
+
+Call after compute_model / forecast. Requires a named invertible g
+('identity', 'cbrt', 'sqrt'). With g='sqrt' negative arguments (i.e.
+p below the probability of zero precip) map to q_p = 0.
+
+#### Returns {.doc-section .doc-section-returns}
+
+| Name   | Type                                                               | Description   |
+|--------|--------------------------------------------------------------------|---------------|
+|        | DataArray (quantile, T, Y, X) in the predictand\'s physical units. |               |
+|        | Cells that fell back to climatology or lack thresholds are NaN.    |               |

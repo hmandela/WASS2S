@@ -1,0 +1,33 @@
+# BOMViewer { #wass2s.BOMViewer }
+
+```python
+BOMViewer()
+```
+
+Interactive Jupyter widget for BOM MJO monitoring charts.
+
+Embeds the Australian Bureau of Meteorology MJO page inside an IFrame
+with a dropdown to navigate between tabs (Outlooks, MJO Phase Diagram,
+Monitoring, Cloudiness, Regional Cloudiness, Time-Longitude, Tropical
+Update).
+
+## Examples {.doc-section .doc-section-examples}
+
+```python
+>>> viewer = BOMViewer()
+>>> viewer.show()
+```
+
+## Methods
+
+| Name | Description |
+| --- | --- |
+| [show](#wass2s.BOMViewer.show) | Display the widget interface in the current Jupyter cell. |
+
+### show { #wass2s.BOMViewer.show }
+
+```python
+BOMViewer.show()
+```
+
+Display the widget interface in the current Jupyter cell.
