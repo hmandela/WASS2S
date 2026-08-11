@@ -866,8 +866,6 @@ Visualizes the Receiver Operating Characteristic for each tercile category.
 | dir_to_save_score | str or Path      | Directory to save the plot.                                           | _required_ |
 | y_true_class      | xarray.DataArray | Observed data with dimensions (T, Y, X).                              | _required_ |
 | y_probs           | xarray.DataArray | Forecast probabilities with dimensions (probability, T, Y, X).        | _required_ |
-| clim_year_start   | int or str       | Start year of the climatology period.                                 | _required_ |
-| clim_year_end     | int or str       | End year of the climatology period.                                   | _required_ |
 | n_bootstraps      | int              | Number of bootstrap samples for confidence intervals. Default is 200. | `200`      |
 | ci                | float            | Confidence interval level (e.g., 0.95 for 95%). Default is 0.95.      | `0.95`     |
 
@@ -925,10 +923,8 @@ Visualizes the calibration of forecast probabilities against observed frequencie
 |-------------------|------------------|----------------------------------------------------------------|--------------------------------------------------------------------------------------|
 | modelname         | str              | Name of the model for labeling the plot.                       | _required_                                                                           |
 | dir_to_save_score | str or Path      | Directory to save the plot.                                    | _required_                                                                           |
-| y_true            | xarray.DataArray | Observed data with dimensions (T, Y, X).                       | _required_                                                                           |
+| y_true_class      | xarray.DataArray | Observed class labels with dimensions (T, Y, X).               | _required_                                                                           |
 | y_probs           | xarray.DataArray | Forecast probabilities with dimensions (probability, T, Y, X). | _required_                                                                           |
-| clim_year_start   | int or str       | Start year of the climatology period.                          | _required_                                                                           |
-| clim_year_end     | int or str       | End year of the climatology period.                            | _required_                                                                           |
 | bins              | array - like     | Probability bins for discretizing forecast probabilities.      | `np.array([0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.67])` |
 
 ### reliability_score_grid { #wass2s.WAS_Verification.reliability_score_grid }

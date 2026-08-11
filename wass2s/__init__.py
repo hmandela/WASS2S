@@ -94,3 +94,6 @@ from wass2s.was_bias_correction import *
 from wass2s.was_seasonal_analysis import *
 from wass2s.was_cca_2 import *
 from wass2s.ceac_agro import *
+
+# Deprecated symbols, kept importable for backward compatibility.
+from wass2s._deprecated import *

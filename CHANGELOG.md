@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased — Deprecation lifecycle for superseded classes
+
+### Deprecated
+- `WAS_Analog__` (the archived predecessor of `WAS_Analog`) now emits a `FutureWarning` pointing to `WAS_Analog` on instantiation, and will be removed in **v0.6.0**. Its implementation moved from `wass2s/was_analog.py` to `wass2s/_deprecated.py`, where it's now a thin subclass of `WAS_Analog` instead of a ~1,700-line parallel copy — bug fixes to `WAS_Analog` now apply to it automatically. Import path (`from wass2s import WAS_Analog__`) is unchanged.
+
+### Removed
+- Deleted `WAS_Analog.download_reanalysis_` (trailing underscore) — an unused, superseded draft of `download_reanalysis` with no callers anywhere in the codebase.
+
+### Notes for contributors
+- New pattern for deprecating a public class/function: move it to `wass2s/_deprecated.py`, make it a thin subclass/wrapper of its replacement, and call `wass2s._lifecycle.warn_deprecated(old, new, removed_in=...)` from its entry point. Keep re-exporting it from `wass2s/__init__.py` so the public import path doesn't change.
+
 ## Unreleased — Environment management: conda → pixi
 
 ### Added

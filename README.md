@@ -1,4 +1,5 @@
-# WASS2S
+# WASS2S  <img src="reference/img/WASS2S-hex-sticker.png" align="right" width="25%" alt="WASS2S logo" />
+
 
 > A Python framework for reproducible seasonal climate forecasting.
 
@@ -9,8 +10,6 @@
 **WASS2S** is an open-source Python framework for developing, verifying, and producing seasonal climate forecasts. Designed for operational climate services, researchers, and National Meteorological and Hydrological Services (NMHSs), it provides a reproducible workflow covering data acquisition, preprocessing, model development, verification, and forecast generation.
 
 The framework follows the recommendations of the **World Meteorological Organization (WMO)** for objective and reproducible seasonal forecasting while supporting both traditional statistical methods and modern machine learning approaches.
-
----
 
 ## Features
 
@@ -23,7 +22,6 @@ The framework follows the recommendations of the **World Meteorological Organiza
 - Reproducible environments powered by Pixi.
 - Modular architecture for extending forecasting methods.
 
----
 
 ## Installation
 
@@ -65,17 +63,33 @@ Instead of changing into the project directory each time, you can start the envi
 pixi shell --manifest-path /path/to/WASS2S/pyproject.toml
 ```
 
-#### Bash (Linux/macOS)
+#### Bash / zsh (Linux/macOS)
 
-Add the following function to your `~/.bashrc` or `~/.zshrc`.
+Add the following to your `~/.bashrc` or `~/.zshrc`.
 
 Replace `/path/to/WASS2S` with the location of your local repository.
 
 ```bash
-wass2s() {
-    eval "$(pixi shell-hook \
-        --shell bash \
-        --manifest-path /path/to/WASS2S/pyproject.toml)"
+# wass2s utilities
+export WASS2S_MANIFEST_PATH="/path/to/WASS2S/pyproject.toml"
+
+wass2s_activate() {
+    local manifest_path="${1:-$WASS2S_MANIFEST_PATH}"
+    export _WASS2S_OLD_PATH="$PATH"
+    export _WASS2S_OLD_PS1="$PS1"
+    eval "$(pixi shell-hook --shell bash --manifest-path "$manifest_path")"
+    echo "wass2s activated (manifest: $manifest_path)"
+}
+
+wass2s_deactivate() {
+    if [ -z "${_WASS2S_OLD_PATH:-}" ]; then
+        echo "wass2s: nothing to deactivate."
+        return 1
+    fi
+    export PATH="$_WASS2S_OLD_PATH"
+    export PS1="$_WASS2S_OLD_PS1"
+    unset CONDA_PREFIX PIXI_ENVIRONMENT_NAME PIXI_PROJECT_ROOT _WASS2S_OLD_PATH _WASS2S_OLD_PS1
+    echo "wass2s deactivated."
 }
 ```
 
@@ -85,10 +99,21 @@ Reload your shell:
 source ~/.bashrc
 ```
 
-You can now activate WASS2S from anywhere:
+> **Login shell note:** `bash` only reads `~/.bashrc` for interactive non-login shells. Login shells (e.g. macOS Terminal.app by default, or a fresh SSH session on Linux) read `~/.bash_profile` instead. If the functions don't seem to load, add the following to `~/.bash_profile` so it sources `~/.bashrc` too:
+>
+> ```bash
+> if [[ -f ~/.bashrc ]]; then
+>   source ~/.bashrc
+> fi
+> ```
+>
+> For `zsh`, the equivalent split is `~/.zshrc` (interactive) vs `~/.zprofile` (login). Add the same kind of guard to `~/.zprofile`, sourcing `~/.zshrc` instead.
+
+You can now activate and deactivate WASS2S from anywhere:
 
 ```bash
-wass2s
+wass2s_activate
+wass2s_deactivate
 ```
 
 #### PowerShell (Windows)
@@ -102,15 +127,31 @@ if (!(Test-Path $PROFILE)) {
 notepad $PROFILE
 ```
 
-Add:
+Add the following, replacing `C:\path\to\WASS2S` with your local repository:
 
 ```powershell
-function wass2s {
-    pixi shell --manifest-path "C:\path\to\WASS2S\pyproject.toml"
+$env:WASS2S_MANIFEST_PATH = "C:\path\to\WASS2S\pyproject.toml"
+
+function wass2s_activate {
+    param([string]$ManifestPath = $env:WASS2S_MANIFEST_PATH)
+    $env:_WASS2S_OLD_PATH = $env:PATH
+    (pixi shell-hook --shell powershell --manifest-path $ManifestPath) | Out-String | Invoke-Expression
+    Write-Host "wass2s activated (manifest: $ManifestPath)"
+}
+
+function wass2s_deactivate {
+    if (-not $env:_WASS2S_OLD_PATH) {
+        Write-Host "wass2s: nothing to deactivate."
+        return
+    }
+    $env:PATH = $env:_WASS2S_OLD_PATH
+    Remove-Item Env:_WASS2S_OLD_PATH
+    Remove-Item Env:CONDA_PREFIX -ErrorAction SilentlyContinue
+    Remove-Item Env:PIXI_ENVIRONMENT_NAME -ErrorAction SilentlyContinue
+    Remove-Item Env:PIXI_PROJECT_ROOT -ErrorAction SilentlyContinue
+    Write-Host "wass2s deactivated."
 }
 ```
-
-Replace `C:\path\to\WASS2S` with your local repository.
 
 Reload your profile:
 
@@ -118,13 +159,12 @@ Reload your profile:
 . $PROFILE
 ```
 
-Then simply run
+Then activate and deactivate with:
 
 ```powershell
-wass2s
+wass2s_activate
+wass2s_deactivate
 ```
-
----
 
 ### Install from PyPI
 
@@ -133,9 +173,6 @@ If you only need the Python package,
 ```bash
 pip install wass2s
 ```
-
----
-
 ### Legacy Conda Environment
 
 Legacy Conda environments remain available:
@@ -152,8 +189,6 @@ conda env create -f WAS_S2S_windows.yml
 conda activate WASS2S
 ```
 
----
-
 ## Tutorial Notebooks
 
 Example notebooks are available in the companion repository:
@@ -162,40 +197,18 @@ Example notebooks are available in the companion repository:
 git clone https://github.com/hmandela/WASS2S_notebooks.git
 ```
 
----
-
 ## Climate Data Access
 
 WASS2S supports downloading seasonal forecast datasets from the **Copernicus Climate Data Store (CDS)** and other supported data providers.
 
 To enable downloads, create a CDS account and configure your API credentials as described [here](https://cds.climate.copernicus.eu/how-to-api).
 
----
-
 ## Documentation
 
 Comprehensive documentation is available online.
 
-- User Guide
-- Installation
-- Tutorials
-- API Reference
-- Training Material
-
-Documentation:
-
 - https://wass2s.readthedocs.io
 - https://hmandela.github.io/WAS_S2S_Training/
-
----
-
-## Support
-
-- Questions: GitHub Discussions
-- Bug reports: GitHub Issues
-- Documentation: Read the User Guide
-
----
 
 ## Contributing
 
@@ -205,31 +218,17 @@ Whether you're fixing bugs, improving documentation, implementing new forecastin
 
 Please read the [Contributing Guide](CONTRIBUTING.md) before opening an issue or submitting a pull request.
 
----
+
 
 ## Code of Conduct
 
 To foster an open and welcoming community, all contributors are expected to follow the project's [Code of Conduct](CODE_OF_CONDUCT.md).
-
----
 
 ## Citation
 
 If WASS2S contributes to your research, please cite the software.
 
 GitHub provides a citation through the repository's **Cite this repository** button. Citation metadata are also available in `CITATION.cff`.
-
----
-
-## Acknowledgments
-
-WASS2S has been developed with support from the **Accelerating Impacts of CGIAR Climate Research for Africa (AICCRA)** project and the **AGRHYMET Regional Climate Centre for West Africa and the Sahel (AGRHYMET RCC-WAS)**.
-
-We thank the participants of the *Training on the New Generation of Seasonal Forecasting in West Africa and the Sahel* for their valuable feedback and contributions.
-
-WASS2S builds upon numerous open-source scientific software projects, including **xarray**, **scikit-learn**, **xeofs**, **xcast**, **xskillscore**, **Cartopy**, **NumPy**, **SciPy**, **Matplotlib**, and many others. We gratefully acknowledge their developers and maintainers.
-
----
 
 ## License
 

@@ -187,9 +187,6 @@ Strategy:
 | T1             | float        | Lower tercile threshold.          | _required_ |
 | T2             | float        | Upper tercile threshold.          | _required_ |
 | dist_code      | int          | Distribution code (1-8).          | _required_ |
-| shape          | float        | Shape parameter.                  | _required_ |
-| loc            | float        | Location parameter.               | _required_ |
-| scale          | float        | Scale parameter.                  | _required_ |
 
 #### Returns {.doc-section .doc-section-returns}
 

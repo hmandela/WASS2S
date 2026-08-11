@@ -66,6 +66,8 @@ from __future__ import annotations
 # =============================================================================
 import os
 import io
+import shutil
+import tempfile
 import zipfile
 import calendar
 from pathlib import Path
@@ -2760,3 +2762,56 @@ def et0_fao56_daily(tmax, tmin, rs, mlsp, dem, tdew=None, u10=None, v10=None, wf
                            long_name="Reference ET0 (FAO-56 PM)")
     et0.name = "ET0"
     return et0
+
+
+def _normalize_eol(filepath):
+    """Normalize line endings in a plain-text file.
+
+    Internal helper for files that may have been created or prepared on
+    different operating systems. Converts all line endings to the
+    convention of the current operating system.
+
+    This function is not part of the public API.
+    """
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(
+            f"{filepath!r} does not exist or is not a file."
+        )
+
+    with open(filepath, "rb") as f:
+        content = f.read()
+
+    if b"\x00" in content:
+        raise ValueError(
+            f"{filepath!r} appears to be a binary file "
+            "(null byte found), not plain text."
+        )
+
+    normalized = (
+        content
+        .replace(b"\r\n", b"\n")
+        .replace(b"\r", b"\n")
+    )
+
+    eol = os.linesep.encode("ascii")
+    if eol != b"\n":
+        normalized = normalized.replace(b"\n", eol)
+
+    if normalized == content:
+        return
+
+    directory = os.path.dirname(os.path.abspath(os.fspath(filepath))) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory)
+
+    try:
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(normalized)
+
+        shutil.copymode(filepath, tmp_path)
+        os.replace(tmp_path, filepath)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise

@@ -99,6 +99,14 @@ Documentation is an important part of WASS2S.
 
 If your contribution changes user-facing functionality, please update the relevant documentation, tutorials, notebooks, or examples.
 
+To preview the documentation site locally (requires the system [Quarto CLI](https://quarto.org/docs/get-started/), which is not pixi-managed):
+
+```bash
+pixi run -e docs docs-render
+```
+
+This regenerates the API reference from docstrings and renders the full site into `docs/`. Open `docs/index.html` in a browser to review your changes before submitting a Pull Request.
+
 ## Questions
 
 If you have questions about contributing or using WASS2S, feel free to open a GitHub Discussion before opening an issue.

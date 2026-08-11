@@ -1526,14 +1526,10 @@ class WAS_Verification:
             Name of the model for labeling the plot.
         dir_to_save_score : str or Path
             Directory to save the plot.
-        y_true : xarray.DataArray
-            Observed data with dimensions (T, Y, X).
+        y_true_class : xarray.DataArray
+            Observed class labels with dimensions (T, Y, X).
         y_probs : xarray.DataArray
             Forecast probabilities with dimensions (probability, T, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
         bins : array-like, optional
             Probability bins for discretizing forecast probabilities.
         """
@@ -1624,10 +1620,6 @@ class WAS_Verification:
             Observed data with dimensions (T, Y, X).
         y_probs : xarray.DataArray
             Forecast probabilities with dimensions (probability, T, Y, X).
-        clim_year_start : int or str
-            Start year of the climatology period.
-        clim_year_end : int or str
-            End year of the climatology period.
         n_bootstraps : int, optional
             Number of bootstrap samples for confidence intervals. Default is 200.
         ci : float, optional

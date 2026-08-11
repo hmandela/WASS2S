@@ -431,12 +431,6 @@ class WAS_LinearRegression_Model:
             Upper tercile threshold.
         dist_code : int
             Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
     
         Returns
         -------
@@ -1436,12 +1430,6 @@ class WAS_Ridge_Model:
             Upper tercile threshold.
         dist_code : int
             Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
     
         Returns
         -------
@@ -2311,12 +2299,6 @@ class WAS_Lasso_Model:
             Upper tercile threshold.
         dist_code : int
             Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
     
         Returns
         -------
@@ -3331,12 +3313,6 @@ class WAS_ElasticNet_Model:
             Upper tercile threshold.
         dist_code : int
             Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
     
         Returns
         -------
@@ -4367,12 +4343,6 @@ class WAS_LassoLars_Model:
             Upper tercile threshold.
         dist_code : int
             Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
     
         Returns
         -------

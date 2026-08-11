@@ -115,6 +115,10 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
       <div class="navbar-container container-fluid">
       <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo light-content">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo dark-content">
+    </a>
     <a class="navbar-brand" href="../index.html">
     <span class="navbar-title">wass2s</span>
     </a>
@@ -194,10 +198,10 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <h2 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters">Parameters</h2>
 <table class="caption-top table">
 <colgroup>
-<col style="width: 9%">
+<col style="width: 8%">
 <col style="width: 6%">
-<col style="width: 76%">
-<col style="width: 7%">
+<col style="width: 77%">
+<col style="width: 8%">
 </colgroup>
 <thead>
 <tr class="header">
@@ -263,22 +267,10 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <td><code>[0.0, 0.001, 0.01]</code></td>
 </tr>
 <tr class="even">
-<td>max_leaf_nodes_range</td>
-<td>list of int or None</td>
-<td>List of max leaf nodes (default is [None, 50, 100]).</td>
-<td><em>required</em></td>
-</tr>
-<tr class="odd">
 <td>ccp_alpha_range</td>
 <td>list of float</td>
 <td>List of complexity parameters for pruning (default is [0.0, 0.001, 0.01]).</td>
 <td><code>[0.0, 0.001, 0.01]</code></td>
-</tr>
-<tr class="even">
-<td>min_weight_fraction_leaf_range</td>
-<td>list of float</td>
-<td>List of minimum weighted fraction of leaves (default is [0.0, 0.1, 0.2]).</td>
-<td><em>required</em></td>
 </tr>
 <tr class="odd">
 <td>warm_start</td>

@@ -115,6 +115,10 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
       <div class="navbar-container container-fluid">
       <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo light-content">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo dark-content">
+    </a>
     <a class="navbar-brand" href="../index.html">
     <span class="navbar-title">wass2s</span>
     </a>
@@ -2357,18 +2361,6 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <td><em>required</em></td>
 </tr>
 <tr class="odd">
-<td>clim_year_start</td>
-<td>int or str</td>
-<td>Start year of the climatology period.</td>
-<td><em>required</em></td>
-</tr>
-<tr class="even">
-<td>clim_year_end</td>
-<td>int or str</td>
-<td>End year of the climatology period.</td>
-<td><em>required</em></td>
-</tr>
-<tr class="odd">
 <td>n_bootstraps</td>
 <td>int</td>
 <td>Number of bootstrap samples for confidence intervals. Default is 200.</td>
@@ -2506,27 +2498,15 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <td><em>required</em></td>
 </tr>
 <tr class="odd">
-<td>y_true</td>
+<td>y_true_class</td>
 <td>xarray.DataArray</td>
-<td>Observed data with dimensions (T, Y, X).</td>
+<td>Observed class labels with dimensions (T, Y, X).</td>
 <td><em>required</em></td>
 </tr>
 <tr class="even">
 <td>y_probs</td>
 <td>xarray.DataArray</td>
 <td>Forecast probabilities with dimensions (probability, T, Y, X).</td>
-<td><em>required</em></td>
-</tr>
-<tr class="odd">
-<td>clim_year_start</td>
-<td>int or str</td>
-<td>Start year of the climatology period.</td>
-<td><em>required</em></td>
-</tr>
-<tr class="even">
-<td>clim_year_end</td>
-<td>int or str</td>
-<td>End year of the climatology period.</td>
 <td><em>required</em></td>
 </tr>
 <tr class="odd">

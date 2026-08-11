@@ -21,6 +21,90 @@ title: "Get Started"
     ```
     `pixi shell` drops you into an activated shell with `wass2s` and all its dependencies available.
 
+#### Activate wass2s from any directory
+
+Instead of changing into the project directory each time, you can start the environment directly:
+
+```bash
+pixi shell --manifest-path /path/to/WASS2S/pyproject.toml
+```
+
+**Bash / zsh (Linux/macOS).** Add the following to your `~/.bashrc` or `~/.zshrc`, replacing `/path/to/WASS2S` with the location of your local repository:
+
+```bash
+# wass2s utilities
+export WASS2S_MANIFEST_PATH="/path/to/WASS2S/pyproject.toml"
+
+wass2s_activate() {
+    local manifest_path="${1:-$WASS2S_MANIFEST_PATH}"
+    export _WASS2S_OLD_PATH="$PATH"
+    export _WASS2S_OLD_PS1="$PS1"
+    eval "$(pixi shell-hook --shell bash --manifest-path "$manifest_path")"
+    echo "wass2s activated (manifest: $manifest_path)"
+}
+
+wass2s_deactivate() {
+    if [ -z "${_WASS2S_OLD_PATH:-}" ]; then
+        echo "wass2s: nothing to deactivate."
+        return 1
+    fi
+    export PATH="$_WASS2S_OLD_PATH"
+    export PS1="$_WASS2S_OLD_PS1"
+    unset CONDA_PREFIX PIXI_ENVIRONMENT_NAME PIXI_PROJECT_ROOT _WASS2S_OLD_PATH _WASS2S_OLD_PS1
+    echo "wass2s deactivated."
+}
+```
+
+Reload your shell (`source ~/.bashrc`), then activate and deactivate from anywhere:
+
+```bash
+wass2s_activate
+wass2s_deactivate
+```
+
+> **Login shell note:** `bash` only reads `~/.bashrc` for interactive non-login shells. Login shells (e.g. macOS Terminal.app by default, or a fresh SSH session on Linux) read `~/.bash_profile` instead. If the functions don't seem to load, add this to `~/.bash_profile` so it sources `~/.bashrc` too:
+>
+> ```bash
+> if [[ -f ~/.bashrc ]]; then
+>   source ~/.bashrc
+> fi
+> ```
+>
+> For `zsh`, the equivalent split is `~/.zshrc` (interactive) vs `~/.zprofile` (login). Add the same kind of guard to `~/.zprofile`, sourcing `~/.zshrc` instead.
+
+**PowerShell (Windows).** Open your profile (`notepad $PROFILE`, creating it first if needed) and add, replacing `C:\path\to\WASS2S` with your local repository:
+
+```powershell
+$env:WASS2S_MANIFEST_PATH = "C:\path\to\WASS2S\pyproject.toml"
+
+function wass2s_activate {
+    param([string]$ManifestPath = $env:WASS2S_MANIFEST_PATH)
+    $env:_WASS2S_OLD_PATH = $env:PATH
+    (pixi shell-hook --shell powershell --manifest-path $ManifestPath) | Out-String | Invoke-Expression
+    Write-Host "wass2s activated (manifest: $ManifestPath)"
+}
+
+function wass2s_deactivate {
+    if (-not $env:_WASS2S_OLD_PATH) {
+        Write-Host "wass2s: nothing to deactivate."
+        return
+    }
+    $env:PATH = $env:_WASS2S_OLD_PATH
+    Remove-Item Env:_WASS2S_OLD_PATH
+    Remove-Item Env:CONDA_PREFIX -ErrorAction SilentlyContinue
+    Remove-Item Env:PIXI_ENVIRONMENT_NAME -ErrorAction SilentlyContinue
+    Remove-Item Env:PIXI_PROJECT_ROOT -ErrorAction SilentlyContinue
+    Write-Host "wass2s deactivated."
+}
+```
+
+Reload your profile (`. $PROFILE`), then activate and deactivate with:
+
+```powershell
+wass2s_activate
+wass2s_deactivate
+```
+
 ### Option B: pip (lightweight, core dependencies only)
 
 ```bash

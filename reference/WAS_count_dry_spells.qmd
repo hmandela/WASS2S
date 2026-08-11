@@ -28,11 +28,9 @@ References:
 - Sivakumar (1991): Methodology for dry spell analysis in Sahelian agriculture
 - Common practice in West African national meteorological and agricultural services
 
-## Parameters {.doc-section .doc-section-parameters}
+## Notes {.doc-section .doc-section-notes}
 
-| Name   | Type   | Description   | Default    |
-|--------|--------|---------------|------------|
-| None   |        |               | _required_ |
+This class takes no initialization parameters; all criteria are passed at compute time.
 
 ## Functions {.doc-section .doc-section-functions}
 

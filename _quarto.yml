@@ -6,6 +6,9 @@ project:
     - get_started.qmd
     - reference/*.qmd
 
+execute:
+  freeze: auto
+
 website:
   title: "wass2s"
   description: "A Python-based tool for seasonal climate forecasting in West Africa and the Sahel"
@@ -16,6 +19,8 @@ website:
   navbar:
     background: light
     pinned: true
+    logo: reference/img/WASS2S-hex-sticker.png
+    logo-alt: "WASS2S logo"
     left:
       - text: "Get Started"
         file: get_started.qmd
@@ -32,7 +37,7 @@ website:
 format:
   html:
     theme: cosmo
-    sidebar: false
+    sidebar: true
 
 quartodoc:
   title: Reference

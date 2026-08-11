@@ -82,11 +82,10 @@ Compute index for xarray DataArray (gridded data).
 
 #### Parameters {.doc-section .doc-section-parameters}
 
-| Name       | Type         | Description                                                              | Default    |
-|------------|--------------|--------------------------------------------------------------------------|------------|
-| da         | xr.DataArray | Precipitation DataArray with dimensions (time, y, x) or (time, lat, lon) | _required_ |
-| chunk_size | dict         | Chunk sizes for parallel processing, e.g., {'y': 100, 'x': 100}          | _required_ |
-| parallel   | bool         | Whether to use Dask for parallel processing                              | `True`     |
+| Name     | Type         | Description                                                              | Default    |
+|----------|--------------|--------------------------------------------------------------------------|------------|
+| da       | xr.DataArray | Precipitation DataArray with dimensions (time, y, x) or (time, lat, lon) | _required_ |
+| parallel | bool         | Whether to use Dask for parallel processing                              | `True`     |
 
 #### Returns {.doc-section .doc-section-returns}
 

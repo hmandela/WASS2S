@@ -3957,9 +3957,12 @@ def fit_one_grid_min_crps(
     dry_threshold : censoring/truncation point c (precip families)
     var_link      : 'linear' (sigma^2 = c + d*svar) or 'softplus'
 
-    Returns (params[a,b,c,d], info_dict). For truncated_normal only the wet
-    observations (y > c) enter the score, matching the conditional likelihood
-    used in Thorarinsdottir & Gneiting (2010).
+    Returns
+    -------
+    tuple
+        ``(params[a, b, c, d], info_dict)``. For truncated_normal only the wet
+        observations (y > c) enter the score, matching the conditional
+        likelihood used in Thorarinsdottir & Gneiting (2010).
     """
     fbar = np.asarray(fbar, float)
     svar = np.asarray(svar, float)
@@ -6525,10 +6528,10 @@ class WAS_mme_FastBMA:
         Returns
         -------
         xr.Dataset:
-          ``predictive_mean``       — (T, Y, X)
-          ``predictive_quantiles``  — ('quantile', T, Y, X)
-          ``tercile_probability``   — ('probability', T, Y, X)  [if terciles given]
-          ``tercile_thresholds``    — ('tercile', Y, X)          [if terciles given]
+            ``predictive_mean``       — (T, Y, X)
+            ``predictive_quantiles``  — ('quantile', T, Y, X)
+            ``tercile_probability``   — ('probability', T, Y, X)  [if terciles given]
+            ``tercile_thresholds``    — ('tercile', Y, X)          [if terciles given]
         """
         if not self.fitted:
             raise ValueError("Call .fit() before .predict_probabilistic().")
@@ -7654,12 +7657,8 @@ class WAS_mme_RF:
         List of max samples as fraction of dataset (default is [None, 0.7, 0.8]).
     min_impurity_decrease_range : list of float, optional
         List of min impurity decrease values (default is [0.0, 0.001, 0.01]).
-    max_leaf_nodes_range : list of int or None, optional
-        List of max leaf nodes (default is [None, 50, 100]).
     ccp_alpha_range : list of float, optional
         List of complexity parameters for pruning (default is [0.0, 0.001, 0.01]).
-    min_weight_fraction_leaf_range : list of float, optional
-        List of minimum weighted fraction of leaves (default is [0.0, 0.1, 0.2]).
     warm_start : bool, optional
         Whether to reuse solution of previous call to fit (default is False).
     random_state : int, optional
@@ -8547,9 +8546,6 @@ class WAS_mme_XGBoosting:
         Number of iterations for randomized/bayesian search or points to sample for grid search (default is 10).
     cv_folds : int, optional
         Number of cross-validation folds (default is 3).
-    cv_method : str, optional
-        Cross-validation method: 'timeseries' or 'kfold' (default: 'timeseries').
-        Use 'timeseries' for temporal data to prevent data leakage.
     n_clusters : int, optional
         Number of clusters for homogenized zones (default is 4).
     optuna_n_jobs : int, optional

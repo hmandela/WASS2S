@@ -2286,9 +2286,9 @@ class WAS_count_dry_spells:
     - Sivakumar (1991): Methodology for dry spell analysis in Sahelian agriculture
     - Common practice in West African national meteorological and agricultural services
 
-    Parameters
-    ----------
-    None (no initialization parameters required — all criteria passed at compute time)
+    Notes
+    -----
+    This class takes no initialization parameters; all criteria are passed at compute time.
 
     Methods
     -------
@@ -2776,9 +2776,9 @@ class WAS_count_wet_spells:
     - Sivakumar (1991): Rainfall variability and wet spell analysis in Sahelian agriculture
     - Common practice in West African national meteorological and agricultural services
 
-    Parameters
-    ----------
-    None (no initialization parameters required — all criteria passed at compute time)
+    Notes
+    -----
+    This class takes no initialization parameters; all criteria are passed at compute time.
 
     Methods
     -------
@@ -3212,9 +3212,9 @@ class WAS_count_rainy_days:
     - Sivakumar (1991): Rainfall characteristics and agricultural planning in West Africa
     - Common practice in Sahelian and Sudanian national meteorological services
 
-    Parameters
-    ----------
-    None (no initialization parameters required — all criteria passed at compute time)
+    Notes
+    -----
+    This class takes no initialization parameters; all criteria are passed at compute time.
 
     Methods
     -------
@@ -4418,8 +4418,6 @@ class WAS_PrecipIndices:
         ----------
         da : xr.DataArray
             Precipitation DataArray with dimensions (time, y, x) or (time, lat, lon)
-        chunk_size : dict, optional
-            Chunk sizes for parallel processing, e.g., {'y': 100, 'x': 100}
         parallel : bool
             Whether to use Dask for parallel processing
         

@@ -115,6 +115,10 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
       <div class="navbar-container container-fluid">
       <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo light-content">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo dark-content">
+    </a>
     <a class="navbar-brand" href="../index.html">
     <span class="navbar-title">wass2s</span>
     </a>
@@ -282,9 +286,9 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <h4 class="doc-section doc-section-parameters anchored" data-anchor-id="parameters-1">Parameters</h4>
 <table class="caption-top table">
 <colgroup>
-<col style="width: 10%">
+<col style="width: 9%">
 <col style="width: 12%">
-<col style="width: 66%">
+<col style="width: 67%">
 <col style="width: 10%">
 </colgroup>
 <thead>
@@ -303,12 +307,6 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <td><em>required</em></td>
 </tr>
 <tr class="even">
-<td>chunk_size</td>
-<td>dict</td>
-<td>Chunk sizes for parallel processing, e.g., {‘y’: 100, ‘x’: 100}</td>
-<td><em>required</em></td>
-</tr>
-<tr class="odd">
 <td>parallel</td>
 <td>bool</td>
 <td>Whether to use Dask for parallel processing</td>

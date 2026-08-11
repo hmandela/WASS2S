@@ -96,7 +96,6 @@ and Agglomerative clustering.
 | [download_and_process](#wass2s.WAS_Analog.download_and_process) | Download and process reanalysis and forecast data. |
 | [download_models](#wass2s.WAS_Analog.download_models) | Download and process seasonal forecast and hindcast data. |
 | [download_reanalysis](#wass2s.WAS_Analog.download_reanalysis) | Download reanalysis data. |
-| [download_reanalysis_](#wass2s.WAS_Analog.download_reanalysis_) | Download reanalysis data (ERA5 and NOAA ERSST). |
 | [forecast](#wass2s.WAS_Analog.forecast) | Generate deterministic and probabilistic forecasts for the target year. |
 | [identify_analogs_bmu](#wass2s.WAS_Analog.identify_analogs_bmu) | Identify analog years based on SOM Best Matching Units (BMUs). |
 | [standardize_timeseries](#wass2s.WAS_Analog.standardize_timeseries) | Standardize the dataset by removing climatological mean and scaling by standard deviation. |
@@ -318,15 +317,6 @@ WAS_Analog.download_reanalysis(force_download=False)
 ```
 
 Download reanalysis data.
-
-### download_reanalysis_ { #wass2s.WAS_Analog.download_reanalysis_ }
-
-```python
-WAS_Analog.download_reanalysis_(force_download=False)
-```
-
-Download reanalysis data (ERA5 and NOAA ERSST).
-Saves raw MONTHLY data (1-12) without aggregation, preserving seasonality.
 
 ### forecast { #wass2s.WAS_Analog.forecast }
 

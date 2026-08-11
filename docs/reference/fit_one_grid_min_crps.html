@@ -115,6 +115,10 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
       <div class="navbar-container container-fluid">
       <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo light-content">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo dark-content">
+    </a>
     <a class="navbar-brand" href="../index.html">
     <span class="navbar-title">wass2s</span>
     </a>
@@ -229,23 +233,29 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <td></td>
 <td><code>'linear'</code></td>
 </tr>
-<tr class="odd">
-<td>Returns</td>
-<td></td>
-<td></td>
-<td><em>required</em></td>
+</tbody>
+</table>
+</section>
+<section id="returns" class="level2 doc-section doc-section-returns">
+<h2 class="doc-section doc-section-returns anchored" data-anchor-id="returns">Returns</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 3%">
+<col style="width: 3%">
+<col style="width: 92%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
 </tr>
-<tr class="even">
-<td>observations</td>
-<td></td>
-<td></td>
-<td><em>required</em></td>
-</tr>
+</thead>
+<tbody>
 <tr class="odd">
-<td>used</td>
 <td></td>
-<td></td>
-<td><em>required</em></td>
+<td>tuple</td>
+<td><code>(params[a, b, c, d], info_dict)</code>. For truncated_normal only the wet observations (y &gt; c) enter the score, matching the conditional likelihood used in Thorarinsdottir &amp; Gneiting (2010).</td>
 </tr>
 </tbody>
 </table>

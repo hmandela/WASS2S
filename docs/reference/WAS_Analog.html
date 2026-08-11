@@ -115,6 +115,10 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
       <div class="navbar-container container-fluid">
       <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo light-content">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo dark-content">
+    </a>
     <a class="navbar-brand" href="../index.html">
     <span class="navbar-title">wass2s</span>
     </a>
@@ -454,22 +458,18 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <td>Download reanalysis data.</td>
 </tr>
 <tr class="odd">
-<td><a href="#wass2s.WAS_Analog.download_reanalysis_">download_reanalysis_</a></td>
-<td>Download reanalysis data (ERA5 and NOAA ERSST).</td>
-</tr>
-<tr class="even">
 <td><a href="#wass2s.WAS_Analog.forecast">forecast</a></td>
 <td>Generate deterministic and probabilistic forecasts for the target year.</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td><a href="#wass2s.WAS_Analog.identify_analogs_bmu">identify_analogs_bmu</a></td>
 <td>Identify analog years based on SOM Best Matching Units (BMUs).</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td><a href="#wass2s.WAS_Analog.standardize_timeseries">standardize_timeseries</a></td>
 <td>Standardize the dataset by removing climatological mean and scaling by standard deviation.</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td><a href="#wass2s.WAS_Analog.weibull_shape_solver">weibull_shape_solver</a></td>
 <td>Function to find the root of the Weibull shape parameter ‘k’.</td>
 </tr>
@@ -694,38 +694,33 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb19"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a>WAS_Analog.download_reanalysis(force_download<span class="op">=</span><span class="va">False</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Download reanalysis data.</p>
 </section>
-<section id="wass2s.WAS_Analog.download_reanalysis_" class="level3">
-<h3 class="anchored" data-anchor-id="wass2s.WAS_Analog.download_reanalysis_">download_reanalysis_</h3>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb20"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a>WAS_Analog.download_reanalysis_(force_download<span class="op">=</span><span class="va">False</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>Download reanalysis data (ERA5 and NOAA ERSST). Saves raw MONTHLY data (1-12) without aggregation, preserving seasonality.</p>
-</section>
 <section id="wass2s.WAS_Analog.forecast" class="level3">
 <h3 class="anchored" data-anchor-id="wass2s.WAS_Analog.forecast">forecast</h3>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb21"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a>WAS_Analog.forecast(</span>
-<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a>    predictant,</span>
-<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
-<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
-<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>    hindcast_det,</span>
-<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a>    best_code_da<span class="op">=</span><span class="va">None</span>,</span>
-<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>    best_shape_da<span class="op">=</span><span class="va">None</span>,</span>
-<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>    best_loc_da<span class="op">=</span><span class="va">None</span>,</span>
-<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>    best_scale_da<span class="op">=</span><span class="va">None</span>,</span>
-<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb20"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a>WAS_Analog.forecast(</span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>    predictant,</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>    clim_year_start,</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>    clim_year_end,</span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>    hindcast_det,</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>    best_code_da<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>    best_shape_da<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>    best_loc_da<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>    best_scale_da<span class="op">=</span><span class="va">None</span>,</span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Generate deterministic and probabilistic forecasts for the target year.</p>
 </section>
 <section id="wass2s.WAS_Analog.identify_analogs_bmu" class="level3">
 <h3 class="anchored" data-anchor-id="wass2s.WAS_Analog.identify_analogs_bmu">identify_analogs_bmu</h3>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb22"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a>WAS_Analog.identify_analogs_bmu(target_year, bmu_dict)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb21"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a>WAS_Analog.identify_analogs_bmu(target_year, bmu_dict)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Identify analog years based on SOM Best Matching Units (BMUs).</p>
 </section>
 <section id="wass2s.WAS_Analog.standardize_timeseries" class="level3">
 <h3 class="anchored" data-anchor-id="wass2s.WAS_Analog.standardize_timeseries">standardize_timeseries</h3>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb23"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a>WAS_Analog.standardize_timeseries(ds)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb22"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a>WAS_Analog.standardize_timeseries(ds)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Standardize the dataset by removing climatological mean and scaling by standard deviation.</p>
 </section>
 <section id="wass2s.WAS_Analog.weibull_shape_solver" class="level3">
 <h3 class="anchored" data-anchor-id="wass2s.WAS_Analog.weibull_shape_solver">weibull_shape_solver</h3>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb24"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a>WAS_Analog.weibull_shape_solver(k, M, V)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb23"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a>WAS_Analog.weibull_shape_solver(k, M, V)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Function to find the root of the Weibull shape parameter ‘k’. We find ‘k’ such that the theoretical variance/mean^2 ratio matches the observed V/M^2 ratio.</p>
 
 

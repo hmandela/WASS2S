@@ -115,6 +115,10 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
       <div class="navbar-container container-fluid">
       <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo light-content">
+    <img src="../reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo dark-content">
+    </a>
     <a class="navbar-brand" href="../index.html">
     <span class="navbar-title">wass2s</span>
     </a>
@@ -294,30 +298,24 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <td><code>3</code></td>
 </tr>
 <tr class="odd">
-<td>cv_method</td>
-<td>str</td>
-<td>Cross-validation method: ‘timeseries’ or ‘kfold’ (default: ‘timeseries’). Use ‘timeseries’ for temporal data to prevent data leakage.</td>
-<td><em>required</em></td>
-</tr>
-<tr class="even">
 <td>n_clusters</td>
 <td>int</td>
 <td>Number of clusters for homogenized zones (default is 4).</td>
 <td><code>4</code></td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>optuna_n_jobs</td>
 <td>int</td>
 <td>Optional Optuna-specific worker count. When <code>None</code>, it inherits <code>n_jobs</code> (default is None).</td>
 <td><code>None</code></td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>optuna_timeout</td>
 <td>int</td>
 <td>Timeout in seconds for Optuna optimization (default is None).</td>
 <td><code>None</code></td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>n_jobs</td>
 <td>int</td>
 <td>Maximum number of parallel workers. <code>-1</code> uses all available CPUs. Search CV/trials run in parallel at the outer level; inner XGBoost fits use one thread during tuning. Final zone models use <code>n_jobs</code> directly (default is 4).</td>

@@ -115,6 +115,10 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
       <div class="navbar-container container-fluid">
       <div class="navbar-brand-container mx-auto">
+    <a href="./index.html" class="navbar-brand navbar-brand-logo">
+    <img src="./reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo light-content">
+    <img src="./reference/img/WASS2S-hex-sticker.png" alt="WASS2S logo" class="navbar-logo dark-content">
+    </a>
     <a class="navbar-brand" href="./index.html">
     <span class="navbar-title">wass2s</span>
     </a>
@@ -187,21 +191,83 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <li>Install pixi: <code>bash  curl -fsSL https://pixi.sh/install.sh | sh</code></li>
 <li>Clone the repository and install the environment: <code>bash  git clone https://github.com/hmandela/WASS2S.git  cd WASS2S  pixi install  pixi shell</code> <code>pixi shell</code> drops you into an activated shell with <code>wass2s</code> and all its dependencies available.</li>
 </ol>
+<section id="activate-wass2s-from-any-directory" class="level4">
+<h4 class="anchored" data-anchor-id="activate-wass2s-from-any-directory">Activate wass2s from any directory</h4>
+<p>Instead of changing into the project directory each time, you can start the environment directly:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pixi</span> shell <span class="at">--manifest-path</span> /path/to/WASS2S/pyproject.toml</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><strong>Bash / zsh (Linux/macOS).</strong> Add the following to your <code>~/.bashrc</code> or <code>~/.zshrc</code>, replacing <code>/path/to/WASS2S</code> with the location of your local repository:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># wass2s utilities</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">WASS2S_MANIFEST_PATH</span><span class="op">=</span><span class="st">"/path/to/WASS2S/pyproject.toml"</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">wass2s_activate()</span> <span class="kw">{</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="bu">local</span> <span class="va">manifest_path</span><span class="op">=</span><span class="st">"</span><span class="va">${1</span><span class="op">:-</span><span class="va">$WASS2S_MANIFEST_PATH}</span><span class="st">"</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="bu">export</span> <span class="va">_WASS2S_OLD_PATH</span><span class="op">=</span><span class="st">"</span><span class="va">$PATH</span><span class="st">"</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="bu">export</span> <span class="va">_WASS2S_OLD_PS1</span><span class="op">=</span><span class="st">"</span><span class="va">$PS1</span><span class="st">"</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">eval</span> <span class="st">"</span><span class="va">$(</span><span class="ex">pixi</span> shell-hook <span class="at">--shell</span> bash <span class="at">--manifest-path</span> <span class="st">"</span><span class="va">$manifest_path</span><span class="st">"</span><span class="va">)</span><span class="st">"</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">"wass2s activated (manifest: </span><span class="va">$manifest_path</span><span class="st">)"</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="fu">wass2s_deactivate()</span> <span class="kw">{</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">[</span> <span class="ot">-z</span> <span class="st">"</span><span class="va">${_WASS2S_OLD_PATH</span><span class="op">:-</span><span class="va">}</span><span class="st">"</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>        <span class="bu">echo</span> <span class="st">"wass2s: nothing to deactivate."</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">fi</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="bu">export</span> <span class="va">PATH</span><span class="op">=</span><span class="st">"</span><span class="va">$_WASS2S_OLD_PATH</span><span class="st">"</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">export</span> <span class="va">PS1</span><span class="op">=</span><span class="st">"</span><span class="va">$_WASS2S_OLD_PS1</span><span class="st">"</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="bu">unset</span> <span class="va">CONDA_PREFIX</span> <span class="va">PIXI_ENVIRONMENT_NAME</span> <span class="va">PIXI_PROJECT_ROOT</span> <span class="va">_WASS2S_OLD_PATH</span> <span class="va">_WASS2S_OLD_PS1</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">"wass2s deactivated."</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Reload your shell (<code>source ~/.bashrc</code>), then activate and deactivate from anywhere:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">wass2s_activate</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">wass2s_deactivate</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<blockquote class="blockquote">
+<p><strong>Login shell note:</strong> <code>bash</code> only reads <code>~/.bashrc</code> for interactive non-login shells. Login shells (e.g.&nbsp;macOS Terminal.app by default, or a fresh SSH session on Linux) read <code>~/.bash_profile</code> instead. If the functions don’t seem to load, add this to <code>~/.bash_profile</code> so it sources <code>~/.bashrc</code> too:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="kw">[[</span> <span class="ot">-f</span> ~/.bashrc <span class="kw">]];</span> <span class="cf">then</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="bu">source</span> ~/.bashrc</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>For <code>zsh</code>, the equivalent split is <code>~/.zshrc</code> (interactive) vs <code>~/.zprofile</code> (login). Add the same kind of guard to <code>~/.zprofile</code>, sourcing <code>~/.zshrc</code> instead.</p>
+</blockquote>
+<p><strong>PowerShell (Windows).</strong> Open your profile (<code>notepad $PROFILE</code>, creating it first if needed) and add, replacing <code>C:\path\to\WASS2S</code> with your local repository:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode powershell code-with-copy"><code class="sourceCode powershell"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="va">$env</span><span class="op">:</span><span class="va">WASS2S_MANIFEST_PATH</span> <span class="op">=</span> <span class="st">"C:\path\to\WASS2S\pyproject.toml"</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">function</span> wass2s_activate <span class="op">{</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">param</span><span class="op">([</span><span class="dt">string</span><span class="op">]</span><span class="va">$ManifestPath</span> <span class="op">=</span> <span class="va">$env</span><span class="op">:</span><span class="va">WASS2S_MANIFEST_PATH</span><span class="op">)</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="va">$env</span><span class="op">:</span><span class="va">_WASS2S_OLD_PATH</span> <span class="op">=</span> <span class="va">$env</span><span class="op">:</span><span class="va">PATH</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">(</span>pixi shell-hook <span class="op">--</span>shell powershell <span class="op">--</span>manifest-path <span class="va">$ManifestPath</span><span class="op">)</span> <span class="op">|</span> <span class="fu">Out-String</span> <span class="op">|</span> <span class="fu">Invoke-Expression</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">Write-Host</span> <span class="st">"wass2s activated (manifest: </span><span class="va">$ManifestPath</span><span class="st">)"</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="kw">function</span> wass2s_deactivate <span class="op">{</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(-not</span> <span class="va">$env</span><span class="op">:</span><span class="va">_WASS2S_OLD_PATH</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>        <span class="fu">Write-Host</span> <span class="st">"wass2s: nothing to deactivate."</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    <span class="va">$env</span><span class="op">:</span><span class="va">PATH</span> <span class="op">=</span> <span class="va">$env</span><span class="op">:</span><span class="va">_WASS2S_OLD_PATH</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="fu">Remove-Item</span> Env<span class="op">:</span>_WASS2S_OLD_PATH</span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="fu">Remove-Item</span> Env<span class="op">:</span>CONDA_PREFIX <span class="op">-</span>ErrorAction SilentlyContinue</span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="fu">Remove-Item</span> Env<span class="op">:</span>PIXI_ENVIRONMENT_NAME <span class="op">-</span>ErrorAction SilentlyContinue</span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="fu">Remove-Item</span> Env<span class="op">:</span>PIXI_PROJECT_ROOT <span class="op">-</span>ErrorAction SilentlyContinue</span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    <span class="fu">Write-Host</span> <span class="st">"wass2s deactivated."</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Reload your profile (<code>. $PROFILE</code>), then activate and deactivate with:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode powershell code-with-copy"><code class="sourceCode powershell"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>wass2s_activate</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>wass2s_deactivate</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
 </section>
 <section id="option-b-pip-lightweight-core-dependencies-only" class="level3">
 <h3 class="anchored" data-anchor-id="option-b-pip-lightweight-core-dependencies-only">Option B: pip (lightweight, core dependencies only)</h3>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install wass2s</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install wass2s</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </section>
 <section id="legacy-conda" class="level3">
 <h3 class="anchored" data-anchor-id="legacy-conda">Legacy: conda</h3>
 <p>The original conda environment files (<code>WAS_S2S_linux.yml</code>, <code>WAS_S2S_windows.yml</code>) are still available in the repo root:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">conda</span> env create <span class="at">-f</span> WAS_S2S_linux.yml   <span class="co"># or WAS_S2S_windows.yml on Windows</span></span>
-<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">conda</span> activate WASS2S</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">conda</span> env create <span class="at">-f</span> WAS_S2S_linux.yml   <span class="co"># or WAS_S2S_windows.yml on Windows</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">conda</span> activate WASS2S</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </section>
 </section>
 <section id="download-notebooks-for-simulation" class="level2">
 <h2 class="anchored" data-anchor-id="download-notebooks-for-simulation">Download notebooks for simulation</h2>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/hmandela/WASS2S_notebooks.git</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb9"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/hmandela/WASS2S_notebooks.git</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </section>
 <section id="set-up-your-cds-api-key" class="level2">
 <h2 class="anchored" data-anchor-id="set-up-your-cds-api-key">Set up your CDS API key</h2>
@@ -211,20 +277,20 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <li>Log in to your Copernicus account and click your name in the top-right corner. Note your <strong>UID</strong> and <strong>Personal Access Token</strong>.</li>
 <li>Configure your <code>.cdsapirc</code> file. In an activated terminal, start <code>python3</code> and run:</li>
 </ol>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
-<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>config_data <span class="op">=</span> <span class="st">'''url: https://cds.climate.copernicus.eu/api</span></span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="st">key: Personal Access Token</span></span>
-<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="st">verify: 0</span></span>
-<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="st">'''</span></span>
-<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>path_to_home <span class="op">=</span> <span class="st">"/"</span>.join([os.path.expanduser(<span class="st">'~'</span>), <span class="st">".cdsapirc"</span>])</span>
-<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="kw">not</span> os.path.exists(path_to_home):</span>
-<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> <span class="bu">open</span>(path_to_home, <span class="st">'w'</span>) <span class="im">as</span> <span class="bu">file</span>:</span>
-<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>        <span class="bu">file</span>.write(config_data)</span>
-<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">"Configuration file created successfully!"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>config_data <span class="op">=</span> <span class="st">'''url: https://cds.climate.copernicus.eu/api</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="st">key: Personal Access Token</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="st">verify: 0</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="st">'''</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>path_to_home <span class="op">=</span> <span class="st">"/"</span>.join([os.path.expanduser(<span class="st">'~'</span>), <span class="st">".cdsapirc"</span>])</span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="kw">not</span> os.path.exists(path_to_home):</span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> <span class="bu">open</span>(path_to_home, <span class="st">'w'</span>) <span class="im">as</span> <span class="bu">file</span>:</span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>        <span class="bu">file</span>.write(config_data)</span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">"Configuration file created successfully!"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Replace <code>Personal Access Token</code> with the token noted above.</p>
 </section>
 <section id="upgrading" class="level2">
@@ -237,9 +303,9 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <section id="potential-issues" class="level2">
 <h2 class="anchored" data-anchor-id="potential-issues">Potential issues</h2>
 <p>If you encounter matplotlib errors:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install matplotlib==3.7.3</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb11"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install matplotlib==3.7.3</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>If you encounter cartopy/xcast build errors with conda:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">conda</span> install <span class="at">-c</span> conda-forge <span class="at">-c</span> hallkjc01 xcast</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb12"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">conda</span> install <span class="at">-c</span> conda-forge <span class="at">-c</span> hallkjc01 xcast</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>pixi users get a compatible <code>xcast</code> build automatically from the <code>hallkjc01</code> channel configured in <code>pyproject.toml</code>.</p>
 <p>For other issues, see the <a href="https://github.com/hmandela/WASS2S/blob/main/TROUBLESHOOTING.md">Troubleshooting Guide</a>.</p>
 

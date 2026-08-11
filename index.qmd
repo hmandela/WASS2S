@@ -21,8 +21,5 @@ The tool helps forecasters download data, build models, verify them, and produce
 - [Reference](reference/index.qmd) — the full API reference for every public class and function.
 - [Training Docs](https://hmandela.github.io/WAS_S2S_Training/) — tutorials and training material.
 
-## Credits
 
-Built on top of [scikit-learn](https://scikit-learn.org/stable/), [xeofs](https://github.com/xarray-contrib/xeofs), [xcast](https://github.com/kjhall01/xcast/), [xskillscore](https://github.com/xarray-contrib/xskillscore), and many more open-source projects.
 
-Developed with support from the **AICCRA project** and **AGRHYMET RCC-WAS**.

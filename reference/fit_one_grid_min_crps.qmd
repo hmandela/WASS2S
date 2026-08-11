@@ -25,6 +25,9 @@ Minimum-CRPS EMOS fit at a single grid point.
 | family        |                                                             |               | `'censored_normal'` |
 | dry_threshold | censoring/truncation point c (precip families)              |               | `0.0`               |
 | var_link      |                                                             |               | `'linear'`          |
-| Returns       |                                                             |               | _required_          |
-| observations  |                                                             |               | _required_          |
-| used          |                                                             |               | _required_          |
+
+## Returns {.doc-section .doc-section-returns}
+
+| Name   | Type   | Description                                                                                                                                                                                 |
+|--------|--------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|        | tuple  | ``(params[a, b, c, d], info_dict)``. For truncated_normal only the wet observations (y > c) enter the score, matching the conditional likelihood used in Thorarinsdottir & Gneiting (2010). |

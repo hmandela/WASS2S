@@ -81,7 +81,6 @@ or::
 | [WAS_Qmap](WAS_Qmap.qmd#wass2s.WAS_Qmap) | Bias correction methods using quantile mapping techniques, adapted from |
 | [WAS_bias_correction](WAS_bias_correction.qmd#wass2s.WAS_bias_correction) | Bias correction methods for continuous climate variables (e.g. temperature, |
 | [WAS_Analog](WAS_Analog.qmd#wass2s.WAS_Analog) | Analog-based forecasting toolkit for seasonal climate applications. |
-| [WAS_Analog__](WAS_Analog__.qmd#wass2s.WAS_Analog__) | Analog-based forecasting toolkit for seasonal climate applications. |
 | [WAS_CCA](WAS_CCA.qmd#wass2s.WAS_CCA) |  |
 | [WAS_CCA_base](WAS_CCA_base.qmd#wass2s.WAS_CCA_base) | Canonical Correlation Analysis model based on xeofs.cross.CCA. |
 | [WAS_CCA_op](WAS_CCA_op.qmd#wass2s.WAS_CCA_op) |  |
@@ -196,3 +195,4 @@ or::
 | [CEAC_compute_cessation_dry_spell](CEAC_compute_cessation_dry_spell.qmd#wass2s.CEAC_compute_cessation_dry_spell) |  |
 | [CEAC_count_dry_spells](CEAC_count_dry_spells.qmd#wass2s.CEAC_count_dry_spells) |  |
 | [CEAC_count_wet_spells](CEAC_count_wet_spells.qmd#wass2s.CEAC_count_wet_spells) |  |
+| [WAS_Analog__](WAS_Analog__.qmd#wass2s.WAS_Analog__) | Deprecated alias for :class:`wass2s.was_analog.WAS_Analog`. |
