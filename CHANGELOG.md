@@ -1,11 +1,15 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+Title: Fix DLL error when loading netCDF4 on win-64
 
-## Unreleased — Deprecation lifecycle for superseded classes
+### Fixed
+- **Windows:** Preload `netCDF4` in `wass2s.__init__` to prevent DLL conflicts when importing WASS2S with Pixi.
+
+## Deprecation lifecycle for superseded classes
 
 ### Deprecated
-- `WAS_Analog__` (the archived predecessor of `WAS_Analog`) now emits a `FutureWarning` pointing to `WAS_Analog` on instantiation, and will be removed in **v0.6.0**. Its implementation moved from `wass2s/was_analog.py` to `wass2s/_deprecated.py`, where it's now a thin subclass of `WAS_Analog` instead of a ~1,700-line parallel copy — bug fixes to `WAS_Analog` now apply to it automatically. Import path (`from wass2s import WAS_Analog__`) is unchanged.
+- `WAS_Analog__` (the archived predecessor of `WAS_Analog`) now emits a `FutureWarning` pointing to `WAS_Analog` on instantiation, and will be removed in **v0.5.0.0**. Its implementation moved from `wass2s/was_analog.py` to `wass2s/_deprecated.py`, where it's now a thin subclass of `WAS_Analog` instead of a ~1,700-line parallel copy — bug fixes to `WAS_Analog` now apply to it automatically. Import path (`from wass2s import WAS_Analog__`) is unchanged.
 
 ### Removed
 - Deleted `WAS_Analog.download_reanalysis_` (trailing underscore) — an unused, superseded draft of `download_reanalysis` with no callers anywhere in the codebase.
