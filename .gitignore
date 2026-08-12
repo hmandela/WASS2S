@@ -6,7 +6,7 @@ objects.json
 /.quarto/
 **/*.quarto_ipynb
 /.claude/
-reference/
+reference/*.qmd
 *.qmd
 *.html
 .DS_Store
