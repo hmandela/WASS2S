@@ -33,7 +33,14 @@ Install Pixi by following the official guide:
 
 https://pixi.sh/latest/installation/
 
-Clone the repository:
+You may first need to install **Git** for your operating system in order to clone WASS2S repository. Find the appropriate instructions [here](https://git-scm.com/install/).
+
+Verify the installation:
+
+```bash
+git --version
+```
+Clone WASS2S repository
 
 ```bash
 git clone https://github.com/hmandela/WASS2S.git
@@ -130,25 +137,79 @@ notepad $PROFILE
 Add the following, replacing `C:\path\to\WASS2S` with your local repository:
 
 ```powershell
+# Path to the WASS2S Pixi manifest
+
 $env:WASS2S_MANIFEST_PATH = "C:\path\to\WASS2S\pyproject.toml"
 
+# wass2s_activate: activate WASS2S Pixi environment from anywhere
 function wass2s_activate {
     param([string]$ManifestPath = $env:WASS2S_MANIFEST_PATH)
+
+    # Prevent activation twice
+    if ($env:WASS2S_ACTIVE -eq "1") {
+        Write-Host "wass2s: already activated."
+        return
+    }
+
+    # Save current PATH
     $env:_WASS2S_OLD_PATH = $env:PATH
-    (pixi shell-hook --shell powershell --manifest-path $ManifestPath) | Out-String | Invoke-Expression
+
+    # Save the original PowerShell prompt
+    $global:_WASS2S_OLD_PROMPT = $function:prompt
+
+    # Remove invalid SSL certificate path if present
+    Remove-Item Env:SSL_CERT_DIR -ErrorAction SilentlyContinue
+
+    # Generate Pixi shell hook
+    $hook = pixi shell-hook --shell powershell --manifest-path $ManifestPath |
+        Out-String
+
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($hook)) {
+        Write-Error "wass2s: pixi shell-hook failed."
+        return
+    }
+
+    # Apply Pixi environment
+    Invoke-Expression $hook
+
+    # Mark environment as active
+    $env:WASS2S_ACTIVE = "1"
+
+    # Add (wass2s) while preserving the original PowerShell prompt
+    function global:prompt {
+        Write-Host "(wass2s) " -NoNewline -ForegroundColor Green
+        & $global:_WASS2S_OLD_PROMPT
+    }
+
     Write-Host "wass2s activated (manifest: $ManifestPath)"
 }
 
+# wass2s_deactivate: deactivate WASS2S Pixi environment
 function wass2s_deactivate {
-    if (-not $env:_WASS2S_OLD_PATH) {
+
+    if ($env:WASS2S_ACTIVE -ne "1") {
         Write-Host "wass2s: nothing to deactivate."
         return
     }
+
+    # Restore PATH
     $env:PATH = $env:_WASS2S_OLD_PATH
-    Remove-Item Env:_WASS2S_OLD_PATH
+
+    # Restore original PowerShell prompt
+    if ($global:_WASS2S_OLD_PROMPT) {
+        Set-Item Function:\prompt $global:_WASS2S_OLD_PROMPT
+    }
+
+    # Remove WASS2S/Pixi environment variables
+    Remove-Item Env:WASS2S_ACTIVE -ErrorAction SilentlyContinue
+    Remove-Item Env:_WASS2S_OLD_PATH -ErrorAction SilentlyContinue
     Remove-Item Env:CONDA_PREFIX -ErrorAction SilentlyContinue
     Remove-Item Env:PIXI_ENVIRONMENT_NAME -ErrorAction SilentlyContinue
     Remove-Item Env:PIXI_PROJECT_ROOT -ErrorAction SilentlyContinue
+
+    # Remove saved prompt
+    Remove-Variable _WASS2S_OLD_PROMPT -Scope Global -ErrorAction SilentlyContinue
+
     Write-Host "wass2s deactivated."
 }
 ```
