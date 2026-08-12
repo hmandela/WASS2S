@@ -22,6 +22,9 @@ The framework follows the recommendations of the **World Meteorological Organiza
 - Reproducible environments powered by Pixi.
 - Modular architecture for extending forecasting methods.
 
+Below, find the most important sub modules available in `WASS2S`
+
+![WASS2S submodules to streamline objective S2S Outlook generation](modules.png)
 
 ## Installation
 
@@ -29,9 +32,7 @@ The framework follows the recommendations of the **World Meteorological Organiza
 
 WASS2S is developed with **Pixi**, which automatically manages all Python, geospatial, and machine learning dependencies.
 
-Install Pixi by following the official guide:
-
-https://pixi.sh/latest/installation/
+Install Pixi by following the official guide [here](https://pixi.sh/latest/installation/)
 
 You may first need to install **Git** for your operating system in order to clone WASS2S repository. Find the appropriate instructions [here](https://git-scm.com/install/).
 

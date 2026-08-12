@@ -1,9 +1,12 @@
 .pixi/
 __pycache__/
 *.egg-info/
+objects.json
 
 /.quarto/
 **/*.quarto_ipynb
 /.claude/
 reference/
 *.qmd
+*.html
+.DS_Store
