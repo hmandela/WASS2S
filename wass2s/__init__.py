@@ -5,9 +5,7 @@ namespace.  Every public symbol from the sub-modules listed below is
 re-exported here so that users only need::
 
     from wass2s import *
-
 or::
-
     import wass2s as w2s
 
 Sub-modules
@@ -68,7 +66,7 @@ ceac_agro
     station and gridded data (``CEAC_compute_onset``, ``CEAC_compute_cessation``, …).
 """
 
-__version__ = "0.4.8.5"
+__version__ = "0.4.10.2"
 
 # Backward-compatibility shim: scipy removed scipy.interp in 1.14.
 # Backward-compatibility shim: scipy removed scipy.interp in 1.14.
