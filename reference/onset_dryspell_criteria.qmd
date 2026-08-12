@@ -1,4 +1,0 @@
-# onset_dryspell_criteria { #wass2s.onset_dryspell_criteria }
-
-`onset_dryspell_criteria`
-

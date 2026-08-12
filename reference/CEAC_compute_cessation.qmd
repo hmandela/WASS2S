@@ -1,6 +1,0 @@
-# CEAC_compute_cessation { #wass2s.CEAC_compute_cessation }
-
-```python
-CEAC_compute_cessation(user_criteria=None)
-```
-

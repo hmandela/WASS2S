@@ -1,6 +1,0 @@
-# CEAC_compute_onset_dry_spell { #wass2s.CEAC_compute_onset_dry_spell }
-
-```python
-CEAC_compute_onset_dry_spell(user_criteria=None)
-```
-

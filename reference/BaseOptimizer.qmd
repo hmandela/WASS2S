@@ -1,7 +1,0 @@
-# BaseOptimizer { #wass2s.BaseOptimizer }
-
-```python
-BaseOptimizer(optimization_method='grid', n_trials=20, cv=5, random_state=42)
-```
-
-Unified Optimizer. Supports SVR (multi-grid), MLP, and Stacking architectures.

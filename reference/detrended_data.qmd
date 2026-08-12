@@ -1,6 +1,0 @@
-# detrended_data { #wass2s.detrended_data }
-
-```python
-detrended_data(da, dim='T', min_valid=10)
-```
-

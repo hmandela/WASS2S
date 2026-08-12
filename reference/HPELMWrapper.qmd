@@ -1,7 +1,0 @@
-# HPELMWrapper { #wass2s.HPELMWrapper }
-
-```python
-HPELMWrapper(neurons=10, activation='sigm', norm=1.0, random_state=42)
-```
-
-Wrapper for HPELM to make it compatible with scikit-learn's hyperparameter optimization.

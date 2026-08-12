@@ -1,4 +1,0 @@
-# HAS_CCA_ZOO { #wass2s.HAS_CCA_ZOO }
-
-`HAS_CCA_ZOO`
-

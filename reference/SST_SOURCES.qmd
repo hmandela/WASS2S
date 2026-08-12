@@ -1,4 +1,0 @@
-# SST_SOURCES { #wass2s.SST_SOURCES }
-
-`SST_SOURCES`
-

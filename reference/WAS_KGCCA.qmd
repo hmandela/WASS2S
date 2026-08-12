@@ -1,7 +1,0 @@
-# WAS_KGCCA { #wass2s.WAS_KGCCA }
-
-```python
-WAS_KGCCA(*args, cv_folds=5, **kwargs)
-```
-
-Kernel Generalized CCA (cca-zoo KGCCA / GCCA).

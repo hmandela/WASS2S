@@ -1,5 +1,0 @@
-# DAILY_STATISTIC { #wass2s.DAILY_STATISTIC }
-
-`DAILY_STATISTIC`
-
-dict: CDS daily statistic requested for each configured variable.

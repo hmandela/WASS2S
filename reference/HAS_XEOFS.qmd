@@ -1,4 +1,0 @@
-# HAS_XEOFS { #wass2s.HAS_XEOFS }
-
-`HAS_XEOFS`
-

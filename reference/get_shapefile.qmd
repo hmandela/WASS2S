@@ -1,8 +1,0 @@
-# get_shapefile { #wass2s.get_shapefile }
-
-```python
-get_shapefile(country_code, admin_level=0, source='naturalearth')
-```
-
-Downloads or loads shapefiles based on country ISO3 code.
-Automatically switches to GADM if admin_level > 1.

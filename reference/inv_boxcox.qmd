@@ -1,7 +1,0 @@
-# inv_boxcox { #wass2s.inv_boxcox }
-
-```python
-inv_boxcox(y, lmbda)
-```
-
-Inverse Box-Cox transformation.

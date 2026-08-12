@@ -1,7 +1,0 @@
-# plot_det_forecasts { #wass2s.plot_det_forecasts }
-
-```python
-plot_det_forecasts(da2d, title, outpng=None)
-```
-
-Plot a 2D field (Y, X) on a PlateCarree map.

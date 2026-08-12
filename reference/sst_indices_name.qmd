@@ -1,4 +1,0 @@
-# sst_indices_name { #wass2s.sst_indices_name }
-
-`sst_indices_name`
-

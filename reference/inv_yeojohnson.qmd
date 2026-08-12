@@ -1,7 +1,0 @@
-# inv_yeojohnson { #wass2s.inv_yeojohnson }
-
-```python
-inv_yeojohnson(y, lmbda)
-```
-
-Inverse Yeo-Johnson transformation.
