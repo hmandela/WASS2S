@@ -71,11 +71,19 @@ ceac_agro
 __version__ = "0.4.8.5"
 
 # Backward-compatibility shim: scipy removed scipy.interp in 1.14.
+# Backward-compatibility shim: scipy removed scipy.interp in 1.14.
+
 import numpy as _np
 import scipy as _scipy
+
 if not hasattr(_scipy, "interp"):
     _scipy.interp = _np.interp
 
+# Preload netCDF4 before importing other WASS2S modules.
+# This avoids Windows DLL conflicts at from wass2s import *
+import netCDF4 as _netCDF4
+
+# Loading WASS2S modules
 from wass2s.was_verification import *
 from wass2s.was_analog import *
 from wass2s.was_cca import *
