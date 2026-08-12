@@ -5,5 +5,5 @@ __pycache__/
 /.quarto/
 **/*.quarto_ipynb
 /.claude/
-reference/*.qmd
+reference/
 *.qmd
