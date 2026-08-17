@@ -340,6 +340,29 @@ def _download_ersstv6_monthly_sst(
 # Variable configuration
 # ---------------------------------------------------------------------------
 
+from matplotlib.colors import ListedColormap
+from matplotlib.colors import BoundaryNorm
+
+NOAA_SST_CMAP = ListedColormap([
+    "#2b0080",  # < -3.5
+    "#0000b3",
+    "#0033ff",
+    "#3366ff",
+    "#6699ff",
+    "#99bbff",
+    "#ccdfff",  # -1 to -0.5
+    "#ffffff",  # -0.5 to +0.5
+    "#ffff66",  # 0.5 to 1
+    "#ffd24d",
+    "#ffad33",
+    "#ff7a1a",
+    "#ff3b0d",
+    "#d90000",
+    "#990000",
+])
+
+
+
 VAR_CONFIG = {
     "sst": {
         "cds_name": "sea_surface_temperature",
@@ -347,8 +370,8 @@ VAR_CONFIG = {
         "unit_func": lambda x: x - 273.15,
         "unit_label": "°C",
         "plot_type": "anomaly_only",
-        "cmap": "RdBu_r",
-        "levels": np.arange(-3.0, 3.5, 0.5),
+        "cmap": NOAA_SST_CMAP,
+        "levels": [-4, -3.5, -3, -2.5, -2, -1.5, -1, -0.5, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4],
         "extent": [40, -180, -40, 180],
         "compute_seasonal": True,
     },
@@ -876,10 +899,23 @@ def plot_maps(data_main, data_overlay, var_key, title_prefix="Monthly"):
 
         if conf["plot_type"] == "anomaly_only":
             val = data_main.isel(time=i)
-            last_cf = ax.contourf(val.longitude, val.latitude, val,
-                                  levels=conf["levels"], cmap=conf["cmap"],
-                                  extend="both", transform=ccrs.PlateCarree())
-
+            levels = np.asarray(conf["levels"], dtype=float)
+            cmap = conf["cmap"]
+            norm = mcolors.BoundaryNorm(
+                boundaries=levels,
+                ncolors=cmap.N,
+                clip=False,
+            )
+            last_cf = ax.contourf(
+                val.longitude,
+                val.latitude,
+                val,
+                levels=levels,
+                cmap=cmap,
+                norm=norm,
+                extend="both",
+                transform=ccrs.PlateCarree(),
+            )
         elif conf["plot_type"] == "contour_overlay":
             val_anom = data_main.isel(time=i)
             last_cf = ax.contourf(val_anom.longitude, val_anom.latitude, val_anom,
@@ -935,10 +971,29 @@ def plot_maps(data_main, data_overlay, var_key, title_prefix="Monthly"):
             cbar_label_text = f"Anomalie ({conf['unit_label']})"
         else:
             cbar_label_text = conf["unit_label"]
-        cbar_ax = fig.add_axes([0.96, 0.15, 0.02, 0.7])
-        cbar = fig.colorbar(last_cf, cax=cbar_ax, orientation="vertical")
-        cbar.set_label(cbar_label_text, fontsize=14, fontweight="bold")
+        cbar_ax = fig.add_axes([0.955, 0.18, 0.012, 0.62])
+        if conf["plot_type"] == "anomaly_only":
+            ticks = [-3.5, -3, -2.5, -2, -1.5, -1, -0.5, 0.5, 1, 1.5, 2, 2.5, 3, 3.5]
+        else:
+            ticks = None
+    
+        cbar = fig.colorbar(
+            last_cf,
+            cax=cbar_ax,
+            orientation="vertical",
+            ticks=ticks,
+        )
+    
+        cbar.set_label(
+            cbar_label_text,
+            fontsize=14,
+            fontweight="bold",
+        )
+    
         cbar.ax.tick_params(labelsize=12)
+        # cbar = fig.colorbar(last_cf, cax=cbar_ax, orientation="vertical")
+        # cbar.set_label(cbar_label_text, fontsize=14, fontweight="bold")
+        # cbar.ax.tick_params(labelsize=12)
 
     plt.show()
 

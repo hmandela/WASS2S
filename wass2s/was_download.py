@@ -1502,453 +1502,927 @@ class WAS_Download:
             else:
                 print(f"Skipping save for {var} due to incomplete year downloads.")
 
+
     def WAS_Download_Models_Daily(
-        self,
-        dir_to_save,
-        center_variable,
-        month_of_initialization,
-        day_of_initialization,
-        leadtime_hour,
-        year_start_hindcast,
-        year_end_hindcast,
-        area,
-        year_forecast=None,
-        ensemble_mean=None,
-        force_download=False,
-        data_format="netcdf",
-        output_layout="valid_time",
-        runoff_units="m3/s",
-    ):
-        """
-        Download daily seasonal hindcast/forecast data from CDS seasonal-original
-        datasets and save a clean WAS-style NetCDF.
+            self,
+            dir_to_save,
+            center_variable,
+            month_of_initialization,
+            day_of_initialization,
+            leadtime_hour,
+            year_start_hindcast,
+            year_end_hindcast,
+            area,
+            year_forecast=None,
+            ensemble_mean=None,
+            force_download=False,
+            data_format="netcdf",
+            output_layout="valid_time",
+            runoff_units="m3/s",
+        ):
+            """
+            Download daily seasonal hindcast/forecast data from CDS seasonal-original
+            datasets.
     
-        Output conventions:
-            output_layout="valid_time":
-                T, Y, X when ensemble_mean is "mean" or "median"
-                T, M, Y, X when members are kept
+            Output conventions:
+                output_layout="valid_time":
+                    T, Y, X when ensemble_mean is "mean" or "median"
+                    T, M, Y, X when members are kept
     
-            output_layout="init_leadtime":
-                member, T, leadtime, level, Y, X
+                output_layout="init_leadtime":
+                    member, T, leadtime, level, Y, X
     
-        Notes:
-            - In "valid_time" layout, T is the valid forecast date.
-            - In "init_leadtime" layout, T is the initialization date/year.
-            - Accumulated variables are deaccumulated along leadtime.
-            - RUNOFF can be saved as "mm" or "m3/s".
-        """
-        from calendar import month_abbr
-        from pathlib import Path
-        import gc
-        import os
-        import time as _time
+            Notes:
+                - In "valid_time" layout, T is the valid forecast date.
+                - In "init_leadtime" layout, T is the initialization date/year.
+                - Accumulated variables are deaccumulated along leadtime.
+                - RUNOFF can be saved as "mm" or "m3/s".
+                - Works for both data_format="netcdf" and data_format="grib".
+                  CDS NetCDF exposes the initialization time as
+                  "forecast_reference_time"/"indexing_time"; cfgrib on GRIB1
+                  (DWD, etc.) exposes it as a scalar coord named "time". Both are
+                  normalized to a proper "T" dimension here.
+            """
+            from calendar import month_abbr
+            from pathlib import Path
+            import gc
+            import os
+            import time as _time
     
-        import cdsapi
-        import numpy as np
-        import xarray as xr
+            import cdsapi
+            import numpy as np
+            import xarray as xr
     
-        if isinstance(center_variable, str):
-            raise TypeError(
-                "center_variable must be a list, for example "
-                "['ECMWF_51.RUNOFF'] or ['ECMWF_51.RUNOFF', 'UKMO_604.RUNOFF']."
-            )
-        center_variable = list(center_variable)
-    
-        if isinstance(leadtime_hour, (str, int, np.integer)):
-            leadtime_hour = [str(leadtime_hour)]
-        else:
-            leadtime_hour = [str(lt) for lt in leadtime_hour]
-    
-        if ensemble_mean not in [None, "mean", "median"]:
-            raise ValueError("ensemble_mean must be None, 'mean', or 'median'.")
-    
-        if output_layout not in ["valid_time", "init_leadtime"]:
-            raise ValueError("output_layout must be 'valid_time' or 'init_leadtime'.")
-    
-        if runoff_units not in ["mm", "m3/s"]:
-            raise ValueError("runoff_units must be 'mm' or 'm3/s'.")
-    
-        if year_forecast is None:
-            years = [str(y) for y in range(year_start_hindcast, year_end_hindcast + 1)]
-            file_prefix = "hindcast"
-        else:
-            years = [str(year_forecast)]
-            file_prefix = "forecast"
-    
-        centre = {
-            "BOM_2": "bom",
-            "ECMWF_51": "ecmwf",
-            "UKMO_603": "ukmo",
-            "UKMO_604": "ukmo",
-            "UKMO_605": "ukmo",
-            "UKMO_610": "ukmo",
-            "METEOFRANCE_8": "meteo_france",
-            "METEOFRANCE_9": "meteo_france",
-            "DWD_21": "dwd",
-            "DWD_22": "dwd",
-            "CMCC_35": "cmcc",
-            "CMCC_4": "cmcc",
-            "NCEP_2": "ncep",
-            "JMA_3": "jma",
-            "JMA_4": "jma",
-            "ECCC_4": "eccc",
-            "ECCC_5": "eccc",
-        }
-    
-        system = {
-            "BOM_2": "2",
-            "ECMWF_51": "51",
-            "UKMO_603": "603",
-            "UKMO_604": "604",
-            "UKMO_605": "605",
-            "UKMO_610": "610",
-            "METEOFRANCE_8": "8",
-            "METEOFRANCE_9": "9",
-            "DWD_21": "21",
-            "DWD_22": "22",
-            "CMCC_35": "35",
-            "CMCC_4": "4",
-            "NCEP_2": "2",
-            "JMA_3": "3",
-            "JMA_4": "4",
-            "ECCC_4": "4",
-            "ECCC_5": "5",
-        }
-    
-        variables_1 = {
-            "PRCP": "total_precipitation",
-            "TEMP": "2m_temperature",
-            "TDEW": "2m_dewpoint_temperature",
-            "TMAX": "maximum_2m_temperature_in_the_last_24_hours",
-            "TMIN": "minimum_2m_temperature_in_the_last_24_hours",
-            "UGRD10": "10m_u_component_of_wind",
-            "VGRD10": "10m_v_component_of_wind",
-            "SST": "sea_surface_temperature",
-            "SLP": "mean_sea_level_pressure",
-            "DSWR": "surface_solar_radiation_downwards",
-            "DLWR": "surface_thermal_radiation_downwards",
-            "NOLR": "top_net_thermal_radiation",
-            "SRUNOFF": "surface_runoff",
-            "RUNOFF": "runoff",
-        }
-    
-        variables_2 = {
-            "HUSS_1000": "specific_humidity",
-            "HUSS_925": "specific_humidity",
-            "HUSS_850": "specific_humidity",
-            "UGRD_1000": "u_component_of_wind",
-            "UGRD_925": "u_component_of_wind",
-            "UGRD_850": "u_component_of_wind",
-            "UGRD_700": "u_component_of_wind",
-            "UGRD_200": "u_component_of_wind",
-            "VGRD_1000": "v_component_of_wind",
-            "VGRD_925": "v_component_of_wind",
-            "VGRD_850": "v_component_of_wind",
-            "VGRD_700": "v_component_of_wind",
-            "VGRD_200": "v_component_of_wind",
-        }
-    
-        init_day_dict_jma = {
-            "01": 16, "02": 10, "03": 12, "04": 11, "05": 16, "06": 15,
-            "07": 15, "08": 14, "09": 13, "10": 13, "11": 12, "12": 12,
-        }
-        init_day_dict_ncep = {
-            "01": 1, "02": 5, "03": 2, "04": 1, "05": 1, "06": 5,
-            "07": 5, "08": 4, "09": 3, "10": 3, "11": 2, "12": 2,
-        }
-    
-        def _open_download(path, fmt):
-            if fmt == "grib":
-                return xr.open_dataset(
-                    path,
-                    engine="cfgrib",
-                    backend_kwargs={"indexpath": ""},
+            if isinstance(center_variable, str):
+                raise TypeError(
+                    "center_variable must be a list, for example "
+                    "['ECMWF_51.RUNOFF'] or ['ECMWF_51.RUNOFF', 'UKMO_604.RUNOFF']."
                 )
-            return xr.open_dataset(path)
+            center_variable = list(center_variable)
     
-        def _normalize_cds_dataset(ds):
-            rename_map = {}
-    
-            if "number" in ds.dims or "number" in ds.coords:
-                rename_map["number"] = "member"
-            if "longitude" in ds.dims or "longitude" in ds.coords:
-                rename_map["longitude"] = "X"
-            if "latitude" in ds.dims or "latitude" in ds.coords:
-                rename_map["latitude"] = "Y"
-            if "forecast_period" in ds.dims or "forecast_period" in ds.coords:
-                rename_map["forecast_period"] = "leadtime"
-            if "step" in ds.dims or "step" in ds.coords:
-                rename_map["step"] = "leadtime"
-            if "forecast_reference_time" in ds.dims:
-                rename_map["forecast_reference_time"] = "T"
-            elif "indexing_time" in ds.dims:
-                rename_map["indexing_time"] = "T"
-            elif "time" in ds.dims and ("forecast_period" in ds.dims or "step" in ds.dims):
-                rename_map["time"] = "T"
-            if "isobaricInhPa" in ds.dims or "isobaricInhPa" in ds.coords:
-                rename_map["isobaricInhPa"] = "level"
-            if "pressure_level" in ds.dims or "pressure_level" in ds.coords:
-                rename_map["pressure_level"] = "level"
-    
-            ds = ds.rename({k: v for k, v in rename_map.items() if k in ds})
-    
-            if "T" not in ds.dims:
-                if "forecast_reference_time" in ds.coords:
-                    ds = ds.expand_dims(T=np.atleast_1d(ds["forecast_reference_time"].values))
-                    ds = ds.drop_vars("forecast_reference_time", errors="ignore")
-                elif "indexing_time" in ds.coords:
-                    ds = ds.expand_dims(T=np.atleast_1d(ds["indexing_time"].values))
-                    ds = ds.drop_vars("indexing_time", errors="ignore")
-    
-            if "valid_time" not in ds.coords and "T" in ds.coords and "leadtime" in ds.coords:
-                ds = ds.assign_coords(valid_time=ds["T"] + ds["leadtime"])
-    
-            drop_vars = [
-                "surface",
-                "heightAboveGround",
-                "meanSea",
-                "entireAtmosphere",
-            ]
-            ds = ds.drop_vars([name for name in drop_vars if name in ds.variables], errors="ignore")
-    
-            if "Y" in ds.coords:
-                ds = ds.sortby("Y")
-    
-            preferred = ["member", "T", "leadtime", "level", "Y", "X"]
-            for name in list(ds.data_vars):
-                dims = [dim for dim in preferred if dim in ds[name].dims]
-                dims += [dim for dim in ds[name].dims if dim not in dims]
-                ds[name] = ds[name].transpose(*dims)
-    
-            return ds
-    
-        def _deaccumulate(ds, dim="leadtime"):
-            if dim not in ds.dims:
-                return ds
-            first = ds.isel({dim: slice(0, 1)})
-            diff = ds.diff(dim)
-            out = xr.concat([first, diff], dim=dim)
-            out = out.assign_coords({dim: ds[dim]})
-            return out.where(out >= 0, 0)
-    
-        def _grid_cell_area_m2(ds):
-            if "Y" not in ds.coords or "X" not in ds.coords:
-                raise ValueError("RUNOFF conversion to m3/s needs X and Y coordinates.")
-            if ds.sizes.get("Y", 0) < 2 or ds.sizes.get("X", 0) < 2:
-                raise ValueError("RUNOFF conversion to m3/s needs at least two X and Y points.")
-    
-            radius = 6371000.0
-            dlat = np.deg2rad(float(abs(ds["Y"].diff("Y").median())))
-            dlon = np.deg2rad(float(abs(ds["X"].diff("X").median())))
-            area_y = (radius ** 2) * dlat * dlon * np.cos(np.deg2rad(ds["Y"]))
-            area_y.attrs["units"] = "m2"
-            return area_y
-    
-        def _leadtime_interval_seconds(ds):
-            if "leadtime" not in ds.coords:
-                raise ValueError("RUNOFF conversion to m3/s needs leadtime coordinates.")
-    
-            lead = ds["leadtime"]
-            if np.issubdtype(lead.dtype, np.timedelta64):
-                lead_seconds = (lead / np.timedelta64(1, "s")).astype(float)
+            if isinstance(leadtime_hour, (str, int, np.integer)):
+                leadtime_hour = [str(leadtime_hour)]
             else:
-                # CDS leadtime_hour requests are in hours when decoded as numeric values.
-                lead_seconds = lead.astype(float) * 3600.0
+                leadtime_hour = [str(lt) for lt in leadtime_hour]
     
-            first = lead_seconds.isel(leadtime=slice(0, 1))
-            diff = lead_seconds.diff("leadtime")
-            seconds = xr.concat([first, diff], dim="leadtime")
-            seconds = seconds.assign_coords(leadtime=lead)
-            return seconds.where(seconds > 0)
+            if ensemble_mean not in [None, "mean", "median"]:
+                raise ValueError("ensemble_mean must be None, 'mean', or 'median'.")
     
-        def _apply_units(ds, var_code):
-            if var_code in ["TMIN", "TEMP", "TMAX", "SST", "TDEW"]:
-                ds = ds - 273.15
-                for name in ds.data_vars:
-                    ds[name].attrs["units"] = "degC"
+            if output_layout not in ["valid_time", "init_leadtime"]:
+                raise ValueError("output_layout must be 'valid_time' or 'init_leadtime'.")
     
-            elif var_code == "SLP":
-                ds = ds / 100.0
-                for name in ds.data_vars:
-                    ds[name].attrs["units"] = "hPa"
+            if runoff_units not in ["mm", "m3/s"]:
+                raise ValueError("runoff_units must be 'mm' or 'm3/s'.")
     
-            elif var_code == "PRCP":
-                ds = _deaccumulate(ds) * 1000.0
-                for name in ds.data_vars:
-                    ds[name].attrs["units"] = "mm"
+            if year_forecast is None:
+                years = [str(y) for y in range(year_start_hindcast, year_end_hindcast + 1)]
+                file_prefix = "hindcast"
+            else:
+                years = [str(year_forecast)]
+                file_prefix = "forecast"
     
-            elif var_code in ["SRUNOFF", "RUNOFF"]:
-                ds = _deaccumulate(ds)
-                if runoff_units == "mm":
-                    ds = ds * 1000.0
-                    for name in ds.data_vars:
-                        ds[name].attrs["units"] = "mm"
-                else:
-                    cell_area = _grid_cell_area_m2(ds)
-                    interval_seconds = _leadtime_interval_seconds(ds)
-                    ds = (ds * cell_area) / interval_seconds
-                    for name in ds.data_vars:
-                        ds[name].attrs["units"] = "m3 s-1"
+            centre = {
+                "BOM_2": "bom",
+                "ECMWF_51": "ecmwf",
+                "UKMO_603": "ukmo",
+                "UKMO_604": "ukmo",
+                "UKMO_605": "ukmo",
+                "UKMO_610": "ukmo",
+                "METEOFRANCE_8": "meteo_france",
+                "METEOFRANCE_9": "meteo_france",
+                "DWD_21": "dwd",
+                "DWD_22": "dwd",
+                "CMCC_35": "cmcc",
+                "CMCC_4": "cmcc",
+                "NCEP_2": "ncep",
+                "JMA_3": "jma",
+                "JMA_4": "jma",
+                "ECCC_4": "eccc",
+                "ECCC_5": "eccc",
+            }
     
-            elif var_code in ["DSWR", "DLWR", "NOLR"]:
-                ds = _deaccumulate(ds) / 86400.0
-                for name in ds.data_vars:
-                    ds[name].attrs["units"] = "W m-2"
+            system = {
+                "BOM_2": "2",
+                "ECMWF_51": "51",
+                "UKMO_603": "603",
+                "UKMO_604": "604",
+                "UKMO_605": "605",
+                "UKMO_610": "610",
+                "METEOFRANCE_8": "8",
+                "METEOFRANCE_9": "9",
+                "DWD_21": "21",
+                "DWD_22": "22",
+                "CMCC_35": "35",
+                "CMCC_4": "4",
+                "NCEP_2": "2",
+                "JMA_3": "3",
+                "JMA_4": "4",
+                "ECCC_4": "4",
+                "ECCC_5": "5",
+            }
     
-            return ds
+            variables_1 = {
+                "PRCP": "total_precipitation",
+                "TEMP": "2m_temperature",
+                "TDEW": "2m_dewpoint_temperature",
+                "TMAX": "maximum_2m_temperature_in_the_last_24_hours",
+                "TMIN": "minimum_2m_temperature_in_the_last_24_hours",
+                "UGRD10": "10m_u_component_of_wind",
+                "VGRD10": "10m_v_component_of_wind",
+                "SST": "sea_surface_temperature",
+                "SLP": "mean_sea_level_pressure",
+                "DSWR": "surface_solar_radiation_downwards",
+                "DLWR": "surface_thermal_radiation_downwards",
+                "NOLR": "top_net_thermal_radiation",
+                "SRUNOFF": "surface_runoff",
+                "RUNOFF": "runoff",
+            }
     
-        def _rearrange_to_valid_time(ds):
-            if "T" in ds.dims and "leadtime" in ds.dims:
-                if "valid_time" not in ds.coords:
+            variables_2 = {
+                "HUSS_1000": "specific_humidity",
+                "HUSS_925": "specific_humidity",
+                "HUSS_850": "specific_humidity",
+                "UGRD_1000": "u_component_of_wind",
+                "UGRD_925": "u_component_of_wind",
+                "UGRD_850": "u_component_of_wind",
+                "UGRD_700": "u_component_of_wind",
+                "UGRD_200": "u_component_of_wind",
+                "VGRD_1000": "v_component_of_wind",
+                "VGRD_925": "v_component_of_wind",
+                "VGRD_850": "v_component_of_wind",
+                "VGRD_700": "v_component_of_wind",
+                "VGRD_200": "v_component_of_wind",
+            }
+    
+            init_day_dict_jma = {
+                "01": 16, "02": 10, "03": 12, "04": 11, "05": 16, "06": 15,
+                "07": 15, "08": 14, "09": 13, "10": 13, "11": 12, "12": 12,
+            }
+            init_day_dict_ncep = {
+                "01": 1, "02": 5, "03": 2, "04": 1, "05": 1, "06": 5,
+                "07": 5, "08": 4, "09": 3, "10": 3, "11": 2, "12": 2,
+            }
+    
+            def _open_download(path, fmt):
+                if fmt == "grib":
+                    return xr.open_dataset(
+                        path,
+                        engine="cfgrib",
+                        backend_kwargs={"indexpath": ""},
+                    )
+                return xr.open_dataset(path)
+    
+            def _normalize_cds_dataset(ds):
+                rename_map = {}
+    
+                if "number" in ds.dims or "number" in ds.coords:
+                    rename_map["number"] = "member"
+                if "longitude" in ds.dims or "longitude" in ds.coords:
+                    rename_map["longitude"] = "X"
+                if "latitude" in ds.dims or "latitude" in ds.coords:
+                    rename_map["latitude"] = "Y"
+                if "forecast_period" in ds.dims or "forecast_period" in ds.coords:
+                    rename_map["forecast_period"] = "leadtime"
+                if "step" in ds.dims or "step" in ds.coords:
+                    rename_map["step"] = "leadtime"
+    
+                # --- Initialization / reference-time coordinate ---------------------
+                # CDS NetCDF names it "forecast_reference_time" or "indexing_time"
+                # (dim or scalar coord). cfgrib on GRIB1 (DWD, etc.) instead exposes
+                # it as a SCALAR coord literally named "time" (standard_name =
+                # forecast_reference_time), which the dim-only checks would miss ->
+                # "T" would never be built and the valid_time layout would collapse.
+                # We resolve whichever of these is present to "T".
+                ref_name = None
+                for cand in ("forecast_reference_time", "indexing_time"):
+                    if cand in ds.dims or cand in ds.coords:
+                        ref_name = cand
+                        break
+                if ref_name is None and ("time" in ds.coords or "time" in ds.dims):
+                    t = ds["time"] if "time" in ds.variables else None
+                    looks_like_ref = (
+                        (t is not None and t.attrs.get("standard_name") == "forecast_reference_time")
+                        or "step" in ds.dims
+                        or "forecast_period" in ds.dims
+                        or "step" in rename_map
+                        or "forecast_period" in rename_map
+                    )
+                    if looks_like_ref:
+                        ref_name = "time"
+                if ref_name is not None:
+                    rename_map[ref_name] = "T"
+    
+                if "isobaricInhPa" in ds.dims or "isobaricInhPa" in ds.coords:
+                    rename_map["isobaricInhPa"] = "level"
+                if "pressure_level" in ds.dims or "pressure_level" in ds.coords:
+                    rename_map["pressure_level"] = "level"
+    
+                ds = ds.rename({k: v for k, v in rename_map.items() if k in ds})
+    
+                # Promote a scalar T coord to a length-1 dimension so downstream
+                # `"T" in ds.dims` guards (e.g. _rearrange_to_valid_time) pass. This
+                # covers forecast_reference_time, indexing_time and the GRIB1 "time"
+                # case in one line, using the existing datetime value.
+                if "T" in ds.coords and "T" not in ds.dims:
+                    ds = ds.expand_dims("T")
+    
+                if "valid_time" not in ds.coords and "T" in ds.coords and "leadtime" in ds.coords:
                     ds = ds.assign_coords(valid_time=ds["T"] + ds["leadtime"])
     
-                ds = ds.stack(_sample=("T", "leadtime"))
-                ds = ds.reset_index("_sample")
+                drop_vars = [
+                    "surface",
+                    "heightAboveGround",
+                    "meanSea",
+                    "entireAtmosphere",
+                ]
+                ds = ds.drop_vars([name for name in drop_vars if name in ds.variables], errors="ignore")
     
-                valid_time = ds["valid_time"].values
-                if "T" in ds.coords:
-                    ds = ds.rename({"T": "init_time"})
+                if "Y" in ds.coords:
+                    ds = ds.sortby("Y")
     
-                ds = ds.assign_coords(T=("_sample", valid_time))
-                ds = ds.swap_dims({"_sample": "T"})
-                ds = ds.drop_vars("_sample", errors="ignore")
-                ds = ds.sortby("T")
+                preferred = ["member", "T", "leadtime", "level", "Y", "X"]
+                for name in list(ds.data_vars):
+                    dims = [dim for dim in preferred if dim in ds[name].dims]
+                    dims += [dim for dim in ds[name].dims if dim not in dims]
+                    ds[name] = ds[name].transpose(*dims)
     
-            ds = ds.drop_vars(["valid_time", "init_time", "leadtime"], errors="ignore")
+                return ds
     
-            if "member" in ds.dims:
-                ds = ds.rename({"member": "M"})
+            def _deaccumulate(ds, dim="leadtime"):
+                if dim not in ds.dims:
+                    return ds
+                first = ds.isel({dim: slice(0, 1)})
+                diff = ds.diff(dim)
+                out = xr.concat([first, diff], dim=dim)
+                out = out.assign_coords({dim: ds[dim]})
+                return out.where(out >= 0, 0)
     
-            for name in list(ds.data_vars):
-                if "M" in ds[name].dims:
-                    preferred = ["M", "T", "level", "Y", "X"]
+            def _grid_cell_area_m2(ds):
+                if "Y" not in ds.coords or "X" not in ds.coords:
+                    raise ValueError("RUNOFF conversion to m3/s needs X and Y coordinates.")
+                if ds.sizes.get("Y", 0) < 2 or ds.sizes.get("X", 0) < 2:
+                    raise ValueError("RUNOFF conversion to m3/s needs at least two X and Y points.")
+    
+                radius = 6371000.0
+                dlat = np.deg2rad(float(abs(ds["Y"].diff("Y").median())))
+                dlon = np.deg2rad(float(abs(ds["X"].diff("X").median())))
+                area_y = (radius ** 2) * dlat * dlon * np.cos(np.deg2rad(ds["Y"]))
+                area_y.attrs["units"] = "m2"
+                return area_y
+    
+            def _leadtime_interval_seconds(ds):
+                if "leadtime" not in ds.coords:
+                    raise ValueError("RUNOFF conversion to m3/s needs leadtime coordinates.")
+    
+                lead = ds["leadtime"]
+                if np.issubdtype(lead.dtype, np.timedelta64):
+                    lead_seconds = (lead / np.timedelta64(1, "s")).astype(float)
                 else:
-                    preferred = ["T", "level", "Y", "X"]
-                dims = [dim for dim in preferred if dim in ds[name].dims]
-                dims += [dim for dim in ds[name].dims if dim not in dims]
-                ds[name] = ds[name].transpose(*dims)
+                    # CDS leadtime_hour requests are in hours when decoded as numeric values.
+                    lead_seconds = lead.astype(float) * 3600.0
     
-            return ds
+                first = lead_seconds.isel(leadtime=slice(0, 1))
+                diff = lead_seconds.diff("leadtime")
+                seconds = xr.concat([first, diff], dim="leadtime")
+                seconds = seconds.assign_coords(leadtime=lead)
+                return seconds.where(seconds > 0)
     
-        dir_to_save = Path(dir_to_save)
-        dir_to_save.mkdir(parents=True, exist_ok=True)
+            def _apply_units(ds, var_code):
+                if var_code in ["TMIN", "TEMP", "TMAX", "SST", "TDEW"]:
+                    ds = ds - 273.15
+                    for name in ds.data_vars:
+                        ds[name].attrs["units"] = "degC"
     
-        month_key = f"{int(month_of_initialization):02}"
-        abb_month_ini = month_abbr[int(month_of_initialization)]
-        years_str = f"{years[0]}_{years[-1]}" if len(years) > 1 else years[0]
-        lead_str = f"{leadtime_hour[0]}-{leadtime_hour[-1]}" if len(leadtime_hour) > 1 else leadtime_hour[0]
+                elif var_code == "SLP":
+                    ds = ds / 100.0
+                    for name in ds.data_vars:
+                        ds[name].attrs["units"] = "hPa"
     
-        store_file_path = {}
-        client = cdsapi.Client()
+                elif var_code == "PRCP":
+                    ds = _deaccumulate(ds) * 1000.0
+                    for name in ds.data_vars:
+                        ds[name].attrs["units"] = "mm"
     
-        for cv in center_variable:
-            try:
-                c, v = cv.split(".", 1)
-                if c not in centre:
-                    raise ValueError(f"Unknown centre/system code: {c}")
-                if v not in variables_1 and v not in variables_2:
-                    raise ValueError(f"Unknown variable code: {v}")
+                elif var_code in ["SRUNOFF", "RUNOFF"]:
+                    ds = _deaccumulate(ds)
+                    if runoff_units == "mm":
+                        ds = ds * 1000.0
+                        for name in ds.data_vars:
+                            ds[name].attrs["units"] = "mm"
+                    else:
+                        cell_area = _grid_cell_area_m2(ds)
+                        interval_seconds = _leadtime_interval_seconds(ds)
+                        ds = (ds * cell_area) / interval_seconds
+                        for name in ds.data_vars:
+                            ds[name].attrs["units"] = "m3 s-1"
     
-                cent = centre[c]
-                syst = system[c]
+                elif var_code in ["DSWR", "DLWR", "NOLR"]:
+                    ds = _deaccumulate(ds) / 86400.0
+                    for name in ds.data_vars:
+                        ds[name].attrs["units"] = "W m-2"
     
-                request_day = int(day_of_initialization)
-                if year_forecast is None and cent == "jma":
-                    request_day = init_day_dict_jma[month_key]
-                elif year_forecast is None and cent == "ncep":
-                    request_day = init_day_dict_ncep[month_key]
+                return ds
     
-                day_key = f"{int(request_day):02}"
-                unit_tag = "_m3s" if v in ["RUNOFF", "SRUNOFF"] and runoff_units == "m3/s" else ""
-                output_file = (
-                    dir_to_save
-                    / f"{file_prefix}_{cent}{syst}_{v}_{abb_month_ini}{day_key}_{years_str}_{lead_str}{unit_tag}.nc"
-                )
+            def _rearrange_to_valid_time(ds):
+                if "T" in ds.dims and "leadtime" in ds.dims:
+                    if "valid_time" not in ds.coords:
+                        ds = ds.assign_coords(valid_time=ds["T"] + ds["leadtime"])
     
-                if output_file.exists() and not force_download:
-                    print(f"{output_file} already exists. Skipping download.")
+                    ds = ds.stack(_sample=("T", "leadtime"))
+                    ds = ds.reset_index("_sample")
+    
+                    valid_time = ds["valid_time"].values
+                    if "T" in ds.coords:
+                        ds = ds.rename({"T": "init_time"})
+    
+                    ds = ds.assign_coords(T=("_sample", valid_time))
+                    ds = ds.swap_dims({"_sample": "T"})
+                    ds = ds.drop_vars("_sample", errors="ignore")
+                    ds = ds.sortby("T")
+    
+                ds = ds.drop_vars(["valid_time", "init_time", "leadtime"], errors="ignore")
+    
+                if "member" in ds.dims:
+                    ds = ds.rename({"member": "M"})
+    
+                for name in list(ds.data_vars):
+                    if "M" in ds[name].dims:
+                        preferred = ["M", "T", "level", "Y", "X"]
+                    else:
+                        preferred = ["T", "level", "Y", "X"]
+                    dims = [dim for dim in preferred if dim in ds[name].dims]
+                    dims += [dim for dim in ds[name].dims if dim not in dims]
+                    ds[name] = ds[name].transpose(*dims)
+    
+                return ds
+    
+            dir_to_save = Path(dir_to_save)
+            dir_to_save.mkdir(parents=True, exist_ok=True)
+    
+            month_key = f"{int(month_of_initialization):02}"
+            abb_month_ini = month_abbr[int(month_of_initialization)]
+            years_str = f"{years[0]}_{years[-1]}" if len(years) > 1 else years[0]
+            lead_str = f"{leadtime_hour[0]}-{leadtime_hour[-1]}" if len(leadtime_hour) > 1 else leadtime_hour[0]
+    
+            store_file_path = {}
+            client = cdsapi.Client()
+    
+            for cv in center_variable:
+                try:
+                    c, v = cv.split(".", 1)
+                    if c not in centre:
+                        raise ValueError(f"Unknown centre/system code: {c}")
+                    if v not in variables_1 and v not in variables_2:
+                        raise ValueError(f"Unknown variable code: {v}")
+    
+                    cent = centre[c]
+                    syst = system[c]
+    
+                    request_day = int(day_of_initialization)
+                    if year_forecast is None and cent == "jma":
+                        request_day = init_day_dict_jma[month_key]
+                    elif year_forecast is None and cent == "ncep":
+                        request_day = init_day_dict_ncep[month_key]
+    
+                    day_key = f"{int(request_day):02}"
+                    unit_tag = "_m3s" if v in ["RUNOFF", "SRUNOFF"] and runoff_units == "m3/s" else ""
+                    output_file = (
+                        dir_to_save
+                        / f"{file_prefix}_{cent}{syst}_{v}_{abb_month_ini}{day_key}_{years_str}_{lead_str}{unit_tag}.nc"
+                    )
+    
+                    if output_file.exists() and not force_download:
+                        print(f"{output_file} already exists. Skipping download.")
+                        store_file_path[cv] = output_file
+                        continue
+    
+                    fmt = data_format.lower()
+                    if fmt not in ["netcdf", "grib"]:
+                        raise ValueError("data_format must be 'netcdf' or 'grib'.")
+    
+                    suffix = "grib" if fmt == "grib" else "nc"
+                    temp_file = dir_to_save / f"temp_{cent}{syst}_{v}.{suffix}"
+    
+                    if v in variables_2:
+                        dataset = "seasonal-original-pressure-levels"
+                        pressure_level = v.rsplit("_", 1)[1]
+                        request = {
+                            "originating_centre": cent,
+                            "system": syst,
+                            "variable": [variables_2[v]],
+                            "pressure_level": [pressure_level],
+                            "year": years,
+                            "month": [month_key],
+                            "day": [day_key],
+                            "leadtime_hour": [str(lt) for lt in leadtime_hour],
+                            "data_format": fmt,
+                            "area": area,
+                        }
+                    else:
+                        dataset = "seasonal-original-single-levels"
+                        request = {
+                            "originating_centre": cent,
+                            "system": syst,
+                            "variable": [variables_1[v]],
+                            "year": years,
+                            "month": [month_key],
+                            "day": [day_key],
+                            "leadtime_hour": [str(lt) for lt in leadtime_hour],
+                            "data_format": fmt,
+                            "area": area,
+                        }
+    
+                    print(f"Requesting data from '{dataset}' for {cv}...")
+                    client.retrieve(dataset, request).download(str(temp_file))
+                    print(f"Downloaded: {temp_file}")
+    
+                    ds = _open_download(temp_file, fmt)
+                    ds = _normalize_cds_dataset(ds)
+    
+                    if ensemble_mean in ["mean", "median"] and "member" in ds.dims:
+                        ds = getattr(ds, ensemble_mean)(dim="member")
+    
+                    ds = _apply_units(ds, v)
+                    if output_layout == "valid_time":
+                        ds = _rearrange_to_valid_time(ds)
+    
+                    ds.attrs["source_dataset"] = dataset
+                    ds.attrs["originating_centre"] = cent
+                    ds.attrs["system"] = syst
+                    ds.attrs["variable_code"] = v
+                    ds.attrs["download_format"] = fmt
+                    ds.attrs["output_layout"] = output_layout
+                    if v in ["RUNOFF", "SRUNOFF"]:
+                        ds.attrs["runoff_units"] = runoff_units
+    
+                    encoding = {name: {"zlib": True, "complevel": 4} for name in ds.data_vars}
+                    ds.to_netcdf(output_file, encoding=encoding)
+                    print(f"Saved processed data to: {output_file}")
+    
+                    ds.close()
                     store_file_path[cv] = output_file
-                    continue
     
-                fmt = data_format.lower()
-                if fmt not in ["netcdf", "grib"]:
-                    raise ValueError("data_format must be 'netcdf' or 'grib'.")
+                    if temp_file.exists():
+                        os.remove(temp_file)
+                        print(f"Deleted temp file: {temp_file}")
     
-                suffix = "grib" if fmt == "grib" else "nc"
-                temp_file = dir_to_save / f"temp_{cent}{syst}_{v}.{suffix}"
+                    del ds, request
+                    gc.collect()
     
-                if v in variables_2:
-                    dataset = "seasonal-original-pressure-levels"
-                    pressure_level = v.rsplit("_", 1)[1]
-                    request = {
-                        "originating_centre": cent,
-                        "system": syst,
-                        "variable": [variables_2[v]],
-                        "pressure_level": [pressure_level],
-                        "year": years,
-                        "month": [month_key],
-                        "day": [day_key],
-                        "leadtime_hour": [str(lt) for lt in leadtime_hour],
-                        "data_format": fmt,
-                        "area": area,
-                    }
-                else:
-                    dataset = "seasonal-original-single-levels"
-                    request = {
-                        "originating_centre": cent,
-                        "system": syst,
-                        "variable": [variables_1[v]],
-                        "year": years,
-                        "month": [month_key],
-                        "day": [day_key],
-                        "leadtime_hour": [str(lt) for lt in leadtime_hour],
-                        "data_format": fmt,
-                        "area": area,
-                    }
+                except Exception as exc:
+                    print(f"Failed to download data for {cv}: {exc}")
     
-                print(f"Requesting data from '{dataset}' for {cv}...")
-                client.retrieve(dataset, request).download(str(temp_file))
-                print(f"Downloaded: {temp_file}")
+                _time.sleep(1)
     
-                ds = _open_download(temp_file, fmt)
-                ds = _normalize_cds_dataset(ds)
+            return store_file_path
+
+    # def WAS_Download_Models_Daily(
+    #     self,
+    #     dir_to_save,
+    #     center_variable,
+    #     month_of_initialization,
+    #     day_of_initialization,
+    #     leadtime_hour,
+    #     year_start_hindcast,
+    #     year_end_hindcast,
+    #     area,
+    #     year_forecast=None,
+    #     ensemble_mean=None,
+    #     force_download=False,
+    #     data_format="netcdf",
+    #     output_layout="valid_time",
+    #     runoff_units="m3/s",
+    # ):
+    #     """
+    #     Download daily seasonal hindcast/forecast data from CDS seasonal-original
+    #     datasets and save a clean WAS-style NetCDF.
     
-                if ensemble_mean in ["mean", "median"] and "member" in ds.dims:
-                    ds = getattr(ds, ensemble_mean)(dim="member")
+    #     Output conventions:
+    #         output_layout="valid_time":
+    #             T, Y, X when ensemble_mean is "mean" or "median"
+    #             T, M, Y, X when members are kept
     
-                ds = _apply_units(ds, v)
-                if output_layout == "valid_time":
-                    ds = _rearrange_to_valid_time(ds)
+    #         output_layout="init_leadtime":
+    #             member, T, leadtime, level, Y, X
     
-                ds.attrs["source_dataset"] = dataset
-                ds.attrs["originating_centre"] = cent
-                ds.attrs["system"] = syst
-                ds.attrs["variable_code"] = v
-                ds.attrs["download_format"] = fmt
-                ds.attrs["output_layout"] = output_layout
-                if v in ["RUNOFF", "SRUNOFF"]:
-                    ds.attrs["runoff_units"] = runoff_units
+    #     Notes:
+    #         - In "valid_time" layout, T is the valid forecast date.
+    #         - In "init_leadtime" layout, T is the initialization date/year.
+    #         - Accumulated variables are deaccumulated along leadtime.
+    #         - RUNOFF can be saved as "mm" or "m3/s".
+    #     """
+    #     from calendar import month_abbr
+    #     from pathlib import Path
+    #     import gc
+    #     import os
+    #     import time as _time
     
-                encoding = {name: {"zlib": True, "complevel": 4} for name in ds.data_vars}
-                ds.to_netcdf(output_file, encoding=encoding)
-                print(f"Saved processed data to: {output_file}")
+    #     import cdsapi
+    #     import numpy as np
+    #     import xarray as xr
     
-                ds.close()
-                store_file_path[cv] = output_file
+    #     if isinstance(center_variable, str):
+    #         raise TypeError(
+    #             "center_variable must be a list, for example "
+    #             "['ECMWF_51.RUNOFF'] or ['ECMWF_51.RUNOFF', 'UKMO_604.RUNOFF']."
+    #         )
+    #     center_variable = list(center_variable)
     
-                if temp_file.exists():
-                    os.remove(temp_file)
-                    print(f"Deleted temp file: {temp_file}")
+    #     if isinstance(leadtime_hour, (str, int, np.integer)):
+    #         leadtime_hour = [str(leadtime_hour)]
+    #     else:
+    #         leadtime_hour = [str(lt) for lt in leadtime_hour]
     
-                del ds, request
-                gc.collect()
+    #     if ensemble_mean not in [None, "mean", "median"]:
+    #         raise ValueError("ensemble_mean must be None, 'mean', or 'median'.")
     
-            except Exception as exc:
-                print(f"Failed to download data for {cv}: {exc}")
+    #     if output_layout not in ["valid_time", "init_leadtime"]:
+    #         raise ValueError("output_layout must be 'valid_time' or 'init_leadtime'.")
     
-            _time.sleep(1)
+    #     if runoff_units not in ["mm", "m3/s"]:
+    #         raise ValueError("runoff_units must be 'mm' or 'm3/s'.")
     
-        return store_file_path
+    #     if year_forecast is None:
+    #         years = [str(y) for y in range(year_start_hindcast, year_end_hindcast + 1)]
+    #         file_prefix = "hindcast"
+    #     else:
+    #         years = [str(year_forecast)]
+    #         file_prefix = "forecast"
+    
+    #     centre = {
+    #         "BOM_2": "bom",
+    #         "ECMWF_51": "ecmwf",
+    #         "UKMO_603": "ukmo",
+    #         "UKMO_604": "ukmo",
+    #         "UKMO_605": "ukmo",
+    #         "UKMO_610": "ukmo",
+    #         "METEOFRANCE_8": "meteo_france",
+    #         "METEOFRANCE_9": "meteo_france",
+    #         "DWD_21": "dwd",
+    #         "DWD_22": "dwd",
+    #         "CMCC_35": "cmcc",
+    #         "CMCC_4": "cmcc",
+    #         "NCEP_2": "ncep",
+    #         "JMA_3": "jma",
+    #         "JMA_4": "jma",
+    #         "ECCC_4": "eccc",
+    #         "ECCC_5": "eccc",
+    #     }
+    
+    #     system = {
+    #         "BOM_2": "2",
+    #         "ECMWF_51": "51",
+    #         "UKMO_603": "603",
+    #         "UKMO_604": "604",
+    #         "UKMO_605": "605",
+    #         "UKMO_610": "610",
+    #         "METEOFRANCE_8": "8",
+    #         "METEOFRANCE_9": "9",
+    #         "DWD_21": "21",
+    #         "DWD_22": "22",
+    #         "CMCC_35": "35",
+    #         "CMCC_4": "4",
+    #         "NCEP_2": "2",
+    #         "JMA_3": "3",
+    #         "JMA_4": "4",
+    #         "ECCC_4": "4",
+    #         "ECCC_5": "5",
+    #     }
+    
+    #     variables_1 = {
+    #         "PRCP": "total_precipitation",
+    #         "TEMP": "2m_temperature",
+    #         "TDEW": "2m_dewpoint_temperature",
+    #         "TMAX": "maximum_2m_temperature_in_the_last_24_hours",
+    #         "TMIN": "minimum_2m_temperature_in_the_last_24_hours",
+    #         "UGRD10": "10m_u_component_of_wind",
+    #         "VGRD10": "10m_v_component_of_wind",
+    #         "SST": "sea_surface_temperature",
+    #         "SLP": "mean_sea_level_pressure",
+    #         "DSWR": "surface_solar_radiation_downwards",
+    #         "DLWR": "surface_thermal_radiation_downwards",
+    #         "NOLR": "top_net_thermal_radiation",
+    #         "SRUNOFF": "surface_runoff",
+    #         "RUNOFF": "runoff",
+    #     }
+    
+    #     variables_2 = {
+    #         "HUSS_1000": "specific_humidity",
+    #         "HUSS_925": "specific_humidity",
+    #         "HUSS_850": "specific_humidity",
+    #         "UGRD_1000": "u_component_of_wind",
+    #         "UGRD_925": "u_component_of_wind",
+    #         "UGRD_850": "u_component_of_wind",
+    #         "UGRD_700": "u_component_of_wind",
+    #         "UGRD_200": "u_component_of_wind",
+    #         "VGRD_1000": "v_component_of_wind",
+    #         "VGRD_925": "v_component_of_wind",
+    #         "VGRD_850": "v_component_of_wind",
+    #         "VGRD_700": "v_component_of_wind",
+    #         "VGRD_200": "v_component_of_wind",
+    #     }
+    
+    #     init_day_dict_jma = {
+    #         "01": 16, "02": 10, "03": 12, "04": 11, "05": 16, "06": 15,
+    #         "07": 15, "08": 14, "09": 13, "10": 13, "11": 12, "12": 12,
+    #     }
+    #     init_day_dict_ncep = {
+    #         "01": 1, "02": 5, "03": 2, "04": 1, "05": 1, "06": 5,
+    #         "07": 5, "08": 4, "09": 3, "10": 3, "11": 2, "12": 2,
+    #     }
+    
+    #     def _open_download(path, fmt):
+    #         if fmt == "grib":
+    #             return xr.open_dataset(
+    #                 path,
+    #                 engine="cfgrib",
+    #                 backend_kwargs={"indexpath": ""},
+    #             )
+    #         return xr.open_dataset(path)
+    
+    #     def _normalize_cds_dataset(ds):
+    #         rename_map = {}
+    
+    #         if "number" in ds.dims or "number" in ds.coords:
+    #             rename_map["number"] = "member"
+    #         if "longitude" in ds.dims or "longitude" in ds.coords:
+    #             rename_map["longitude"] = "X"
+    #         if "latitude" in ds.dims or "latitude" in ds.coords:
+    #             rename_map["latitude"] = "Y"
+    #         if "forecast_period" in ds.dims or "forecast_period" in ds.coords:
+    #             rename_map["forecast_period"] = "leadtime"
+    #         if "step" in ds.dims or "step" in ds.coords:
+    #             rename_map["step"] = "leadtime"
+    #         if "forecast_reference_time" in ds.dims:
+    #             rename_map["forecast_reference_time"] = "T"
+    #         elif "indexing_time" in ds.dims:
+    #             rename_map["indexing_time"] = "T"
+    #         elif "time" in ds.dims and ("forecast_period" in ds.dims or "step" in ds.dims):
+    #             rename_map["time"] = "T"
+    #         if "isobaricInhPa" in ds.dims or "isobaricInhPa" in ds.coords:
+    #             rename_map["isobaricInhPa"] = "level"
+    #         if "pressure_level" in ds.dims or "pressure_level" in ds.coords:
+    #             rename_map["pressure_level"] = "level"
+    
+    #         ds = ds.rename({k: v for k, v in rename_map.items() if k in ds})
+    
+    #         if "T" not in ds.dims:
+    #             if "forecast_reference_time" in ds.coords:
+    #                 ds = ds.expand_dims(T=np.atleast_1d(ds["forecast_reference_time"].values))
+    #                 ds = ds.drop_vars("forecast_reference_time", errors="ignore")
+    #             elif "indexing_time" in ds.coords:
+    #                 ds = ds.expand_dims(T=np.atleast_1d(ds["indexing_time"].values))
+    #                 ds = ds.drop_vars("indexing_time", errors="ignore")
+    
+    #         if "valid_time" not in ds.coords and "T" in ds.coords and "leadtime" in ds.coords:
+    #             ds = ds.assign_coords(valid_time=ds["T"] + ds["leadtime"])
+    
+    #         drop_vars = [
+    #             "surface",
+    #             "heightAboveGround",
+    #             "meanSea",
+    #             "entireAtmosphere",
+    #         ]
+    #         ds = ds.drop_vars([name for name in drop_vars if name in ds.variables], errors="ignore")
+    
+    #         if "Y" in ds.coords:
+    #             ds = ds.sortby("Y")
+    
+    #         preferred = ["member", "T", "leadtime", "level", "Y", "X"]
+    #         for name in list(ds.data_vars):
+    #             dims = [dim for dim in preferred if dim in ds[name].dims]
+    #             dims += [dim for dim in ds[name].dims if dim not in dims]
+    #             ds[name] = ds[name].transpose(*dims)
+    
+    #         return ds
+    
+    #     def _deaccumulate(ds, dim="leadtime"):
+    #         if dim not in ds.dims:
+    #             return ds
+    #         first = ds.isel({dim: slice(0, 1)})
+    #         diff = ds.diff(dim)
+    #         out = xr.concat([first, diff], dim=dim)
+    #         out = out.assign_coords({dim: ds[dim]})
+    #         return out.where(out >= 0, 0)
+    
+    #     def _grid_cell_area_m2(ds):
+    #         if "Y" not in ds.coords or "X" not in ds.coords:
+    #             raise ValueError("RUNOFF conversion to m3/s needs X and Y coordinates.")
+    #         if ds.sizes.get("Y", 0) < 2 or ds.sizes.get("X", 0) < 2:
+    #             raise ValueError("RUNOFF conversion to m3/s needs at least two X and Y points.")
+    
+    #         radius = 6371000.0
+    #         dlat = np.deg2rad(float(abs(ds["Y"].diff("Y").median())))
+    #         dlon = np.deg2rad(float(abs(ds["X"].diff("X").median())))
+    #         area_y = (radius ** 2) * dlat * dlon * np.cos(np.deg2rad(ds["Y"]))
+    #         area_y.attrs["units"] = "m2"
+    #         return area_y
+    
+    #     def _leadtime_interval_seconds(ds):
+    #         if "leadtime" not in ds.coords:
+    #             raise ValueError("RUNOFF conversion to m3/s needs leadtime coordinates.")
+    
+    #         lead = ds["leadtime"]
+    #         if np.issubdtype(lead.dtype, np.timedelta64):
+    #             lead_seconds = (lead / np.timedelta64(1, "s")).astype(float)
+    #         else:
+    #             # CDS leadtime_hour requests are in hours when decoded as numeric values.
+    #             lead_seconds = lead.astype(float) * 3600.0
+    
+    #         first = lead_seconds.isel(leadtime=slice(0, 1))
+    #         diff = lead_seconds.diff("leadtime")
+    #         seconds = xr.concat([first, diff], dim="leadtime")
+    #         seconds = seconds.assign_coords(leadtime=lead)
+    #         return seconds.where(seconds > 0)
+    
+    #     def _apply_units(ds, var_code):
+    #         if var_code in ["TMIN", "TEMP", "TMAX", "SST", "TDEW"]:
+    #             ds = ds - 273.15
+    #             for name in ds.data_vars:
+    #                 ds[name].attrs["units"] = "degC"
+    
+    #         elif var_code == "SLP":
+    #             ds = ds / 100.0
+    #             for name in ds.data_vars:
+    #                 ds[name].attrs["units"] = "hPa"
+    
+    #         elif var_code == "PRCP":
+    #             ds = _deaccumulate(ds) * 1000.0
+    #             for name in ds.data_vars:
+    #                 ds[name].attrs["units"] = "mm"
+    
+    #         elif var_code in ["SRUNOFF", "RUNOFF"]:
+    #             ds = _deaccumulate(ds)
+    #             if runoff_units == "mm":
+    #                 ds = ds * 1000.0
+    #                 for name in ds.data_vars:
+    #                     ds[name].attrs["units"] = "mm"
+    #             else:
+    #                 cell_area = _grid_cell_area_m2(ds)
+    #                 interval_seconds = _leadtime_interval_seconds(ds)
+    #                 ds = (ds * cell_area) / interval_seconds
+    #                 for name in ds.data_vars:
+    #                     ds[name].attrs["units"] = "m3 s-1"
+    
+    #         elif var_code in ["DSWR", "DLWR", "NOLR"]:
+    #             ds = _deaccumulate(ds) / 86400.0
+    #             for name in ds.data_vars:
+    #                 ds[name].attrs["units"] = "W m-2"
+    
+    #         return ds
+    
+    #     def _rearrange_to_valid_time(ds):
+    #         if "T" in ds.dims and "leadtime" in ds.dims:
+    #             if "valid_time" not in ds.coords:
+    #                 ds = ds.assign_coords(valid_time=ds["T"] + ds["leadtime"])
+    
+    #             ds = ds.stack(_sample=("T", "leadtime"))
+    #             ds = ds.reset_index("_sample")
+    
+    #             valid_time = ds["valid_time"].values
+    #             if "T" in ds.coords:
+    #                 ds = ds.rename({"T": "init_time"})
+    
+    #             ds = ds.assign_coords(T=("_sample", valid_time))
+    #             ds = ds.swap_dims({"_sample": "T"})
+    #             ds = ds.drop_vars("_sample", errors="ignore")
+    #             ds = ds.sortby("T")
+    
+    #         ds = ds.drop_vars(["valid_time", "init_time", "leadtime"], errors="ignore")
+    
+    #         if "member" in ds.dims:
+    #             ds = ds.rename({"member": "M"})
+    
+    #         for name in list(ds.data_vars):
+    #             if "M" in ds[name].dims:
+    #                 preferred = ["M", "T", "level", "Y", "X"]
+    #             else:
+    #                 preferred = ["T", "level", "Y", "X"]
+    #             dims = [dim for dim in preferred if dim in ds[name].dims]
+    #             dims += [dim for dim in ds[name].dims if dim not in dims]
+    #             ds[name] = ds[name].transpose(*dims)
+    
+    #         return ds
+    
+    #     dir_to_save = Path(dir_to_save)
+    #     dir_to_save.mkdir(parents=True, exist_ok=True)
+    
+    #     month_key = f"{int(month_of_initialization):02}"
+    #     abb_month_ini = month_abbr[int(month_of_initialization)]
+    #     years_str = f"{years[0]}_{years[-1]}" if len(years) > 1 else years[0]
+    #     lead_str = f"{leadtime_hour[0]}-{leadtime_hour[-1]}" if len(leadtime_hour) > 1 else leadtime_hour[0]
+    
+    #     store_file_path = {}
+    #     client = cdsapi.Client()
+    
+    #     for cv in center_variable:
+    #         try:
+    #             c, v = cv.split(".", 1)
+    #             if c not in centre:
+    #                 raise ValueError(f"Unknown centre/system code: {c}")
+    #             if v not in variables_1 and v not in variables_2:
+    #                 raise ValueError(f"Unknown variable code: {v}")
+    
+    #             cent = centre[c]
+    #             syst = system[c]
+    
+    #             request_day = int(day_of_initialization)
+    #             if year_forecast is None and cent == "jma":
+    #                 request_day = init_day_dict_jma[month_key]
+    #             elif year_forecast is None and cent == "ncep":
+    #                 request_day = init_day_dict_ncep[month_key]
+    
+    #             day_key = f"{int(request_day):02}"
+    #             unit_tag = "_m3s" if v in ["RUNOFF", "SRUNOFF"] and runoff_units == "m3/s" else ""
+    #             output_file = (
+    #                 dir_to_save
+    #                 / f"{file_prefix}_{cent}{syst}_{v}_{abb_month_ini}{day_key}_{years_str}_{lead_str}{unit_tag}.nc"
+    #             )
+    
+    #             if output_file.exists() and not force_download:
+    #                 print(f"{output_file} already exists. Skipping download.")
+    #                 store_file_path[cv] = output_file
+    #                 continue
+    
+    #             fmt = data_format.lower()
+    #             if fmt not in ["netcdf", "grib"]:
+    #                 raise ValueError("data_format must be 'netcdf' or 'grib'.")
+    
+    #             suffix = "grib" if fmt == "grib" else "nc"
+    #             temp_file = dir_to_save / f"temp_{cent}{syst}_{v}.{suffix}"
+    
+    #             if v in variables_2:
+    #                 dataset = "seasonal-original-pressure-levels"
+    #                 pressure_level = v.rsplit("_", 1)[1]
+    #                 request = {
+    #                     "originating_centre": cent,
+    #                     "system": syst,
+    #                     "variable": [variables_2[v]],
+    #                     "pressure_level": [pressure_level],
+    #                     "year": years,
+    #                     "month": [month_key],
+    #                     "day": [day_key],
+    #                     "leadtime_hour": [str(lt) for lt in leadtime_hour],
+    #                     "data_format": fmt,
+    #                     "area": area,
+    #                 }
+    #             else:
+    #                 dataset = "seasonal-original-single-levels"
+    #                 request = {
+    #                     "originating_centre": cent,
+    #                     "system": syst,
+    #                     "variable": [variables_1[v]],
+    #                     "year": years,
+    #                     "month": [month_key],
+    #                     "day": [day_key],
+    #                     "leadtime_hour": [str(lt) for lt in leadtime_hour],
+    #                     "data_format": fmt,
+    #                     "area": area,
+    #                 }
+    
+    #             print(f"Requesting data from '{dataset}' for {cv}...")
+    #             client.retrieve(dataset, request).download(str(temp_file))
+    #             print(f"Downloaded: {temp_file}")
+    
+    #             ds = _open_download(temp_file, fmt)
+    #             ds = _normalize_cds_dataset(ds)
+    
+    #             if ensemble_mean in ["mean", "median"] and "member" in ds.dims:
+    #                 ds = getattr(ds, ensemble_mean)(dim="member")
+    
+    #             ds = _apply_units(ds, v)
+    #             if output_layout == "valid_time":
+    #                 ds = _rearrange_to_valid_time(ds)
+    
+    #             ds.attrs["source_dataset"] = dataset
+    #             ds.attrs["originating_centre"] = cent
+    #             ds.attrs["system"] = syst
+    #             ds.attrs["variable_code"] = v
+    #             ds.attrs["download_format"] = fmt
+    #             ds.attrs["output_layout"] = output_layout
+    #             if v in ["RUNOFF", "SRUNOFF"]:
+    #                 ds.attrs["runoff_units"] = runoff_units
+    
+    #             encoding = {name: {"zlib": True, "complevel": 4} for name in ds.data_vars}
+    #             ds.to_netcdf(output_file, encoding=encoding)
+    #             print(f"Saved processed data to: {output_file}")
+    
+    #             ds.close()
+    #             store_file_path[cv] = output_file
+    
+    #             if temp_file.exists():
+    #                 os.remove(temp_file)
+    #                 print(f"Deleted temp file: {temp_file}")
+    
+    #             del ds, request
+    #             gc.collect()
+    
+    #         except Exception as exc:
+    #             print(f"Failed to download data for {cv}: {exc}")
+    
+    #         _time.sleep(1)
+    
+    #     return store_file_path
     
 
     # def WAS_Download_Models_Daily(
@@ -2985,6 +3459,8 @@ class WAS_Download:
                 
     #         return file_path
 
+
+    
 
     def WAS_Download_Reanalysis(
         self,
@@ -6195,7 +6671,381 @@ class WAS_Download:
     
         print(f"[INFO] Saved daily TAMSAT data to {out_nc}")
         return out_nc
-
+    
+    def WAS_Download_GloFAS_historical(
+        self,
+        dir_to_save,
+        variables,
+        year_start,
+        year_end,
+        area,
+        system_version="version_5_0",
+        product_type="consolidated",
+        force_download=False,
+        max_retries=3,
+        retry_delay=10,
+        keep_temporary=False,
+    ):
+        """
+        Download historical daily GloFAS hydrological data from the Copernicus
+        Emergency Management Service (CEMS) Early Warning Data Store and save it
+        in WASS2S-compatible xarray format (dimensions T=time, Y=lat, X=lon).
+    
+        Parameters
+        ----------
+        dir_to_save : str or Path
+            Output directory for the final NetCDF files.
+        variables : list of str
+            GloFAS variables to download. Supported: "GLOFAS.Q"
+            (river discharge in the last 24 hours, m3 s-1).
+        year_start, year_end : int
+            Inclusive year range.
+        area : list of float
+            Bounding box [North, West, South, East]. Benin/Oueme e.g. [11, 1, 6, 4].
+        system_version : str, optional
+            e.g. "version_5_0" (default), "version_4_0".
+        product_type : str, optional
+            "consolidated" (ERA5, default) or "intermediate" (ERA5T).
+        force_download : bool, optional
+            Overwrite existing outputs. Default False.
+        max_retries, retry_delay : int, optional
+            Per-month retry attempts and delay in seconds.
+        keep_temporary : bool, optional
+            Keep monthly/yearly temp files. Default False.
+    
+        Returns
+        -------
+        None
+            Writes one NetCDF per variable, e.g. Daily_Q_1990_2025.nc, with
+            Q of shape (T, Y, X).
+    
+        Notes
+        -----
+        Requires a valid EWDS config in ~/.cdsapirc. Downloads run month by month
+        for robustness; monthly data are combined into yearly temp files, then the
+        final multi-year file. Longitudes are wrapped to [-180, 180), coordinates
+        sorted ascending, duplicate timestamps dropped, discharge stored as
+        compressed float32.
+        """
+    
+        import calendar
+        import time as _time
+        from pathlib import Path
+    
+        import numpy as np
+        import xarray as xr
+        import cdsapi
+    
+        DATASET = "cems-glofas-historical"
+        REQUIRED_DIMS = {"T", "Y", "X"}
+    
+        COORD_ALIASES = {
+            "longitude": "X", "lon": "X",
+            "latitude": "Y", "lat": "Y",
+            "time": "T", "valid_time": "T", "date": "T",
+        }
+    
+        VARIABLE_MAPPING = {
+            "GLOFAS.Q": {
+                "cds_variable": "river_discharge_in_the_last_24_hours",
+                "output_name": "Q",
+                "long_name": "GloFAS daily river discharge",
+                "units": "m3 s-1",
+            },
+        }
+    
+        dir_to_save = Path(dir_to_save)
+        dir_to_save.mkdir(parents=True, exist_ok=True)
+    
+        tmp_root = dir_to_save / ".glofas_tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+    
+        # ------------------------------------------------------------------
+        # Standardize a raw GloFAS dataset to the WASS2S T/Y/X convention
+        # ------------------------------------------------------------------
+        def _standardize(ds, output_name):
+            ds = ds.drop_vars(
+                [v for v in ("crs", "spatial_ref", "surface") if v in ds.variables],
+                errors="ignore",
+            )
+    
+            data_vars = list(ds.data_vars)
+            if not data_vars:
+                raise ValueError("No data variable found in downloaded GloFAS file.")
+    
+            # Pick the discharge variable: prefer known names, else the largest 2D+ field
+            preferred = ["dis24", "q", "Q", "river_discharge_in_the_last_24_hours"]
+            source = next((v for v in preferred if v in data_vars), None)
+            if source is None:
+                candidates = [v for v in data_vars if ds[v].ndim >= 2] or data_vars
+                source = max(candidates, key=lambda v: ds[v].size)
+    
+            da = ds[source]
+    
+            # Rename coordinates -> T/Y/X
+            rename = {
+                old: new for old, new in COORD_ALIASES.items()
+                if old in da.dims or old in da.coords
+            }
+            if rename:
+                da = da.rename(rename)
+    
+            # Drop singleton extra dims; anything else is unexpected
+            for dim in [d for d in da.dims if d not in REQUIRED_DIMS]:
+                if da.sizes[dim] == 1:
+                    da = da.isel({dim: 0}, drop=True)
+                else:
+                    raise ValueError(
+                        f"Unexpected non-singleton dimension '{dim}' "
+                        f"with size {da.sizes[dim]}"
+                    )
+    
+            missing = REQUIRED_DIMS - set(da.dims)
+            if missing:
+                raise ValueError(
+                    f"Could not identify all required GloFAS dimensions T/Y/X. "
+                    f"Missing: {missing}. Found: {da.dims}"
+                )
+    
+            # 0..360 -> -180..180 if needed
+            if float(da["X"].max()) > 180.0:
+                da = da.assign_coords(X=((da["X"] + 180.0) % 360.0) - 180.0)
+    
+            return (
+                da.sortby("X").sortby("Y").sortby("T")
+                  .transpose("T", "Y", "X")
+                  .rename(output_name)
+            )
+    
+        def _dedup_time(da):
+            _, idx = np.unique(da["T"].values, return_index=True)
+            return da.isel(T=np.sort(idx))
+    
+        def _encoding(name):
+            return {name: {"dtype": "float32", "zlib": True,
+                           "complevel": 4, "_FillValue": -9999.0}}
+    
+        client = cdsapi.Client()
+    
+        # ==================================================================
+        # Per-variable loop
+        # ==================================================================
+        for var in variables:
+            if var not in VARIABLE_MAPPING:
+                print(f"Unknown GloFAS variable: {var}. "
+                      f"Supported: {list(VARIABLE_MAPPING)}")
+                continue
+    
+            mapping = VARIABLE_MAPPING[var]
+            cds_variable = mapping["cds_variable"]
+            output_name = mapping["output_name"]
+            short_name = var.split(".")[-1]
+    
+            output_path = dir_to_save / f"Daily_{short_name}_{year_start}_{year_end}.nc"
+            if output_path.exists():
+                if not force_download:
+                    print(f"{output_path} already exists. Skipping download.")
+                    continue
+                output_path.unlink()
+    
+            var_tmp = tmp_root / short_name
+            var_tmp.mkdir(parents=True, exist_ok=True)
+    
+            year_files = []
+            all_years_ok = True
+    
+            # --------------------------------------------------------------
+            # Year loop
+            # --------------------------------------------------------------
+            for year in range(year_start, year_end + 1):
+                print(f"\n{'=' * 70}\nGloFAS {output_name}: processing year {year}\n{'=' * 70}")
+    
+                year_file = var_tmp / f"{short_name}_{year}.nc"
+                if year_file.exists() and not force_download:
+                    print(f"Using existing temporary yearly file: {year_file}")
+                    year_files.append(year_file)
+                    continue
+    
+                monthly_arrays = []
+                year_complete = True
+    
+                # ----------------------------------------------------------
+                # Month loop
+                # ----------------------------------------------------------
+                for month in range(1, 13):
+                    n_days = calendar.monthrange(year, month)[1]
+                    days = [f"{d:02d}" for d in range(1, n_days + 1)]
+    
+                    raw_file = var_tmp / f"raw_{short_name}_{year}{month:02d}.nc"
+    
+                    request = {
+                        "system_version": [system_version],
+                        "hydrological_model": ["lisflood"],
+                        "product_type": [product_type],
+                        "variable": [cds_variable],
+                        "hyear": [f"{year:04d}"],
+                        "hmonth": [f"{month:02d}"],
+                        "hday": days,
+                        "data_format": "netcdf",
+                        "download_format": "unarchived",
+                        "area": area,
+                    }
+    
+                    success = False
+                    for attempt in range(1, max_retries + 1):
+                        try:
+                            reuse = (raw_file.exists()
+                                     and raw_file.stat().st_size > 0
+                                     and not force_download)
+                            if reuse:
+                                print(f"Using existing {raw_file.name}")
+                            else:
+                                raw_file.unlink(missing_ok=True)
+                                print(f"Attempt {attempt}/{max_retries}: downloading "
+                                      f"{cds_variable} {year}-{month:02d}")
+                                client.retrieve(DATASET, request, str(raw_file))
+                                print(f"Downloaded: {raw_file}")
+    
+                            with xr.open_dataset(raw_file) as ds_raw:
+                                # load so the temp file can be removed afterwards
+                                monthly_arrays.append(
+                                    _standardize(ds_raw, output_name).load()
+                                )
+                            success = True
+                            break
+    
+                        except Exception as e:
+                            print(f"Attempt {attempt}/{max_retries} failed for "
+                                  f"{year}-{month:02d}: {e}")
+                            if raw_file.exists():
+                                try:
+                                    raw_file.unlink()
+                                    print(f"Deleted incomplete file: {raw_file}")
+                                except Exception:
+                                    pass
+                            if attempt < max_retries:
+                                print(f"Retrying after {retry_delay} seconds...")
+                                _time.sleep(retry_delay)
+    
+                    if not success:
+                        print(f"FAILED: GloFAS {year}-{month:02d}")
+                        year_complete = False
+                        break
+    
+                    if not keep_temporary and raw_file.exists():
+                        try:
+                            raw_file.unlink()
+                        except Exception:
+                            pass
+    
+                # ----------------------------------------------------------
+                # Assemble yearly file
+                # ----------------------------------------------------------
+                if year_complete and monthly_arrays:
+                    try:
+                        da_year = _dedup_time(
+                            xr.concat(monthly_arrays, dim="T").sortby("T")
+                        ).transpose("T", "Y", "X")
+    
+                        da_year.attrs.update({
+                            "long_name": mapping["long_name"],
+                            "units": mapping["units"],
+                            "source": "Copernicus CEMS GloFAS",
+                            "system_version": system_version,
+                            "product_type": product_type,
+                        })
+    
+                        da_year.to_dataset(name=output_name).to_netcdf(
+                            year_file, encoding=_encoding(output_name)
+                        )
+                        print(f"Yearly GloFAS file saved: {year_file}")
+                        year_files.append(year_file)
+                        del da_year, monthly_arrays
+    
+                    except Exception as e:
+                        print(f"Failed to create yearly GloFAS file for {year}: {e}")
+                        year_complete = False
+    
+                if not year_complete:
+                    all_years_ok = False
+                    print(f"Year {year} incomplete. Stopping final assembly.")
+                    break
+    
+            # --------------------------------------------------------------
+            # Final multi-year assembly
+            # --------------------------------------------------------------
+            expected = year_end - year_start + 1
+            if not (all_years_ok and len(year_files) == expected):
+                print(f"Skipping final save for {var} because one or more "
+                      "years/months were not downloaded successfully.")
+                continue
+    
+            print(f"\n{'=' * 70}\nCombining GloFAS {output_name}: "
+                  f"{year_start}-{year_end}\n{'=' * 70}")
+    
+            combined_ds = None
+            try:
+                # Preferred: Dask-backed multi-file dataset; fall back to sequential concat
+                try:
+                    combined_ds = xr.open_mfdataset(
+                        year_files, combine="by_coords",
+                        chunks={"T": 365}, parallel=False,
+                    )
+                    da_final = combined_ds[output_name]
+                except Exception as dask_error:
+                    print("open_mfdataset unavailable; falling back to sequential "
+                          f"xarray concatenation.\nReason: {dask_error}")
+                    arrays = []
+                    for yf in year_files:
+                        with xr.open_dataset(yf) as ds_year:
+                            arrays.append(ds_year[output_name].load())
+                    da_final = xr.concat(arrays, dim="T")
+    
+                da_final = _dedup_time(
+                    da_final.sortby("T").sortby("Y").sortby("X")
+                ).transpose("T", "Y", "X")
+    
+                da_final.attrs.update({
+                    "long_name": mapping["long_name"],
+                    "units": mapping["units"],
+                    "source": "Copernicus Emergency Management Service - GloFAS",
+                    "dataset": DATASET,
+                    "system_version": system_version,
+                    "hydrological_model": "LISFLOOD",
+                    "product_type": product_type,
+                    "frequency": "daily",
+                    "WASS2S_dimensions": "T,Y,X",
+                })
+    
+                da_final.to_dataset(name=output_name).to_netcdf(
+                    output_path, encoding=_encoding(output_name)
+                )
+    
+                print(f"\nSaved final GloFAS dataset:\n  {output_path}")
+                print(f"\nFinal structure:\n{da_final}")
+    
+            except Exception as e:
+                print(f"Failed to create final GloFAS dataset for {var}: {e}")
+                continue
+    
+            finally:
+                if combined_ds is not None:
+                    combined_ds.close()
+    
+            # --------------------------------------------------------------
+            # Cleanup
+            # --------------------------------------------------------------
+            if not keep_temporary:
+                for yf in year_files:
+                    try:
+                        yf.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                try:
+                    if var_tmp.exists() and not any(var_tmp.iterdir()):
+                        var_tmp.rmdir()
+                except Exception:
+                    pass
 
 #####
 
