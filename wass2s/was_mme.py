@@ -10148,32 +10148,57 @@ class WAS_mme_MLP:
                     n_jobs=self.n_jobs)
                 random_search.fit(X_clean_c, y_clean_c, groups=groups_c)
                 best_params_dict[c] = random_search.best_params_
-
+    
             elif self.search_method == 'bayesian':
                 if not HAS_OPTUNA:
                     raise ImportError("search_method='bayesian' requires optuna.")
+            
                 study = optuna.create_study(
                     direction='maximize',
                     sampler=optuna.samplers.TPESampler(seed=self.random_state),
-                    pruner=optuna.pruners.MedianPruner(n_startup_trials=5))
-                objective_with_data = (lambda trial:
-                                       self._objective(trial, X_clean_c, y_clean_c, groups_c, splitter))
-                study.optimize(objective_with_data, n_trials=self.n_iter_search,
-                               timeout=self.optuna_timeout, n_jobs=self.optuna_n_jobs)
+                    pruner=optuna.pruners.MedianPruner(n_startup_trials=5)
+                )
+            
+                objective_with_data = lambda trial: self._objective(
+                    trial,
+                    X_clean_c,
+                    y_clean_c,
+                    groups_c,
+                    splitter
+                )
+            
+                study.optimize(
+                    objective_with_data,
+                    n_trials=self.n_iter_search,
+                    timeout=self.optuna_timeout,
+                    n_jobs=self.optuna_n_jobs
+                )
+            
                 bp = study.best_params
+                solver = bp['solver']
+            
+                # Reconstruct parameters that may have been fixed rather than
+                # explicitly suggested to Optuna.
                 best_params_dict[c] = {
                     'hidden_layer_sizes': bp['hidden_layer_sizes'],
-                    'learning_rate_init': bp.get('learning_rate_init', 0.001),
+                    'learning_rate_init': (
+                        0.001
+                        if solver == 'lbfgs'
+                        else bp.get('learning_rate_init', 0.001)
+                    ),
                     'activation': bp['activation'],
-                    'solver': bp['solver'],
+                    'solver': solver,
                     'alpha': bp['alpha'],
-                    'early_stopping': bp['early_stopping'],
+                    'early_stopping': (
+                        False
+                        if solver == 'lbfgs'
+                        else bp.get('early_stopping', False)
+                    ),
                 }
             else:
                 raise ValueError(f"Unknown search_method: {self.search_method}. "
-                                 "Choose from 'grid', 'random', or 'bayesian'.")
-
-        return best_params_dict, cluster_da
+                                 "Choose from 'grid', 'random', or 'bayesian'.")    
+            return best_params_dict, cluster_da
 
     # ------------------------------------------------------ deterministic fit
     def compute_model(self, X_train, y_train, X_test, y_test=None,
