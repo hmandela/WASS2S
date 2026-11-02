@@ -30,7 +30,6 @@ def run(command: list[str], *, cwd: Path = ROOT, capture: bool = False,
 
 def version() -> str:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
-    pixi = tomllib.loads((ROOT / "pixi.toml").read_text())["workspace"]
     module_version = None
     module = ast.parse((ROOT / "wass2s/__init__.py").read_text())
     for node in module.body:
@@ -40,8 +39,14 @@ def version() -> str:
         ):
             module_version = ast.literal_eval(node.value)
     value = project["version"]
-    if project["name"] != "wass2s" or value != pixi["version"] or value != module_version:
-        raise RuntimeError("Synchronisez les versions dans pyproject.toml, pixi.toml et wass2s/__init__.py.")
+    if project["name"] != "wass2s" or value != module_version:
+        raise RuntimeError("Synchronisez les versions dans pyproject.toml et wass2s/__init__.py.")
+    # Pixi is optional: pip-only source trees need no Pixi configuration.
+    pixi_path = ROOT / "pixi.toml"
+    if pixi_path.exists():
+        pixi = tomllib.loads(pixi_path.read_text())["workspace"]
+        if value != pixi["version"]:
+            raise RuntimeError("Synchronisez les versions dans pyproject.toml, pixi.toml et wass2s/__init__.py.")
     if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+(?:[a-z0-9.]+)?", value):
         raise RuntimeError(f"Version de publication invalide : {value!r}")
     return value
@@ -81,7 +86,7 @@ def twine_check(paths: list[Path]) -> None:
 
 
 def smoke_test(wheel: Path) -> None:
-    """Install the built wheel separately, reusing the locked Pixi dependencies."""
+    """Install the built wheel separately and resolve its declared dependencies."""
     with tempfile.TemporaryDirectory(prefix="wass2s-wheel-") as folder:
         directory = Path(folder)
         environment = directory / "venv"
@@ -89,11 +94,15 @@ def smoke_test(wheel: Path) -> None:
         python = environment / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
         dependencies = os.environ.copy()
         if sys.platform.startswith("linux"):
-            # The test venv reuses Pixi's compiled dependencies and their shared libraries.
+            # Reuse shared libraries from the invoking environment when available.
             library = str(Path(sys.prefix) / "lib")
             previous = dependencies.get("LD_LIBRARY_PATH", "")
             dependencies["LD_LIBRARY_PATH"] = library + (os.pathsep + previous if previous else "")
         run([str(python), "-I", "-m", "pip", "install", "--no-deps", "--force-reinstall", str(wheel)], cwd=directory, env=dependencies)
+        # system_site_packages exposes the base Python's packages, not those
+        # installed only in an invoking pip venv. Resolve any missing requirements
+        # after forcing our wheel to take precedence over an inherited install.
+        run([str(python), "-I", "-m", "pip", "install", str(wheel)], cwd=directory, env=dependencies)
         run([str(python), "-I", "-m", "pip", "check"], cwd=directory, env=dependencies)
         code = (
             "from pathlib import Path; import sys, wass2s; "
@@ -138,7 +147,7 @@ def checked_archives() -> tuple[str, list[Path]]:
     paths = archives(value)
     manifest = DIST / "SHA256SUMS"
     if not manifest.is_file() or not all(path.is_file() for path in paths):
-        raise RuntimeError("Lancez d'abord pixi run -e dev release-check.")
+        raise RuntimeError("Lancez d'abord python scripts/release.py check.")
     lines = manifest.read_text().splitlines()
     if f"# source-sha256 {source_digest()}" not in lines:
         raise RuntimeError("Les sources ont changé : relancez release-check avant publication.")
