@@ -68,7 +68,7 @@ ceac_agro
     station and gridded data (``CEAC_compute_onset``, ``CEAC_compute_cessation``, …).
 """
 
-__version__ = "0.4.8.5"
+__version__ = "0.4.11"
 
 # Backward-compatibility shim: scipy removed scipy.interp in 1.14.
 import numpy as _np
@@ -93,4 +93,15 @@ from wass2s.was_transformdata import *
 from wass2s.was_bias_correction import *
 from wass2s.was_seasonal_analysis import *
 from wass2s.was_cca_2 import *
+# agro
+from wass2s.was_compute_predictand import *
 from wass2s.ceac_agro import *
+# hydro
+# from wass2s.highwater_season_predictands_modeaware import *
+# from wass2s.glofas_highflow_bias_correction import *
+# from wass2s.WAS_Hydro import *
+
+from wass2s.WAS_Hydro import * 
+from wass2s.highflow_outlet_aggregation import *
+from wass2s.highflow_seasonal_evaluation import *
+

@@ -71,10 +71,6 @@ import xeofs as xe
 from wass2s.utils import * 
 
 
-# -----------------------------------------------------------------------------
-# Shared safety utilities. They do not alter the scientific transformation used
-# by each CCA class; they only enforce dimensions, alignment and output contracts.
-# -----------------------------------------------------------------------------
 
 _DISTRIBUTION_CODES = {
     "normal": 1,
