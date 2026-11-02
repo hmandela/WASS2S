@@ -1,4 +1,0 @@
-dist
-scripts
-tests
-wass2s
