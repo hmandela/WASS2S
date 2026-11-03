@@ -242,7 +242,7 @@ _PUBLIC_EXPORTS = {
     'plot_maps': 'was_seasonal_analysis',
     'plot_period_map': 'was_seasonal_analysis',
     'plot_prob_forecasts': 'utils',
-    'plot_prob_forecastsAlpha': 'utils',
+    'plot_prob_forecasts_rcc': 'utils',
     'plot_prob_forecasts_': 'utils',
     'plot_station_diagnostic': 'highwater_season_predictands_modeaware',
     'plot_tercile': 'utils',
