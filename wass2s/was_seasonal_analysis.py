@@ -31,6 +31,7 @@ import datetime
 from datetime import date, timedelta
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -44,14 +45,73 @@ import requests
 import ipywidgets as widgets
 from IPython.display import display, IFrame
 
-warnings.filterwarnings("ignore")
+
+
+
+def _deduplicate_identical_time(data):
+    """Merge exact overlapping records, rejecting conflicting duplicates."""
+    data = data.sortby("time")
+    index = data.get_index("time")
+    if index.hasnans:
+        raise ValueError("Time coordinates must be finite.")
+    for stamp in index[index.duplicated()].unique():
+        positions = np.flatnonzero(index == stamp)
+        first = data.isel(time=int(positions[0]), drop=True)
+        if any(not first.equals(data.isel(time=int(i), drop=True)) for i in positions[1:]):
+            raise ValueError(f"Conflicting duplicate time coordinate: {stamp}.")
+    return data.isel(time=np.flatnonzero(~index.duplicated()))
+
+
+def _validate_daily_axis(data):
+    """Require one unique midnight-labelled field per Gregorian calendar day."""
+    if "time" not in data.dims:
+        raise ValueError("Daily data require a time dimension.")
+    try:
+        dates = pd.DatetimeIndex(data.time.values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ERA5/AgERA5 diagnostics require a Gregorian daily calendar.") from exc
+    if dates.hasnans or not dates.is_unique:
+        raise ValueError("Daily dates must be finite and unique.")
+    if not dates.equals(dates.normalize()):
+        raise ValueError("Daily fields must be labelled at midnight; subdaily inputs are invalid.")
+    return data.sortby("time")
+
+
+def _complete_monthly_precipitation(daily):
+    """Integrate mm/day only when every calendar day is finite at that cell."""
+    daily = _validate_daily_axis(daily)
+    if daily.sizes["time"] == 0:
+        raise ValueError("Cannot aggregate an empty daily precipitation record.")
+    if np.any(np.asarray(daily.where(np.isfinite(daily))).ravel() < 0):
+        raise ValueError("Daily precipitation cannot be negative.")
+    finite = daily.where(np.isfinite(daily))
+    sums = finite.resample(time="MS").sum("time", skipna=True, min_count=1)
+    counts = finite.resample(time="MS").count("time")
+    result = sums.where(counts == sums.time.dt.days_in_month)
+    result.attrs = dict(daily.attrs)
+    result.attrs.update({"units": "mm month-1", "completeness": "all calendar days finite"})
+    return result
+
+
+def _validate_monthly_axis(data):
+    """Reject multiple fields for one year/month before climatological means."""
+    month_key = np.asarray(data.time.dt.year) * 12 + np.asarray(data.time.dt.month)
+    if len(np.unique(month_key)) != len(month_key):
+        raise ValueError("Monthly diagnostics require exactly one field per year/month.")
+    return data
 
 
 def _monthly_precip_to_mm(data):
     """Convert ERA5 monthly-mean precipitation from m/day to mm/month."""
     if "time" not in data.coords:
         raise ValueError("Monthly precipitation conversion requires a time coordinate.")
-    return data * data["time"].dt.days_in_month * 1000.0
+    result = data * data["time"].dt.days_in_month * 1000.0
+    if isinstance(result, xr.DataArray):
+        result.attrs = {**data.attrs, "units": "mm month-1"}
+    else:
+        for name in result.data_vars:
+            result[name].attrs = {**data[name].attrs, "units": "mm month-1"}
+    return result
 
 
 def _save_earthkit_result(result, path):
@@ -151,11 +211,25 @@ def _agera5_precipitation_array(data):
         if dim not in {"time", "latitude", "longitude"} and da.sizes[dim] == 1:
             da = da.squeeze(dim, drop=True)
 
-    units = str(da.attrs.get("units", "")).lower().replace(" ", "")
-    # The official AgERA5 unit is mm/day. Retain compatibility with any file
-    # encoded in m/day by converting only when the metadata is unambiguous.
-    if units and "mm" not in units and (units.startswith("m/") or "mday" in units):
-        da = da * 1000.0
+    units = str(da.attrs.get("units", "")).lower().replace(" ", "").replace("**", "^")
+    units = units.replace("^", "").replace("{", "").replace("}", "")
+    original_attrs = dict(da.attrs)
+    if units in {"", "mm", "mm/day", "mmday-1", "mmd-1", "mmdaily"}:
+        factor = 1.0
+    elif units in {"m", "m/day", "mday-1", "md-1"}:
+        factor = 1000.0
+    elif units in {"kgm-2s-1", "kg/m2/s", "mm/s", "mms-1"}:
+        factor = 86400.0
+    elif units in {"kgm-2day-1", "kg/m2/day"}:
+        factor = 1.0
+    elif units in {"m/s", "ms-1"}:
+        factor = 86400000.0
+    else:
+        raise ValueError(f"Unsupported AgERA5 precipitation units: {original_attrs.get('units')!r}.")
+    da = da * factor
+    da.attrs = original_attrs
+    if not units:
+        da.attrs["unit_assumption"] = "official AgERA5 precipitation_flux: mm day-1"
 
     da = da.rename("precipitation")
     da.attrs.update({
@@ -309,7 +383,7 @@ def _download_ersstv6_monthly_sst(
             parts.append(part.load())
 
     output = xr.concat(parts, dim="time").sortby("time")
-    output = output.drop_duplicates("time")
+    output = _deduplicate_identical_time(output)
     output = _subset_ersstv6_extent(output, extent)
     output = output.rename({"sst": "sea_surface_temperature"})
 
@@ -383,7 +457,7 @@ VAR_CONFIG = {
         "plot_type": "contour_overlay",
         "cmap": "RdBu_r",
         "levels_anom": np.arange(-5, 6, 1),
-        "levels_contour": np.arange(990, 1038, 2),
+        "levels_contour": np.r_[np.arange(990, 1015, 2), np.arange(1015, 1041, 5)],
         "highlight_black": [1015],
         "highlight_green": [1012],
         "extent": [50, -60, -45, 130],
@@ -501,10 +575,10 @@ def _clean_dataset(ds):
     if "expver" in ds.dims:
         if ds.sizes["expver"] > 1:
             values = set(np.asarray(ds["expver"].values).tolist())
-            if {1, 5}.issubset(values):
+            if values == {1, 5}:
                 ds = ds.sel(expver=1).combine_first(ds.sel(expver=5))
             else:
-                ds = ds.isel(expver=0, drop=True)
+                raise ValueError(f"Unknown multiple ERA5 expver values: {sorted(values)}")
         else:
             ds = ds.squeeze("expver", drop=True)
 
@@ -515,10 +589,7 @@ def _clean_dataset(ds):
     if "time" not in ds.coords and "time" not in ds.dims:
         raise ValueError("No time coordinate was found in the ERA5 dataset.")
 
-    ds = ds.sortby("time")
-    if hasattr(ds, "drop_duplicates"):
-        ds = ds.drop_duplicates("time")
-    return ds
+    return _deduplicate_identical_time(ds)
 
 
 # ===========================================================================
@@ -554,8 +625,12 @@ def _download_agera5_monthly_precipitation(
     )
     fpath = os.path.join(dir_to_save, fname)
     if os.path.exists(fpath) and not force_download:
-        print(f" Data found: {fname}")
-        return fpath
+        with xr.open_dataset(fpath) as cached:
+            current = cached.attrs.get("wass2s_processing_version") == "complete-months-20260911"
+        if current:
+            print(f" Data found: {fname}")
+            return fpath
+        print(" Rebuilding monthly AgERA5 totals from daily caches with strict completeness.")
 
     cache_dir = os.path.join(dir_to_save, "agera5_daily_cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -594,8 +669,8 @@ def _download_agera5_monthly_precipitation(
     for path in daily_paths:
         with xr.open_dataset(path) as opened:
             parts.append(_first_data_array(_clean_dataset(opened)).load())
-    daily = xr.concat(parts, dim="time").sortby("time").drop_duplicates("time")
-    monthly = daily.resample(time="MS").sum("time", skipna=True, min_count=1)
+    daily = _deduplicate_identical_time(xr.concat(parts, dim="time"))
+    monthly = _complete_monthly_precipitation(daily)
     monthly = monthly.rename("precipitation")
     monthly.attrs.update({
         "units": "mm month-1",
@@ -606,7 +681,8 @@ def _download_agera5_monthly_precipitation(
     output.attrs.update({
         "precip_source": "agera5",
         "agera5_version": agera5_version,
-        "aggregation": "sum of daily precipitation flux",
+        "aggregation": "sum of daily precipitation flux; every calendar day finite",
+        "wass2s_processing_version": "complete-months-20260911",
     })
     os.makedirs(dir_to_save, exist_ok=True)
     output.to_netcdf(fpath)
@@ -698,6 +774,23 @@ def _latitude_band(data, south, north):
     return data.sel(latitude=lat_slice)
 
 
+
+def _latitude_band_mean(data, south, north):
+    """Area mean on the regular latitude/longitude grids of ERA5 and ERSST."""
+    band = _latitude_band(data, south, north)
+    if band.sizes.get("latitude", 0) == 0:
+        raise ValueError("The selected latitude band is empty.")
+    latitude = band["latitude"]
+    if not np.isfinite(latitude).all() or (np.abs(latitude) > 90).any():
+        raise ValueError("Latitudes must be finite and within [-90, 90].")
+    if latitude.size > 2:
+        spacing = np.abs(np.diff(latitude.values))
+        if not np.allclose(spacing, spacing[0], rtol=1e-5, atol=1e-8):
+            raise ValueError("Latitude area averaging requires a regular grid.")
+    weights = np.cos(np.deg2rad(latitude)).clip(min=0)
+    return band.weighted(weights).mean("latitude")
+
+
 def plot_hovmoller(data_anom, data_abs, var_key):
     """Plot a time–longitude Hovmöller diagram for a supported variable.
 
@@ -721,8 +814,8 @@ def plot_hovmoller(data_anom, data_abs, var_key):
     print(f"Generating Hovmöller for {var_key}...")
     lat_max, lat_min = max(conf["hov_band"]), min(conf["hov_band"])
 
-    hov_anom = _latitude_band(data_anom, lat_min, lat_max).mean(dim="latitude")
-    hov_abs = _latitude_band(data_abs, lat_min, lat_max).mean(dim="latitude")
+    hov_anom = _latitude_band_mean(data_anom, lat_min, lat_max)
+    hov_abs = _latitude_band_mean(data_abs, lat_min, lat_max)
 
     if conf["plot_type"] in ["vector", "streamlines", "stream_humidity"]:
         u_var = [v for v in hov_anom.data_vars if "u" in v.lower() or "var131" in v][0]
@@ -1011,7 +1104,7 @@ def process_variable(fpath, var_key, clim_start, clim_end, target_date,
     precip_src = _normalise_precip_source(precip_source)
     sst_src = _normalise_sst_source(sst_source)
     with xr.open_dataset(fpath) as opened:
-        ds = _clean_dataset(opened).load()
+        ds = _validate_monthly_axis(_clean_dataset(opened)).load()
         file_precip_source = str(opened.attrs.get("precip_source", "")).lower()
         file_sst_source = str(opened.attrs.get("sst_source", "")).lower()
 
@@ -1046,12 +1139,14 @@ def process_variable(fpath, var_key, clim_start, clim_end, target_date,
     if recent.sizes.get("time", 0) == 0:
         raise ValueError("No monthly data were found for the requested six-month window.")
 
+    if recent.sizes["time"] != 6 or np.unique(recent.time.dt.month).size != 6:
+        raise ValueError("The six-month window must contain exactly six monthly fields")
     anomaly = recent.groupby("time.month") - clim
 
     if conf["plot_type"] == "ratio" and ratio_mode == "cumulative":
         monthly_normal = clim.sel(month=recent["time.month"])
-        normal_cumulative = monthly_normal.sum("time", skipna=True)
-        observed_cumulative = recent.sum("time", skipna=True)
+        normal_cumulative = monthly_normal.sum("time", skipna=False)
+        observed_cumulative = recent.sum("time", skipna=False)
         normal_cumulative = normal_cumulative.where(normal_cumulative > 1.0)
         ratio_cumulative = observed_cumulative / normal_cumulative * 100.0
         plot_period_map(
@@ -1388,7 +1483,7 @@ def _open_clim(paths, var_key, precip_source="era5"):
         parts.append(_first_data_array(ds))
     if not parts:
         raise ValueError("No climatology files could be opened.")
-    return xr.concat(parts, dim="time").sortby("time").drop_duplicates("time")
+    return _deduplicate_identical_time(xr.concat(parts, dim="time"))
 
 
 def _clim_window_stat(da, target_date, n_days, clim_start, clim_end, reducer="sum"):
@@ -1396,17 +1491,22 @@ def _clim_window_stat(da, target_date, n_days, clim_start, clim_end, reducer="su
     if reducer not in {"sum", "mean"}:
         raise ValueError('reducer must be either "sum" or "mean".')
 
+    if not isinstance(n_days, (int, np.integer)) or isinstance(n_days, (bool, np.bool_)) or n_days < 1:
+        raise ValueError("n_days must be a positive integer.")
+    if clim_start > clim_end:
+        raise ValueError("clim_start must not exceed clim_end.")
+    da = _validate_daily_axis(da).where(np.isfinite(da))
     per_year = []
     years = []
     for year in range(clim_start, clim_end + 1):
         start, end = _analog_window(target_date, n_days, year)
         subset = da.sel(time=slice(str(start), str(end)))
-        if subset.sizes.get("time", 0) == 0:
+        if subset.sizes.get("time", 0) != n_days:
             continue
         aggregate = (
-            subset.mean("time", skipna=True)
+            subset.mean("time", skipna=False)
             if reducer == "mean"
-            else subset.sum("time", skipna=True)
+            else subset.sum("time", skipna=False)
         )
         per_year.append(aggregate)
         years.append(year)
@@ -1415,7 +1515,11 @@ def _clim_window_stat(da, target_date, n_days, clim_start, clim_end, reducer="su
         raise ValueError("No reference-year data found for the analog window.")
 
     climatology = xr.concat(per_year, dim=xr.IndexVariable("clim_year", years))
-    return climatology.mean("clim_year", skipna=True)
+    result = climatology.mean("clim_year", skipna=True)
+    result = result.assign_coords(n_reference_years=climatology.count("clim_year"))
+    result.attrs.update({"climatology_start": int(clim_start), "climatology_end": int(clim_end),
+                         "reference_completeness": "all days finite within each analog window"})
+    return result
 
 
 def _clim_window_sum(da, target_date, n_days, clim_start, clim_end):
@@ -1568,11 +1672,9 @@ def process_daily(dir_save, var_key, target_date_str, n_days=30, stat=None,
     if ds.sizes.get("time", 0) == 0:
         print(" No daily data are available in the requested window.")
         return None
-    if ds.sizes.get("time", 0) < n_days:
-        print(
-            f" Warning: only {ds.sizes['time']} of {n_days} requested days "
-            "are available."
-        )
+    ds = _validate_daily_axis(ds).where(np.isfinite(ds))
+    if ds.sizes.get("time", 0) != n_days:
+        raise ValueError(f"Incomplete daily window: {ds.sizes['time']} of {n_days} days")
     is_agera5_precip = var_key == "precip" and source == "agera5"
     if var_key != "wind_850" and not is_agera5_precip:
         ds = unit_func(ds)
@@ -1583,7 +1685,7 @@ def process_daily(dir_save, var_key, target_date_str, n_days=30, stat=None,
             raise ValueError('stat="ratio" requires clim_start and clim_end.')
 
         obs = ds if isinstance(ds, xr.DataArray) else _first_data_array(ds)
-        obs_sum = obs.sum("time")
+        obs_sum = obs.sum("time", skipna=False)
 
         cpaths = download_daily_climatology(
             dir_save, var_key, conf["extent"], target_date, n_days,
@@ -1612,7 +1714,7 @@ def process_daily(dir_save, var_key, target_date_str, n_days=30, stat=None,
             return None
 
         obs = ds if isinstance(ds, xr.DataArray) else _first_data_array(ds)
-        obs_mean = obs.mean("time")
+        obs_mean = obs.mean("time", skipna=False)
 
         cpaths = download_daily_climatology(
             dir_save, var_key, conf["extent"], target_date, n_days,
@@ -1633,7 +1735,7 @@ def process_daily(dir_save, var_key, target_date_str, n_days=30, stat=None,
         return anom
 
     # Plain sum / mean -------------------------------------------------------
-    agg = ds.sum("time") if stat == "sum" else ds.mean("time")
+    agg = ds.sum("time", skipna=False) if stat == "sum" else ds.mean("time", skipna=False)
     if var_key == "precip" and stat == "sum":
         unit_label = f"mm ({n_days} jours)"
 
@@ -1939,7 +2041,7 @@ class BOMViewer:
 # from dateutil.relativedelta import relativedelta
 # import earthkit.data
 
-# warnings.filterwarnings("ignore")
+# 
 
 # # ---------------------------------------------------------------------------
 # # Variable configuration
@@ -1965,7 +2067,7 @@ class BOMViewer:
 #         "plot_type": "contour_overlay",
 #         "cmap": "RdBu_r",
 #         "levels_anom": np.arange(-5, 6, 1),
-#         "levels_contour": np.arange(990, 1038, 2),
+#         "levels_contour": np.r_[np.arange(990, 1015, 2), np.arange(1015, 1041, 5)],
 #         "highlight_black": [1015],
 #         "highlight_green": [1012],
 #         "extent": [50, -60, -45, 130],

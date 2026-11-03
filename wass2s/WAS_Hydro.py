@@ -23,11 +23,11 @@ import pandas as pd
 import xarray as xr
 import geopandas as gpd
 from shapely.geometry import box
-try:
+if __package__:
     from .highflow_periods import ClimatologyPeriod, slice_series, slice_dataarray
     from .highflow_window_regionalization import GridWindowConfig, regionalize_highflow_windows
     from .highflow_topkriging import TopKrigingConfig
-except ImportError:
+else:
     from highflow_periods import ClimatologyPeriod, slice_series, slice_dataarray
     from highflow_window_regionalization import GridWindowConfig, regionalize_highflow_windows
     from highflow_topkriging import TopKrigingConfig
@@ -38,14 +38,14 @@ except ImportError:
 # Sibling scientific/correction modules.  Relative import when installed as
 # part of a package (wass2s), absolute import when the modules sit side by side
 # in a flat directory or are run from a notebook.
-try:
+if __package__:
     from .highwater_season_predictands_modeaware import (
         HighWaterConfig,
         fit_station_highwater_regime,
         compute_annual_predictands,
         bootstrap_window_uncertainty,
     )
-except ImportError:  # pragma: no cover - standalone / flat layout
+else:  # pragma: no cover - standalone / flat layout
     from highwater_season_predictands_modeaware import (
         HighWaterConfig,
         fit_station_highwater_regime,
@@ -53,7 +53,7 @@ except ImportError:  # pragma: no cover - standalone / flat layout
         bootstrap_window_uncertainty,
     )
 
-try:
+if __package__:
     from .glofas_highflow_bias_correction import (
         GloFASPixelMatchConfig,
         GloFASHighFlowBiasConfig,
@@ -73,7 +73,7 @@ try:
         outlet_xarray_to_picture,
         evaluate_glofas_highflow_correction,
     )
-except ImportError:  # pragma: no cover - standalone / flat layout
+else:  # pragma: no cover - standalone / flat layout
     from glofas_highflow_bias_correction import (
         GloFASPixelMatchConfig,
         GloFASHighFlowBiasConfig,
@@ -169,6 +169,7 @@ class WAS_Hydro:
         sentinels = self._resolve_hydro_missing_values(missing_values)
         for code in sentinels:
             numeric[np.isclose(numeric, code, equal_nan=False)] = np.nan
+        numeric[~np.isfinite(numeric)] = np.nan
         if negative_flow_as_nan:
             numeric[numeric < 0] = np.nan
         return numeric
@@ -2156,11 +2157,98 @@ class WAS_Hydro:
         """Gridded calendar correction; see GridWindowConfig and explicit supports."""
         return regionalize_highflow_windows(*args, **kwargs)
 
+    def build_glofas_network(self, data, *, config=None, version=None):
+        """Build the v5.2 static network from the unified GloFAS download.
+
+        ``data`` is an open xarray.Dataset or the path returned as ``'static'``
+        by WAS_Download_GloFAS_historical(return_paths=True). A Q Dataset with
+        attached auxiliaries is also accepted: Q is NEVER loaded by this method.
+        LDD and UPAREA (or UPAREA_KM2) are required; CHAN/CELLAREA are optional.
+        The native grid, codes, versions and network budget are validated by
+        GloFASStaticNetwork. The domain is not declared complete automatically.
+        """
+        if __package__:
+            from .glofas_static_network import GloFASStaticNetwork
+        else:
+            from glofas_static_network import GloFASStaticNetwork
+        owned = isinstance(data, (str, Path))
+        ds = xr.open_dataset(data) if owned else data
+        if not isinstance(ds, xr.Dataset):
+            raise TypeError("data must be a GloFAS Dataset or a NetCDF path")
+        try:
+            area = next((name for name in ("UPAREA", "UPAREA_KM2") if name in ds), None)
+            if "LDD" not in ds or area is None:
+                raise ValueError("The Dataset must contain LDD and UPAREA/UPAREA_KM2; request the auxiliaries in WAS_Download_GloFAS_historical")
+
+            def static(name):
+                if name not in ds:
+                    return None
+                # Preserve explicit model metadata supplied at Dataset level.
+                return ds[name].assign_attrs(dict(ds.attrs, **ds[name].attrs))
+
+            network = GloFASStaticNetwork(
+                ldd=static("LDD"), uparea=static(area),
+                channel_mask=static("CHAN"), cell_area=static("CELLAREA"),
+                version=version, config=config,
+            )
+            # The graph constructor uses ndarray codes, but also keeps LDD for
+            # maps/fingerprints. Make this small static field independent of the
+            # file context; never materialize the dynamic Q variable.
+            network.ldd.load()
+            return network
+        finally:
+            if owned:
+                ds.close()
+
+    def export_glofas_matching_review(self, matching, directory, **kwargs):
+        """Export the review tables/GeoJSON through the existing WAS_Hydro object."""
+        if __package__:
+            from .glofas_matching_review import export_matching_review
+        else:
+            from glofas_matching_review import export_matching_review
+        return export_matching_review(matching, directory, **kwargs)
+
+    def save_glofas_matching(self, matching, directory):
+        """Persist a frozen mapping; does not approve the proposed locations."""
+        if __package__:
+            from .glofas_matching_storage import save_glofas_matching
+        else:
+            from glofas_matching_storage import save_glofas_matching
+        return save_glofas_matching(matching, directory)
+
+    def load_glofas_matching(self, directory, static_network):
+        """Reload a saved mapping; application still checks grid/training identity."""
+        if __package__:
+            from .glofas_matching_storage import load_glofas_matching
+        else:
+            from glofas_matching_storage import load_glofas_matching
+        return load_glofas_matching(directory, static_network)
+
+    def prepare_glofas_matching(self, **kwargs):
+        """v5.2: prepare a frozen LDD/area/regime mapping before bias correction.
+
+        No downloads or spatial review are performed implicitly. See
+        RegimeMatchingConfig and MatchingTrainingContext.
+        """
+        if __package__:
+            from .glofas_matching_pixel import prepare_glofas_matching
+        else:
+            from glofas_matching_pixel import prepare_glofas_matching
+        return prepare_glofas_matching(self, **kwargs)
+
+    def review_glofas_matching(self, matching, decisions):
+        """Apply explicit human decisions, without bypassing hard filters."""
+        if __package__:
+            from .glofas_matching_review import apply_matching_decisions
+        else:
+            from glofas_matching_review import apply_matching_decisions
+        return apply_matching_decisions(matching, decisions)
+
     def build_highflow_predictand(self, *, glofas_discharge, glofas_uparea=None,
             basins=None, outlets=None, hydrosheds=None, hybas_level=None,
             observations=None, observation_variable="Observation", station_attributes=None,
             variable=None, config=None, aggregation_config=None, highflow_config=None,
-            match_config=None, periods=None, output_format="both", years=None):
+            match_config=None, periods=None, output_format="both", years=None, glofas_matching=None):
         """v5: windows -> annual aggregates -> bias correction of aggregates.
 
         PredictandConfig(reference_source="glofas") is a complete no-observation
@@ -2176,7 +2264,8 @@ class WAS_Hydro:
             hybas_level=hybas_level,observations=observations,observation_variable=observation_variable,
             station_attributes=station_attributes,variable=variable,config=config,
             aggregation_config=aggregation_config,highflow_config=highflow_config,
-            match_config=match_config,periods=periods,output_format=output_format,years=years)
+            match_config=match_config,periods=periods,output_format=output_format,years=years,
+            glofas_matching=glofas_matching)
 
     def aggregate_highflow_field(self, data, *, reference=None, outlets=None,
             windows=None, variable=None, config=None, kind=None, selector=None,
@@ -2227,3 +2316,21 @@ __all__ = [
     'WAS_Hydro', 'HighWaterConfig', 'ClimatologyPeriod', 'GridWindowConfig', 'TopKrigingConfig', 'GloFASPixelMatchConfig',
     'GloFASHighFlowBiasConfig', 'GloFASCorrectionEvaluationConfig', 'PredictandConfig', 'AggregationConfig', 'MonthlyBiasConfig'
 ]
+
+# v5.2 public matching configurations; no computation at import.
+if __package__:
+    from .glofas_static_network import GloFASStaticNetwork, LDDNetworkConfig
+    from .glofas_training_context import MatchingTrainingContext
+    from .glofas_matching_pixel import RegimeMatchingConfig, GloFASMatchingResult
+else:
+    from glofas_static_network import GloFASStaticNetwork, LDDNetworkConfig
+    from glofas_training_context import MatchingTrainingContext
+    from glofas_matching_pixel import RegimeMatchingConfig, GloFASMatchingResult
+
+__all__ += ['GloFASStaticNetwork', 'LDDNetworkConfig', 'MatchingTrainingContext',
+            'RegimeMatchingConfig', 'GloFASMatchingResult']
+
+# Component version is independent of the parent wass2s distribution version.
+WAS_HYDRO_VERSION = "5.2.0"
+WAS_HYDRO_INTEGRATION_REVISION = "unified-glofas-download-1"
+__all__ += ["WAS_HYDRO_VERSION", "WAS_HYDRO_INTEGRATION_REVISION"]

@@ -1,12 +1,11 @@
-# wass2s: A python-based tool for seasonal climate forecast
-
+# wass2s: A python-based tool for seasonal agro-hydro-climatic forecasts 
 
 **wass2s** is a comprehensive tool developed to enhance the accuracy and reproducibility of seasonal forecasts in West Africa and the Sahel. This initiative aligns with the World Meteorological Organization's (WMO) guidelines for objective, operational, and scientifically rigorous seasonal forecasting methods.
 
-
 ## Overview
-The wass2s tool is designed to facilitate the generation of seasonal forecasts using various statistical and machine learning methods including the Exploration of AI methods. 
-It helps forecaster to download data, build models, verify the models, and forecast. A user-friendly jupyter-lab notebook streaming the process of prevision.
+
+**wass2s** is an open-source Python tool for seasonal climate forecast calibration, statistical downscaling, and prediction. It combines statistical and machine learning methods.
+The tool helps forecasters download and preprocess data, calibrate climate model outputs against observations, train predictive models, generate forecasts, and evaluate forecast skill through cross-validation and verification. User-friendly **JupyterLab notebooks** guide users through the workflow, while **command-line interfaces (CLIs)** support automated processing and operational forecasting. Both options support reproducible analyses.
 
 ## 🚀 Features
 
@@ -84,15 +83,6 @@ pip install --upgrade wass2s
 ```
 
 ### Potential Issues
-If you encounter matplotlib errors, try the following steps:
-1.  Install this version of matplotlib:
-    ```bash
-    pip install matplotlib==3.7.3
-    ```
-2.  Install the latest version of cartopy:
-    ```bash
-    conda install -c conda-forge -c hallkjc01 xcast
-    ```
 If you encounter other issues during installation or usage, please refer to the [Troubleshooting Guide](https://github.com/hmandela/WASS2S/blob/main/TROUBLESHOOTING.md).
 
 ## ⚙️ Usage

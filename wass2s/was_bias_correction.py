@@ -9,7 +9,7 @@ Two classes are provided:
 
 - ``WAS_bias_correction`` : bias-correction methods for continuous variables
   such as temperature or wind speed. Supports MEAN, VARSCALE, QUANT, NORM
-  and DIST methods.
+  DIST and additive/multiplicative QDM methods.
 
 Both classes accept NumPy arrays (1D / 2D / 3D) and 3D ``xarray.DataArray``
 inputs, and they propagate / handle NaNs.
@@ -18,6 +18,7 @@ This is a corrected version of the original implementation.
 """
 
 import inspect
+import warnings
 import numpy as np
 import xarray as xr
 from scipy import stats
@@ -63,9 +64,121 @@ def _filter_nan_pair(o, m):
     """Drop NaN entries independently from each 1D array."""
     o = np.asarray(o, dtype=float)
     m = np.asarray(m, dtype=float)
-    o = o[~np.isnan(o)]
-    m = m[~np.isnan(m)]
+    o = o[np.isfinite(o)]
+    m = m[np.isfinite(m)]
     return o, m
+
+
+def _validate_bias_arrays(obs, mod, positive=False):
+    """Reject mixed labelled/unlabelled inputs and impossible physical values."""
+    if isinstance(obs, xr.DataArray) != isinstance(mod, xr.DataArray):
+        raise TypeError("obs and mod must both be DataArrays or both be NumPy arrays.")
+    if isinstance(obs, xr.DataArray):
+        for data in (obs, mod):
+            for dim in data.dims:
+                index = data.get_index(dim)
+                if not index.is_unique or index.hasnans:
+                    raise ValueError(f"Bias correction coordinate {dim!r} must be finite and unique.")
+    if positive:
+        for value in (obs, mod):
+            a = np.asarray(value, dtype=float)
+            if np.any(a[np.isfinite(a)] < 0):
+                raise ValueError("Precipitation quantile mapping requires non-negative values.")
+
+
+def _qdm_reference_array(reference, fobj):
+    """Validate the independent target-model distribution on the fitted grid."""
+    if reference is None:
+        raise ValueError(
+            "QDM requires reference=<target-period model sample>. Supply the model "
+            "distribution explicitly; an individual forecast cannot identify it."
+        )
+    if fobj.get("is_xarray", False):
+        if not isinstance(reference, xr.DataArray):
+            raise TypeError("QDM reference must be a DataArray on the fitted grid.")
+        if set(reference.dims) != {"T", "Y", "X"}:
+            raise ValueError("QDM reference must have dimensions T, Y, X.")
+        for dim in ("Y", "X"):
+            if not reference.get_index(dim).equals(fobj['coords'].indexes[dim]):
+                raise ValueError(f"QDM reference coordinate {dim!r} differs from fitted grid.")
+        reference = reference.transpose("T", "Y", "X")
+    reference = np.asarray(reference, dtype=float)
+    if reference.ndim == 1:
+        reference = reference[:, None]
+    elif reference.ndim == 3:
+        reference = reference.reshape(reference.shape[0], -1)
+    if reference.ndim != 2 or reference.shape[1] != len(fobj['par']['obs']):
+        raise ValueError("QDM reference must match the fitted number of grid cells.")
+    if reference.shape[0] < 2:
+        raise ValueError("QDM reference requires at least two target-period model samples.")
+    return reference
+
+
+def _fit_qdm(obs, mod, kind="additive", denominator_floor=None, max_ratio=None):
+    """Store empirical historical marginals; no target-period data are fitted."""
+    kind = str(kind).lower()
+    if kind not in {"additive", "multiplicative"}:
+        raise ValueError("QDM kind must be 'additive' or 'multiplicative'.")
+    for name, value in (("denominator_floor", denominator_floor), ("max_ratio", max_ratio)):
+        if value is not None and (not np.isfinite(value) or value <= 0):
+            raise ValueError(f"{name} must be a finite positive number or None.")
+    if kind == "additive" and (denominator_floor is not None or max_ratio is not None):
+        raise ValueError("Ratio regularisation applies only to multiplicative QDM.")
+    if kind == "multiplicative":
+        _validate_bias_arrays(obs, mod, positive=True)
+    par = {"obs": [], "mod": [], "kind": kind,
+           "denominator_floor": denominator_floor, "max_ratio": max_ratio}
+    for col in range(obs.shape[1]):
+        o, m = _filter_nan_pair(obs[:, col], mod[:, col])
+        par["obs"].append(np.sort(o))
+        par["mod"].append(np.sort(m))
+    return {"class": "fitQDM", "par": par,
+            "method": "quantile_delta_mapping", "cdf_ties": "mean plotting position",
+            "zero_denominator": "NaN for positive targets unless an explicit floor is set"}
+
+
+def _do_qdm(x, fobj, reference=None):
+    """Empirical QDM at target-model ranks, following Cannon et al. (2015).
+
+    For p = F_target(x), additive QDM is Q_obs(p) + x - Q_hist(p),
+    multiplicative QDM is Q_obs(p) * x / Q_hist(p). Finite-sample CDFs
+    invert the linear empirical quantile function, averaging tied ranks.
+    Tails use the boundary rank (0/1), retaining the model delta or ratio.
+    Raw zero targets remain zero in multiplicative mode. A positive target
+    above a zero historical model quantile is unidentified and stays NaN;
+    explicit ratio regularisation changes this default only when requested.
+    """
+    r = _qdm_reference_array(reference, fobj)
+    par = fobj['par']
+    if x.shape[1] != len(par['obs']):
+        raise ValueError("QDM input does not match the fitted number of grid cells.")
+    ratio = par['kind'] == 'multiplicative'
+    if ratio:
+        _validate_bias_arrays(x, r, positive=True)
+    out = np.full_like(x, np.nan, dtype=float)
+    for col, (o, m) in enumerate(zip(par['obs'], par['mod'])):
+        ri = np.sort(r[np.isfinite(r[:, col]), col])
+        if min(len(o), len(m), len(ri)) < 2:
+            continue
+        valid = np.isfinite(x[:, col])
+        xi = x[valid, col]
+        unique, first, counts = np.unique(ri, return_index=True, return_counts=True)
+        # Mean tied positions in the inverse of numpy's type-7 quantiles.
+        probabilities = (first + (counts - 1) / 2) / (len(ri) - 1)
+        p = np.interp(xi, unique, probabilities, left=0.0, right=1.0)
+        qo = np.quantile(o, p)
+        qm = np.quantile(m, p)
+        if ratio:
+            denominator = qm if par['denominator_floor'] is None else np.maximum(qm, par['denominator_floor'])
+            delta = np.divide(xi, denominator, out=np.full_like(xi, np.nan), where=denominator > 0)
+            if par['max_ratio'] is not None:
+                delta = np.minimum(delta, par['max_ratio'])
+            values = qo * delta
+            values[xi == 0] = 0.0
+        else:
+            values = qo + xi - qm
+        out[valid, col] = values
+    return out
 
 
 class WAS_Qmap:
@@ -114,24 +227,27 @@ class WAS_Qmap:
         dict
             Fitted object with parameters, ``class`` identifier and metadata.
         """
+        _validate_bias_arrays(obs, mod, positive=True)
+        if 'wet_day' in kwargs and isinstance(kwargs['wet_day'], np.bool_):
+            kwargs['wet_day'] = bool(kwargs['wet_day'])
         is_xarray = isinstance(obs, xr.DataArray) and isinstance(mod, xr.DataArray)
         time_dim = spatial_dims = coords = attrs = original_dims = None
 
         if is_xarray:
-            if obs.shape != mod.shape or len(obs.dims) != 3:
-                raise ValueError(
-                    "xarray DataArrays must be 3D with matching shapes and "
-                    "dimensions (T, Y, X)"
-                )
-            time_dim = obs.dims[0]
-            spatial_dims = obs.dims[1:]
+            if set(obs.dims) != {"T", "Y", "X"} or set(mod.dims) != {"T", "Y", "X"}:
+                raise ValueError("xarray inputs must have named dimensions T, Y, X.")
+            original_dims = obs.dims
+            obs = obs.transpose("T", "Y", "X")
+            mod = mod.transpose("T", "Y", "X")
+            obs, mod = xr.align(obs, mod, join="exact", copy=False)
+            time_dim = "T"
+            spatial_dims = ("Y", "X")
             obs_stacked = obs.stack(grid=spatial_dims).transpose(time_dim, 'grid')
             mod_stacked = mod.stack(grid=spatial_dims).transpose(time_dim, 'grid')
             obs_data = obs_stacked.values
             mod_data = mod_stacked.values
             coords = obs.coords
             attrs = obs.attrs
-            original_dims = obs.dims
         else:
             obs_data = WAS_Qmap._to_2d(obs)
             mod_data = WAS_Qmap._to_2d(mod)
@@ -141,8 +257,16 @@ class WAS_Qmap:
                     f"{obs_data.shape} and {mod_data.shape}"
                 )
 
+        if "qstep" in kwargs and kwargs["qstep"] is not None:
+            if not 0 < float(kwargs["qstep"]) <= 1:
+                raise ValueError("qstep must be in (0, 1].")
         method_up = method.upper()
-        if method_up == 'QUANT':
+        if method_up == 'QDM':
+            kwargs.setdefault('kind', 'multiplicative')
+            if kwargs['kind'] != 'multiplicative':
+                raise ValueError("Use WAS_bias_correction for additive QDM.")
+            fobj = _fit_qdm(obs_data, mod_data, **kwargs)
+        elif method_up == 'QUANT':
             fobj = WAS_Qmap.fitQmapQUANT(obs_data, mod_data, **kwargs)
         elif method_up == 'RQUANT':
             fobj = WAS_Qmap.fitQmapRQUANT(obs_data, mod_data, **kwargs)
@@ -155,6 +279,7 @@ class WAS_Qmap:
         else:
             raise ValueError(f"Unknown method: {method}")
 
+        fobj['n_grid'] = obs_data.shape[1]
         if is_xarray:
             fobj['is_xarray'] = True
             fobj['time_dim'] = time_dim
@@ -177,10 +302,13 @@ class WAS_Qmap:
                     "Input x must be xarray.DataArray when the model was "
                     "fitted from a DataArray"
                 )
-            if len(x.dims) != 3 or x.dims[1:] != fobj['spatial_dims']:
-                raise ValueError("Input x must have matching spatial dimensions")
             time_dim = fobj['time_dim']
             spatial_dims = fobj['spatial_dims']
+            if set(x.dims) != {time_dim, *spatial_dims}:
+                raise ValueError("Input x must have matching named dimensions.")
+            for dim in spatial_dims:
+                if not x.get_index(dim).equals(fobj['coords'].indexes[dim]):
+                    raise ValueError(f"Input x coordinate {dim!r} differs from the fitted grid.")
             x_stacked = x.stack(grid=spatial_dims).transpose(time_dim, 'grid')
             x_data = x_stacked.values
             corrected_data = WAS_Qmap._doQmap_internal(x_data, fobj, **kwargs)
@@ -192,8 +320,9 @@ class WAS_Qmap:
                     'grid': x_stacked.coords['grid'],
                 },
             )
-            corrected = corrected_stacked.unstack('grid')
-            corrected.attrs = fobj['attrs']
+            corrected = corrected_stacked.unstack('grid').transpose(*x.dims)
+            corrected.attrs = dict(fobj['attrs'])
+            corrected.name = x.name
             return corrected
 
         # NumPy path: preserve original ndim instead of using np.squeeze,
@@ -215,7 +344,13 @@ class WAS_Qmap:
     @staticmethod
     def _doQmap_internal(x, fobj, **kwargs):
         """Dispatch to the appropriate ``doQmap*`` based on fitted class."""
+        if np.any(x[np.isfinite(x)] < 0):
+            raise ValueError("Precipitation quantile mapping requires non-negative values.")
+        if 'n_grid' in fobj and x.shape[1] != fobj['n_grid']:
+            raise ValueError("Input does not match the fitted number of grid cells.")
         cls = fobj['class']
+        if cls == 'fitQDM':
+            return _do_qdm(x, fobj, **kwargs)
         if cls == 'fitQmapQUANT':
             return WAS_Qmap.doQmapQUANT(x, fobj, **kwargs)
         if cls == 'fitQmapRQUANT':
@@ -256,14 +391,14 @@ class WAS_Qmap:
             if len(obs) == 0:
                 return 0.0, 0.0
             p_wet = float(np.mean(obs > 0))
-            th_mod = float(np.quantile(mod, 1 - p_wet)) if len(mod) else 0.0
+            th_mod = (float(np.nextafter(np.min(mod), -np.inf)) if p_wet == 1 else float(np.quantile(mod, 1 - p_wet))) if len(mod) else 0.0
             return th_mod, 0.0
         # numeric threshold
         th_obs = float(wet_day)
         if len(obs) == 0:
             return 0.0, th_obs
         p_wet = float(np.mean(obs >= th_obs))
-        th_mod = float(np.quantile(mod, 1 - p_wet)) if len(mod) else 0.0
+        th_mod = (float(np.nextafter(np.min(mod), -np.inf)) if p_wet == 1 else float(np.quantile(mod, 1 - p_wet))) if len(mod) else 0.0
         return th_mod, th_obs
 
     # ------------------------------------------------------------------
@@ -271,8 +406,9 @@ class WAS_Qmap:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def fitQmapQUANT(obs, mod, wet_day=False, qstep=0.01, nboot=1):
+    def fitQmapQUANT(obs, mod, wet_day=False, qstep=0.01, nboot=1, random_state=None):
         """Fit empirical quantile mapping with optional bootstrap of obs."""
+        rng = np.random.default_rng(random_state)
         n_cols = obs.shape[1]
         n_q = int(1 / qstep) + 1
         probs = np.linspace(0, 1, n_q)
@@ -283,6 +419,7 @@ class WAS_Qmap:
             'wet_day_th_mod': np.zeros(n_cols),
             'wet_day_th_obs': np.zeros(n_cols),
             'all_nan': np.zeros(n_cols, dtype=bool),
+            'all_dry': np.zeros(n_cols, dtype=bool),
         }
 
         for col in range(n_cols):
@@ -292,11 +429,12 @@ class WAS_Qmap:
                 WAS_Qmap._wet_day_threshold(o, m, wet_day)
             )
             th_obs = par['wet_day_th_obs'][col]
+            par['all_dry'][col] = bool(o.size >= 2 and m.size >= 2 and np.all(o <= 0 if isinstance(wet_day, (bool, np.bool_)) else o < th_obs))
             if wet_day is True:
                 o = o[o > th_obs]
             else:
                 o = o[o >= th_obs]
-            m = m[m >= par['wet_day_th_mod'][col]]
+            m = m[m > par['wet_day_th_mod'][col]] if wet_day is not False else m[m >= 0]
 
             if len(o) < 2 or len(m) < 2:
                 par['all_nan'][col] = True
@@ -305,7 +443,7 @@ class WAS_Qmap:
             par['modq'][:, col] = np.quantile(m, probs)
             if nboot > 1:
                 boot_q = np.array([
-                    np.quantile(np.random.choice(o, len(o), replace=True), probs)
+                    np.quantile(rng.choice(o, len(o), replace=True), probs)
                     for _ in range(nboot)
                 ])
                 par['fitq'][:, col] = np.mean(boot_q, axis=0)
@@ -332,6 +470,9 @@ class WAS_Qmap:
         all_nan = par.get('all_nan', np.zeros(n_cols, dtype=bool))
 
         for col in range(n_cols):
+            if par.get('all_dry', np.zeros(n_cols, dtype=bool))[col]:
+                corrected[:, col] = np.where(np.isfinite(x[:, col]), 0.0, np.nan)
+                continue
             if all_nan[col]:
                 continue
             xi = x[:, col].astype(float, copy=True)
@@ -344,8 +485,8 @@ class WAS_Qmap:
 
             xi_out = np.full_like(xi, np.nan)
 
-            valid = ~np.isnan(xi)
-            mask_dry = valid & (xi < th_mod)
+            valid = np.isfinite(xi)
+            mask_dry = valid & ((xi <= th_mod) if fobj.get('wet_day', False) is not False else (xi < th_mod))
             mask_high = valid & (xi > modq[-1])
             mask_interp = valid & ~mask_dry & ~mask_high
 
@@ -363,7 +504,7 @@ class WAS_Qmap:
                 else:
                     xi_out[mask_interp] = fitq_u[0] if fitq_u.size else np.nan
 
-            corrected[:, col] = xi_out
+            corrected[:, col] = np.maximum(xi_out, 0.0)
         return corrected
 
     # ------------------------------------------------------------------
@@ -371,8 +512,9 @@ class WAS_Qmap:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def fitQmapRQUANT(obs, mod, wet_day=True, qstep=0.01, nlls=10, nboot=10):
+    def fitQmapRQUANT(obs, mod, wet_day=True, qstep=0.01, nlls=10, nboot=10, random_state=None):
         """Robust quantile mapping with local linear fits."""
+        rng = np.random.default_rng(random_state)
         n_cols = obs.shape[1]
         probs = np.linspace(0, 1, int(1 / qstep) + 1)
         n = len(probs)
@@ -384,6 +526,7 @@ class WAS_Qmap:
             'wet_day_th_mod': np.zeros(n_cols),
             'wet_day_th_obs': np.zeros(n_cols),
             'all_nan': np.zeros(n_cols, dtype=bool),
+            'all_dry': np.zeros(n_cols, dtype=bool),
         }
 
         for col in range(n_cols):
@@ -392,11 +535,12 @@ class WAS_Qmap:
                 WAS_Qmap._wet_day_threshold(o, m, wet_day)
             )
             th_obs = par['wet_day_th_obs'][col]
+            par['all_dry'][col] = bool(o.size >= 2 and m.size >= 2 and np.all(o <= 0 if isinstance(wet_day, (bool, np.bool_)) else o < th_obs))
             if wet_day is True:
                 o = o[o > th_obs]
             else:
                 o = o[o >= th_obs]
-            m = m[m >= par['wet_day_th_mod'][col]]
+            m = m[m > par['wet_day_th_mod'][col]] if wet_day is not False else m[m >= 0]
 
             if len(o) < 2 or len(m) < 2:
                 par['all_nan'][col] = True
@@ -405,7 +549,7 @@ class WAS_Qmap:
             par['modq'][:, col] = np.quantile(m, probs)
             if nboot > 1:
                 boot_q = np.array([
-                    np.quantile(np.random.choice(o, len(o), replace=True), probs)
+                    np.quantile(rng.choice(o, len(o), replace=True), probs)
                     for _ in range(nboot)
                 ])
                 obsq = np.mean(boot_q, axis=0)
@@ -425,6 +569,7 @@ class WAS_Qmap:
                 else:
                     slope, intercept = np.polyfit(X_u, y_u, 1)
                     fitq[i] = slope * par['modq'][i, col] + intercept
+            fitq = np.maximum.accumulate(np.maximum(fitq, 0.0))
             par['fitq'][:, col] = fitq
 
             # FIX: estimate boundary slopes from the first/last `nlls` points
@@ -451,6 +596,9 @@ class WAS_Qmap:
         all_nan = par.get('all_nan', np.zeros(n_cols, dtype=bool))
 
         for col in range(n_cols):
+            if par.get('all_dry', np.zeros(n_cols, dtype=bool))[col]:
+                corrected[:, col] = np.where(np.isfinite(x[:, col]), 0.0, np.nan)
+                continue
             if all_nan[col]:
                 continue
             xi = x[:, col].astype(float, copy=True)
@@ -467,8 +615,8 @@ class WAS_Qmap:
             modq_u, fitq_u = _dedupe_monotone(modq, fitq)
 
             xi_out = np.full_like(xi, np.nan)
-            valid = ~np.isnan(xi)
-            mask_dry = valid & (xi < th_mod)
+            valid = np.isfinite(xi)
+            mask_dry = valid & ((xi <= th_mod) if fobj.get('wet_day', False) is not False else (xi < th_mod))
             mask_low = valid & (xi < modq[0]) & ~mask_dry
             mask_high = valid & (xi > modq[-1])
             mask_interp = valid & ~mask_dry & ~mask_low & ~mask_high
@@ -483,8 +631,10 @@ class WAS_Qmap:
                     bounds_error=False, fill_value='extrapolate',
                 )
                 xi_out[mask_interp] = interp_func(xi[mask_interp])
+            elif np.any(mask_interp) and modq_u.size == 1:
+                xi_out[mask_interp] = fitq_u[0]
 
-            corrected[:, col] = xi_out
+            corrected[:, col] = np.maximum(xi_out, 0.0)
         return corrected
 
     # ------------------------------------------------------------------
@@ -493,7 +643,7 @@ class WAS_Qmap:
 
     @staticmethod
     def fitQmapSSPLIN(obs, mod, wet_day=False, qstep=0.01):
-        """Fit quantile mapping using PCHIP smoothing splines."""
+        """Fit monotone PCHIP quantile interpolation (legacy SSPLIN name; no smoothing penalty)."""
         n_cols = obs.shape[1]
         n_q = int(1 / qstep) + 1
         probs = np.linspace(0, 1, n_q)
@@ -504,6 +654,7 @@ class WAS_Qmap:
             'wet_day_th_mod': np.zeros(n_cols),
             'wet_day_th_obs': np.zeros(n_cols),
             'all_nan': np.zeros(n_cols, dtype=bool),
+            'all_dry': np.zeros(n_cols, dtype=bool),
         }
         for col in range(n_cols):
             o, m = _filter_nan_pair(obs[:, col], mod[:, col])
@@ -511,11 +662,12 @@ class WAS_Qmap:
                 WAS_Qmap._wet_day_threshold(o, m, wet_day)
             )
             th_obs = par['wet_day_th_obs'][col]
+            par['all_dry'][col] = bool(o.size >= 2 and m.size >= 2 and np.all(o <= 0 if isinstance(wet_day, (bool, np.bool_)) else o < th_obs))
             if wet_day is True:
                 o = o[o > th_obs]
             else:
                 o = o[o >= th_obs]
-            m = m[m >= par['wet_day_th_mod'][col]]
+            m = m[m > par['wet_day_th_mod'][col]] if wet_day is not False else m[m >= 0]
 
             if len(o) < 2 or len(m) < 2:
                 par['all_nan'][col] = True
@@ -534,6 +686,9 @@ class WAS_Qmap:
         all_nan = par.get('all_nan', np.zeros(n_cols, dtype=bool))
 
         for col in range(n_cols):
+            if par.get('all_dry', np.zeros(n_cols, dtype=bool))[col]:
+                corrected[:, col] = np.where(np.isfinite(x[:, col]), 0.0, np.nan)
+                continue
             if all_nan[col]:
                 continue
             xi = x[:, col].astype(float, copy=True)
@@ -545,18 +700,20 @@ class WAS_Qmap:
             modq_u, fitq_u = _dedupe_monotone(modq, fitq)
 
             xi_out = np.full_like(xi, np.nan)
-            valid = ~np.isnan(xi)
-            mask_dry = valid & (xi < th_mod)
+            valid = np.isfinite(xi)
+            mask_dry = valid & ((xi <= th_mod) if fobj.get('wet_day', False) is not False else (xi < th_mod))
             mask_interp = valid & ~mask_dry
 
             xi_out[mask_dry] = 0.0
             if np.any(mask_interp):
                 if modq_u.size >= 2:
                     interp_func = PchipInterpolator(modq_u, fitq_u, extrapolate=True)
-                    xi_out[mask_interp] = interp_func(xi[mask_interp])
+                    xi_out[mask_interp] = interp_func(np.clip(xi[mask_interp], modq_u[0], modq_u[-1]))
+                    high = mask_interp & (xi > modq_u[-1])
+                    xi_out[high] = xi[high] + fitq_u[-1] - modq_u[-1]
                 else:
                     xi_out[mask_interp] = fitq_u[0] if fitq_u.size else np.nan
-            corrected[:, col] = xi_out
+            corrected[:, col] = np.maximum(xi_out, 0.0)
         return corrected
 
     # ------------------------------------------------------------------
@@ -618,6 +775,7 @@ class WAS_Qmap:
             'wet_day_th_mod': np.zeros(n_cols),
             'wet_day_th_obs': np.zeros(n_cols),
             'all_nan': np.zeros(n_cols, dtype=bool),
+            'all_dry': np.zeros(n_cols, dtype=bool),
         }
 
         if callable(transfun):
@@ -637,11 +795,12 @@ class WAS_Qmap:
                 WAS_Qmap._wet_day_threshold(o, m, wet_day)
             )
             th_obs = par['wet_day_th_obs'][col]
+            par['all_dry'][col] = bool(o.size >= 2 and m.size >= 2 and np.all(o <= 0 if isinstance(wet_day, (bool, np.bool_)) else o < th_obs))
             if wet_day is True:
                 o = o[o > th_obs]
             else:
                 o = o[o >= th_obs]
-            m = m[m >= par['wet_day_th_mod'][col]]
+            m = m[m > par['wet_day_th_mod'][col]] if wet_day is not False else m[m >= 0]
 
             if len(o) < 2 or len(m) < 2:
                 par['par'].append(np.array([0.0] * n_params))
@@ -673,6 +832,13 @@ class WAS_Qmap:
                 return float(np.sum(np.abs(oq - pred)))
 
             res = minimize(objective, p0, method='Nelder-Mead')
+            with np.errstate(all="ignore"):
+                fitted_curve = np.asarray(tf(mq, *res.x), float)
+            tolerance = 1e-10 * max(1.0, float(np.max(np.abs(oq))))
+            if (not res.success or not np.isfinite(fitted_curve).all()
+                    or np.any(np.diff(fitted_curve) < -tolerance)):
+                par['all_nan'][col] = True
+                warnings.warn(f"PTF fit failed or was non-monotone at grid column {col}.", RuntimeWarning)
             par['par'].append(np.asarray(res.x))
 
         return {'class': 'fitQmapPTF', 'par': par, 'wet_day': wet_day}
@@ -693,6 +859,9 @@ class WAS_Qmap:
                 raise ValueError(f"Unknown transfun: {transfun}")
 
         for col in range(n_cols):
+            if par.get('all_dry', np.zeros(n_cols, dtype=bool))[col]:
+                corrected[:, col] = np.where(np.isfinite(x[:, col]), 0.0, np.nan)
+                continue
             if all_nan[col]:
                 continue
             xi = x[:, col].astype(float, copy=True)
@@ -700,8 +869,8 @@ class WAS_Qmap:
             th_mod = par['wet_day_th_mod'][col]
 
             xi_out = np.full_like(xi, np.nan)
-            valid = ~np.isnan(xi)
-            mask_dry = valid & (xi < th_mod)
+            valid = np.isfinite(xi)
+            mask_dry = valid & ((xi <= th_mod) if fobj.get('wet_day', False) is not False else (xi < th_mod))
             mask_wet = valid & ~mask_dry
 
             xi_out[mask_dry] = 0.0
@@ -710,7 +879,7 @@ class WAS_Qmap:
                     vals = tf(xi[mask_wet], *params)
                 vals = np.where(np.isfinite(vals), vals, np.nan)
                 xi_out[mask_wet] = vals
-            corrected[:, col] = xi_out
+            corrected[:, col] = np.maximum(xi_out, 0.0)
         return corrected
 
     # ------------------------------------------------------------------
@@ -734,7 +903,8 @@ class WAS_Qmap:
         """
         n_cols = obs.shape[1]
         par = {'par_o': [], 'par_m': [], 'tfun': [], 'distr': distr,
-               'all_nan': np.zeros(n_cols, dtype=bool)}
+               'all_nan': np.zeros(n_cols, dtype=bool),
+               'all_dry': np.zeros(n_cols, dtype=bool)}
 
         dist = WAS_Qmap._DIST_MAP_QMAP.get(distr)
         if dist is None:
@@ -743,6 +913,7 @@ class WAS_Qmap:
         for col in range(n_cols):
             o, m = _filter_nan_pair(obs[:, col], mod[:, col])
 
+            par['all_dry'][col] = bool(o.size >= 2 and m.size >= 2 and np.all(o == 0))
             # FIX: wet-day probabilities must come from the RAW data,
             # never from a reduced quantile sample.
             p_o = float(np.mean(o > 0)) if o.size else 0.0
@@ -768,7 +939,7 @@ class WAS_Qmap:
             try:
                 if p_o > 0 and len(o_pos) >= 2:
                     if distr == 'bernlnorm':
-                        par_o['params'] = dist.fit(o_pos)
+                        par_o['params'] = dist.fit(o_pos, floc=0)
                     else:
                         par_o['params'] = dist.fit(o_pos, floc=0)
                 else:
@@ -780,7 +951,7 @@ class WAS_Qmap:
             try:
                 if p_m > 0 and len(m_pos) >= 2:
                     if distr == 'bernlnorm':
-                        par_m['params'] = dist.fit(m_pos)
+                        par_m['params'] = dist.fit(m_pos, floc=0)
                     else:
                         par_m['params'] = dist.fit(m_pos, floc=0)
                 else:
@@ -820,7 +991,7 @@ class WAS_Qmap:
             if par_o['prob'] == 0 or par_o['params'] is None:
                 return out
 
-            valid = ~np.isnan(val)
+            valid = np.isfinite(val)
             cdf_m = np.zeros_like(val)
             cdf_m[valid] = (
                 (1 - par_m['prob'])
@@ -847,6 +1018,9 @@ class WAS_Qmap:
         par = fobj['par']
         all_nan = par.get('all_nan', np.zeros(n_cols, dtype=bool))
         for col in range(n_cols):
+            if par.get('all_dry', np.zeros(n_cols, dtype=bool))[col]:
+                corrected[:, col] = np.where(np.isfinite(x[:, col]), 0.0, np.nan)
+                continue
             if all_nan[col]:
                 continue
             tfun = par['tfun'][col]
@@ -1151,24 +1325,25 @@ class WAS_bias_correction:
     @staticmethod
     def fitBC(obs, mod, method, **kwargs):
         """Fit a bias correction model using the specified method."""
+        _validate_bias_arrays(obs, mod)
         is_xarray = isinstance(obs, xr.DataArray) and isinstance(mod, xr.DataArray)
         time_dim = spatial_dims = coords = attrs = original_dims = None
 
         if is_xarray:
-            if obs.shape != mod.shape or len(obs.dims) != 3:
-                raise ValueError(
-                    "xarray DataArrays must be 3D with matching shapes and "
-                    "dimensions (T, Y, X)"
-                )
-            time_dim = obs.dims[0]
-            spatial_dims = obs.dims[1:]
+            if set(obs.dims) != {"T", "Y", "X"} or set(mod.dims) != {"T", "Y", "X"}:
+                raise ValueError("xarray inputs must have named dimensions T, Y, X.")
+            original_dims = obs.dims
+            obs = obs.transpose("T", "Y", "X")
+            mod = mod.transpose("T", "Y", "X")
+            obs, mod = xr.align(obs, mod, join="exact", copy=False)
+            time_dim = "T"
+            spatial_dims = ("Y", "X")
             obs_stacked = obs.stack(grid=spatial_dims).transpose(time_dim, 'grid')
             mod_stacked = mod.stack(grid=spatial_dims).transpose(time_dim, 'grid')
             obs_data = obs_stacked.values
             mod_data = mod_stacked.values
             coords = obs.coords
             attrs = obs.attrs
-            original_dims = obs.dims
         else:
             obs_data = WAS_bias_correction._to_2d(obs)
             mod_data = WAS_bias_correction._to_2d(mod)
@@ -1178,8 +1353,13 @@ class WAS_bias_correction:
                     f"{obs_data.shape} and {mod_data.shape}"
                 )
 
+        if "qstep" in kwargs and kwargs["qstep"] is not None:
+            if not 0 < float(kwargs["qstep"]) <= 1:
+                raise ValueError("qstep must be in (0, 1].")
         method_up = method.upper()
-        if method_up == 'MEAN':
+        if method_up == 'QDM':
+            fobj = WAS_bias_correction.fitQDM(obs_data, mod_data, **kwargs)
+        elif method_up == 'MEAN':
             fobj = WAS_bias_correction.fitMean(obs_data, mod_data, **kwargs)
         elif method_up == 'VARSCALE':
             fobj = WAS_bias_correction.fitVarscale(obs_data, mod_data, **kwargs)
@@ -1193,6 +1373,7 @@ class WAS_bias_correction:
         else:
             raise ValueError(f"Unknown method: {method}")
 
+        fobj['n_grid'] = obs_data.shape[1]
         if is_xarray:
             fobj['is_xarray'] = True
             fobj['time_dim'] = time_dim
@@ -1210,10 +1391,13 @@ class WAS_bias_correction:
                 raise ValueError(
                     "Input x must be xarray.DataArray when fitted with DataArray"
                 )
-            if len(x.dims) != 3 or x.dims[1:] != fobj['spatial_dims']:
-                raise ValueError("Input x must have matching spatial dimensions")
             time_dim = fobj['time_dim']
             spatial_dims = fobj['spatial_dims']
+            if set(x.dims) != {time_dim, *spatial_dims}:
+                raise ValueError("Input x must have matching named dimensions.")
+            for dim in spatial_dims:
+                if not x.get_index(dim).equals(fobj['coords'].indexes[dim]):
+                    raise ValueError(f"Input x coordinate {dim!r} differs from the fitted grid.")
             x_stacked = x.stack(grid=spatial_dims).transpose(time_dim, 'grid')
             x_data = x_stacked.values
             corrected_data = WAS_bias_correction._doBC_internal(x_data, fobj, **kwargs)
@@ -1225,8 +1409,9 @@ class WAS_bias_correction:
                     'grid': x_stacked.coords['grid'],
                 },
             )
-            corrected = corrected_stacked.unstack('grid')
-            corrected.attrs = fobj['attrs']
+            corrected = corrected_stacked.unstack('grid').transpose(*x.dims)
+            corrected.attrs = dict(fobj['attrs'])
+            corrected.name = x.name
             return corrected
 
         x_arr = np.asarray(x, dtype=float)
@@ -1245,7 +1430,11 @@ class WAS_bias_correction:
 
     @staticmethod
     def _doBC_internal(x, fobj, **kwargs):
+        if 'n_grid' in fobj and x.shape[1] != fobj['n_grid']:
+            raise ValueError("Input does not match the fitted number of grid cells.")
         cls = fobj['class']
+        if cls == 'fitQDM':
+            return WAS_bias_correction.doQDM(x, fobj, **kwargs)
         if cls == 'fitMean':
             return WAS_bias_correction.doMean(x, fobj, **kwargs)
         if cls == 'fitVarscale':
@@ -1268,6 +1457,31 @@ class WAS_bias_correction:
         elif arr.ndim > 3:
             raise ValueError("Numpy array must be 1D, 2D, or 3D")
         return arr
+
+    @staticmethod
+    def fitQDM(obs, mod, kind="additive", denominator_floor=None, max_ratio=None):
+        """Fit historical empirical marginals for quantile delta mapping.
+
+        Use ``fitBC(obs, mod, "QDM", kind="additive")`` for signed variables
+        and ``kind="multiplicative"`` for non-negative ratio variables.
+        Application requires ``doBC(x, fitted, reference=target_model_sample)``.
+        Neither fitting nor application accepts target observations. Fit on
+        the training years only; choose the model-only reference period before
+        evaluation. A full projection block may serve as its own reference,
+        but this is a transductive projection adjustment, not an operational
+        single-date forecasting procedure. Partition by season/month upstream.
+
+        This is deterministic empirical QDM, not precipitation occurrence
+        randomisation. Ratio floors/caps are optional approximations and break
+        exact relative-change preservation where they activate.
+        Reference: Cannon, Sobie & Murdock (2015), doi:10.1175/JCLI-D-14-00754.1.
+        """
+        return _fit_qdm(obs, mod, kind, denominator_floor, max_ratio)
+
+    @staticmethod
+    def doQDM(x, fobj, reference=None):
+        """Apply QDM using an explicit target-period model distribution."""
+        return _do_qdm(x, fobj, reference)
 
     # ------------------------------------------------------------------
     # MEAN
@@ -1296,7 +1510,7 @@ class WAS_bias_correction:
         for col in range(n_cols):
             if par['all_nan'][col]:
                 continue
-            corrected[:, col] = x[:, col] + par['delta'][col]
+            corrected[:, col] = np.where(np.isfinite(x[:, col]), x[:, col] + par['delta'][col], np.nan)
         return corrected
 
     # ------------------------------------------------------------------
@@ -1346,7 +1560,7 @@ class WAS_bias_correction:
                 continue
             corrected[:, col] = (
                 par['mean_o'][col]
-                + (x[:, col] - par['mean_m'][col])
+                + (np.where(np.isfinite(x[:, col]), x[:, col], np.nan) - par['mean_m'][col])
                 * (par['std_o'][col] / par['std_m'][col])
             )
         return corrected
@@ -1356,8 +1570,9 @@ class WAS_bias_correction:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def fitQuant(obs, mod, qstep=0.01, nboot=1):
+    def fitQuant(obs, mod, qstep=0.01, nboot=1, random_state=None):
         """Fit empirical quantile mapping (non-parametric)."""
+        rng = np.random.default_rng(random_state)
         n_cols = obs.shape[1]
         nq = int(1 / qstep) + 1
         probs = np.linspace(0, 1, nq)
@@ -1374,7 +1589,7 @@ class WAS_bias_correction:
             par['modq'][:, col] = np.quantile(m, probs)
             if nboot > 1:
                 boot_q = np.array([
-                    np.quantile(np.random.choice(o, len(o), replace=True), probs)
+                    np.quantile(rng.choice(o, len(o), replace=True), probs)
                     for _ in range(nboot)
                 ])
                 par['fitq'][:, col] = np.mean(boot_q, axis=0)
@@ -1398,14 +1613,14 @@ class WAS_bias_correction:
             modq_u, fitq_u = _dedupe_monotone(modq, fitq)
             if modq_u.size < 2:
                 if modq_u.size == 1:
-                    corrected[:, col] = np.where(np.isnan(xi), np.nan, fitq_u[0])
+                    corrected[:, col] = np.where(np.isfinite(xi), fitq_u[0], np.nan)
                 continue
             interp_func = interp1d(
                 modq_u, fitq_u, kind=type,
                 bounds_error=False, fill_value='extrapolate',
             )
             out = np.full_like(xi, np.nan)
-            valid = ~np.isnan(xi)
+            valid = np.isfinite(xi)
             out[valid] = interp_func(xi[valid])
             corrected[:, col] = out
         return corrected
@@ -1432,7 +1647,7 @@ class WAS_bias_correction:
         if dist is None:
             raise ValueError(f"Unknown distribution: {distr}")
 
-        floc_kwargs = {'floc': 0} if distr_l in ('gamma', 'weibull') else {}
+        floc_kwargs = {'floc': 0} if distr_l in ('gamma', 'weibull', 'lognormal') else {}
 
         for col in range(n_cols):
             o, m = _filter_nan_pair(obs[:, col], mod[:, col])
@@ -1471,7 +1686,7 @@ class WAS_bias_correction:
             par_m = par['par_m'][col]
             xi = x[:, col].astype(float, copy=True)
             out = np.full_like(xi, np.nan)
-            valid = ~np.isnan(xi)
+            valid = np.isfinite(xi)
             cdf = dist.cdf(xi[valid], *par_m)
             # FIX: clip strictly inside (0, 1) so that ppf doesn't return inf
             # at saturated tails.
@@ -1479,3 +1694,136 @@ class WAS_bias_correction:
             out[valid] = dist.ppf(cdf, *par_o)
             corrected[:, col] = out
         return corrected
+
+
+# =============================================================================
+# Cross-validator adapters (2026-08-26)
+# =============================================================================
+# These wrappers do not change WAS_Qmap / WAS_bias_correction.  They expose the
+# standard WASS2S compute_model/forecast contract so WAS_Cross_Validator can fit
+# every correction strictly inside each temporal training fold.
+
+class _WAS_BiasCorrectionCVBase:
+    _was_bias_correction_adapter = True
+    family = None
+
+    def __init__(self, method, fit_kwargs=None, apply_kwargs=None,
+                 member_dim="M", reduce_members="mean", random_state=None):
+        self.method=str(method)
+        self.fit_kwargs={} if fit_kwargs is None else dict(fit_kwargs)
+        self.apply_kwargs={} if apply_kwargs is None else dict(apply_kwargs)
+        self.member_dim=str(member_dim)
+        if reduce_members not in (None,"mean","median"):
+            raise ValueError("reduce_members must be None, 'mean', or 'median'.")
+        self.reduce_members=reduce_members
+        self.random_state=random_state
+        self.fitted_=None
+
+    @staticmethod
+    def _target(y):
+        if isinstance(y,xr.DataArray) and "M" in y.dims:
+            if y.sizes["M"] != 1:
+                raise ValueError("Observation must have no ensemble axis or a singleton M.")
+            y=y.isel(M=0,drop=True)
+        if isinstance(y,xr.DataArray):
+            y=y.transpose("T","Y","X")
+        return y
+
+    def _fit_one(self, obs, mod):
+        return self._fit_dispatch(obs, mod)
+
+    def _fit_dispatch(self, obs, mod):
+        raise NotImplementedError
+
+    def _apply_dispatch(self, x, fobj, apply_kwargs=None):
+        raise NotImplementedError
+
+    def fit(self, obs, mod):
+        obs=self._target(obs)
+        if isinstance(mod,xr.DataArray) and self.member_dim in mod.dims:
+            fitted={}
+            for m in mod[self.member_dim].values:
+                fitted[m.item() if hasattr(m,"item") else m]=self._fit_one(
+                    obs,mod.sel({self.member_dim:m},drop=True).transpose("T","Y","X"))
+            self.fitted_=fitted
+        else:
+            if isinstance(mod,xr.DataArray): mod=mod.transpose("T","Y","X")
+            self.fitted_=self._fit_one(obs,mod)
+        return self
+
+    def transform(self, x):
+        if self.fitted_ is None:
+            raise RuntimeError("Bias correction is not fitted. Call fit() first.")
+        if isinstance(x,xr.DataArray) and self.member_dim in x.dims:
+            out=[]
+            for m in x[self.member_dim].values:
+                key=m.item() if hasattr(m,"item") else m
+                if key not in self.fitted_:
+                    raise KeyError(f"No fitted bias correction for member {key!r}.")
+                options = dict(self.apply_kwargs)
+                reference = options.get("reference")
+                if isinstance(reference, xr.DataArray) and self.member_dim in reference.dims:
+                    options["reference"] = reference.sel({self.member_dim: m}, drop=True)
+                da=self._apply_dispatch(x.sel({self.member_dim:m},drop=True).transpose("T","Y","X"),self.fitted_[key], options)
+                out.append(da.expand_dims({self.member_dim:[m]}))
+            ans=xr.concat(out,dim=self.member_dim).transpose("T",self.member_dim,"Y","X")
+            if self.reduce_members=="mean": return ans.mean(self.member_dim,skipna=True)
+            if self.reduce_members=="median": return ans.median(self.member_dim,skipna=True)
+            return ans
+        ans=self._apply_dispatch(x.transpose("T","Y","X") if isinstance(x,xr.DataArray) else x,self.fitted_)
+        return ans
+
+    def fit_transform(self, obs, mod_train, mod_test=None):
+        self.fit(obs,mod_train)
+        return self.transform(mod_train if mod_test is None else mod_test)
+
+    def compute_model(self, X_train, y_train, X_test, y_test=None, **kwargs):
+        """Fold-safe correction: fit on (y_train, X_train), apply to X_test."""
+        self.fit(y_train,X_train)
+        out=self.transform(X_test)
+        return out
+
+    def forecast(self, Predictant, Predictor, Predictor_for_year, **kwargs):
+        """Fit on the historical pair then correct the real forecast year."""
+        self.fit(Predictant,Predictor)
+        return self.transform(Predictor_for_year)
+
+    def get_params(self):
+        return {"family":self.family,"method":self.method,"fit_kwargs":dict(self.fit_kwargs),
+                "apply_kwargs":dict(self.apply_kwargs),"member_dim":self.member_dim,
+                "reduce_members":self.reduce_members,"random_state":self.random_state}
+
+
+class WAS_Qmap_CV(_WAS_BiasCorrectionCVBase):
+    """Cross-validator-ready precipitation quantile-mapping adapter."""
+    family="qmap"
+    def __init__(self, method="RQUANT", fit_kwargs=None, apply_kwargs=None,
+                 member_dim="M", reduce_members="mean", random_state=None):
+        super().__init__(method,fit_kwargs,apply_kwargs,member_dim,reduce_members,random_state)
+    def _fit_dispatch(self,obs,mod):
+        kwargs = dict(self.fit_kwargs)
+        if self.method.upper() in {"QUANT", "RQUANT"}:
+            kwargs.setdefault("random_state", self.random_state)
+        return WAS_Qmap.fitQmap(obs, mod, self.method, **kwargs)
+    def _apply_dispatch(self,x,fobj,apply_kwargs=None):
+        return WAS_Qmap.doQmap(x,fobj,**(self.apply_kwargs if apply_kwargs is None else apply_kwargs))
+
+
+class WAS_bias_correction_CV(_WAS_BiasCorrectionCVBase):
+    """Cross-validator-ready continuous-variable bias-correction adapter."""
+    family="continuous"
+    def __init__(self, method="MEAN", fit_kwargs=None, apply_kwargs=None,
+                 member_dim="M", reduce_members="mean", random_state=None):
+        super().__init__(method,fit_kwargs,apply_kwargs,member_dim,reduce_members,random_state)
+    def _fit_dispatch(self,obs,mod):
+        kwargs = dict(self.fit_kwargs)
+        if self.method.upper() == "QUANT":
+            kwargs.setdefault("random_state", self.random_state)
+        return WAS_bias_correction.fitBC(obs, mod, self.method, **kwargs)
+    def _apply_dispatch(self,x,fobj,apply_kwargs=None):
+        return WAS_bias_correction.doBC(x,fobj,**(self.apply_kwargs if apply_kwargs is None else apply_kwargs))
+
+
+# More explicit aliases for new notebooks, while retaining the historical names.
+WAS_Qmap_Model = WAS_Qmap_CV
+WAS_BiasCorrection_Model = WAS_bias_correction_CV

@@ -1,10 +1,9 @@
 import xarray as xr
 import numpy as np
-from xeofs.single import EOF
-from wass2s.was_linear_models import *
-from wass2s.utils import *
-from wass2s.was_machine_learning import *
-from wass2s.was_eof import *
+import inspect
+from wass2s.was_eof import WAS_EOF
+from wass2s.was_scientific_utils import align_predictor_target
+from wass2s.was_probability_calibration import normalize_probability_calibration
 
 
 class WAS_PCR:
@@ -68,6 +67,10 @@ class WAS_PCR:
         covariance in a multivariate EOF.  ``None`` means *auto*: enabled
         for a list of fields, disabled for a single field.
 
+    probability_calibration : {"outer", "nested", "inner"}, default "outer"
+        Residual calibration used by the cross-validator. ``inner`` aliases
+        ``nested``; model selection remains controlled separately.
+
     Attributes
     ----------
     eof_model : :class:`~wass2s.was_eof.WAS_EOF` or None
@@ -90,8 +93,10 @@ class WAS_PCR:
     """
 
     def __init__(self, regression_model, n_modes=None, use_coslat=True, standardize=False,
-                 detrend=True, opti_explained_variance=None, L2norm=False, normalize=None):
+                 detrend=True, opti_explained_variance=None, L2norm=False, normalize=None,
+                 probability_calibration="outer"):
         self.reg_model = regression_model
+        self.probability_calibration = normalize_probability_calibration(probability_calibration)
         self.n_modes = n_modes
         self.use_coslat = use_coslat
         self.standardize = standardize
@@ -140,16 +145,37 @@ class WAS_PCR:
         X_test_pcs : xarray.DataArray
             Test PCs with dimensions ``(T, features)``.
         """
+        X_test = self._ensure_T(X_test)
+        test_fields = X_test if isinstance(X_test, (list, tuple)) else [X_test]
+        available = None
+        for field in test_fields:
+            observed = np.isfinite(field).any([d for d in field.dims if d != "T"])
+            available = observed if available is None else available | observed
         eof = WAS_EOF(n_modes=self.n_modes, use_coslat=self.use_coslat,
                       standardize=self.standardize, detrend=self.detrend,
                       opti_explained_variance=self.opti_explained_variance,
                       L2norm=self.L2norm, normalize=self.normalize)
-        _, s_train, _ = eof.fit(X_train, dim="T")
         self.eof_model = eof
+        from wass2s.was_eof import EOFRankError
+        try:
+            _, s_train, _ = eof.fit(X_train, dim="T")
+        except EOFRankError:
+            # A zero-rank field contains no usable predictor variation. A
+            # constant feature lets supported regression backends estimate
+            # their intercept without amplifying null singular vectors.
+            train = X_train[0] if isinstance(X_train, (list, tuple)) else X_train
+            test = self._ensure_T(X_test)
+            test = test[0] if isinstance(test, (list, tuple)) else test
+            self.rank_zero_fallback_ = True
+            def constant_feature(time):
+                return xr.DataArray(np.zeros((len(time), 1)), dims=("T", "features"),
+                                    coords={"T": time, "features": [0]})
+            return constant_feature(train["T"]), constant_feature(test["T"]).where(available)
+        self.rank_zero_fallback_ = False
 
         X_train_pcs = s_train.rename({"mode": "features"}).transpose("T", "features")
         s_test = eof.transform(self._ensure_T(X_test), dim="T")
-        X_test_pcs = s_test.rename({"mode": "features"}).transpose("T", "features")
+        X_test_pcs = s_test.rename({"mode": "features"}).where(available).transpose("T", "features")
         return X_train_pcs, X_test_pcs
 
     def compute_model(self, X_train, y_train, X_test, y_test=None, **kwargs):
@@ -178,9 +204,11 @@ class WAS_PCR:
             Whatever the wrapped regression model's ``compute_model`` returns
             (typically a deterministic hindcast DataArray).
         """
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
         X_train_pcs, X_test_pcs = self._prepare_pcs(X_train, X_test)
-        if y_test is not None and "y_test" in self.reg_model.compute_model.__code__.co_varnames:
-            return self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test, **kwargs)
+        parameters = inspect.signature(self.reg_model.compute_model).parameters
+        if y_test is not None and "y_test" in parameters:
+            return self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, y_test=y_test, **kwargs)
         return self.reg_model.compute_model(X_train_pcs, y_train, X_test_pcs, **kwargs)
 
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det, **kwargs):
@@ -211,13 +239,15 @@ class WAS_PCR:
         """
         if not hasattr(self.reg_model, "compute_prob"):
             return None
+        signature = inspect.signature(self.reg_model.compute_prob)
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
         params_prob = {k: v for k, v in kwargs.items()
-                       if k not in self.reg_model.compute_model.__code__.co_varnames}
+                       if accepts_kwargs or k in signature.parameters}
         return self.reg_model.compute_prob(Predictant, clim_year_start, clim_year_end,
                                            hindcast_det, **params_prob)
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
-                 hindcast_det, Predictor_for_year, **kwargs):
+                 hindcast_det, Predictor_for_year, target_times=None, **kwargs):
         """Generate an operational forecast for a target year.
 
         EOF patterns are fitted on the full hindcast predictor, and the
@@ -237,7 +267,12 @@ class WAS_PCR:
         hindcast_det : xarray.DataArray
             Deterministic hindcast produced during cross-validation.
         Predictor_for_year : xarray.DataArray or list of xarray.DataArray
-            Predictor field(s) for the target forecast year.
+            Predictor field(s) labelled with target valid times. Lag availability
+            dates must be retained separately from this verification calendar.
+        target_times : array-like, optional
+            Explicit verification dates to assign BEFORE EOF projection and
+            detrending, useful when the source predictor is labelled by its lag
+            month. No cross-year shift is inferred from months alone.
         **kwargs
             Additional keyword arguments forwarded to the regression model.
 
@@ -247,7 +282,37 @@ class WAS_PCR:
             Operational forecast returned by the wrapped regression model's
             ``forecast`` method.
         """
+        Predictor = align_predictor_target(Predictor, Predictant, mode="season_year")
+        if target_times is not None:
+            times = np.atleast_1d(np.asarray(target_times))
+            def label_target(field):
+                field = self._ensure_T(field)
+                if field.sizes["T"] != len(times):
+                    raise ValueError("target_times must match the forecast predictor's T length")
+                return field.assign_coords(T=times)
+            Predictor_for_year = ([label_target(field) for field in Predictor_for_year]
+                if isinstance(Predictor_for_year, (list, tuple)) else label_target(Predictor_for_year))
+        # A seasonal lag month cannot serve as the target valid time: it would
+        # also change the extrapolated training trend before regression. Ask
+        # for explicit target dates rather than guessing a cross-year offset.
+        if np.issubdtype(Predictant["T"].dtype, np.datetime64):
+            target_months = np.unique(Predictant["T"].dt.month.values)
+            future_fields = (Predictor_for_year if isinstance(Predictor_for_year, (list, tuple))
+                             else [Predictor_for_year])
+            for field in future_fields:
+                if np.issubdtype(field["T"].dtype, np.datetime64):
+                    if len(target_months) == 1 and np.any(field["T"].dt.month.values != target_months[0]):
+                        raise ValueError("PCR forecast T must label the target season; supply target_times explicitly for lagged predictors")
         Predictor_pcs, Predictor_year_pcs = self._prepare_pcs(Predictor, Predictor_for_year)
-        return self.reg_model.forecast(
+        result = self.reg_model.forecast(
             Predictant, clim_year_start, clim_year_end,
             Predictor_pcs, hindcast_det, Predictor_year_pcs, **kwargs)
+        # The backends share the same conditional probability kernel as CV.
+        # Preserve their declared reference and metadata without recalibrating
+        # a second time in the wrapper.
+        return result
+
+
+# Keep constructor inputs for fresh model instances in nested cross-validation.
+from .was_crossfit_adapters import capture_constructors as _capture_constructors
+_capture_constructors(globals())

@@ -2105,12 +2105,10 @@ class WAS_Download:
                         print(f"Download finished, combined dataset for {cent} {syst} {k} to {output_path}")
                         ds.close()
                         store_file_path[f"{cent}_{syst}"] = file_path
-                        
                     # except Exception as e:
                     #     if "raw_path" in locals() and os.path.exists(raw_path):
                     #         os.unlink(raw_path)
                     #     raise RuntimeError(f"C3S processing failed for {cent}/{syst}/{k}") from e
-
                     except Exception as e:
                         print(f"C3S processing failed for {cent}/{syst}/{k}")
         return store_file_path
@@ -4568,25 +4566,36 @@ class WAS_Download:
             ds = _normalize_coords(ds)
             ds = _subset_area(ds)
             ds = ds.rename({"sst": "SST"})
-            ds = ds.drop_vars("lev", errors="ignore").squeeze()
-    
-            seasonal = []
-            for season_year in range(year_start, year_end + 1):
-                monthly = []
-                for _, cal_year, month in _season_calendar_months(season_year):
-                    t0 = np.datetime64(f"{cal_year}-{month:02d}-01")
-                    month_ds = ds.sel(time=t0, method="nearest").load()
-                    days = calendar.monthrange(cal_year, month)[1]
-                    month_ds["SST"].attrs["monthly_days"] = int(days)
-                    month_ds.attrs["monthly_days"] = int(days)
-                    monthly.append(month_ds)
-    
-                out = _aggregate_months(monthly, "SST")
-                out = out.expand_dims(time=[_representative_time(season_year)])
-                seasonal.append(out)
-    
-            ds.close()
+            ds = ds.drop_vars("lev", errors="ignore")
+            if "lev" in ds.dims:
+                ds = ds.squeeze("lev", drop=True)
+
+            seasonal, incomplete = [], []
+            try:
+                for season_year in range(year_start, year_end + 1):
+                    required_months = _season_calendar_months(season_year)
+                    indices = _noaa_exact_month_indices(
+                        ds["time"].values, [(y, m) for _, y, m in required_months])
+                    if indices is None:
+                        incomplete.append(season_year)
+                        print(f"NOAA SST: incomplete season {season_year}; skipped (missing calendar month).")
+                        continue
+                    monthly = []
+                    for index, (_, cal_year, month) in zip(indices, required_months):
+                        month_ds = ds.isel(time=int(index), drop=True).load()
+                        days = calendar.monthrange(cal_year, month)[1]
+                        month_ds["SST"].attrs["monthly_days"] = int(days)
+                        month_ds.attrs["monthly_days"] = int(days)
+                        monthly.append(month_ds)
+                    out = _aggregate_months(monthly, "SST")
+                    out = out.expand_dims(time=[_representative_time(season_year)])
+                    seasonal.append(out)
+            finally:
+                ds.close()
+            if not seasonal:
+                raise ValueError("NOAA SST: no complete requested season; missing months are never substituted.")
             out = xr.concat(seasonal, dim="time")
+            out.attrs["incomplete_seasons_skipped"] = ",".join(map(str, incomplete))
             out = out.rename({"time": "T"})
             out = _finalize_output(out, "NOAA", v)
             out.to_netcdf(out_file)
@@ -7458,8 +7467,7 @@ class WAS_Download:
     
         print(f"[INFO] Saved daily TAMSAT data to {out_nc}")
         return out_nc
-
-
+    
     def WAS_Download_GloFAS_historical(
         self,
         dir_to_save,
@@ -7481,48 +7489,77 @@ class WAS_Download:
         allow_incomplete=False,
         end_date=None,
         refresh_incomplete=True,
+        *,
+        attach_static_maps_to_q=True,
+        network_area=None,
+        static_map_urls=None,
+        static_map_files=None,
+        force_static_download=None,
+        return_paths=False,
     ):
 
-        """Download GloFAS Q(T,Y,X), optionally with UPAREA(Y,X).
+        """Download daily GloFAS and optional static maps through ONE interface.
 
-        Existing parameters and public filenames are retained. area is [N,W,S,E].
-        Q is in m3 s-1; UPAREA in m2 and UPAREA_KM2 in km2. Static maps remain
-        version-specific. ewds_url/key/rc_file configure an isolated EWDS client.
+        Backward-compatible inputs / outputs
+        -----------------------------------
+        Existing Q/UPAREA calls, Q filenames, incomplete-year policy, monthly
+        checkpoints and EWDS authentication are retained. A Q request returns
+        its Path, as in the user's original module. A static-only request returns
+        None unless return_paths=True. No files are downloaded at import.
 
-        New parameters
-        --------------
+        variables : sequence of str
+            "GLOFAS.Q", "GLOFAS.UPAREA" (or "GLOFAS.DRAINAGE_AREA"),
+            "GLOFAS.LDD", "GLOFAS.CHAN", "GLOFAS.CELLAREA".
+            Q is m3 s-1. UPAREA is m2, UPAREA_KM2 is km2, CELLAREA is m2.
+            LDD retains PCRaster codes; CHAN is a 0/1 mask. Static fields are Y,X,
+            never broadcast over time. Zero Q and zero CHAN remain valid.
+
+        attach_static_maps_to_q : bool, default True
+            Attach requested LDD/CHAN/CELLAREA to Q on its native grid. UPAREA
+            remains controlled by attach_upstream_area_to_q. Existing complete
+            Q files can be enriched without a new EWDS discharge request.
+        network_area : [North, West, South, East] or None
+            Optional larger domain for the combined static file. None uses area.
+            Q retains the requested area. Attached fields are a native subset.
+            A crop is NOT proof that the complete upstream domain is included.
+        static_map_urls : mapping or None
+            Explicit version-compatible HTTPS URLs, keyed by LDD, UPAREA, CHAN,
+            CELLAREA (GLOFAS. prefixes also accepted). There is no cross-version
+            fallback. upstream_area_url remains supported; conflicting entries
+            are refused. v4 CHAN/CELLAREA require compatible explicit sources.
+        static_map_files : mapping or None
+            Optional existing NetCDF sources for these maps, for offline use.
+            Source version conflicts and invalid direction codes are rejected.
+            A source without version metadata is recorded as user-asserted.
+        force_static_download : bool or None
+            None follows force_download. True refreshes ONLY auxiliary data when
+            force_download=False, without forcing a Q re-download.
+        return_paths : bool, default False
+            True returns {"discharge": Path or None, "static": Path or None,
+            "uparea": Path or None, "system_version": str, "area": tuple,
+            "network_area": tuple, "requested_variables": tuple}.
+            This manifest is also stored in self.last_glofas_download.
+
         allow_incomplete : bool, default False
-            False: require all days of the requested period before publishing the
-            final file. True: save all valid days actually returned, including a
-            partial month/year and historical gaps. Never interpolate or fill Q
-            with zeros. Duplicate/subdaily/invalid dates and permanent HTTP errors
-            remain errors. Temporary download failures are recorded explicitly.
+            False requires all requested days. True saves available days and
+            permits an incomplete year. Missing Q is never filled/interpolated.
+            Monthly checkpoints and a .coverage.json report permit later refresh.
         end_date : date-like or None
-            Optional inclusive final API request date, within year_start..year_end.
-            Default is 31 December of year_end. Requests never extend beyond
-            yesterday UTC. With allow_incomplete=False, a future end date is an
-            error. An explicit date adds _toYYYYMMDD to the output filename.
-            The API request date and provider valid_time can differ: T is NEVER
-            shifted. REQUEST_DATE(T) is retained for temporal coverage accounting.
+            Inclusive final request date within year_start..year_end. Requests
+            stop at yesterday UTC. Provider valid time T is NEVER shifted;
+            REQUEST_DATE is retained when different. An explicit end adds a
+            _toYYYYMMDD filename suffix. Static-only requests do not use dates.
         refresh_incomplete : bool, default True
-            With force_download=False, reuse complete monthly checkpoints and
-            refresh only missing/incomplete months (including the current month).
-            False reuses existing partial checkpoints; entirely missing monthly
-            files may still be requested. It does NOT fill missing dates.
-            force_download=True overrides this setting.
+            Refresh incomplete periods only; complete monthly caches are reused.
 
         Notes
         -----
-        * The original .glofas_tmp hash of version/product/area is unchanged so
-          completed monthly checkpoints from the previous method can be reused.
-        * Incomplete outputs do not block subsequent refreshes. Checkpoints are
-          retained for incomplete calendar periods, even if keep_temporary=False.
-        * A .coverage.json sidecar and NetCDF attributes document requested versus
-          actual temporal coverage. This is timestamp coverage, NOT pixelwise QC.
-        * Existing final files must match version, product and area. Use separate
-          directories for different configurations sharing the same output name.
-        * Returns None, as the original method; outputs are saved in dir_to_save.
-        * Copy the ENTIRE method: its helpers/imports are deliberately local.
+        Static global NetCDF sources are cached in .glofas_static before native
+        cropping. Static_GLOFAS_<version>.nc groups the requested fields;
+        Static_UPAREA_<version>.nc remains available for older workflows.
+        Native labels may be reconciled for tiny coordinate-rounding noise only;
+        no interpolation, flow repair, or snapping to a neighbouring river cell.
+        Keep source datasets closed before enriching files on Windows.
         """
 
         import calendar
@@ -7535,7 +7572,7 @@ class WAS_Download:
 
 
         import pandas as pd
-        _glofas_patch_revision = "GLOFAS_INCOMPLETE_YEARS_20260923"
+        _glofas_patch_revision = "GLOFAS_UNIFIED_AUXILIARIES_HYDRO_V52"
 
         # Private helpers belong INSIDE this method so copying this complete
         # definition into WAS_Download does not need other WASS2S module globals.
@@ -7693,25 +7730,12 @@ class WAS_Download:
             "date": "T",
         }
 
-        # Official version-specific GloFAS upstream-area files.
-        # IMPORTANT: never mix static maps across GloFAS model versions.
-        # v4 auxiliary file: CEMS-Flood documentation.
-        # v5 static maps: JRC LISFLOOD static-map catalogue (OS-LISFLOOD v5.x).
-        OFFICIAL_UPAREA_URLS = {
-            "version_4_0": (
-                "https://confluence.ecmwf.int/download/attachments/242067380/"
-                "uparea_glofas_v4_0.nc?api=v2"
-            ),
-            "version_5_0": (
-                "https://jeodpp.jrc.ec.europa.eu/ftp/jrc-opendata/"
-                "CEMS-GLOFAS/LISFLOOD_static_and_parameter_maps_for_GloFAS/"
-                "v2.1.1_OS-LISFLOOD-v5.x/"
-                "Catchments_morphology_and_river_network/"
-                "upArea_repaired_correctedmetadata_3000.nc"
-            ),
-        }
-
         UPAREA_ALIASES = {"GLOFAS.UPAREA", "GLOFAS.DRAINAGE_AREA"}
+        AUXILIARY_ALIASES = {
+            "GLOFAS.UPAREA": "UPAREA", "GLOFAS.DRAINAGE_AREA": "UPAREA",
+            "GLOFAS.LDD": "LDD", "GLOFAS.CHAN": "CHAN",
+            "GLOFAS.CELLAREA": "CELLAREA",
+        }
 
         VARIABLE_MAPPING = {
             "GLOFAS.Q": {
@@ -7736,7 +7760,9 @@ class WAS_Download:
         if not variables:
             raise ValueError("At least one GloFAS variable is required.")
         want_uparea = any(v in UPAREA_ALIASES for v in variables)
-        dynamic_variables = [v for v in variables if v not in UPAREA_ALIASES]
+        auxiliary_variables = tuple(dict.fromkeys(
+            AUXILIARY_ALIASES[v] for v in variables if v in AUXILIARY_ALIASES))
+        dynamic_variables = [v for v in variables if v not in AUXILIARY_ALIASES]
 
         unknown = [
             v for v in dynamic_variables
@@ -7745,7 +7771,7 @@ class WAS_Download:
         if unknown:
             raise ValueError(
                 f"Unknown GloFAS variable(s): {unknown}. Supported: "
-                f"{list(VARIABLE_MAPPING) + ['GLOFAS.UPAREA']}"
+                f"{list(VARIABLE_MAPPING) + list(AUXILIARY_ALIASES)}"
             )
 
         dir_to_save = Path(dir_to_save)
@@ -7926,206 +7952,19 @@ class WAS_Download:
                 }
             }
 
-        def _encoding_static():
-            return {
-                "UPAREA": {
-                    "dtype": "float32",
-                    "zlib": True,
-                    "complevel": 4,
-                    "_FillValue": -9999.0,
-                },
-                "UPAREA_KM2": {
-                    "dtype": "float32",
-                    "zlib": True,
-                    "complevel": 4,
-                    "_FillValue": -9999.0,
-                },
-            }
+        def _encoding_static(dataset):
+            encoding = {}
+            for name in dataset.data_vars:
+                dtype, fill = (("int16", -9999) if name == "LDD" else
+                               ("int8", -1) if name == "CHAN" else
+                               ("float32", -9999.0))
+                encoding[name] = dict(dtype=dtype, zlib=True, complevel=4,
+                                      _FillValue=fill)
+            return encoding
 
-        # ================================================================
-        # Static upstream/drained area
-        # ================================================================
-        def _download_file(url, destination):
-            """Small dependency-free streamed downloader with retries."""
-            for attempt in range(1, max_retries + 1):
-                try:
-                    reuse = (
-                        destination.exists()
-                        and destination.stat().st_size > 0
-                        and not force_download
-                    )
-                    if reuse:
-                        print(f"Using existing static raw file: {destination}")
-                        return
-
-                    destination.unlink(missing_ok=True)
-                    print(
-                        f"Attempt {attempt}/{max_retries}: downloading "
-                        f"GloFAS upstream area"
-                    )
-
-                    req = Request(
-                        url,
-                        headers={"User-Agent": "WASS2S-GloFAS/1.0"},
-                    )
-                    with urlopen(req, timeout=180) as response, open(
-                        destination, "wb"
-                    ) as fout:
-                        while True:
-                            chunk = response.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            fout.write(chunk)
-
-                    if destination.stat().st_size <= 0:
-                        raise IOError("Downloaded upstream-area file is empty.")
-
-                    print(f"Downloaded upstream area: {destination}")
-                    return
-
-                except Exception as exc:
-                    destination.unlink(missing_ok=True)
-                    print(
-                        f"Attempt {attempt}/{max_retries} failed for upstream "
-                        f"area: {exc}"
-                    )
-                    if attempt < max_retries:
-                        print(f"Retrying after {retry_delay} seconds...")
-                        _time.sleep(retry_delay)
-                    else:
-                        raise
-
-        def _prepare_upstream_area():
-            """Download, standardize, subset, and save UPAREA in WASS2S form."""
-            chosen_url = upstream_area_url
-            if chosen_url is None:
-                chosen_url = OFFICIAL_UPAREA_URLS.get(system_version)
-
-            if chosen_url is None:
-                raise ValueError(
-                    "GLOFAS.UPAREA was requested, but no official upstream-area "
-                    f"URL is configured in this function for {system_version!r}. "
-                    "Upstream area is version dependent, so another version's file "
-                    "will NOT be silently reused. Pass upstream_area_url=... pointing "
-                    "to the official static NetCDF for exactly this GloFAS version."
-                )
-
-            static_output = (
-                dir_to_save / f"Static_UPAREA_{system_version}.nc"
-            )
-
-            if static_output.exists() and not force_download:
-                print(f"Using existing upstream-area dataset: {static_output}")
-                with xr.open_dataset(static_output) as ds:
-                    import ast as _ast
-                    old_area = ds.attrs.get("spatial_subset_NWSE")
-                    if old_area is not None and tuple(_ast.literal_eval(old_area)) != tuple(area):
-                        raise ValueError("Existing UPAREA has another area; use a separate directory or force_download=True.")
-                    return ds[["UPAREA", "UPAREA_KM2"]].load(), static_output
-
-            static_tmp = tmp_root / f"raw_uparea_{system_version}.nc"
-            _download_file(chosen_url, static_tmp)
-
-            with xr.open_dataset(static_tmp) as ds_raw:
-                data_vars = list(ds_raw.data_vars)
-                preferred = [
-                    "uparea",
-                    "upArea",
-                    "UPAREA",
-                    "ec_upArea",
-                    "upstream_area",
-                ]
-                source = next(
-                    (v for v in preferred if v in data_vars),
-                    None,
-                )
-                if source is None:
-                    candidates = [v for v in data_vars if ds_raw[v].ndim >= 2]
-                    if not candidates:
-                        raise ValueError(
-                            "No 2-D upstream-area variable found in static file. "
-                            f"Variables found: {data_vars}"
-                        )
-                    source = max(candidates, key=lambda v: ds_raw[v].size)
-
-                uparea = ds_raw[source]
-                for dim in [d for d in uparea.dims if d not in {"Y", "X", "lat", "lon", "latitude", "longitude"}]:
-                    if uparea.sizes[dim] == 1:
-                        uparea = uparea.isel({dim: 0}, drop=True)
-                uparea = _subset_area_xy(_wrap_sort_xy(uparea)).load()
-
-            # Ensure only horizontal dimensions remain.
-            uparea = _wrap_sort_xy(uparea)
-            extra_dims = [d for d in uparea.dims if d not in {"Y", "X"}]
-            for dim in extra_dims:
-                if uparea.sizes[dim] == 1:
-                    uparea = uparea.isel({dim: 0}, drop=True)
-                else:
-                    raise ValueError(
-                        f"Unexpected upstream-area dimension {dim!r} with "
-                        f"size {uparea.sizes[dim]}."
-                    )
-
-            if set(uparea.dims) != {"Y", "X"}:
-                raise ValueError(
-                    f"UPAREA must be 2-D Y/X after standardization; got {uparea.dims}."
-                )
-
-            uparea = _subset_area_xy(uparea).transpose("Y", "X")
-
-            # Preserve source values in m2 and add convenient km2 copy.
-            uparea = uparea.astype("float32").rename("UPAREA")
-            uparea.attrs.update(
-                {
-                    "long_name": "Total upstream/drained area of each GloFAS pixel",
-                    "units": "m2",
-                    "source": "Copernicus CEMS GloFAS auxiliary data",
-                    "system_version": system_version,
-                    "WASS2S_dimensions": "Y,X",
-                }
-            )
-
-            uparea_km2 = (uparea / 1.0e6).astype("float32").rename("UPAREA_KM2")
-            uparea_km2.attrs.update(
-                {
-                    "long_name": "Total upstream/drained area of each GloFAS pixel",
-                    "units": "km2",
-                    "derived_from": "UPAREA / 1e6",
-                    "system_version": system_version,
-                    "WASS2S_dimensions": "Y,X",
-                }
-            )
-
-            ds_up = xr.Dataset(
-                {
-                    "UPAREA": uparea,
-                    "UPAREA_KM2": uparea_km2,
-                }
-            )
-            ds_up.attrs.update(
-                {
-                    "title": "GloFAS upstream/drained area subset",
-                    "source": "Copernicus Emergency Management Service - GloFAS",
-                    "system_version": system_version,
-                    "spatial_subset_NWSE": str(list(area)),
-                    "crs": "EPSG:4326",
-                    "WASS2S_dimensions": "Y,X",
-                }
-            )
-
-            _was_write_netcdf(ds_up, static_output, encoding=_encoding_static())
-
-            print(f"\nSaved GloFAS upstream area:\n  {static_output}")
-            print(f"\nStatic structure:\n{ds_up}")
-
-            if not keep_temporary:
-                static_tmp.unlink(missing_ok=True)
-
-            return ds_up, static_output
-
-        def _align_uparea_to_dynamic_grid(ds_up, dynamic_da):
+        def _align_static_to_dynamic_grid(ds_up, dynamic_da):
             """
-            Align static UPAREA to the exact Q Y/X grid without regridding the
+            Align requested static maps to the exact Q Y/X grid without regridding the
             hydrological values. Only coordinate-rounding differences are allowed;
             a shift to another river pixel is rejected.
             """
@@ -8147,7 +7986,7 @@ class WAS_Download:
             for dim in ("X", "Y"):
                 idx = ds_up.get_index(dim).get_indexer(dynamic_da[dim].values, method="nearest", tolerance=tolerance)
                 if (idx < 0).any() or len(np.unique(idx)) != len(idx):
-                    raise ValueError(f"UPAREA and Q grids do not match along {dim}; refusing hydrological nearest-neighbour remapping.")
+                    raise ValueError(f"Auxiliary and Q grids do not match along {dim}; refusing hydrological nearest-neighbour remapping.")
 
             aligned = ds_up.reindex(
                 X=dynamic_da["X"],
@@ -8157,6 +7996,72 @@ class WAS_Download:
             )
 
             return aligned
+
+        for name, value in (("attach_static_maps_to_q", attach_static_maps_to_q),
+                            ("attach_upstream_area_to_q", attach_upstream_area_to_q),
+                            ("return_paths", return_paths)):
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError(f"{name} must be True or False")
+        if force_static_download is not None and not isinstance(force_static_download, (bool, np.bool_)):
+            raise TypeError("force_static_download must be True, False or None")
+        auxiliary_area = area if network_area is None else _was_validate_area(network_area)
+        paths = dict(discharge=None, static=None, uparea=None,
+                     system_version=system_version, area=area,
+                     network_area=auxiliary_area,
+                     requested_variables=tuple(variables))
+        self.last_glofas_download = dict(paths)
+        ds_aux = None
+        if auxiliary_variables:
+            if __package__:
+                from .glofas_static_download import prepare_glofas_auxiliaries
+            else:
+                from glofas_static_download import prepare_glofas_auxiliaries
+            urls = {str(k).removeprefix("GLOFAS.").upper(): v
+                    for k, v in (static_map_urls or {}).items()}
+            if upstream_area_url is not None:
+                if "UPAREA" in urls and urls["UPAREA"] != upstream_area_url:
+                    raise ValueError("Conflicting upstream_area_url and static_map_urls['UPAREA']")
+                urls["UPAREA"] = upstream_area_url
+            ds_aux, auxiliary_paths = prepare_glofas_auxiliaries(
+                dir_to_save, variables=auxiliary_variables, version=system_version,
+                area=auxiliary_area,
+                force=force_download if force_static_download is None else force_static_download,
+                url_overrides=urls, local_files=static_map_files,
+                max_retries=max_retries, retry_delay=retry_delay,
+            )
+            paths.update(auxiliary_paths)
+            self.last_glofas_download = dict(paths)
+
+        def _attach_auxiliaries(dataset, q):
+            """Attach only requested fields, never expand the dynamic spatial grid."""
+            if ds_aux is None:
+                return dataset, {}
+            names = []
+            if want_uparea and attach_upstream_area_to_q:
+                names += ["UPAREA", "UPAREA_KM2"]
+            if attach_static_maps_to_q:
+                names += [name for name in auxiliary_variables if name != "UPAREA"]
+            if not names:
+                return dataset, {}
+            aligned = _align_static_to_dynamic_grid(ds_aux[names], q)
+            # Explicit encoding below must not conflict with inherited source packing.
+            aligned = aligned.drop_encoding()
+            for name in aligned:
+                aligned[name].attrs = {k: v for k, v in aligned[name].attrs.items()
+                                       if k not in ("_FillValue", "missing_value", "scale_factor", "add_offset")}
+            out = dataset.assign({name: aligned[name] for name in names})
+            out.attrs = dict(dataset.attrs)
+            out.attrs.update(glofas_static_file=str(paths["static"]),
+                             glofas_static_network_area_NWSE=str(list(auxiliary_area)),
+                             attached_static_variables=",".join(names))
+            if "UPAREA" in names:
+                out.attrs["upstream_area_static_file"] = str(paths["uparea"])
+            return out, _encoding_static(aligned)
+
+        if not dynamic_variables:
+            if not keep_temporary and tmp_root.exists() and not any(tmp_root.iterdir()):
+                tmp_root.rmdir()
+            return dict(paths) if return_paths else None
 
         # ================================================================
         # Temporal policy: calendar completeness is distinct from file validity.
@@ -8335,25 +8240,6 @@ class WAS_Download:
             finally:
                 Path(tmp).unlink(missing_ok=True)
 
-        # ================================================================
-        # Download upstream area first, if requested
-        # ================================================================
-        ds_uparea = None
-        static_uparea_path = None
-
-        if want_uparea:
-            ds_uparea, static_uparea_path = _prepare_upstream_area()
-
-        # If only static upstream area was requested, we are done.
-        if not dynamic_variables:
-            if not keep_temporary:
-                try:
-                    if tmp_root.exists() and not any(tmp_root.iterdir()):
-                        tmp_root.rmdir()
-                except Exception:
-                    pass
-            return
-
         client = None  # No credentials needed until a real Q request is necessary.
         for var in dynamic_variables:
             mapping = VARIABLE_MAPPING[var]
@@ -8362,6 +8248,7 @@ class WAS_Download:
             date_tag = "" if end_date is None else f"_to{requested_end:%Y%m%d}"
             output_path = dir_to_save / f"Daily_{short_name}_{year_start}_{year_end}{date_tag}.nc"
             report_path = output_path.with_suffix(".coverage.json")
+            paths["discharge"] = output_path
             var_tmp = tmp_root / short_name
             var_tmp.mkdir(parents=True, exist_ok=True)
             final_seed = None
@@ -8375,12 +8262,12 @@ class WAS_Download:
                     needed = _dates_for(requested_start, requested_end)
                     covers_request = len(needed.difference(days)) == 0
                     if covers_request:
-                        if ds_uparea is not None and attach_upstream_area_to_q:
-                            aligned = _align_uparea_to_dynamic_grid(ds_uparea, candidate)
-                            enriched = cached_q.assign(UPAREA=aligned["UPAREA"], UPAREA_KM2=aligned["UPAREA_KM2"])
+                        enriched, auxiliary_encoding = _attach_auxiliaries(cached_q, candidate)
+                        if auxiliary_encoding:
                             _was_write_netcdf(enriched, output_path,
-                                encoding={**_encoding_dynamic(output_name), **_encoding_static()},
+                                encoding={**_encoding_dynamic(output_name), **auxiliary_encoding},
                                 before_replace=cached_q.close)
+                        self.last_glofas_download = dict(paths)
                         print(f"{output_path} reused; requested period is complete, no discharge redownload.")
                         continue
                 final_seed = output_path
@@ -8642,12 +8529,8 @@ class WAS_Download:
                     n_failed_requests=len(failures),
                 )
                 final_encoding = _encoding_dynamic(output_name)
-                if ds_uparea is not None and attach_upstream_area_to_q:
-                    aligned_up = _align_uparea_to_dynamic_grid(ds_uparea, da_final)
-                    ds_out["UPAREA"] = aligned_up["UPAREA"].astype("float32")
-                    ds_out["UPAREA_KM2"] = aligned_up["UPAREA_KM2"].astype("float32")
-                    ds_out.attrs["upstream_area_static_file"] = str(static_uparea_path)
-                    final_encoding.update(_encoding_static())
+                ds_out, auxiliary_encoding = _attach_auxiliaries(ds_out, da_final)
+                final_encoding.update(auxiliary_encoding)
                 _was_write_netcdf(ds_out, output_path, encoding=final_encoding)
                 report = dict(
                     status="complete" if calendar_complete else "partial",
@@ -8688,10 +8571,11 @@ class WAS_Download:
         if not keep_temporary and tmp_root.exists() and not any(tmp_root.iterdir()):
             tmp_root.rmdir()
         
-        return output_path
+        self.last_glofas_download = dict(paths)
+        return dict(paths) if return_paths else output_path
 
 
-#####
+    # Complementary downloaders from WAS_Download_REVIEWED.py
 
     def _WAS_http_download(
         self,
@@ -11423,3 +11307,17 @@ def plot_map(extent, title="Map"): # [west, east, south, north]
     # Show plot
     plt.tight_layout()
     plt.show()
+
+
+def _noaa_exact_month_indices(times, required_months):
+    """Find exact calendar months in monthly NOAA SST; never reuse a neighbour."""
+    months = np.asarray(times).astype("datetime64[M]")
+    indices = []
+    for year, month in required_months:
+        match = np.flatnonzero(months == np.datetime64(f"{year:04d}-{month:02d}", "M"))
+        if match.size == 0:
+            return None
+        if match.size != 1:
+            raise ValueError(f"NOAA SST: duplicate monthly records for {year}-{month:02d}")
+        indices.append(int(match[0]))
+    return indices

@@ -1,3 +1,4 @@
+from wass2s.was_scientific_utils import apply_physical_support, align_predictor_target
 """Machine-learning regression models for seasonal forecasting.
 
 All classes expose the standard
@@ -10,9 +11,9 @@ BaseOptimizer
     Unified hyperparameter optimizer supporting grid search, random search,
     and Optuna Bayesian optimization.
 WAS_PolynomialRegression
-    Polynomial feature expansion followed by ridge regression.
+    Polynomial feature expansion followed by ordinary least squares.
 WAS_MARS_Model
-    Multivariate Adaptive Regression Splines (py-earth).
+    Multivariate adaptive hinge regression implemented in NumPy (see MARS notes).
 WAS_LogisticRegression_Model
     Pixel-wise multinomial logistic regression for direct tercile
     classification.
@@ -23,19 +24,17 @@ WAS_NonNeural_Base
 """
 # Machine Learning and Statistical Modeling
 from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.svm import SVR, SVC
 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, cross_val_score
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.base import clone
-from sklearn.neural_network import MLPRegressor
 from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
 from sklearn.compose import TransformedTargetRegressor
-import xgboost as xgb
-import statsmodels.api as sm
-from statsmodels.stats.outliers_influence import variance_inflation_factor as VIF
-from statsmodels.stats.anova import anova_lm
+# xgboost / lightgbm are optional: imported lazily inside the estimator
+# factories (WAS_XGBoost_Model, WAS_XGBoost_Classifier_Model, LightGBM ones)
+# so that this module, and everything star-importing it, loads without them.
 from wass2s.utils import *
 import optuna
 from scipy.stats import uniform, loguniform, randint
@@ -43,6 +42,8 @@ from sklearn.linear_model import LogisticRegression
 
 # Data Manipulation and Analysis
 import xarray as xr
+from .was_probability_reference import climatological_terciles
+from .was_tuning_support import geographical_cluster_map, fold_local_regression_score
 import numpy as np
 import pandas as pd
 
@@ -58,9 +59,6 @@ from scipy.stats import (
     norm, lognorm, expon, gamma, weibull_min,
     t as t_dist, poisson, nbinom
 )
-
-# EOF Analysis
-import xeofs as xe
 
 # Parallel Computing
 from multiprocessing import cpu_count
@@ -138,7 +136,7 @@ from collections import defaultdict
 
 # Warnings
 import warnings
-warnings.filterwarnings('ignore')
+# Do not suppress convergence and numerical warnings process-wide.
 
 import numpy as np
 import pandas as pd
@@ -155,131 +153,487 @@ from scipy.optimize import fsolve
 
 import optuna
 
+
+def _climatology_positions(time_coord, clim_year_start, clim_year_end, min_years=3):
+    """Positional ``[start, stop)`` of the climatology window along a sorted T axis.
+
+    Label slicing (``.sel(T=slice(...))``) tolerates a window that exceeds the
+    record, e.g. a cross-validation training fold missing its first or last
+    years, where ``get_index('T').get_loc(str(year))`` raises ``KeyError``.
+    The declared reference is never silently replaced by another period.
+    """
+    index = time_coord.get_index("T")
+    if index.has_duplicates or not index.is_monotonic_increasing:
+        raise ValueError("Climatology T coordinates must be unique and sorted")
+    window = time_coord.sel(T=slice(str(clim_year_start), str(clim_year_end)))
+    if int(window.sizes["T"]) < min_years:
+        raise ValueError(f"At least {min_years} observations are required in the requested climatology interval")
+    positions = np.flatnonzero(np.isin(time_coord.values, window.values))
+    return int(positions[0]), int(positions[-1]) + 1
+
+
+def _aligned_training(predictor, predictand):
+    """Require the caller to provide matching valid-time coordinates; never relabel."""
+    for data in (predictor, predictand):
+        index = data.get_index("T")
+        if index.has_duplicates or not index.is_monotonic_increasing:
+            raise ValueError("Training T coordinates must be unique and sorted")
+    predictor = align_predictor_target(predictor, predictand)
+    return xr.align(predictor, predictand, join="exact", copy=False)
+
+
+def _forecast_times(predictor):
+    """Retain supplied valid times, including an explicitly supplied scalar T."""
+    if "T" not in predictor.dims:
+        if "T" not in predictor.coords or predictor.coords["T"].size != 1:
+            raise ValueError("Forecast predictors must include their actual valid-time T coordinate")
+        value = np.asarray(predictor.coords["T"].values).reshape(-1)[0]
+        predictor = predictor.drop_vars("T").expand_dims(T=[value])
+    index = predictor.get_index("T")
+    if len(index) == 0 or index.has_duplicates or not index.is_monotonic_increasing:
+        raise ValueError("Forecast T coordinates must be nonempty, unique and sorted")
+    return predictor.transpose(..., "T", "features")
+
+
+def _spatial_classifier(model, X_train, labels, X_test, parameters=()):
+    """One fit per cell and test date without train/test T alignment collisions."""
+    X_train, labels = _aligned_training(X_train, labels)
+    X_test = _forecast_times(X_test)
+    cy = max(1, int(np.ceil(labels.sizes["Y"] / max(1, model.nb_cores))))
+    cx = max(1, int(np.ceil(labels.sizes["X"] / max(1, model.nb_cores))))
+    labels = labels.transpose("T", "Y", "X").chunk({"T": -1, "Y": cy, "X": cx})
+    results = []
+    for i in range(X_test.sizes["T"]):
+        result = xr.apply_ufunc(model.fit_predict, X_train, labels,
+            X_test.isel(T=i, drop=True), *parameters,
+            input_core_dims=[("T", "features"), ("T",), ("features",)] + [() for _ in parameters],
+            output_core_dims=[("probability",)], vectorize=True, dask="parallelized",
+            output_dtypes=[float], dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True})
+        results.append(result.expand_dims(T=[X_test.coords["T"].values[i]]))
+    result = xr.concat(results, dim="T").assign_coords(probability=["PB", "PN", "PA"])
+    result.attrs.update(probability_calibration="native_classifier",
+                        residual_calibration="not_applicable")
+    if type(model).__name__ == "WAS_SVC_Classifier_Model":
+        result.attrs["native_probability_calibration"] = "libsvm internal 5-fold Platt calibration; independent of outer/nested residual controls"
+    from threadpoolctl import threadpool_limits
+    with threadpool_limits(limits=1):
+        return result.transpose("probability", "T", "Y", "X").compute()
+
+
+def _spatial_regression(model, X_train, y_train, X_test, y_test, parameters=()):
+    """Preserve singleton spatial/features axes and support one or several test dates."""
+    X_train, y_train = _aligned_training(X_train, y_train)
+    X_train = X_train.transpose(..., "T", "features")
+    y_train = y_train.transpose("T", "Y", "X")
+    cy = max(1, int(np.ceil(y_train.sizes["Y"] / max(1, model.nb_cores))))
+    cx = max(1, int(np.ceil(y_train.sizes["X"] / max(1, model.nb_cores))))
+    y_train = y_train.chunk({"T": -1, "Y": cy, "X": cx})
+    has_time = "T" in X_test.dims
+    tests = range(X_test.sizes["T"]) if has_time else range(1)
+    outputs = []
+    for i in tests:
+        xt = X_test.isel(T=i, drop=True) if has_time else X_test
+        if y_test is None:
+            yt = xr.full_like(y_train.isel(T=0, drop=True), np.nan)
+        elif "T" in y_test.dims:
+            yt = y_test.isel(T=i, drop=True)
+        else:
+            yt = y_test.drop_vars("T", errors="ignore")
+        value = xr.apply_ufunc(
+            model.fit_predict, X_train, y_train, xt, yt, *parameters,
+            input_core_dims=[("T", "features"), ("T",), ("features",), ()]
+                            + [() for _ in parameters],
+            output_core_dims=[("output",)], vectorize=True, dask="parallelized",
+            output_dtypes=[float], dask_gufunc_kwargs={"output_sizes": {"output": 2},
+                                                     "allow_rechunk": True},
+        ).isel(output=1, drop=True)
+        if has_time:
+            value = value.expand_dims(T=[X_test.coords["T"].values[i]])
+        outputs.append(value)
+    if not outputs:
+        raise ValueError("X_test must contain at least one forecast time")
+    result = xr.concat(outputs, dim="T") if has_time else outputs[0]
+    try:
+        from dask.distributed import get_client
+        get_client()
+    except ValueError:
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=1):
+            return result.compute(scheduler="threads", num_workers=max(1, int(model.nb_cores)))
+    return result.compute()
+
+
+def _regression_pair(estimator, x, y, x_test, y_test):
+    """Fit only finite training pairs; missing targets remain missing."""
+    x, y = np.asarray(x, float), np.asarray(y, float).reshape(-1)
+    xt = np.asarray(x_test, float).reshape(1, -1)
+    if x.ndim == 1:
+        x = x[:, None]
+    if x.shape[0] != y.size or x.shape[1] != xt.shape[1]:
+        raise ValueError("Incompatible training/test feature shapes")
+    good = np.isfinite(y) & np.isfinite(x).all(axis=1)
+    if good.sum() < 2 or not np.isfinite(xt).all():
+        return np.array([np.nan, np.nan])
+    neighbors = {name: min(int(value), int(good.sum()))
+        for name, value in estimator.get_params(deep=True).items()
+        if name.split("__")[-1] == "n_neighbors"} if hasattr(estimator, "get_params") else {}
+    if neighbors:
+        estimator.set_params(**neighbors)
+    estimator.fit(x[good], y[good])
+    prediction = float(np.asarray(estimator.predict(xt)).reshape(-1)[0])
+    error = np.nan if y_test is None else float(np.asarray(y_test).reshape(-1)[0]) - prediction
+    return np.array([error, prediction])
+
+def _residual_probabilities(forecast, residuals, t1, t2, nonneg=False):
+    """Shared empirical CDF: at least three errors, fixed bounds and support."""
+    from .was_linear_models import _residual_probabilities as empirical_cdf
+    return empirical_cdf(forecast, residuals, t1, t2, nonneg=nonneg)
+
+
+def _operational_forecast(model, Predictant, clim_year_start, clim_year_end,
+                          Predictor, hindcast_det, Predictor_for_year, parameters=(),
+                          best_code_da=None, best_shape_da=None, best_loc_da=None,
+                          best_scale_da=None, raw_target=False):
+    """Fit available observations and calibrate future predictions from OOF errors.
+
+    ``hindcast_det`` must be an out-of-fold hindcast in the target's physical
+    units, independently obtained. This operational calibration must not be used
+    to score those same hindcast years; use the nested Cross_Validator for that.
+    Forecast dates are retained exactly as supplied in Predictor_for_year.
+    """
+    Predictor, Predictant = _aligned_training(Predictor, Predictant)
+    Predictor_for_year = _forecast_times(Predictor_for_year)
+    years = Predictant.coords["T"].dt.year
+    reference = Predictant.where((years >= int(clim_year_start)) & (years <= int(clim_year_end)), drop=True)
+    if reference.sizes.get("T", 0) == 0:
+        raise ValueError("No training observations in the requested climatology interval")
+    center = reference.mean("T", skipna=True)
+    scale = reference.std("T", skipna=True)
+    scale = xr.where(scale > 0, scale, 1.0)
+    fit_y = Predictant if raw_target else (Predictant-center)/scale
+    prediction = _spatial_regression(model, Predictor, fit_y, Predictor_for_year,
+                                     None, parameters)
+    if not raw_target:
+        prediction = prediction*scale + center
+    prediction = apply_physical_support(prediction, Predictant).transpose("T", "Y", "X")
+    if "output" in hindcast_det.dims:
+        hindcast_det = hindcast_det.isel(output=1, drop=True)
+    obs, hindcast = xr.align(Predictant, hindcast_det, join="inner")
+    if obs.sizes.get("T", 0) < 3:
+        raise ValueError("At least three matching out-of-fold hindcast dates are required")
+    residuals = (obs-hindcast).rename(T="sample")
+    event_reference = Predictant if getattr(model, "tercile_reference", "climatology") == "training" else reference
+    q = climatological_terciles(event_reference)[0]
+    t1, t2 = q.isel(quantile=0, drop=True), q.isel(quantile=1, drop=True)
+    nonnegative = bool(apply_physical_support(xr.DataArray(-1.), Predictant) == 0.)
+    if model.dist_method == "nonparam":
+        probability = xr.apply_ufunc(_residual_probabilities, prediction, residuals, t1, t2,
+            input_core_dims=[("T",), ("sample",), (), ()],
+            output_core_dims=[("probability", "T")], vectorize=True, dask="parallelized",
+            kwargs={"nonneg":nonnegative}, output_dtypes=[float],
+            dask_gufunc_kwargs={"output_sizes":{"probability":3}, "allow_rechunk":True})
+    elif model.dist_method == "bestfit":
+        if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
+            raise ValueError("bestfit requires distribution parameters fitted on available training data")
+        # Event bounds are empirical for either declared reference. The fitted
+        # probability family must not redefine the meaning of PB/PN/PA.
+        variance = residuals.var("sample", skipna=True, ddof=1)
+        residual_count = residuals.count("sample")
+        dof = xr.where(residual_count > 4, residual_count-1, 3)
+        calibrated_mean = apply_physical_support(prediction+residuals.mean("sample", skipna=True), Predictant)
+        # External/legacy model kernels may implement the six-argument API.
+        # New native kernels accept support explicitly; only forward it when
+        # advertised rather than catching a TypeError from inside the kernel.
+        import inspect
+        kernel = model.calculate_tercile_probabilities_bestfit
+        try:
+            parameters = inspect.signature(kernel).parameters
+            supports_nonneg = "nonneg" in parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        except (TypeError, ValueError):
+            supports_nonneg = False
+        probability = xr.apply_ufunc(kernel,
+            calibrated_mean, variance, t1, t2, best_code_da, dof,
+            input_core_dims=[("T",),(),(),(),(),()], output_core_dims=[("probability","T")],
+            kwargs={"nonneg":nonnegative} if supports_nonneg else {},
+            vectorize=True, dask="parallelized", output_dtypes=[float],
+            dask_gufunc_kwargs={"output_sizes":{"probability":3}, "allow_rechunk":True})
+        # A zero residual variance is a degenerate predictive distribution.
+        deterministic = xr.concat([xr.where(calibrated_mean<=t1,1.,0.),
+            xr.where((calibrated_mean>t1)&(calibrated_mean<=t2),1.,0.),
+            xr.where(calibrated_mean>t2,1.,0.)],dim="probability").where(np.isfinite(calibrated_mean))
+        probability = xr.where(variance == 0, deterministic, probability)
+    else:
+        raise ValueError("dist_method must be 'nonparam' or 'bestfit'")
+    probability = probability.where(residuals.count("sample") >= 3)
+    probability = probability.clip(min=0, max=1)
+    probability = probability / probability.sum("probability", skipna=False)
+    probability = probability.assign_coords(probability=["PB","PN","PA"])
+    probability.attrs.update(probability_calibration="historical_oof_operational",
+        probability_bias_correction="mean of historical out-of-fold residuals",
+        tercile_reference=getattr(model, "tercile_reference", "climatology"))
+    return prediction, probability.transpose("probability","T","Y","X").compute()
+
+
+def _report_tuned(tag, verbose=True, cluster_da=None, **fields):
+    """Log the tuned hyperparameters of a spatially varying model.
+
+    Unlike the MME learners, these classes return hyperparameter FIELDS
+    (an alpha map, a Dataset of per-cell parameters) rather than a dict per
+    cluster, so there is nothing to print verbatim. What matters operationally
+    is the same thing: whether the search landed on strong regularisation
+    (a near-linear, heavily shrunk model) or on a flexible one, and whether it
+    is spatially coherent. This prints the median and range of each field, plus
+    the per-cluster median when a cluster map is supplied.
+
+    Silent tuning was the norm across was_linear_models, was_machine_learning
+    and was_cca_2: a run gave no way to tell a converged search from one that
+    returned all-NaN.
+    """
+    if not verbose:
+        return
+    import numpy as _np
+    for name, field in fields.items():
+        if field is None:
+            continue
+        try:
+            values = _np.asarray(getattr(field, "values", field), dtype=float)
+            finite = values[_np.isfinite(values)]
+            if finite.size == 0:
+                print(f"[{tag}] {name}: aucune valeur finie (recherche échouée ?)", flush=True)
+                continue
+            print(f"[{tag}] {name}: médiane={_np.median(finite):.4g} "
+                  f"[{finite.min():.4g}, {finite.max():.4g}] "
+                  f"sur {finite.size}/{values.size} cellules", flush=True)
+            if cluster_da is not None:
+                labels = _np.asarray(getattr(cluster_da, "values", cluster_da), dtype=float)
+                if labels.shape == values.shape:
+                    for c in sorted({v for v in _np.unique(labels) if _np.isfinite(v)}):
+                        sel = values[(labels == c) & _np.isfinite(values)]
+                        if sel.size:
+                            print(f"[{tag}]   cluster {int(c)}: {name}"
+                                  f"={_np.median(sel):.4g}", flush=True)
+        except Exception as exc:
+            print(f"[{tag}] {name}: rapport impossible ({exc!r})", flush=True)
+
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+def _classifier_probabilities(estimator, x, y, x_test):
+    """Encode each training partition and map probabilities back to PB/PN/PA."""
+    x, y = np.asarray(x, float), np.asarray(y, float).reshape(-1)
+    xt = np.asarray(x_test, float)
+    if xt.ndim == 1:
+        xt = xt.reshape(1, -1)
+    out = np.full((len(xt), 3), np.nan)
+    valid_test = np.isfinite(xt).all(axis=1)
+    valid = np.isfinite(y) & np.isfinite(x).all(axis=1)
+    if not valid.any() or not valid_test.any():
+        return out
+    x, y = x[valid], y[valid]
+    if not np.isin(y, [0, 1, 2]).all():
+        raise ValueError("Tercile classifiers require labels 0, 1, 2 or NaN")
+    classes, encoded = np.unique(y.astype(int), return_inverse=True)
+    if len(classes) == 1:
+        out[valid_test] = 0.0
+        out[valid_test, classes[0]] = 1.0
+        return out
+    neighbors = {name: min(int(value), len(y)) for name, value in estimator.get_params(deep=True).items()
+                 if name.split("__")[-1] == "n_neighbors"}
+    if neighbors:
+        estimator.set_params(**neighbors)
+    estimator.fit(x, encoded)
+    probabilities = estimator.predict_proba(xt[valid_test])
+    fitted_classes = np.asarray(estimator.classes_, int)
+    if probabilities.shape[1] != len(fitted_classes):
+        raise ValueError("Estimator probability columns disagree with its fitted classes")
+    mapped = np.zeros((valid_test.sum(), 3))
+    mapped[:, classes[fitted_classes]] = probabilities
+    out[valid_test] = mapped
+    return out
+
+
+def _regression_cv_score(owner, X, y, params):
+    """Fit each cell's scaling and regional proxy afresh in every inner fold."""
+    return fold_local_regression_score(owner._make_estimator(**params), X, y, owner.inner_cv)
+
+
+def _classification_folds(cv, X, y):
+    """Respect custom splitters; cap integer folds for short/rare-class samples."""
+    from sklearn.model_selection import check_cv, KFold, StratifiedKFold
+    if isinstance(cv, (int, np.integer)):
+        count = min(int(cv), len(y))
+        if count < 2:
+            raise ValueError("At least two classification folds are required")
+        _, sizes = np.unique(y, return_counts=True)
+        splitter = (StratifiedKFold(min(count, int(sizes.min()))) if len(sizes)>1 and sizes.min()>=2
+                    else KFold(count))
+    else:
+        splitter = check_cv(cv, y=y, classifier=True)
+    return list(splitter.split(X, y))
+
+
+def _classification_score(estimator, X, y, folds, scoring):
+    from sklearn.metrics import log_loss, accuracy_score
+    scores = []
+    for train, valid in folds:
+        probability = _classifier_probabilities(clone(estimator), X[train], y[train], X[valid])
+        if not np.isfinite(probability).all():
+            raise ValueError("No finite inner validation probabilities")
+        if scoring == "neg_log_loss":
+            scores.append(-log_loss(y[valid], probability, labels=[0,1,2]))
+        elif scoring == "accuracy":
+            scores.append(accuracy_score(y[valid], probability.argmax(axis=1)))
+        else:
+            raise ValueError("Classifier tuning supports scoring='neg_log_loss' or 'accuracy'")
+    return float(np.mean(scores))
+
+
+def _classifier_cv_score(owner, X, y, params):
+    """Score fixed tercile probabilities even when an inner fold lacks a class."""
+    return _classification_score(owner._make_estimator(**params), X, y,
+                                 _classification_folds(owner.inner_cv, X, y), owner.scoring)
+
+
 class BaseOptimizer:
+    """One CV protocol across search backends, fresh estimator per fold, bounded parallelism.
+
+    ``cv`` accepts sklearn splitters or an explicit list of folds. Supply a temporal
+    splitter for autocorrelated series. This is the inner search only: the outer
+    evaluation must rerun the complete preprocessing and search on its training set.
     """
-    Unified Optimizer. Supports SVR (multi-grid), MLP, and Stacking architectures.
-    """
-    
-    def __init__(self, optimization_method="grid", n_trials=20, cv=5, random_state=42):
+    def __init__(self, optimization_method="grid", n_trials=20, cv=5, random_state=42, n_jobs=1):
         self.optimization_method = optimization_method
-        self.n_trials = n_trials
+        self.n_trials = int(n_trials)
         self.cv = cv
         self.random_state = random_state
+        self.n_jobs = n_jobs
 
-    def optimize(self, model, param_space, X, y, scoring='neg_mean_squared_error'):
-        # Ensure data is in numpy format for sklearn stability
-        X_data = X.values if hasattr(X, 'values') else X
-        y_data = y.values if hasattr(y, 'values') else y
-        
-        if self.optimization_method == "grid":
-            return self._grid_search(model, param_space, X_data, y_data, scoring)
-        elif self.optimization_method == "random":
-            return self._random_search(model, param_space, X_data, y_data, scoring)
-        elif self.optimization_method == "bayesian":
-            return self._optuna_search(model, param_space, X_data, y_data, scoring)
-        else:
-            raise ValueError(f"Unknown method: {self.optimization_method}")
-
-    def _prepare_space(self, param_space, is_wrapped):
-        """Adds 'regressor__' prefix if model is a TransformedTargetRegressor."""
-        prefix = "regressor__" if is_wrapped else ""
-        
-        if isinstance(param_space, list):
-            return [{f"{prefix}{k}": v for k, v in d.items()} for d in param_space]
-        return {f"{prefix}{k}": v for k, v in param_space.items()}
+    def _prepare_space(self, param_space, model):
+        known = model.get_params(deep=True)
+        def resolve(name):
+            if name in known:
+                return name
+            matches = [k for k in known if k.endswith("__" + name)]
+            if len(matches) != 1:
+                raise ValueError(f"Parameter {name!r} is unknown or ambiguous; use its full pipeline name")
+            return matches[0]
+        self._param_aliases = {}
+        def mapped(space):
+            result = {}
+            for key, value in space.items():
+                resolved = resolve(key)
+                self._param_aliases[resolved] = key
+                result[resolved] = value
+            return result
+        return [mapped(v) for v in param_space] if isinstance(param_space, list) else mapped(param_space)
 
     def _clean_best_params(self, best_params):
-        """Removes 'regressor__' prefix from results for class compatibility."""
-        return {k.replace("regressor__", ""): v for k, v in best_params.items()}
+        return {self._param_aliases.get(k, k): v for k, v in best_params.items() if k != "_branch"}
 
-    def _grid_search(self, model, param_space, X, y, scoring):
-        space = self._prepare_space(param_space, hasattr(model, 'regressor'))
-        gs = GridSearchCV(model, space, cv=self.cv, scoring=scoring, n_jobs=-1)
-        gs.fit(X, y)
-        return self._clean_best_params(gs.best_params_)
+    def optimize(self, model, param_space, X, y, scoring="neg_mean_squared_error"):
+        from sklearn.model_selection import check_cv
+        from sklearn.base import is_classifier
+        X, y = np.asarray(X, float), np.asarray(y)
+        mask = np.isfinite(y) & np.isfinite(X).all(axis=1)
+        if not np.all(mask):
+            raise ValueError("Optimizer input must contain finite training pairs; mask before constructing CV folds")
+        if is_classifier(model):
+            return self._classifier_search(model, param_space, X, y, scoring)
+        splitter = check_cv(self.cv, y=y, classifier=False)
+        folds = list(splitter.split(X, y))
+        space = self._prepare_space(param_space, model)
+        if self.optimization_method == "grid":
+            search = GridSearchCV(model, space, cv=folds, scoring=scoring,
+                                  n_jobs=self.n_jobs, error_score="raise")
+        elif self.optimization_method == "random":
+            # Preserve conditional branches (e.g. distinct SVR kernels).
+            search = RandomizedSearchCV(model, space, n_iter=self.n_trials, cv=folds,
+                scoring=scoring, random_state=self.random_state, n_jobs=self.n_jobs,
+                error_score="raise")
+        elif self.optimization_method in {"bayesian", "optuna"}:
+            return self._optuna_search(model, space, X, y, scoring, folds)
+        else:
+            raise ValueError(f"Unknown method: {self.optimization_method}")
+        search.fit(X, y)
+        return self._clean_best_params(search.best_params_)
 
-    def _random_search(self, model, param_space, X, y, scoring):
-        # Handle SVR list of dicts by consolidating for RandomSearch
-        if isinstance(param_space, list):
-            consolidated = {}
-            for d in param_space: consolidated.update(d)
-            param_space = consolidated
-            
-        space = self._prepare_space(param_space, hasattr(model, 'regressor'))
-        # Convert lists to random distributions
-        dist_space = {k: (v if not isinstance(v, list) else v) for k, v in space.items()}
-        
-        rs = RandomizedSearchCV(model, dist_space, n_iter=self.n_trials, 
-                                cv=self.cv, scoring=scoring, random_state=self.random_state, n_jobs=-1)
-        rs.fit(X, y)
-        return self._clean_best_params(rs.best_params_)
-
-    def _optuna_search(self, model, param_space, X, y, scoring):
-            # 1. Prepare the search space
-            if isinstance(param_space, list):
-                flat_space = {}
-                for d in param_space: flat_space.update(d)
-            else:
-                flat_space = param_space
-    
+    def _classifier_search(self, model, param_space, X, y, scoring):
+        from sklearn.model_selection import ParameterGrid, ParameterSampler
+        space = self._prepare_space(param_space, model)
+        folds = _classification_folds(self.cv, X, y)
+        def score(params):
+            return _classification_score(clone(model).set_params(**params), X, y, folds, scoring)
+        if self.optimization_method == "grid":
+            candidates = ParameterGrid(space)
+        elif self.optimization_method == "random":
+            candidates = ParameterSampler(space, n_iter=self.n_trials, random_state=self.random_state)
+        elif self.optimization_method in {"bayesian", "optuna"}:
+            branches = space if isinstance(space, list) else [space]
             def objective(trial):
-                suggestions = {}
-                for name, values in flat_space.items():
-                    if isinstance(values, list):
-                        suggestions[name] = trial.suggest_categorical(name, values)
-                    elif isinstance(values, tuple):
-                        low, high = values[0], values[1]
-                        log = len(values) == 3 and values[2] == 'log'
-                        suggestions[name] = trial.suggest_float(name, low, high, log=log)
-    
-                model_instance = clone(model)
-                prefix = "regressor__" if hasattr(model, 'regressor') else ""
-                prefixed_suggestions = {f"{prefix}{k}": v for k, v in suggestions.items()}
-                model_instance.set_params(**prefixed_suggestions)
-    
-                # 2. Implementation of Early Stopping (Pruning)
-                # Instead of a simple cross_val_score, we iterate through the CV folds manually
-                from sklearn.model_selection import KFold
-                from sklearn.metrics import get_scorer
-                
-                cv_splitter = KFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
-                scorer = get_scorer(scoring)
-                cv_scores = []
-    
-                for i, (train_idx, val_idx) in enumerate(cv_splitter.split(X, y)):
-                    X_train_cv, X_val_cv = X[train_idx], X[val_idx]
-                    y_train_cv, y_val_cv = y[train_idx], y[val_idx]
-                    
-                    try:
-                        model_instance.fit(X_train_cv, y_train_cv)
-                        score = scorer(model_instance, X_val_cv, y_val_cv)
-                        cv_scores.append(score)
-                        
-                        # Report intermediate result to Optuna
-                        trial.report(np.mean(cv_scores), i)
-                        
-                        # 3. Check if we should stop this trial early
-                        if trial.should_prune():
-                            raise optuna.TrialPruned()
-                    except (ValueError, RuntimeError, optuna.TrialPruned) as e:
-                        if isinstance(e, optuna.TrialPruned):
-                            raise # Re-raise pruning to let Optuna handle it
-                        return -np.inf # Penalize math errors
-    
-                return np.mean(cv_scores)
-    
-            # 4. Study creation with a MedianPruner
-            # It prunes trials whose best intermediate value is worse than the median 
-            # of previous trials at the same step.
-            study = optuna.create_study(
-                direction="maximize", 
-                sampler=optuna.samplers.TPESampler(seed=self.random_state),
-                pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
-            )
-            
+                branch = trial.suggest_int("_branch", 0, len(branches)-1) if len(branches)>1 else 0
+                params = {}
+                for name, values in branches[branch].items():
+                    key = f"branch{branch}:{name}"
+                    if isinstance(values, tuple) and len(values) in (2,3) and all(isinstance(v,(int,float)) for v in values[:2]):
+                        lo, hi = values[:2]
+                        log = len(values)==3 and values[2]=="log"
+                        params[name] = (trial.suggest_int(key,lo,hi,log=log) if isinstance(lo,int) and isinstance(hi,int)
+                                        else trial.suggest_float(key,lo,hi,log=log))
+                    else:
+                        params[name] = trial.suggest_categorical(key, list(values))
+                trial.set_user_attr("model_params", params)
+                return score(params)
+            study = optuna.create_study(direction="maximize",
+                sampler=optuna.samplers.TPESampler(seed=self.random_state))
             study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
-            return study.best_params
+            return self._clean_best_params(study.best_trial.user_attrs["model_params"])
+        else:
+            raise ValueError(f"Unknown method: {self.optimization_method}")
+        best, best_score = None, -np.inf
+        for params in candidates:
+            value = score(params)
+            if value > best_score:
+                best, best_score = params, value
+        if best is None:
+            raise ValueError("No finite classification hyperparameter score")
+        return self._clean_best_params(best)
+
+    def _optuna_search(self, model, space, X, y, scoring, folds):
+        from sklearn.metrics import get_scorer
+        scorer = get_scorer(scoring) if isinstance(scoring, str) else scoring
+        branches = space if isinstance(space, list) else [space]
+        def objective(trial):
+            branch = trial.suggest_int("_branch", 0, len(branches)-1) if len(branches)>1 else 0
+            params = {}
+            for name, values in branches[branch].items():
+                key = f"branch{branch}:{name}"
+                if isinstance(values, tuple) and len(values) in (2, 3) and all(isinstance(v, (int, float)) for v in values[:2]):
+                    lo, hi = values[:2]
+                    logarithmic = len(values) == 3 and values[2] == "log"
+                    if isinstance(lo, int) and isinstance(hi, int):
+                        params[name] = trial.suggest_int(key, lo, hi, log=logarithmic)
+                    else:
+                        params[name] = trial.suggest_float(key, lo, hi, log=logarithmic)
+                else:
+                    params[name] = trial.suggest_categorical(key, list(values))
+            trial.set_user_attr("model_params", params)
+            scores = []
+            for fold, (train, valid) in enumerate(folds):
+                estimator = clone(model).set_params(**params)
+                estimator.fit(X[train], y[train])
+                score = float(scorer(estimator, X[valid], y[valid]))
+                if not np.isfinite(score):
+                    raise optuna.TrialPruned("Non-finite validation score")
+                scores.append(score)
+                trial.report(float(np.mean(scores)), fold)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+            return float(np.mean(scores))
+        study = optuna.create_study(direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=self.random_state),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1))
+        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
+        return self._clean_best_params(study.best_trial.user_attrs["model_params"])
 
 
 class WAS_LogisticRegression_Model:
@@ -290,8 +644,8 @@ class WAS_LogisticRegression_Model:
     Workflow overview:
     1. **Tercile classification**: Compute spatial map of classes (0=Below, 1=Normal, 2=Above)
        based on climatological terciles (33rd and 67th percentiles).
-    2. **Spatial clustering** (KMeans) on a summary statistic of the predictand
-       (default: mean over time).
+    2. **Spatial grouping** (KMeans) on geographical coordinates, independent
+       of validation target values.
     3. **Per-cluster hyperparameter optimization** of LogisticRegression using
        grid/random/Bayesian search.
     4. **Broadcast best hyperparameters** to every grid cell (Y, X).
@@ -306,7 +660,7 @@ class WAS_LogisticRegression_Model:
     dist_method : {'bestfit', 'nonparam'}, default='nonparam'
         Kept for API consistency with other models; unused in this class.
     n_clusters : int, default=5
-        Number of spatial clusters for KMeans grouping of the predictand field.
+        Number of target-independent geographical groups for shared tuning.
     param_grid : dict or None, default=None
         Hyperparameter search space for LogisticRegression.
         If None, a safe default grid is used (compatible with multinomial + lbfgs):
@@ -362,7 +716,7 @@ class WAS_LogisticRegression_Model:
         self.n_clusters      = int(n_clusters)
         self.optimization_method = optimization_method
         self.n_trials        = int(n_trials)
-        self.cv              = int(cv)
+        self.cv              = cv
         self.random_state    = int(random_state)
         self.x_scaler        = x_scaler
 
@@ -427,12 +781,14 @@ class WAS_LogisticRegression_Model:
     # ------------------------------------------------------------------
     @staticmethod
     def classify(y, index_start, index_end):
-        mask = np.isfinite(y)
-        if np.any(mask):
-            terciles = np.nanpercentile(y[index_start:index_end], [33, 67])
-            y_class  = np.digitize(y, bins=terciles, right=True)  # 0/1/2
-            return y_class, terciles[0], terciles[1]
-        return np.full(y.shape[0], np.nan), np.nan, np.nan
+        y = np.asarray(y, dtype=float)
+        reference = y[index_start:index_end]
+        if np.isfinite(reference).sum() < 3:
+            return np.full(y.shape, np.nan), np.nan, np.nan
+        terciles = np.quantile(reference[np.isfinite(reference)], [1.0/3.0, 2.0/3.0])
+        labels = np.digitize(y, terciles, right=True).astype(float)
+        labels[~np.isfinite(y)] = np.nan
+        return labels, float(terciles[0]), float(terciles[1])
 
     def compute_class(
         self,
@@ -449,8 +805,7 @@ class WAS_LogisticRegression_Model:
         terc33  : xr.DataArray (Y, X)     — 33rd-percentile threshold
         terc67  : xr.DataArray (Y, X)     — 67th-percentile threshold
         """
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        index_start, index_end = _climatology_positions(Predictant["T"], clim_year_start, clim_year_end)
 
         y_class, terc33, terc67 = xr.apply_ufunc(
             self.classify,
@@ -467,22 +822,9 @@ class WAS_LogisticRegression_Model:
     # ------------------------------------------------------------------
     # 2) Spatial clustering and per-cluster HPO
     # ------------------------------------------------------------------
-    def _build_cluster_map(self, predictand: xr.DataArray) -> xr.DataArray:
-        """KMeans on climatological mean; NaN cells stay NaN."""
-        field = predictand.mean("T", skipna=True)
-        flat  = field.values.reshape(-1)
-        valid = np.isfinite(flat)
-
-        labels = np.full(flat.shape, np.nan)
-        if np.any(valid):
-            km = KMeans(n_clusters=self.n_clusters, random_state=self.random_state)
-            labels[valid] = km.fit_predict(flat[valid].reshape(-1, 1)).astype(float)
-
-        cluster_2d = labels.reshape(field.values.shape)
-        cluster_da = xr.DataArray(
-            cluster_2d, coords=field.coords, dims=field.dims, name="cluster"
-        )
-        return cluster_da.where(np.isfinite(field))
+    def _build_cluster_map(self, predictand):
+        return geographical_cluster_map(predictand, self.n_clusters,
+                                   random_state=self.random_state)
 
     def compute_hyperparameters(
         self,
@@ -505,7 +847,9 @@ class WAS_LogisticRegression_Model:
         cluster_da : xr.DataArray (Y, X) — KMeans cluster labels
         """
         predictor = predictor.copy()
-        predictor["T"] = predictand["T"]
+        predictor, predictand = _aligned_training(predictor, predictand)
+        if any(dim in predictor.dims for dim in ("Y", "X")):
+            raise ValueError("Classifier cluster tuning requires T,features predictors; aggregate spatial predictors explicitly")
 
         y_class, _, _ = self.compute_class(predictand, clim_year_start, clim_year_end)
 
@@ -537,8 +881,12 @@ class WAS_LogisticRegression_Model:
             X_mat = X_c.values
             y_vec = y_mode.values.astype(int)
 
+            pairs = np.isfinite(X_mat).all(axis=1) & np.isfinite(y_vec)
+            if pairs.sum() < 2:
+                continue
+            X_mat, y_vec = X_mat[pairs], y_vec[pairs]
             base_est = self._make_estimator()
-            bp = self.optimizer.optimize(
+            bp = {} if np.unique(y_vec).size == 1 else self.optimizer.optimize(
                 base_est, self.param_grid, X_mat, y_vec, scoring=scoring
             )
             best_params_for_cluster[int(c)] = bp
@@ -555,256 +903,37 @@ class WAS_LogisticRegression_Model:
             maxiter_da = maxiter_da.where(~c_mask,  other=float(bp.get("max_iter", 500)))
             solver_da  = solver_da.where(~c_mask,   other=str(bp.get("solver", "lbfgs")))
 
+        _report_tuned("WAS_LogisticRegression_Model", getattr(self, "verbose", True), cluster_da=cluster_da, C=C_da, class_weight=cw_code_da, max_iter=maxiter_da, solver=solver_da)
+
         return C_da, cw_code_da, maxiter_da, solver_da, cluster_da
 
     # ------------------------------------------------------------------
     # 3) Per-pixel fit + predict_proba
     # ------------------------------------------------------------------
     def fit_predict(self, x, y, x_test, C, cw_code, max_iter, solver):
-        """
-        Fit logistic model on one grid cell using broadcast hyperparameters
-        and return probability vector [P(Below), P(Normal), P(Above)].
-
-        FIX A – single-class degenerate: zero-initialise out so missing classes
-                 get P=0 (not NaN), keeping sum-to-1 invariant.
-        FIX B – classes_ extraction: robust Pipeline-unwrapping loop instead of
-                 hard-coded named_steps['logit'] lookup.
-        """
         if not np.isfinite(C) or not np.isfinite(cw_code) or not np.isfinite(max_iter):
             return np.full(3, np.nan)
-
-        class_weight = self._cw_inv.get(int(cw_code), None)
-        est = self._make_estimator(
-            C=C, class_weight=class_weight, max_iter=max_iter, solver=str(solver)
-        )
-
-        mask = np.isfinite(y) & np.all(np.isfinite(x), axis=-1)
-        if not np.any(mask):
-            return np.full(3, np.nan)
-
-        x_c  = x[mask, :]
-        y_c  = y[mask].astype(int)
-        uniq = np.unique(y_c)
-
-        # FIX A: zero-init so absent classes get P=0, not NaN
-        if uniq.size < 2:
-            out = np.zeros(3)
-            out[int(uniq[0])] = 1.0
-            return out
-
-        est.fit(x_c, y_c)
-
-        if x_test.ndim == 1:
-            x_test = x_test.reshape(1, -1)
-
-        proba = est.predict_proba(x_test).reshape(-1)
-
-        # FIX B: robust classes_ extraction through arbitrary Pipeline depth
-        clf = est
-        while isinstance(clf, Pipeline):
-            clf = clf.steps[-1][1]
-        classes = getattr(clf, "classes_", np.arange(len(proba)))
-
-        out = np.zeros(3)   # FIX A: zero-init here too
-        for cls, p in zip(classes, proba):
-            cls = int(cls)
-            if 0 <= cls <= 2:
-                out[cls] = p
-        return out
+        estimator = self._make_estimator(C=C, class_weight=self._cw_inv.get(int(cw_code)),
+                                         max_iter=max_iter, solver=str(solver))
+        return _classifier_probabilities(estimator, x, y, x_test)[0]
 
     # ------------------------------------------------------------------
     # 4) Parallel model over grid with local params
     # ------------------------------------------------------------------
-    def compute_model(
-        self,
-        X_train,
-        y_train,
-        X_test,
-        C_da,
-        cw_code_da,
-        maxiter_da,
-        solver_da,
-    ):
-        """
-        Parallel tercile classification across the full spatial domain.
-
-        Parameters
-        ----------
-        X_train    : xr.DataArray (T, features)
-        y_train    : xr.DataArray (T, Y, X)  — tercile class labels {0,1,2}
-        X_test     : xr.DataArray (T, features) or (features,)
-        C_da, cw_code_da, maxiter_da, solver_da : xr.DataArray (Y, X)
-            Broadcast hyperparameter arrays from compute_hyperparameters.
-
-        Returns
-        -------
-        xr.DataArray  dims (probability=['PB','PN','PA'], T, Y, X)
-
-        FIX C – squeeze() replaced by explicit T=1 handling so that single-step
-                 CV folds do not silently drop the T dimension.
-        FIX D – transpose to ('probability','T','Y','X') added before return,
-                 consistent with all other classifier compute_model methods.
-        """
-        chunksize_x = self._safe_chunk_size(len(y_train.get_index("X")))
-        chunksize_y = self._safe_chunk_size(len(y_train.get_index("Y")))
-
-        X_train = X_train.copy()
-        X_train["T"] = y_train["T"]
-        y_train = y_train.transpose("T", "Y", "X")
-
-        # FIX C: do not use bare .squeeze() — when T=1 it drops the T dim,
-        # causing apply_ufunc to omit T from the output.
-        X_test        = X_test.transpose("T", "features")
-        n_test_steps  = X_test.sizes["T"]
-        T_test_coords = X_test["T"].values
-
-        # Cast solver_da from object dtype to fixed unicode so Dask can chunk it
-        solver_da = solver_da.astype(str)
-
-        # For each test time step run apply_ufunc independently, then stack.
-        # This avoids xarray's T-alignment clash when X_test has a different
-        # T index than X_train (which always occurs in LOO-style CV folds).
-        client = (
-            _get_compute_client(self.nb_cores)
-            if self.nb_cores > 1
-            else None
-        )
-        step_results = []
-        try:
-            for t_idx in range(n_test_steps):
-                X_test_step = X_test.isel(T=t_idx)   # (features,) — no T dim
-
-                step = xr.apply_ufunc(
-                    self.fit_predict,
-                    X_train,
-                    y_train.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                    X_test_step,
-                    C_da,
-                    cw_code_da,
-                    maxiter_da,
-                    solver_da,
-                    input_core_dims=[
-                        ("T", "features"), ("T",), ("features",), (), (), (), ()
-                    ],
-                    output_core_dims=[("probability",)],
-                    vectorize=True,
-                    dask="parallelized",
-                    output_dtypes=["float"],
-                    dask_gufunc_kwargs={"output_sizes": {"probability": 3}},
-                )
-                step = step.compute() if hasattr(step.data, "compute") else step
-                # Restore the T coordinate for this step
-                step = step.expand_dims(T=[T_test_coords[t_idx]])
-                step_results.append(step)
-        finally:
-            if client is not None:
-                _safe_close_client(client)
-
-        result_ = xr.concat(step_results, dim="T")
-        result_ = result_.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-
-        # FIX D: return consistently transposed
-        return result_.transpose("probability", "T", "Y", "X")
+    def compute_model(self, X_train, y_train, X_test, C_da, cw_code_da, maxiter_da, solver_da):
+        """Return PB/PN/PA at every supplied test date, retaining singleton axes."""
+        return _spatial_classifier(self, X_train, y_train, X_test,
+            (C_da, cw_code_da, maxiter_da, solver_da.astype(str)))
 
     # ------------------------------------------------------------------
     # 5) End-to-end forecast for one target year
     # ------------------------------------------------------------------
-    def forecast(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start: int,
-        clim_year_end: int,
-        Predictor: xr.DataArray,
-        Predictor_for_year: xr.DataArray,
-        C_da,
-        cw_code_da,
-        maxiter_da,
-        solver_da,
-    ):
-        """
-        Classify historical data → fit on full history → predict_proba for one year.
-
-        Returns
-        -------
-        xr.DataArray  dims (probability=['PB','PN','PA'], T=1, Y, X)
-
-        FIX E – chunksize_y / chunksize_x now defined locally (were undefined,
-                 causing NameError at runtime).
-        FIX F – T-dim check now uses proba_.dims (computed array) instead of
-                 proba.dims (lazy dask graph).
-        """
-        # 1) Classify predictand into tercile classes
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                 Predictor_for_year, C_da, cw_code_da, maxiter_da, solver_da):
+        """Fit historical classes and predict each explicitly dated future row."""
         y_class, _, _ = self.compute_class(Predictant, clim_year_start, clim_year_end)
-
-        # FIX E: define chunk sizes here (missing in original)
-        chunksize_y = self._safe_chunk_size(len(y_class.get_index("Y")))
-        chunksize_x = self._safe_chunk_size(len(y_class.get_index("X")))
-
-        # 2) Align predictor T axis
-        Predictor = Predictor.copy()
-        Predictor["T"] = y_class["T"]
-
-        # 3) Ensure forecast predictor has a T dimension
-        X_test = Predictor_for_year
-        if "T" not in X_test.dims:
-            if (
-                "T" in Predictor_for_year.coords
-                and Predictor_for_year.coords["T"].size > 0
-            ):
-                t0 = pd.Timestamp(
-                    Predictor_for_year.coords["T"].values[0]
-                ).to_datetime64()
-            else:
-                t0 = pd.Timestamp(Predictor["T"].values[-1]).to_datetime64()
-            X_test = X_test.expand_dims(T=[t0])
-
-        # forecast always has T=1; pass (features,) to fit_predict and restore T after
-        X_test_fp     = X_test.transpose("T", "features").isel(T=0)
-        T_test_coords = X_test["T"].values
-
-        # Cast solver_da from object dtype to fixed unicode so Dask can chunk it
-        solver_da = solver_da.astype(str)
-
-        client = (
-            _get_compute_client(self.nb_cores)
-            if self.nb_cores > 1
-            else None
-        )
-        try:
-            proba = xr.apply_ufunc(
-                self.fit_predict,
-                Predictor,
-                y_class.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                X_test_fp,
-                C_da,
-                cw_code_da,
-                maxiter_da,
-                solver_da,
-                input_core_dims=[
-                    ("T", "features"), ("T",), ("features",), (), (), (), ()
-                ],
-                output_core_dims=[("probability",)],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=["float"],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}},
-            )
-            proba_ = proba.compute() if hasattr(proba.data, "compute") else proba
-        finally:
-            if client is not None:
-                _safe_close_client(client)
-
-        proba_ = proba_.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-
-        # FIX F: check the computed array (proba_), not the lazy graph (proba)
-        if "T" not in proba_.dims:
-            proba_ = proba_.expand_dims(T=T_test_coords)
-
-        return proba_.transpose("probability", "T", "Y", "X")
+        return self.compute_model(Predictor, y_class, _forecast_times(Predictor_for_year),
+                                  C_da, cw_code_da, maxiter_da, solver_da)
 
 def _compute_forecast_prob_nonparam(fc_sq_np, error_samples_np, T1_np, T2_np):
     """
@@ -824,8 +953,8 @@ def _compute_forecast_prob_nonparam(fc_sq_np, error_samples_np, T1_np, T2_np):
             if len(d) == 0:
                 continue
             t1 = T1_np[iy, ix]; t2 = T2_np[iy, ix]
-            pb = float(np.mean(d < t1))
-            pn = float(np.mean((d >= t1) & (d < t2)))
+            pb = float(np.mean(d <= t1))
+            pn = float(np.mean((d > t1) & (d <= t2)))
             out[0, 0, iy, ix] = pb
             out[1, 0, iy, ix] = pn
             out[2, 0, iy, ix] = 1.0 - (pb + pn)
@@ -851,9 +980,8 @@ class WAS_PolynomialRegression:
     Warnings
     --------
     - degree ≥ 4 with many features causes numerical instability; prefer degree 2–3.
-    - Predictors should be normalised externally before calling this class.
-    - Negative predictions are clipped to zero (suitable for rainfall / non-negative
-      variables; remove the clip for temperature or anomalies).
+    - Predictor scaling is fitted on the training observations inside the estimator.
+    - Signed anomalies are preserved; physical support is applied after inverse scaling.
     """
 
     def __init__(self, nb_cores=1, degree=2, dist_method="nonparam"):
@@ -865,103 +993,16 @@ class WAS_PolynomialRegression:
     # 1) Per-pixel fit + predict
     # ------------------------------------------------------------------
     def fit_predict(self, x, y, x_test, y_test):
-        """
-        Fit polynomial regression on one grid cell, return [error, prediction].
-
-        FIX 1 – scalar clip: use np.maximum instead of item-assignment on a
-                 potentially 0-d array (IndexError after squeeze() for T=1 folds).
-        """
-        poly  = PolynomialFeatures(degree=self.degree)
-        model = LinearRegression()
-
-        mask = np.isfinite(y) & np.all(np.isfinite(x), axis=-1)
-        if not np.any(mask):
-            return np.array([np.nan, np.nan], dtype=float).squeeze()
-
-        y_clean = y[mask]
-        x_clean = x[mask, :]
-
-        x_clean_poly = poly.fit_transform(x_clean)
-        model.fit(x_clean_poly, y_clean)
-
-        if x_test.ndim == 1:
-            x_test = x_test.reshape(1, -1)
-        x_test_poly = poly.transform(x_test)
-
-        preds = model.predict(x_test_poly)
-
-        # FIX 1: safe clip for both scalar and array outputs
-        preds = np.maximum(preds, 0.0)
-
-        error_ = np.asarray(y_test, float) - preds
-        return np.array([error_, preds], dtype=float).squeeze()
+        estimator = Pipeline([("scale", StandardScaler()),
+                              ("polynomial", PolynomialFeatures(degree=self.degree, include_bias=False)),
+                              ("regression", LinearRegression())])
+        return _regression_pair(estimator, x, y, x_test, y_test)
 
     # ------------------------------------------------------------------
     # 2) Parallel spatial hindcast
     # ------------------------------------------------------------------
-    def compute_model(self, X_train, y_train, X_test, y_test):
-        """
-        Parallel polynomial regression across the full (Y, X) domain.
-
-
-        Returns
-        -------
-        xr.DataArray (Y, X) or (T, Y, X) — deterministic prediction field.
-        """
-        # FIX 12: clamp to at least 1
-        chunksize_x = max(int(np.round(len(y_train.get_index("X")) / self.nb_cores)), 1)
-        chunksize_y = max(int(np.round(len(y_train.get_index("Y")) / self.nb_cores)), 1)
-
-        X_train = X_train.copy()
-        X_train["T"] = y_train["T"]
-        y_train = y_train.transpose("T", "Y", "X")
-
-        # FIX 2: do NOT use bare .squeeze() — per-step loop preserves T
-        X_test        = X_test.transpose("T", "features")
-        n_test_steps  = X_test.sizes["T"]
-        T_test_coords = X_test["T"].values
-
-        if "T" in y_test.dims:
-            y_test = y_test.drop_vars("T")
-        y_test = y_test.squeeze().transpose("Y", "X")
-
-        # FIX 3: try/finally for Dask client
-        client = (
-            _get_compute_client(self.nb_cores)
-            if self.nb_cores > 1 else None
-        )
-
-        step_results = []
-        try:
-            for t_idx in range(n_test_steps):
-                X_step = X_test.isel(T=t_idx)      # (features,) — no T dim
-
-                step = xr.apply_ufunc(
-                    self.fit_predict,
-                    X_train,
-                    y_train.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                    X_step,
-                    y_test.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                    input_core_dims=[("T", "features"), ("T",), ("features",), ()],
-                    vectorize=True,
-                    output_core_dims=[("output",)],
-                    dask="parallelized",
-                    output_dtypes=["float"],
-                    dask_gufunc_kwargs={"output_sizes": {"output": 2}},
-                )
-                step = step.compute() if hasattr(step.data, "compute") else step
-                # Extract the prediction (output index 1) and restore T
-                step = step.isel(output=1).expand_dims(T=[T_test_coords[t_idx]])
-                step_results.append(step)
-        finally:
-            if client is not None:
-                _safe_close_client(client)
-
-        result_ = xr.concat(step_results, dim="T")
-        # For single-step CV folds return (Y, X); for multi-step return (T, Y, X)
-        if n_test_steps == 1:
-            return result_.squeeze("T", drop=True)
-        return result_
+    def compute_model(self, X_train, y_train, X_test, y_test=None):
+        return _spatial_regression(self, X_train, y_train, X_test, y_test)
 
     # ------------------------------------------------------------------
     # 3) Probability calculation methods
@@ -974,21 +1015,21 @@ class WAS_PolynomialRegression:
         code = int(dist_code)
         try:
             if code == 1:
-                return norm.ppf(0.33, loc=loc, scale=scale),      norm.ppf(0.67, loc=loc, scale=scale)
+                return norm.ppf(1.0 / 3.0, loc=loc, scale=scale),      norm.ppf(2.0 / 3.0, loc=loc, scale=scale)
             elif code == 2:
-                return lognorm.ppf(0.33, s=shape, loc=loc, scale=scale), lognorm.ppf(0.67, s=shape, loc=loc, scale=scale)
+                return lognorm.ppf(1.0 / 3.0, s=shape, loc=loc, scale=scale), lognorm.ppf(2.0 / 3.0, s=shape, loc=loc, scale=scale)
             elif code == 3:
-                return expon.ppf(0.33, loc=loc, scale=scale),     expon.ppf(0.67, loc=loc, scale=scale)
+                return expon.ppf(1.0 / 3.0, loc=loc, scale=scale),     expon.ppf(2.0 / 3.0, loc=loc, scale=scale)
             elif code == 4:
-                return gamma.ppf(0.33, a=shape, loc=loc, scale=scale), gamma.ppf(0.67, a=shape, loc=loc, scale=scale)
+                return gamma.ppf(1.0 / 3.0, a=shape, loc=loc, scale=scale), gamma.ppf(2.0 / 3.0, a=shape, loc=loc, scale=scale)
             elif code == 5:
-                return weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale), weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale)
+                return weibull_min.ppf(1.0 / 3.0, c=shape, loc=loc, scale=scale), weibull_min.ppf(2.0 / 3.0, c=shape, loc=loc, scale=scale)
             elif code == 6:
-                return t.ppf(0.33, df=shape, loc=loc, scale=scale), t.ppf(0.67, df=shape, loc=loc, scale=scale)
+                return t.ppf(1.0 / 3.0, df=shape, loc=loc, scale=scale), t.ppf(2.0 / 3.0, df=shape, loc=loc, scale=scale)
             elif code == 7:
-                return poisson.ppf(0.33, mu=shape, loc=loc),      poisson.ppf(0.67, mu=shape, loc=loc)
+                return poisson.ppf(1.0 / 3.0, mu=shape, loc=loc),      poisson.ppf(2.0 / 3.0, mu=shape, loc=loc)
             elif code == 8:
-                return nbinom.ppf(0.33, n=shape, p=scale, loc=loc), nbinom.ppf(0.67, n=shape, p=scale, loc=loc)
+                return nbinom.ppf(1.0 / 3.0, n=shape, p=scale, loc=loc), nbinom.ppf(2.0 / 3.0, n=shape, p=scale, loc=loc)
         except Exception:
             return np.nan, np.nan
         return np.nan, np.nan
@@ -1006,337 +1047,44 @@ class WAS_PolynomialRegression:
             return -np.inf
 
     @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
-        """
-        Tercile probabilities using best-fit climatological distribution family.
-
-        """
-        best_guess     = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, float)
-        n_time         = best_guess.size
-        out            = np.full((3, n_time), np.nan, float)
-
-        if (np.all(np.isnan(best_guess)) or np.isnan(dist_code)
-                or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance)):
-            return out
-
-        code = int(dist_code)
-
-        if code == 1:
-            std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=std)
-            out[1, :] = norm.cdf(T2, loc=best_guess, scale=std) - norm.cdf(T1, loc=best_guess, scale=std)
-            out[2, :] = 1.0 - norm.cdf(T2, loc=best_guess, scale=std)
-
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
-            mu    = np.log(best_guess) - sigma ** 2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[2, :] = 1.0 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))
-
-        elif code == 3:
-            # FIX 4: loc=best_guess (not undefined loc_t)
-            scale_ = np.sqrt(error_variance)
-            c1 = expon.cdf(T1, loc=best_guess, scale=scale_)
-            c2 = expon.cdf(T2, loc=best_guess, scale=scale_)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5:
-            for i in range(n_time):
-                M = best_guess[i]
-                V = float(error_variance)
-                # FIX 6: no print statements
-                if V <= 0 or M <= 0:
-                    continue
-                # FIX 5: qualified static method reference
-                k = fsolve(WAS_PolynomialRegression.weibull_shape_solver, 2.0, args=(M, V))[0]
-                if k <= 0:
-                    continue
-                lambda_scale = M / gamma_function(1 + 1 / k)
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
-
-        elif code == 6:
-            if dof <= 2:
-                return out
-            scale_ = np.sqrt(error_variance * (dof - 2) / dof)
-            c1 = t.cdf(T1, df=dof, loc=best_guess, scale=scale_)
-            c2 = t.cdf(T2, df=dof, loc=best_guess, scale=scale_)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 7:
-            # FIX 7: no print() warning — Poisson appropriateness is a caller concern
-            mu_ = best_guess
-            c1  = poisson.cdf(T1, mu=mu_)
-            c2  = poisson.cdf(T2, mu=mu_)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8:
-            p = np.where(error_variance > best_guess, best_guess / error_variance, np.nan)
-            n = np.where(error_variance > best_guess,
-                         (best_guess ** 2) / (error_variance - best_guess), np.nan)
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        else:
-            raise ValueError(f"Invalid distribution code: {dist_code}")
-
-        return out
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof, nonneg=False):
+        """Shared predictive CDF; moment matching and support follow one contract."""
+        from .was_linear_models import _regression_tercile_probabilities
+        return _regression_tercile_probabilities(best_guess, error_variance, T1, T2,
+                                               dist_code, dof, nonneg=nonneg)
 
     @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric tercile probabilities from historical error samples."""
-        n_time    = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t_ in range(n_time):
-            if np.isnan(best_guess[t_]):
-                continue
-            dist = best_guess[t_] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below   = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            pred_prob[0, t_] = p_below
-            pred_prob[1, t_] = p_between
-            pred_prob[2, t_] = 1.0 - (p_below + p_between)
-        return pred_prob
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile, nonneg=False):
+        """Empirical CDF with finite errors, declared support and fixed events."""
+        return _residual_probabilities(best_guess, error_samples, first_tercile, second_tercile, nonneg=nonneg)
 
     # ------------------------------------------------------------------
     # 4) compute_prob
     # ------------------------------------------------------------------
-    def compute_prob(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det: xr.DataArray,
-        best_code_da:  xr.DataArray = None,
-        best_shape_da: xr.DataArray = None,
-        best_loc_da:   xr.DataArray = None,
-        best_scale_da: xr.DataArray = None,
-    ) -> xr.DataArray:
-        """Tercile probabilities for a deterministic hindcast."""
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
-        Predictant = Predictant.transpose("T", "Y", "X")
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                     best_code_da=None, best_shape_da=None, best_loc_da=None,
+                     best_scale_da=None, **probability_options):
+        """Calibrate hindcasts with outer reuse by default; inner needs explicit residuals.
 
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof            = max(int(clim.sizes["T"]) - 1, 2)
-        terciles_emp   = clim.quantile([0.33, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-
-        dm = self.dist_method
-
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float],
-            )
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                hindcast_det, error_variance, T1, T2, best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, kwargs={"dof": dof}, dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-            )
-
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det, error_samples, T1_emp, T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, dask="parallelized", output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
+        The held-out year's error is excluded. Use ``diagnostic=True`` explicitly
+        for a full-hindcast residual pool, which is unsuitable for skill scores.
+        """
+        from .was_probability_calibration import direct_hindcast_probabilities
+        probability_options.setdefault("tercile_reference", getattr(self, "tercile_reference", "climatology"))
+        return direct_hindcast_probabilities(self, Predictant, clim_year_start,
+            clim_year_end, hindcast_det, best_code_da, best_shape_da,
+            best_loc_da, best_scale_da, **probability_options)
 
     # ------------------------------------------------------------------
     # 5) forecast
     # ------------------------------------------------------------------
-    def forecast(
-        self,
-        Predictant,
-        clim_year_start,
-        clim_year_end,
-        Predictor,
-        hindcast_det,
-        Predictor_for_year,
-        best_code_da=None, best_shape_da=None,
-        best_loc_da=None,  best_scale_da=None,
-    ):
-        """
-        End-to-end single-year forecast: deterministic prediction + tercile probabilities.
-
-
-        Returns
-        -------
-        forecast_expanded : xr.DataArray (T=1, Y, X) — deterministic forecast
-        forecast_prob     : xr.DataArray (probability=3, T=1, Y, X)
-        """
-        chunksize_x = max(int(np.round(len(Predictant.get_index("X")) / self.nb_cores)), 1)
-        chunksize_y = max(int(np.round(len(Predictant.get_index("Y")) / self.nb_cores)), 1)
-
-        # FIX 9: guard T-coord assignment against size mismatch
-        Predictor = Predictor.copy()
-        if Predictor.sizes["T"] == Predictant.sizes["T"]:
-            Predictor["T"] = Predictant["T"]
-
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        Predictant_st = Predictant_st.transpose("T", "Y", "X")
-
-        # FIX 10: safe single-step extraction — no over-squeezing
-        Predictor_for_year_fp = Predictor_for_year.transpose("T", "features").isel(T=0)
-        T_forecast_coord      = Predictor_for_year["T"].values
-
-        y_test = xr.full_like(Predictant.isel(T=0), np.nan)
-
-        # FIX 8: try/finally for Dask client
-        client = (
-            _get_compute_client(self.nb_cores)
-            if self.nb_cores > 1 else None
-        )
-        try:
-            result = xr.apply_ufunc(
-                self.fit_predict,
-                Predictor,
-                Predictant_st.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                Predictor_for_year_fp,
-                y_test.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                input_core_dims=[("T", "features"), ("T",), ("features",), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_core_dims=[("output",)],
-                output_dtypes=["float"],
-                dask_gufunc_kwargs={"output_sizes": {"output": 2}},
-            )
-            result_ = result.compute() if hasattr(result.data, "compute") else result
-        finally:
-            if client is not None:
-                _safe_close_client(client)
-
-        result_ = result_.isel(output=1)
-        result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end)
-
-        # Build T=1 coordinate
-        year    = T_forecast_coord[0].astype("datetime64[Y]").astype(int) + 1970
-        month_1 = Predictant.isel(T=0).coords["T"].values.astype("datetime64[M]").astype(int) % 12 + 1
-        new_T   = np.datetime64(f"{year}-{month_1:02d}-01")
-
-        forecast_expanded = result_.expand_dims(T=[new_T])
-        forecast_expanded["T"] = forecast_expanded["T"].astype("datetime64[ns]")
-
-        # Climatological terciles and error variance
-        index_start        = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end          = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles           = rainfall_for_tercile.quantile([0.33, 0.67], dim="T")
-        T1_emp             = terciles.isel(quantile=0).drop_vars("quantile")
-        T2_emp             = terciles.isel(quantile=1).drop_vars("quantile")
-        error_variance     = (Predictant - hindcast_det).var(dim="T")
-        dof                = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
-
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan).drop_vars("T").squeeze()
-
-        dm = self.dist_method
-
-        # Pass fc_sq (no T dim) to avoid xarray T-alignment clash between
-        # the forecast step (T=2025) and training arrays (T=1991..2020).
-        # The probability functions receive it as a scalar-per-cell argument
-        # and the T=1 dimension is re-attached via expand_dims after ufunc.
-        fc_sq = forecast_expanded.squeeze("T", drop=True)   # (Y, X)
-
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float],
-            )
-            # Wrap fc_sq in a length-1 "T" core dim so the static fn receives
-            # a (1,) best_guess array — consistent with the hindcast call.
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                fc_sq.expand_dims("T"),          # (T=1, Y, X) — new T has no label, no clash
-                error_variance, T1, T2, best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, dask="parallelized", kwargs={"dof": dof},
-                output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-            )
-
-        elif dm == "nonparam":
-            # Direct numpy computation avoids xarray T-alignment clash between
-            # forecast_expanded (T=1) and error_samples (T=n_years).
-            error_samples = (Predictant - hindcast_det).transpose("T", "Y", "X")
-            T1_np = T1_emp.values
-            T2_np = T2_emp.values
-            fc_np = fc_sq.values   # (Y, X)
-            es_np = error_samples.values   # (T, Y, X)
-            prob_np = _compute_forecast_prob_nonparam(fc_np, es_np, T1_np, T2_np)
-            # prob_np: (3, 1, Y, X)
-            forecast_prob = xr.DataArray(
-                prob_np,
-                dims=("probability", "T", "Y", "X"),
-                coords={"probability": ["PB", "PN", "PA"],
-                        "T": [new_T],
-                        "Y": Predictant.coords["Y"],
-                        "X": Predictant.coords["X"]},
-            )
-            forecast_prob["T"] = forecast_prob["T"].astype("datetime64[ns]")
-            # FIX 11: use result_ (defined), not the non-existent result_da
-            return result_ * mask, (mask * forecast_prob).transpose("probability", "T", "Y", "X")
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        forecast_prob = forecast_prob.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
-        forecast_prob["T"] = forecast_prob["T"].astype("datetime64[ns]")
-        # FIX 11: use result_ (defined), not the non-existent result_da
-        return result_ * mask, (mask * forecast_prob).transpose("probability", "T", "Y", "X")
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                 hindcast_det, Predictor_for_year, best_code_da=None,
+                 best_shape_da=None, best_loc_da=None, best_scale_da=None):
+        return _operational_forecast(self, Predictant, clim_year_start, clim_year_end,
+            Predictor, hindcast_det, Predictor_for_year, parameters=(),
+            best_code_da=best_code_da, best_shape_da=best_shape_da,
+            best_loc_da=best_loc_da, best_scale_da=best_scale_da, raw_target=False)
 
         
 ###########################################
@@ -1376,106 +1124,25 @@ class WAS_PoissonRegression:
     # ------------------------------------------------------------------
     # 1) Per-pixel fit + predict
     # ------------------------------------------------------------------
-    def fit_predict(self, x, y, x_test, y_test):
-        """
-        Fit PoissonRegressor on one grid cell and return [error, prediction].
-
-        """
+    def fit_predict(self, x, y, x_test, y_test=None):
+        """Poisson log-link mean; nonnegative real y permits quasi-likelihood use."""
         from sklearn.linear_model import PoissonRegressor
-
-        # FIX 1: mask invalid / NaN samples
-        mask = np.isfinite(y) & np.all(np.isfinite(x), axis=-1) & (y >= 0)
-        if not np.any(mask):
-            return np.array([np.nan, np.nan], dtype=float)
-
-        x_c = x[mask, :]
-        y_c = y[mask]
-
-        try:
-            model = PoissonRegressor(max_iter=5000)
-            model.fit(x_c, y_c)
-        except Exception:
-            return np.array([np.nan, np.nan], dtype=float)
-
-        if x_test.ndim == 1:
-            x_test = x_test.reshape(1, -1)
-
-        preds = model.predict(x_test).squeeze()
-
-        # FIX 2: safe clip for both scalar and array outputs
-        preds = np.maximum(preds, 0.0)
-
-        error_ = np.asarray(y_test, float) - preds
-        return np.array([error_, preds], dtype=float).squeeze()
+        y = np.asarray(y, float)
+        if np.any(y[np.isfinite(y)] < 0):
+            raise ValueError("Poisson requires nonnegative targets in physical units")
+        valid = np.isfinite(y)
+        if valid.any() and np.all(y[valid] == 0):
+            prediction = 0.0 if np.isfinite(x_test).all() else np.nan
+            return np.array([np.nan if y_test is None else y_test-prediction, prediction])
+        estimator = Pipeline([("scale", StandardScaler()),
+                              ("poisson", PoissonRegressor(alpha=1.0, max_iter=5000))])
+        return _regression_pair(estimator, x, y, x_test, y_test)
 
     # ------------------------------------------------------------------
     # 2) Parallel spatial hindcast
     # ------------------------------------------------------------------
-    def compute_model(self, X_train, y_train, X_test, y_test):
-        """
-        Parallel Poisson regression across the full (Y, X) domain.
-
-        FIX 3 – Dask client wrapped in try/finally so it closes even on error.
-        FIX 4 – X_test T=1 handling: isel(T=0) + expand_dims to avoid the
-                 bare .squeeze() stripping T dimension in CV folds.
-
-        Returns
-        -------
-        xr.DataArray (Y, X) — deterministic prediction field.
-        """
-        chunksize_x = max(int(np.round(len(y_train.get_index("X")) / self.nb_cores)), 1)
-        chunksize_y = max(int(np.round(len(y_train.get_index("Y")) / self.nb_cores)), 1)
-
-        X_train = X_train.copy()
-        X_train["T"] = y_train["T"]
-        y_train = y_train.transpose("T", "Y", "X")
-
-        # FIX 4: preserve T dimension for CV folds (T=1 after squeeze → crash)
-        X_test        = X_test.transpose("T", "features")
-        n_test_steps  = X_test.sizes["T"]
-        T_test_coords = X_test["T"].values
-
-        if "T" in y_test.dims:
-            y_test = y_test.drop_vars("T")
-        y_test = y_test.squeeze().transpose("Y", "X")
-
-        client = (
-            _get_compute_client(self.nb_cores)
-            if self.nb_cores > 1 else None
-        )
-
-        step_results = []
-        try:
-            for t_idx in range(n_test_steps):
-                X_step = X_test.isel(T=t_idx)          # (features,)
-                y_step = y_test                          # (Y, X) — same for all steps
-
-                step = xr.apply_ufunc(
-                    self.fit_predict,
-                    X_train,
-                    y_train.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                    X_step,
-                    y_step.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                    input_core_dims=[("T", "features"), ("T",), ("features",), ()],
-                    vectorize=True,
-                    output_core_dims=[("output",)],
-                    dask="parallelized",
-                    output_dtypes=["float"],
-                    dask_gufunc_kwargs={"output_sizes": {"output": 2}},
-                )
-                step = step.compute() if hasattr(step.data, "compute") else step
-                step = step.isel(output=1).expand_dims(T=[T_test_coords[t_idx]])
-                step_results.append(step)
-        finally:
-            if client is not None:
-                _safe_close_client(client)
-
-        result_ = xr.concat(step_results, dim="T")
-        # For hindcast (T=n_years), drop the T dimension to stay consistent
-        # with other regression compute_model outputs that return (Y, X).
-        if n_test_steps == 1:
-            return result_.squeeze("T", drop=True)
-        return result_.squeeze("T", drop=True) if n_test_steps == 1 else result_.isel(T=0, drop=True) if n_test_steps == 1 else result_
+    def compute_model(self, X_train, y_train, X_test, y_test=None):
+        return _spatial_regression(self, X_train, y_train, X_test, y_test)
 
     # ------------------------------------------------------------------
     # 3) Probability methods
@@ -1488,21 +1155,21 @@ class WAS_PoissonRegression:
         code = int(dist_code)
         try:
             if code == 1:
-                return norm.ppf(0.33, loc=loc, scale=scale), norm.ppf(0.67, loc=loc, scale=scale)
+                return norm.ppf(1.0 / 3.0, loc=loc, scale=scale), norm.ppf(2.0 / 3.0, loc=loc, scale=scale)
             elif code == 2:
-                return lognorm.ppf(0.33, s=shape, loc=loc, scale=scale), lognorm.ppf(0.67, s=shape, loc=loc, scale=scale)
+                return lognorm.ppf(1.0 / 3.0, s=shape, loc=loc, scale=scale), lognorm.ppf(2.0 / 3.0, s=shape, loc=loc, scale=scale)
             elif code == 3:
-                return expon.ppf(0.33, loc=loc, scale=scale), expon.ppf(0.67, loc=loc, scale=scale)
+                return expon.ppf(1.0 / 3.0, loc=loc, scale=scale), expon.ppf(2.0 / 3.0, loc=loc, scale=scale)
             elif code == 4:
-                return gamma.ppf(0.33, a=shape, loc=loc, scale=scale), gamma.ppf(0.67, a=shape, loc=loc, scale=scale)
+                return gamma.ppf(1.0 / 3.0, a=shape, loc=loc, scale=scale), gamma.ppf(2.0 / 3.0, a=shape, loc=loc, scale=scale)
             elif code == 5:
-                return weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale), weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale)
+                return weibull_min.ppf(1.0 / 3.0, c=shape, loc=loc, scale=scale), weibull_min.ppf(2.0 / 3.0, c=shape, loc=loc, scale=scale)
             elif code == 6:
-                return t.ppf(0.33, df=shape, loc=loc, scale=scale), t.ppf(0.67, df=shape, loc=loc, scale=scale)
+                return t.ppf(1.0 / 3.0, df=shape, loc=loc, scale=scale), t.ppf(2.0 / 3.0, df=shape, loc=loc, scale=scale)
             elif code == 7:
-                return poisson.ppf(0.33, mu=shape, loc=loc), poisson.ppf(0.67, mu=shape, loc=loc)
+                return poisson.ppf(1.0 / 3.0, mu=shape, loc=loc), poisson.ppf(2.0 / 3.0, mu=shape, loc=loc)
             elif code == 8:
-                return nbinom.ppf(0.33, n=shape, p=scale, loc=loc), nbinom.ppf(0.67, n=shape, p=scale, loc=loc)
+                return nbinom.ppf(1.0 / 3.0, n=shape, p=scale, loc=loc), nbinom.ppf(2.0 / 3.0, n=shape, p=scale, loc=loc)
         except Exception:
             return np.nan, np.nan
         return np.nan, np.nan
@@ -1520,312 +1187,44 @@ class WAS_PoissonRegression:
             return -np.inf
 
     @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
-        """
-        Tercile probabilities using best-fit climatological distribution family.
-
-        FIX 3 – Exponential (code 3): replaced undefined `loc_t` with `best_guess`
-                 (the forecast mean shifts the exponential location parameter).
-        FIX 4 – Weibull (code 5): replaced bare `weibull_shape_solver` (NameError)
-                 with `WAS_PoissonRegression.weibull_shape_solver` (static method ref).
-        FIX 5 – Weibull (code 5): removed debug print() statements.
-        """
-        best_guess     = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, float)
-        n_time         = best_guess.size
-        out            = np.full((3, n_time), np.nan, float)
-
-        if (np.all(np.isnan(best_guess)) or np.isnan(dist_code)
-                or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance)):
-            return out
-
-        code = int(dist_code)
-
-        if code == 1:
-            std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=std)
-            out[1, :] = norm.cdf(T2, loc=best_guess, scale=std) - norm.cdf(T1, loc=best_guess, scale=std)
-            out[2, :] = 1.0 - norm.cdf(T2, loc=best_guess, scale=std)
-
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
-            mu    = np.log(best_guess) - sigma ** 2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[2, :] = 1.0 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))
-
-        elif code == 3:
-            # FIX 3: loc=best_guess (not undefined loc_t); scale=sqrt(variance)
-            scale_ = np.sqrt(error_variance)
-            c1 = expon.cdf(T1, loc=best_guess, scale=scale_)
-            c2 = expon.cdf(T2, loc=best_guess, scale=scale_)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5:
-            for i in range(n_time):
-                M = best_guess[i]
-                V = float(error_variance)
-                if V <= 0 or M <= 0:
-                    continue
-                # FIX 4: qualified static method reference (not bare name)
-                # FIX 5: removed print() calls
-                k = fsolve(WAS_PoissonRegression.weibull_shape_solver, 2.0, args=(M, V))[0]
-                if k <= 0:
-                    continue
-                lambda_scale = M / gamma_function(1 + 1 / k)
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
-
-        elif code == 6:
-            if dof <= 2:
-                return out
-            scale_ = np.sqrt(error_variance * (dof - 2) / dof)
-            c1 = t.cdf(T1, df=dof, loc=best_guess, scale=scale_)
-            c2 = t.cdf(T2, df=dof, loc=best_guess, scale=scale_)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 7:
-            mu_ = best_guess
-            c1 = poisson.cdf(T1, mu=mu_)
-            c2 = poisson.cdf(T2, mu=mu_)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8:
-            p = np.where(error_variance > best_guess, best_guess / error_variance, np.nan)
-            n = np.where(error_variance > best_guess,
-                         (best_guess ** 2) / (error_variance - best_guess), np.nan)
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        else:
-            raise ValueError(f"Invalid distribution code: {dist_code}")
-
-        return out
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof, nonneg=False):
+        """Shared predictive CDF; moment matching and support follow one contract."""
+        from .was_linear_models import _regression_tercile_probabilities
+        return _regression_tercile_probabilities(best_guess, error_variance, T1, T2,
+                                               dist_code, dof, nonneg=nonneg)
 
     @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric tercile probabilities from historical error samples."""
-        n_time    = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t_ in range(n_time):
-            if np.isnan(best_guess[t_]):
-                continue
-            dist = best_guess[t_] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below   = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            pred_prob[0, t_] = p_below
-            pred_prob[1, t_] = p_between
-            pred_prob[2, t_] = 1.0 - (p_below + p_between)
-        return pred_prob
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile, nonneg=False):
+        """Empirical CDF with finite errors, declared support and fixed events."""
+        return _residual_probabilities(best_guess, error_samples, first_tercile, second_tercile, nonneg=nonneg)
 
     # ------------------------------------------------------------------
     # 4) compute_prob
     # ------------------------------------------------------------------
-    def compute_prob(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det: xr.DataArray,
-        best_code_da:  xr.DataArray = None,
-        best_shape_da: xr.DataArray = None,
-        best_loc_da:   xr.DataArray = None,
-        best_scale_da: xr.DataArray = None,
-    ) -> xr.DataArray:
-        """Tercile probabilities for a deterministic hindcast."""
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
-        Predictant = Predictant.transpose("T", "Y", "X")
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                     best_code_da=None, best_shape_da=None, best_loc_da=None,
+                     best_scale_da=None, **probability_options):
+        """Calibrate hindcasts with outer reuse by default; inner needs explicit residuals.
 
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof            = max(int(clim.sizes["T"]) - 1, 2)
-        terciles_emp   = clim.quantile([0.33, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-
-        dm = self.dist_method
-
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float],
-            )
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                hindcast_det, error_variance, T1, T2, best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, kwargs={"dof": dof}, dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-            )
-
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det, error_samples, T1_emp, T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, dask="parallelized", output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
+        The held-out year's error is excluded. Use ``diagnostic=True`` explicitly
+        for a full-hindcast residual pool, which is unsuitable for skill scores.
+        """
+        from .was_probability_calibration import direct_hindcast_probabilities
+        probability_options.setdefault("tercile_reference", getattr(self, "tercile_reference", "climatology"))
+        return direct_hindcast_probabilities(self, Predictant, clim_year_start,
+            clim_year_end, hindcast_det, best_code_da, best_shape_da,
+            best_loc_da, best_scale_da, **probability_options)
 
     # ------------------------------------------------------------------
     # 5) forecast
     # ------------------------------------------------------------------
-    def forecast(
-        self,
-        Predictant,
-        clim_year_start,
-        clim_year_end,
-        Predictor,
-        hindcast_det,
-        Predictor_for_year,
-        best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None,
-    ):
-        """
-        End-to-end deterministic + tercile forecast for one target year.
-
-
-        Returns
-        -------
-        forecast_expanded : xr.DataArray (T=1, Y, X) — deterministic forecast
-        forecast_prob     : xr.DataArray (probability=3, T=1, Y, X)
-        """
-        chunksize_x = max(int(np.round(len(Predictant.get_index("X")) / self.nb_cores)), 1)
-        chunksize_y = max(int(np.round(len(Predictant.get_index("Y")) / self.nb_cores)), 1)
-
-        # FIX 7: guard T-coord assignment against size mismatch
-        Predictor = Predictor.copy()
-        if Predictor.sizes["T"] == Predictant.sizes["T"]:
-            Predictor["T"] = Predictant["T"]
-
-        Predictant = Predictant.transpose("T", "Y", "X")
-
-        # FIX 8: use isel(T=0) for the single forecast step — no over-squeezing
-        Predictor_for_year_fp = Predictor_for_year.transpose("T", "features").isel(T=0)
-        T_forecast_coord      = Predictor_for_year["T"].values
-
-        y_test = xr.full_like(Predictant.isel(T=0), np.nan)
-
-        # FIX 6: try/finally for Dask client
-        client = (
-            _get_compute_client(self.nb_cores)
-            if self.nb_cores > 1 else None
-        )
-        try:
-            result = xr.apply_ufunc(
-                self.fit_predict,
-                Predictor,
-                Predictant.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                Predictor_for_year_fp,
-                y_test.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                input_core_dims=[("T", "features"), ("T",), ("features",), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_core_dims=[("output",)],
-                output_dtypes=["float"],
-                dask_gufunc_kwargs={"output_sizes": {"output": 2}},
-            )
-            result_ = result.compute() if hasattr(result.data, "compute") else result
-        finally:
-            if client is not None:
-                _safe_close_client(client)
-
-        forecast_det = result_.isel(output=1)
-
-        # Build T=1 coordinate for probability methods
-        year    = T_forecast_coord[0].astype("datetime64[Y]").astype(int) + 1970
-        month_1 = Predictant.isel(T=0).coords["T"].values.astype("datetime64[M]").astype(int) % 12 + 1
-        new_T   = np.datetime64(f"{year}-{month_1:02d}-01")
-
-        forecast_expanded = forecast_det.expand_dims(T=[new_T])
-        forecast_expanded["T"] = forecast_expanded["T"].astype("datetime64[ns]")
-
-        # Climatological terciles and error variance
-        rainfall_clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        terciles      = rainfall_clim.quantile([0.33, 0.67], dim="T")
-        T1_emp        = terciles.isel(quantile=0).drop_vars("quantile")
-        T2_emp        = terciles.isel(quantile=1).drop_vars("quantile")
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof = max(int(rainfall_clim.sizes["T"]) - 1, 2)
-
-        dm = self.dist_method
-
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float],
-            )
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                forecast_expanded, error_variance, T1, T2, best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, dask="parallelized", kwargs={"dof": dof},
-                output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-            )
-
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                forecast_expanded, error_samples, T1_emp, T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, dask="parallelized", output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        forecast_prob = forecast_prob.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
-        return forecast_expanded, forecast_prob.transpose("probability", "T", "Y", "X")
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                 hindcast_det, Predictor_for_year, best_code_da=None,
+                 best_shape_da=None, best_loc_da=None, best_scale_da=None):
+        return _operational_forecast(self, Predictant, clim_year_start, clim_year_end,
+            Predictor, hindcast_det, Predictor_for_year, parameters=(),
+            best_code_da=best_code_da, best_shape_da=best_shape_da,
+            best_loc_da=best_loc_da, best_scale_da=best_scale_da, raw_target=True)
 
 
 class MARS:
@@ -1909,171 +1308,82 @@ class MARS:
         
         return candidates
     
-    def _gcv_score(self, X: np.ndarray, y: np.ndarray, B: np.ndarray, 
-                   beta: np.ndarray) -> float:
-        """Calculate Generalized Cross-Validation score."""
-        n_samples = X.shape[0]
-        y_pred = B @ beta
-        rss = np.sum((y - y_pred) ** 2)
-        
-        # Count unique knots
-        unique_knots = set()
-        for basis in self.basis_functions[1:]:  # Skip intercept
-            for var_idx, knot, _ in basis:
-                unique_knots.add((var_idx, knot))
-        
-        n_knots = len(unique_knots)
-        n_basis = len(self.basis_functions)
-        
-        # Effective degrees of freedom: n_basis + penalty * n_knots
-        effective_dof = n_basis + self.penalty * n_knots
-        
-        # GCV formula
-        if effective_dof >= n_samples:
+    def _gcv_score(self, X, y, B, beta, bases=None):
+        """GCV = mean squared residual / (1 - effective_dof/n)**2.
+
+        Evaluate the candidate bases, never the previous model's complexity.
+        This implementation uses rank(B) + penalty * number of unique knots.
+        """
+        bases = self.basis_functions if bases is None else bases
+        knots = {(v, knot) for basis in bases[1:] for v, knot, _ in basis}
+        effective_dof = np.linalg.matrix_rank(B) + self.penalty * len(knots)
+        n = len(y)
+        if effective_dof >= n:
             return np.inf
-        
-        gcv = rss / ((n_samples - effective_dof) ** 2)
-        return gcv
+        return float(np.mean((y - B @ beta)**2) / (1.0 - effective_dof / n)**2)
     
-    def forward_pass(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Forward pass to add basis functions."""
-        n_samples, n_features = X.shape
-        knot_candidates = self._find_knot_candidates(X, y)
-        
-        # Start with intercept
-        self.basis_functions = [[]]  # Intercept
-        B = np.ones((n_samples, 1))
+    def forward_pass(self, X, y):
+        """Add reflected hinge pairs using training RSS (Friedman forward stage)."""
+        candidates = self._find_knot_candidates(X, y)
+        self.basis_functions = [[]]
+        B = np.ones((len(y), 1))
         beta = np.array([np.mean(y)])
-        best_gcv = self._gcv_score(X, y, B, beta)
-        
-        iteration = 0
-        while len(self.basis_functions) < self.max_terms and iteration < 100:
-            iteration += 1
-            best_improvement = 0
-            best_new_basis = None
-            best_new_B = None
-            
-            # Try adding to each existing basis function
-            for parent_idx, parent_basis in enumerate(self.basis_functions):
-                # Check degree constraint
-                current_degree = len(parent_basis)
-                if current_degree >= self.max_degree:
+        rss = float(np.sum((y - B @ beta)**2))
+        while len(self.basis_functions) + 2 <= self.max_terms:
+            best = None
+            best_rss = rss
+            for basis in self.basis_functions:
+                if len(basis) >= self.max_degree:
                     continue
-                
-                # Find variables not yet used in this basis
-                used_vars = {v for v, _, _ in parent_basis}
-                available_vars = [v for v in range(n_features) if v not in used_vars]
-                
-                for v in available_vars:
-                    for knot in knot_candidates[v]:
-                        # Try both hinge directions
-                        for side in [1, -1]:
-                            # Create new basis function
-                            new_basis = parent_basis + [(v, knot, side)]
-                            
-                            # Evaluate new basis function
-                            new_col = np.ones(n_samples)
-                            for var_idx, t, s in new_basis:
-                                new_col *= self._hinge(X[:, var_idx], t, s)
-                            
-                            # Add to design matrix
-                            new_B = np.column_stack([B, new_col])
-                            
-                            # Solve least squares
-                            try:
-                                new_beta, residuals, rank, _ = np.linalg.lstsq(
-                                    new_B, y, rcond=None
-                                )
-                            except np.linalg.LinAlgError:
-                                continue
-                            
-                            # Check if new column is linearly independent
-                            if rank <= B.shape[1]:
-                                continue
-                            
-                            # Calculate GCV improvement
-                            new_gcv = self._gcv_score(X, y, new_B, new_beta)
-                            improvement = best_gcv - new_gcv
-                            
-                            if improvement > best_improvement:
-                                best_improvement = improvement
-                                best_new_basis = new_basis
-                                best_new_B = new_B
-                                best_new_beta = new_beta
-            
-            # Add the best new basis if it improves GCV
-            if best_improvement > 0:
-                self.basis_functions.append(best_new_basis)
-                B = best_new_B
-                beta = best_new_beta
-                best_gcv = best_gcv - best_improvement
-            else:
+                used = {v for v, _, _ in basis}
+                parent = np.ones(len(y))
+                for v, knot, side in basis:
+                    parent *= self._hinge(X[:, v], knot, side)
+                for v in range(X.shape[1]):
+                    if v in used:
+                        continue
+                    for knot in candidates[v]:
+                        pair = [basis + [(v, knot, 1)], basis + [(v, knot, -1)]]
+                        candidate = np.column_stack([B, parent*self._hinge(X[:, v], knot, 1),
+                                                        parent*self._hinge(X[:, v], knot, -1)])
+                        coef, _, rank, _ = np.linalg.lstsq(candidate, y, rcond=None)
+                        if rank <= np.linalg.matrix_rank(B):
+                            continue
+                        candidate_rss = float(np.sum((y-candidate @ coef)**2))
+                        if candidate_rss < best_rss - 1e-12*max(1.0, rss):
+                            best_rss = candidate_rss
+                            best = pair, candidate, coef
+            if best is None:
                 break
-        
+            pair, B, beta = best
+            self.basis_functions.extend(pair)
+            rss = best_rss
         return B, beta
     
-    def backward_pass(self, X: np.ndarray, y: np.ndarray, B: np.ndarray, beta: np.ndarray):
-        """Backward pass to prune basis functions."""
-        n_basis = len(self.basis_functions)
-        if n_basis <= 2:  # Need at least intercept + 1 basis
-            return
-        
-        current_gcv = self._gcv_score(X, y, B, beta)
-        
-        improved = True
-        while improved and n_basis > 2:
-            improved = False
-            best_gcv = current_gcv
-            best_idx = -1
-            best_B = None
-            best_beta = None
-            
-            # Try removing each basis function (except intercept)
-            for idx in range(1, n_basis):
-                # Create pruned model
-                pruned_basis = self.basis_functions[:idx] + self.basis_functions[idx+1:]
-                
-                # Rebuild design matrix
-                pruned_B = np.ones((X.shape[0], len(pruned_basis)))
-                for j, basis in enumerate(pruned_basis[1:], 1):
-                    col = np.ones(X.shape[0])
-                    for var_idx, knot, side in basis:
-                        col *= self._hinge(X[:, var_idx], knot, side)
-                    pruned_B[:, j] = col
-                
-                # Fit pruned model
-                try:
-                    pruned_beta, _, rank, _ = np.linalg.lstsq(pruned_B, y, rcond=None)
-                    if rank < pruned_B.shape[1]:
-                        continue
-                except np.linalg.LinAlgError:
-                    continue
-                
-                # Calculate GCV
-                gcv = self._gcv_score(X, y, pruned_B, pruned_beta)
-                
-                if gcv < best_gcv:
-                    best_gcv = gcv
-                    best_idx = idx
-                    best_B = pruned_B
-                    best_beta = pruned_beta
-            
-            # Apply best pruning if found
-            if best_idx > 0:
-                self.basis_functions = (
-                    self.basis_functions[:best_idx] + 
-                    self.basis_functions[best_idx+1:]
-                )
-                B = best_B
-                beta = best_beta
-                current_gcv = best_gcv
-                n_basis = len(self.basis_functions)
-                improved = True
-            else:
-                break
-        
-        self.coef_ = beta
-        self.dof_ = len(self.basis_functions) + self.penalty * self._count_knots()
+    def backward_pass(self, X, y, B, beta):
+        """Explore the complete deletion path, retaining the minimum-GCV model."""
+        bases = list(self.basis_functions)
+        best_bases, best_coef = list(bases), beta.copy()
+        best_gcv = self._gcv_score(X, y, B, beta, bases)
+        while len(bases) > 1:
+            candidate_best = None
+            rss_best = np.inf
+            for remove in range(1, len(bases)):
+                reduced = np.delete(B, remove, axis=1)
+                coef, _, _, _ = np.linalg.lstsq(reduced, y, rcond=None)
+                rss = float(np.sum((y - reduced @ coef)**2))
+                if rss < rss_best:
+                    rss_best = rss
+                    candidate_best = remove, reduced, coef
+            remove, B, beta = candidate_best
+            bases = bases[:remove] + bases[remove+1:]
+            score = self._gcv_score(X, y, B, beta, bases)
+            if score <= best_gcv:
+                best_gcv, best_bases, best_coef = score, list(bases), beta.copy()
+        self.basis_functions = best_bases
+        self.coef_ = best_coef
+        self.gcv_ = best_gcv
+        self.dof_ = len(best_bases) + self.penalty * self._count_knots()
     
     def _count_knots(self) -> int:
         """Count unique knots in the model."""
@@ -2083,25 +1393,17 @@ class MARS:
                 unique_knots.add((var_idx, knot))
         return len(unique_knots)
     
-    def fit(self, X: np.ndarray, y: np.ndarray):
-        """Fit MARS model."""
-        # Input validation
-        X = np.asarray(X)
-        y = np.asarray(y).ravel()
-        
-        if X.shape[0] != y.shape[0]:
-            raise ValueError("X and y must have same number of samples")
-        
-        # Forward pass
+    def fit(self, X, y):
+        X, y = np.asarray(X, float), np.asarray(y, float).reshape(-1)
+        if X.ndim != 2 or X.shape[0] != y.size:
+            raise ValueError("X must be 2D with the same number of rows as y")
+        if y.size < 2 or not np.isfinite(X).all() or not np.isfinite(y).all():
+            raise ValueError("MARS requires at least two finite training pairs")
+        if self.max_terms < 1 or self.max_degree < 1 or self.penalty < 0:
+            raise ValueError("Invalid MARS complexity controls")
         B, beta = self.forward_pass(X, y)
-        
-        # Backward pass
         self.backward_pass(X, y, B, beta)
-        
-        # Store final coefficients
-        self.coef_ = beta
-        self.dof_ = len(self.basis_functions) + self.penalty * self._count_knots()
-        
+        # backward_pass owns the retained coefficients; never restore forward beta.
         return self
     
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -2249,100 +1551,11 @@ class WAS_MARS_Model:
         self.c = c
     
     def fit_predict(self, x, y, x_test, y_test=None):
-        """
-        Fits a MARS model to the provided training data, makes predictions 
-        on the test data, and calculates the prediction error (if y_test is provided).
-        
-        Parameters
-        ----------
-        x : array-like, shape (n_samples, n_features)
-            Training data (predictors).
-        y : array-like, shape (n_samples,)
-            Training targets.
-        x_test : array-like, shape (n_features,) or (1, n_features)
-            Test data (predictors).
-        y_test : float or None
-            Test target value. If None, no error is computed.
+        estimator = MARS(max_terms=self.max_terms, max_degree=self.max_degree, penalty=self.c)
+        return _regression_pair(estimator, x, y, x_test, y_test)
 
-        Returns
-        -------
-        np.ndarray
-            If y_test is not None, returns [error, prediction].
-            If y_test is None, returns [prediction].
-        """
-        model = MARS(max_terms=self.max_terms, max_degree=self.max_degree, penalty=self.c)
-        mask = np.isfinite(y) & np.all(np.isfinite(x), axis=-1)
-
-        if np.any(mask):
-            y_clean = y[mask]
-            x_clean = x[mask, :]
-            model.fit(x_clean, y_clean)
-
-            if x_test.ndim == 1:
-                x_test = x_test.reshape(1, -1)
-
-            preds = model.predict(x_test)
-            preds[preds < 0] = 0  
-
-            if y_test is not None:
-                error_ = y_test - preds
-                return np.array([error_, preds]).squeeze()
-            else:
-                # Only return prediction if y_test is None
-                return np.array([preds]).squeeze()
-        else:
-            # If no valid data, return NaNs
-            if y_test is not None:
-                return np.array([np.nan, np.nan]).squeeze()
-            else:
-                return np.array([np.nan]).squeeze()
-
-    def compute_model(self, X_train, y_train, X_test, y_test):
-        """
-        Applies MARS regression across a spatiotemporal dataset in parallel.
-
-        Parameters
-        ----------
-        X_train : xarray.DataArray
-            Training predictors with dims ('T','features').
-        y_train : xarray.DataArray
-            Training targets with dims ('T','Y','X').
-        X_test : xarray.DataArray
-            Test predictors, shape ('features',) or (T, features).
-        y_test : xarray.DataArray
-            Test targets with dims ('Y','X'), or broadcastable.
-
-        Returns
-        -------
-        xarray.DataArray
-            dims ('output','Y','X'), where 'output'=[error, prediction].
-        """
-        chunksize_x = int(np.round(len(y_train.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(y_train.get_index("Y")) / self.nb_cores))
-        
-        # Align times
-        X_train['T'] = y_train['T']
-        y_train = y_train.transpose('T', 'Y', 'X')
-        X_test = X_test.squeeze()
-        y_test = y_test.drop_vars('T').squeeze().transpose('Y', 'X')
-
-        client = _get_compute_client(self.nb_cores)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            X_train,
-            y_train.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            X_test,
-            y_test.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            input_core_dims=[('T','features'), ('T',), ('features',), ()],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('output',)],
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={'output_sizes': {'output': 2}},
-        )
-        result_ = result_da.compute()
-        _safe_close_client(client)
-        return result_.isel(output=1)
+    def compute_model(self, X_train, y_train, X_test, y_test=None):
+        return _spatial_regression(self, X_train, y_train, X_test, y_test)
     
     # ------------------ Probability Calculation Methods ------------------
 
@@ -2368,34 +1581,34 @@ class WAS_MARS_Model:
         try:
             if code == 1:
                 return (
-                    norm.ppf(0.32, loc=loc, scale=scale),
-                    norm.ppf(0.67, loc=loc, scale=scale),
+                    norm.ppf(1.0 / 3.0, loc=loc, scale=scale),
+                    norm.ppf(2.0 / 3.0, loc=loc, scale=scale),
                 )
             elif code == 2:
                 return (
-                    lognorm.ppf(0.32, s=shape, loc=loc, scale=scale),
-                    lognorm.ppf(0.67, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(1.0 / 3.0, s=shape, loc=loc, scale=scale),
+                    lognorm.ppf(2.0 / 3.0, s=shape, loc=loc, scale=scale),
                 )
             elif code == 3:
                 return (
-                    expon.ppf(0.32, loc=loc, scale=scale),
-                    expon.ppf(0.67, loc=loc, scale=scale),
+                    expon.ppf(1.0 / 3.0, loc=loc, scale=scale),
+                    expon.ppf(2.0 / 3.0, loc=loc, scale=scale),
                 )
             elif code == 4:
                 return (
-                    gamma.ppf(0.32, a=shape, loc=loc, scale=scale),
-                    gamma.ppf(0.67, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(1.0 / 3.0, a=shape, loc=loc, scale=scale),
+                    gamma.ppf(2.0 / 3.0, a=shape, loc=loc, scale=scale),
                 )
             elif code == 5:
                 return (
-                    weibull_min.ppf(0.32, c=shape, loc=loc, scale=scale),
-                    weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(1.0 / 3.0, c=shape, loc=loc, scale=scale),
+                    weibull_min.ppf(2.0 / 3.0, c=shape, loc=loc, scale=scale),
                 )
             elif code == 6:
                 # Note: Renamed 't_dist' to 't' for standard scipy.stats
                 return (
-                    t.ppf(0.32, df=shape, loc=loc, scale=scale),
-                    t.ppf(0.67, df=shape, loc=loc, scale=scale),
+                    t.ppf(1.0 / 3.0, df=shape, loc=loc, scale=scale),
+                    t.ppf(2.0 / 3.0, df=shape, loc=loc, scale=scale),
                 )
             elif code == 7:
                 # Poisson: poisson.ppf(q, mu, loc=0)
@@ -2403,8 +1616,8 @@ class WAS_MARS_Model:
                 #             'loc' is passed as 'loc'
                 #             'scale' is unused
                 return (
-                    poisson.ppf(0.32, mu=shape, loc=loc),
-                    poisson.ppf(0.67, mu=shape, loc=loc),
+                    poisson.ppf(1.0 / 3.0, mu=shape, loc=loc),
+                    poisson.ppf(2.0 / 3.0, mu=shape, loc=loc),
                 )
             elif code == 8:
                 # Negative Binomial: nbinom.ppf(q, n, p, loc=0)
@@ -2412,8 +1625,8 @@ class WAS_MARS_Model:
                 #             'p' (probability) is passed as 'scale'
                 #             'loc' is passed as 'loc'
                 return (
-                    nbinom.ppf(0.32, n=shape, p=scale, loc=loc),
-                    nbinom.ppf(0.67, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(1.0 / 3.0, n=shape, p=scale, loc=loc),
+                    nbinom.ppf(2.0 / 3.0, n=shape, p=scale, loc=loc),
                 )
         except Exception:
             return np.nan, np.nan
@@ -2447,568 +1660,43 @@ class WAS_MARS_Model:
             return -np.inf # Handle math errors
 
     @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof 
-    ):
-        """
-        Generic tercile probabilities using best-fit family per grid cell.
-    
-        Inputs (per grid cell):
-        - ``best_guess`` : 1D array over T (hindcast_det or forecast_det)
-        - ``T1``, ``T2`` : scalar terciles from climatological best-fit distribution
-        - ``dist_code`` : int, as in ``_ppf_terciles_from_code``
-        - ``shape``, ``loc``, ``scale`` : scalars from climatology fit
-    
-        Strategy:
-        - For each time step, build a predictive distribution of the same family:
-            * Use ``best_guess[t]`` to adjust mean / location;
-            * Keep shape parameters from climatology.
-        - Then compute probabilities:
-            * P(B) = F(T1)
-            * P(N) = F(T2) - F(T1)
-            * P(A) = 1 - F(T2)
-    
-        Parameters
-        ----------
-        best_guess : array-like
-            Forecast/hindcast best estimates.
-        error_variance : float
-            Variance of prediction errors.
-        T1 : float
-            Lower tercile threshold.
-        T2 : float
-            Upper tercile threshold.
-        dist_code : int
-            Distribution code (1-8).
-        shape : float
-            Shape parameter.
-        loc : float
-            Location parameter.
-        scale : float
-            Scale parameter.
-    
-        Returns
-        -------
-        array-like
-            Probabilities [P(B), P(N), P(A)].
-    
-        Notes
-        -----
-        - Uses :math:`F` as the CDF of the predictive distribution.
-        """
-        
-        best_guess = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        # T1 = np.asarray(T1, dtype=float)
-        # T2 = np.asarray(T2, dtype=float)
-        n_time = best_guess.size
-        out = np.full((3, n_time), np.nan, float)
-
-        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
-            return out
-
-        code = int(dist_code)
-
-        # Normal: loc = forecast; scale from clim
-        if code == 1:
-            error_std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
-
-        # Lognormal: shape = sigma from clim; enforce mean = best_guess
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess**2)))
-            mu = np.log(best_guess) - sigma**2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))      
-
-
-        # Exponential: keep scale from clim; shift loc so mean = best_guess
-        elif code == 3:
-            c1 = expon.cdf(T1, loc=best_guess, scale=np.sqrt(error_variance))
-            c2 = expon.cdf(T2, loc=loc_t, scale=np.sqrt(error_variance))
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        # Gamma: use shape from clim; set scale so mean = best_guess
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5: # Assuming 5 is for Weibull   
-        
-            for i in range(n_time):
-                # Get the scalar values for this specific element (e.g., grid cell)
-                M = best_guess[i]
-                print(M)
-                V = error_variance
-                print(V)
-                
-                # Handle cases with no variance to avoid division by zero
-                if V <= 0 or M <= 0:
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue # Skip to the next element
-        
-                # --- 1. Numerically solve for shape 'k' ---
-                # We need a reasonable starting guess. 2.0 is common (Rayleigh dist.)
-                initial_guess = 2.0
-                
-                # fsolve finds the root of our helper function
-                k = fsolve(weibull_shape_solver, initial_guess, args=(M, V))[0]
-        
-                # --- 2. Check for bad solution and calculate scale 'lambda' ---
-                if k <= 0:
-                    # Solver failed
-                    out[0, i] = np.nan
-                    out[1, i] = np.nan
-                    out[2, i] = np.nan
-                    continue
-                
-                # With 'k' found, we can now algebraically find scale 'lambda'
-                # In scipy.stats, scale is 'scale'
-                lambda_scale = M / gamma_function(1 + 1/k)
-        
-                # --- 3. Calculate Probabilities ---
-                # In scipy.stats, shape 'k' is 'c'
-                # Use the T1 and T2 values for this specific element
-                
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-        
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
-
-        # Student-t: df from clim; scale from clim; loc = best_guess
-        elif code == 6:       
-            # Check if df is valid for variance calculation
-            if dof <= 2:
-                # Cannot calculate scale, fill with NaNs
-                out[0, :] = np.nan
-                out[1, :] = np.nan
-                out[2, :] = np.nan
-            else:
-                # 1. Calculate t-distribution parameters
-                # 'loc' (mean) is just the best_guess
-                loc = best_guess
-                # 'scale' is calculated from the variance and df
-                # Variance = scale**2 * (df / (df - 2))
-                scale = np.sqrt(error_variance * (dof - 2) / dof)
-                
-                # 2. Calculate probabilities
-                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
-                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
-
-                out[0, :] = c1
-                out[1, :] = c2 - c1
-                out[2, :] = 1.0 - c2
-
-        elif code == 7: # Assuming 7 is for Poisson
-            
-            # --- 1. Set the Poisson parameter 'mu' ---
-            # The 'mu' parameter is the mean.
-            
-            # A warning is strongly recommended if error_variance is different from best_guess
-            if not np.allclose(best_guess, error_variance, atol=0.5):
-                print("Warning: 'error_variance' is not equal to 'best_guess'.")
-                print("Poisson model assumes mean=variance and is likely inappropriate.")
-                print("Consider using Negative Binomial.")
-            
-            mu = best_guess
-        
-            # --- 2. Calculate Probabilities ---
-            # poisson.cdf(k, mu) calculates P(X <= k)
-            
-            c1 = poisson.cdf(T1, mu=mu)
-            c2 = poisson.cdf(T2, mu=mu)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8: # Assuming 8 is for Negative Binomial
-            
-            # --- 1. Calculate Negative Binomial Parameters ---
-            # This model is ONLY valid for overdispersion (Variance > Mean).
-            # We will use np.where to set parameters to NaN if V <= M.
-            
-            # p = Mean / Variance
-            p = np.where(error_variance > best_guess, 
-                         best_guess / error_variance, 
-                         np.nan)
-            
-            # n = Mean^2 / (Variance - Mean)
-            n = np.where(error_variance > best_guess, 
-                         (best_guess**2) / (error_variance - best_guess), 
-                         np.nan)
-            
-            # --- 2. Calculate Probabilities ---
-            # The nbinom.cdf function will propagate NaNs, correctly
-            # handling the cases where the model was invalid.
-            
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-            
-        else:
-            raise ValueError(f"Invalid distribution")
-
-        return out
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof, nonneg=False):
+        """Shared predictive CDF; moment matching and support follow one contract."""
+        from .was_linear_models import _regression_tercile_probabilities
+        return _regression_tercile_probabilities(best_guess, error_variance, T1, T2,
+                                               dist_code, dof, nonneg=nonneg)
 
     @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile, nonneg=False):
+        """Empirical CDF with finite errors, declared support and fixed events."""
+        return _residual_probabilities(best_guess, error_samples, first_tercile, second_tercile, nonneg=nonneg)
 
 
-    def compute_prob(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det: xr.DataArray,
-        best_code_da: xr.DataArray = None,
-        best_shape_da: xr.DataArray = None,
-        best_loc_da: xr.DataArray = None,
-        best_scale_da: xr.DataArray = None
-    ) -> xr.DataArray:
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                     best_code_da=None, best_shape_da=None, best_loc_da=None,
+                     best_scale_da=None, **probability_options):
+        """Calibrate hindcasts with outer reuse by default; inner needs explicit residuals.
+
+        The held-out year's error is excluded. Use ``diagnostic=True`` explicitly
+        for a full-hindcast residual pool, which is unsuitable for skill scores.
         """
-        Compute tercile probabilities for deterministic hindcasts.
-
-        If dist_method == 'bestfit':
-            - Use cluster-based best-fit distributions to:
-                * derive terciles analytically from (best_code_da, best_shape_da, best_loc_da, best_scale_da),
-                * compute predictive probabilities using the same family.
-
-        Otherwise:
-            - Use empirical terciles from Predictant climatology and the selected
-              parametric / nonparametric method.
-
-        Parameters
-        ----------
-        Predictant : xarray.DataArray
-            Observed data (T, Y, X) or (T, Y, X, M).
-        clim_year_start, clim_year_end : int or str
-            Climatology period (inclusive) for thresholds.
-        hindcast_det : xarray.DataArray
-            Deterministic hindcast (T, Y, X).
-        best_code_da, best_shape_da, best_loc_da, best_scale_da : xarray.DataArray, optional
-            Output from WAS_TransformData.fit_best_distribution_grid, required for 'bestfit'.
-
-        Returns
-        -------
-        hindcast_prob : xarray.DataArray
-            Probabilities with dims (probability=['PB','PN','PA'], T, Y, X).
-        """
-        # Handle member dimension if present
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
-
-        # Ensure dimension order
-        Predictant = Predictant.transpose("T", "Y", "X")
-
-        # Spatial mask
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-
-        # Climatology subset
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        # Error variance for predictive distributions
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
-
-        # Empirical terciles (used by non-bestfit methods)
-        terciles_emp = clim.quantile([0.32, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-        
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT: zone-wise optimal distributions ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da_da, best_loc_da, best_scale_da."
-                )
-
-            # T1, T2 from best-fit distributions (per grid)
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            # Predictive probabilities using same family
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                hindcast_det,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                kwargs={'dof': dof},
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
+        from .was_probability_calibration import direct_hindcast_probabilities
+        probability_options.setdefault("tercile_reference", getattr(self, "tercile_reference", "climatology"))
+        return direct_hindcast_probabilities(self, Predictant, clim_year_start,
+            clim_year_end, hindcast_det, best_code_da, best_shape_da,
+            best_loc_da, best_scale_da, **probability_options)
 
 
     # --------------------------------------------------------------------------
     #  FORECAST METHOD
     # --------------------------------------------------------------------------
-    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor, hindcast_det, Predictor_for_year, best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
-        """
-        Generate a single-year deterministic forecast using the MARS model,
-        then compute tercile probabilities (PB, PN, PA) based on the selected
-        distribution method (``self.dist_method``).
-
-        The forecast is computed by:
-        - Standardizing the predictand over the climatology period
-        - Fitting the MARS model on historical data and predicting for the target year
-        - Reversing standardization to get raw-scale forecast values
-        - Computing probabilities using either best-fit distributions or nonparametric methods
-
-        Parameters
-        ----------
-        Predictant : xr.DataArray
-            Observed target variable (e.g., rainfall) with dimensions (T, Y, X).
-        clim_year_start : int
-            Start year of climatology period for standardization and terciles.
-        clim_year_end : int
-            End year of climatology period.
-        Predictor : xr.DataArray
-            Historical predictors with dimensions (T, features).
-        hindcast_det : xr.DataArray
-            Historical deterministic hindcasts with dimensions (output=[error, prediction], T, Y, X).
-            Used for error variance estimation in nonparametric method.
-        Predictor_for_year : xr.DataArray
-            Predictors for the target forecast year, shape (features,) or (1, features).
-        best_code_da : xr.DataArray, optional
-            Distribution codes per grid cell (required for "bestfit" method).
-        best_shape_da : xr.DataArray, optional
-            Shape parameters per grid cell (required for "bestfit").
-        best_loc_da : xr.DataArray, optional
-            Location parameters per grid cell (required for "bestfit").
-        best_scale_da : xr.DataArray, optional
-            Scale parameters per grid cell (required for "bestfit").
-
-        Returns
-        -------
-        forecast_expanded : xr.DataArray
-            Deterministic forecast values with dimensions (T=1, Y, X).
-        forecast_prob : xr.DataArray
-            Probabilities with dimensions (probability=3, T=1, Y, X):
-            - probability: ['PB', 'PN', 'PA'] (Below, Normal, Above).
-
-        Raises
-        ------
-        ValueError
-            If "bestfit" method is selected but required distribution parameters are missing.
-            If invalid ``dist_method`` is set.
-
-        Notes
-        -----
-        - For real forecasts, the "error" in the deterministic output is NaN (no verification available).
-        - The forecast date is set to the first day of the month matching the predictand's time structure.
-        - Uses Dask for parallel computation across spatial chunks.
-        """
-        # Provide a dummy y_test with the same shape as the spatial domain => [NaNs]
-        y_test_dummy = xr.full_like(Predictant.isel(T=0), np.nan)
-
-        # Chunk sizes
-        chunksize_x = int(np.round(len(Predictant.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(Predictant.get_index("Y")) / self.nb_cores))
-
-        # Align time dimension
-        Predictor['T'] = Predictant['T']
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        Predictant_st = Predictant_st.transpose('T','Y','X')
-        Predictor_for_year_ = Predictor_for_year.squeeze()
-
-        # 1) Fit+predict in parallel => shape (output=2, Y, X)
-        client = _get_compute_client(self.nb_cores)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            Predictor,
-            Predictant_st.chunk({'Y': chunksize_y, 'X': chunksize_x}),
-            Predictor_for_year_,
-            y_test_dummy.chunk({'Y': chunksize_y, 'X': chunksize_x}),  # dummy y_test
-            input_core_dims=[
-                ('T','features'),  # x
-                ('T',),           # y
-                ('features',),    # x_test
-                ()
-            ],
-            vectorize=True,
-            dask='parallelized',
-            output_core_dims=[('output',)],  # output=2 => [error, prediction]
-            output_dtypes=['float'],
-            dask_gufunc_kwargs={'output_sizes': {'output':2}},
-        )
-        result_ = result_da.compute()
-        _safe_close_client(client)
-        result_ = result_.isel(output=1)
-        result_ = reverse_standardize(result_, Predictant, clim_year_start, clim_year_end)
-
-        # 2) Compute thresholds T1, T2 from climatology
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.32, 0.67], dim='T')
-        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant - hindcast_det).var(dim='T')
-        
-        # Expand single prediction to T=1 so probability methods can handle it
-        forecast_expanded = result_.expand_dims(
-            T=[pd.Timestamp(Predictor_for_year.coords['T'].values[0]).to_pydatetime()]
-        )
-        year = Predictor_for_year.coords['T'].values[0].astype('datetime64[Y]').astype(int) + 1970
-        T_value_1 = Predictant.isel(T=0).coords['T'].values  # Get the datetime64 value from da1
-        month_1 = T_value_1.astype('datetime64[M]').astype(int) % 12 + 1  # Extract month
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-01")
-        
-        forecast_expanded = forecast_expanded.assign_coords(T=xr.DataArray([new_T_value], dims=["T"]))
-        forecast_expanded['T'] = forecast_expanded['T'].astype('datetime64[ns]')
-
-        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
-
-        dm = self.dist_method
-
-        # ---------- BESTFIT ----------
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError(
-                    "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
-                )
-            
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da,
-                best_shape_da,
-                best_loc_da,
-                best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
-
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                forecast_expanded,
-                error_variance,
-                T1,
-                T2,
-                best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                kwargs={"dof": dof},
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        # ---------- Nonparametric ----------
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                forecast_expanded,
-                error_samples,
-                T1_emp,
-                T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={
-                    "output_sizes": {"probability": 3},
-                    "allow_rechunk": True,
-                },
-            )
-
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-        forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
-        return forecast_expanded, forecast_prob.transpose('probability', 'T', 'Y', 'X')
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                 hindcast_det, Predictor_for_year, best_code_da=None,
+                 best_shape_da=None, best_loc_da=None, best_scale_da=None):
+        return _operational_forecast(self, Predictant, clim_year_start, clim_year_end,
+            Predictor, hindcast_det, Predictor_for_year, parameters=(),
+            best_code_da=best_code_da, best_shape_da=best_shape_da,
+            best_loc_da=best_loc_da, best_scale_da=best_scale_da, raw_target=False)
         
         
 def _add_intercept(X: np.ndarray) -> np.ndarray:
@@ -3127,6 +1815,101 @@ def _safe_mask_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     return x[m], y[m]
 
 
+def _count_mean_prediction(kind, x, y, x_test, add_intercept=True, alpha_init=0.2):
+    """NB2/ZINB/hurdle conditional means fitted by the corresponding likelihood.
+
+    ZINB jointly estimates structural-zero probability and NB mean. Hurdle fits
+    occurrence separately and includes the zero-truncation normalizer when fitting
+    positive counts. Bounded optimization controls separation and weak dispersion
+    identification; these models still need out-of-sample evaluation.
+    """
+    from scipy.optimize import minimize
+    from scipy.special import expit, gammaln
+    x, y = np.asarray(x, float), np.asarray(y, float).reshape(-1)
+    if x.ndim == 1:
+        x = x[:, None]
+    x, y = _safe_mask_xy(x, y)
+    xt = np.asarray(x_test, float).reshape(1, -1)
+    if len(y) < 5 or not np.isfinite(xt).all():
+        return np.nan
+    if np.any(y < 0) or not np.allclose(y, np.round(y), rtol=0, atol=1e-8):
+        raise ValueError("NB, ZINB and hurdle models require nonnegative integer counts")
+    if np.max(y) == 0:
+        return 0.0
+    scaler = StandardScaler(with_mean=bool(add_intercept))
+    x, xt = scaler.fit_transform(x), scaler.transform(xt)
+    X = _add_intercept(x) if add_intercept else x
+    Xt = _add_intercept(xt) if add_intercept else xt
+    p = X.shape[1]
+    initial_beta = np.zeros(p)
+    if add_intercept:
+        initial_beta[0] = np.log(max(np.mean(y), 1e-6))
+    initial_alpha = np.log(max(float(alpha_init), 1e-5))
+
+    def nb_terms(counts, design, beta, log_alpha):
+        alpha = np.exp(log_alpha)
+        size = 1.0 / alpha
+        eta = np.clip(design @ beta, -30., 30.)
+        log1p = np.logaddexp(0., log_alpha + eta)
+        logpmf = (gammaln(counts+size)-gammaln(size)-gammaln(counts+1.)
+                  + counts*(log_alpha+eta) - (counts+size)*log1p)
+        return logpmf, -size*log1p
+
+    if kind == "hurdle":
+        positive = y > 0
+        # Binary occurrence includes all training observations.
+        if positive.all():
+            pplus = 1.0
+        else:
+            from sklearn.linear_model import LogisticRegression
+            occurrence = LogisticRegression(C=1e6, fit_intercept=bool(add_intercept),
+                                            max_iter=2000, random_state=42)
+            occurrence.fit(x, positive.astype(int))
+            pplus = float(occurrence.predict_proba(xt)[0, 1])
+        if positive.sum() < 3:
+            return float(pplus * np.mean(y[positive]))
+        def loss(theta):
+            logpmf, logzero = nb_terms(y[positive], X[positive], theta[:p], theta[p])
+            log_nonzero = np.log(-np.expm1(logzero))
+            return -float(np.sum(logpmf - log_nonzero))
+        initial = np.r_[initial_beta, initial_alpha]
+    elif kind == "zinb":
+        pi0 = np.clip(np.mean(y == 0) / 2.0, 1e-4, 1-1e-4)
+        gamma0 = np.zeros(p)
+        if add_intercept:
+            gamma0[0] = np.log(pi0/(1-pi0))
+        def loss(theta):
+            logpmf, logzero = nb_terms(y, X, theta[:p], theta[p])
+            eta_zero = np.clip(X @ theta[p+1:], -30., 30.)
+            logpi = -np.logaddexp(0., -eta_zero)
+            lognotpi = -np.logaddexp(0., eta_zero)
+            values = np.where(y == 0, np.logaddexp(logpi, lognotpi+logzero), lognotpi+logpmf)
+            return -float(np.sum(values))
+        initial = np.r_[initial_beta, initial_alpha, gamma0]
+    else:
+        def loss(theta):
+            logpmf, _ = nb_terms(y, X, theta[:p], theta[p])
+            return -float(np.sum(logpmf))
+        initial = np.r_[initial_beta, initial_alpha]
+    bounds = [(-25., 25.)]*p + [(-12., 10.)]
+    if kind == "zinb":
+        bounds += [(-25., 25.)]*p
+    result = minimize(loss, initial, method="L-BFGS-B", bounds=bounds,
+                      options={"maxiter": 500, "ftol": 1e-10})
+    if not result.success or not np.isfinite(result.fun):
+        warnings.warn(f"{kind} likelihood did not converge: {result.message}", RuntimeWarning)
+        return np.nan
+    beta, log_alpha = result.x[:p], result.x[p]
+    mu = float(np.exp(np.clip(Xt @ beta, -30., 30.))[0])
+    if kind == "zinb":
+        return float((1.0-expit(Xt @ result.x[p+1:])[0])*mu)
+    if kind == "hurdle":
+        alpha = np.exp(log_alpha)
+        logzero = -np.log1p(alpha*mu)/alpha
+        return float(pplus*mu/(-np.expm1(logzero)))
+    return mu
+
+
 class _WAS_CountProbMixin:
     @staticmethod
     def _ppf_terciles_from_code(dist_code, shape, loc, scale):
@@ -3135,29 +1918,29 @@ class _WAS_CountProbMixin:
         code = int(dist_code)
         try:
             if code == 1:
-                return (norm.ppf(0.32, loc=loc, scale=scale),
-                        norm.ppf(0.67, loc=loc, scale=scale))
+                return (norm.ppf(1.0 / 3.0, loc=loc, scale=scale),
+                        norm.ppf(2.0 / 3.0, loc=loc, scale=scale))
             elif code == 2:
-                return (lognorm.ppf(0.32, s=shape, loc=loc, scale=scale),
-                        lognorm.ppf(0.67, s=shape, loc=loc, scale=scale))
+                return (lognorm.ppf(1.0 / 3.0, s=shape, loc=loc, scale=scale),
+                        lognorm.ppf(2.0 / 3.0, s=shape, loc=loc, scale=scale))
             elif code == 3:
-                return (expon.ppf(0.32, loc=loc, scale=scale),
-                        expon.ppf(0.67, loc=loc, scale=scale))
+                return (expon.ppf(1.0 / 3.0, loc=loc, scale=scale),
+                        expon.ppf(2.0 / 3.0, loc=loc, scale=scale))
             elif code == 4:
-                return (gamma.ppf(0.32, a=shape, loc=loc, scale=scale),
-                        gamma.ppf(0.67, a=shape, loc=loc, scale=scale))
+                return (gamma.ppf(1.0 / 3.0, a=shape, loc=loc, scale=scale),
+                        gamma.ppf(2.0 / 3.0, a=shape, loc=loc, scale=scale))
             elif code == 5:
-                return (weibull_min.ppf(0.32, c=shape, loc=loc, scale=scale),
-                        weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale))
+                return (weibull_min.ppf(1.0 / 3.0, c=shape, loc=loc, scale=scale),
+                        weibull_min.ppf(2.0 / 3.0, c=shape, loc=loc, scale=scale))
             elif code == 6:
-                return (t.ppf(0.32, df=shape, loc=loc, scale=scale),
-                        t.ppf(0.67, df=shape, loc=loc, scale=scale))
+                return (t.ppf(1.0 / 3.0, df=shape, loc=loc, scale=scale),
+                        t.ppf(2.0 / 3.0, df=shape, loc=loc, scale=scale))
             elif code == 7:
-                return (poisson.ppf(0.32, mu=shape, loc=loc),
-                        poisson.ppf(0.67, mu=shape, loc=loc))
+                return (poisson.ppf(1.0 / 3.0, mu=shape, loc=loc),
+                        poisson.ppf(2.0 / 3.0, mu=shape, loc=loc))
             elif code == 8:
-                return (nbinom.ppf(0.32, n=shape, p=scale, loc=loc),
-                        nbinom.ppf(0.67, n=shape, p=scale, loc=loc))
+                return (nbinom.ppf(1.0 / 3.0, n=shape, p=scale, loc=loc),
+                        nbinom.ppf(2.0 / 3.0, n=shape, p=scale, loc=loc))
         except Exception:
             return np.nan, np.nan
         return np.nan, np.nan
@@ -3176,115 +1959,16 @@ class _WAS_CountProbMixin:
             return -np.inf
 
     @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
-        best_guess = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        n_time = best_guess.size
-        out = np.full((3, n_time), np.nan, float)
-
-        if np.all(np.isnan(best_guess)) or np.isnan(dist_code) or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance):
-            return out
-
-        code = int(dist_code)
-
-        if code == 1:
-            error_std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[1, :] = norm.cdf(T2, loc=best_guess, scale=error_std) - norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
-
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
-            mu = np.log(best_guess) - sigma ** 2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = lognorm.cdf(T2, s=sigma, scale=np.exp(mu)) - lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))
-
-        elif code == 3:
-####### Revoir cette partie dans les autres classes
-            scale_ = np.sqrt(error_variance)
-            c1 = expon.cdf(T1, loc=best_guess, scale=scale_)
-            c2 = expon.cdf(T2, loc=best_guess, scale=scale_)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5:
-            for i in range(n_time):
-                M = best_guess[i]
-                V = float(error_variance)
-                if (V <= 0) or (M <= 0):
-                    continue
-                k = fsolve(_WAS_CountProbMixin.weibull_shape_solver, 2.0, args=(M, V))[0]
-                if k <= 0:
-                    continue
-                lambda_scale = M / gamma_function(1 + 1 / k)
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
-
-        elif code == 6:
-            if dof <= 2:
-                return out
-            loc_ = best_guess
-            scale_ = np.sqrt(error_variance * (dof - 2) / dof)
-            c1 = t.cdf(T1, df=dof, loc=loc_, scale=scale_)
-            c2 = t.cdf(T2, df=dof, loc=loc_, scale=scale_)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 7:
-            mu_ = best_guess
-            c1 = poisson.cdf(T1, mu=mu_)
-            c2 = poisson.cdf(T2, mu=mu_)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8:
-            p = np.where(error_variance > best_guess, best_guess / error_variance, np.nan)
-            n = np.where(error_variance > best_guess, (best_guess ** 2) / (error_variance - best_guess), np.nan)
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        else:
-            raise ValueError("Invalid distribution code")
-
-        return out
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof, nonneg=False):
+        """Shared predictive CDF; moment matching and support follow one contract."""
+        from .was_linear_models import _regression_tercile_probabilities
+        return _regression_tercile_probabilities(best_guess, error_variance, T1, T2,
+                                               dist_code, dof, nonneg=nonneg)
 
     @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t_ in range(n_time):
-            if np.isnan(best_guess[t_]):
-                continue
-            dist = best_guess[t_] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t_] = p_below
-            pred_prob[1, t_] = p_between
-            pred_prob[2, t_] = p_above
-        return pred_prob
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile, nonneg=False):
+        """Empirical CDF with finite errors, declared support and fixed events."""
+        return _residual_probabilities(best_guess, error_samples, first_tercile, second_tercile, nonneg=nonneg)
 
 
 class WAS_NegativeBinomial_Model(_WAS_CountProbMixin):
@@ -3303,282 +1987,39 @@ class WAS_NegativeBinomial_Model(_WAS_CountProbMixin):
         self.add_intercept = add_intercept
 
     # ------------------------------------------------------------------
-    def fit_predict(self, x, y, x_test, y_test):
-        x      = np.asarray(x, float)
-        y      = np.asarray(y, float)
-        x_test = np.asarray(x_test, float)
-
-        if x.ndim == 1:
-            x = x[:, None]
-        x, y = _safe_mask_xy(x, y)
-
-        if y.size < 5 or np.any(y < 0):
-            return np.array([np.nan, np.nan], dtype=float)
-
-        X = _add_intercept(x) if self.add_intercept else x
-        beta, alpha = _nb2_irls_beta_alpha(y, X, alpha_init=self.alpha_init)
-
-        if x_test.ndim == 1:
-            x_test = x_test.reshape(1, -1)
-        Xtest   = _add_intercept(x_test) if self.add_intercept else x_test
-        eta_test = np.clip(Xtest @ beta, -700.0, 700.0)
-        mu_test  = np.maximum(np.exp(eta_test).squeeze(), 0.0)
-
-        err = (np.asarray(y_test, float) - mu_test).squeeze()
-        return np.array([err, mu_test], dtype=float).squeeze()
+    def fit_predict(self, x, y, x_test, y_test=None):
+        prediction = _count_mean_prediction("nb", x, y, x_test,
+            add_intercept=self.add_intercept, alpha_init=self.alpha_init)
+        error = np.nan if y_test is None else float(np.asarray(y_test).reshape(-1)[0]) - prediction
+        return np.array([error, prediction])
 
     # ------------------------------------------------------------------
-    def compute_model(self, X_train, y_train, X_test, y_test):
-        """
-        Parallel NB2 regression across the full (Y, X) domain.
-
-        FIX 10 – per-step loop instead of bare .squeeze() on X_test,
-                  preserving the T dimension for T=1 CV folds.
-        """
-        chunksize_x = max(int(np.round(len(y_train.get_index("X")) / self.nb_cores)), 1)
-        chunksize_y = max(int(np.round(len(y_train.get_index("Y")) / self.nb_cores)), 1)
-
-        X_train = X_train.copy()
-        X_train["T"] = y_train["T"]
-        y_train = y_train.transpose("T", "Y", "X")
-
-        # FIX 10: do not use bare .squeeze() — splits into per-step calls
-        X_test        = X_test.transpose("T", "features")
-        n_test_steps  = X_test.sizes["T"]
-        T_test_coords = X_test["T"].values
-
-        if "T" in y_test.dims:
-            y_test = y_test.drop_vars("T")
-        y_test = y_test.squeeze().transpose("Y", "X")
-
-        client = (
-            _get_compute_client(self.nb_cores)
-            if self.nb_cores and self.nb_cores > 1 else None
-        )
-
-        step_results = []
-        try:
-            for t_idx in range(n_test_steps):
-                X_step = X_test.isel(T=t_idx)      # (features,)
-
-                step = xr.apply_ufunc(
-                    self.fit_predict,
-                    X_train,
-                    y_train.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                    X_step,
-                    y_test.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                    input_core_dims=[("T", "features"), ("T",), ("features",), ()],
-                    vectorize=True,
-                    output_core_dims=[("output",)],
-                    dask="parallelized",
-                    output_dtypes=["float"],
-                    dask_gufunc_kwargs={"output_sizes": {"output": 2}},
-                )
-                step = step.compute() if hasattr(step.data, "compute") else step
-                step = step.isel(output=1).expand_dims(T=[T_test_coords[t_idx]])
-                step_results.append(step)
-        finally:
-            if client is not None:
-                _safe_close_client(client)
-
-        result_ = xr.concat(step_results, dim="T")
-        # Return (Y, X) for hindcast multi-step or (Y, X) for single step —
-        # squeeze T so shape matches the rest of the framework's convention.
-        if n_test_steps == 1:
-            return result_.squeeze("T", drop=True)
-        return result_
+    def compute_model(self, X_train, y_train, X_test, y_test=None):
+        return _spatial_regression(self, X_train, y_train, X_test, y_test)
 
     # ------------------------------------------------------------------
-    def compute_prob(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start, clim_year_end,
-        hindcast_det: xr.DataArray,
-        best_code_da=None, best_shape_da=None,
-        best_loc_da=None, best_scale_da=None,
-    ) -> xr.DataArray:
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                     best_code_da=None, best_shape_da=None, best_loc_da=None,
+                     best_scale_da=None, **probability_options):
+        """Calibrate hindcasts with outer reuse by default; inner needs explicit residuals.
 
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
-
-        Predictant = Predictant.transpose("T", "Y", "X")
-        mask       = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof            = max(int(clim.sizes["T"]) - 1, 2)
-        terciles_emp   = clim.quantile([0.33, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-
-        dm = self.dist_method
-
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError("dist_method='bestfit' requires all four distribution arrays.")
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float],
-            )
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                hindcast_det, error_variance, T1, T2, best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, kwargs={"dof": dof}, dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-            )
-
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det, error_samples, T1_emp, T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, dask="parallelized", output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
+        The held-out year's error is excluded. Use ``diagnostic=True`` explicitly
+        for a full-hindcast residual pool, which is unsuitable for skill scores.
+        """
+        from .was_probability_calibration import direct_hindcast_probabilities
+        probability_options.setdefault("tercile_reference", getattr(self, "tercile_reference", "climatology"))
+        return direct_hindcast_probabilities(self, Predictant, clim_year_start,
+            clim_year_end, hindcast_det, best_code_da, best_shape_da,
+            best_loc_da, best_scale_da, **probability_options)
 
     # ------------------------------------------------------------------
-    def forecast(
-        self,
-        Predictant, clim_year_start, clim_year_end,
-        Predictor, hindcast_det, Predictor_for_year,
-        best_code_da=None, best_shape_da=None,
-        best_loc_da=None, best_scale_da=None,
-    ):
-        """
-        End-to-end single-year forecast.
-
-        FIX 11 – T-coord assignment guarded by size check.
-        FIX 12 – Predictor_for_year projected via isel(T=0), not bare squeeze.
-        """
-        chunksize_x = max(int(np.round(len(Predictant.get_index("X")) / self.nb_cores)), 1)
-        chunksize_y = max(int(np.round(len(Predictant.get_index("Y")) / self.nb_cores)), 1)
-
-        # FIX 11: guard against size mismatch on T-coord assignment
-        Predictor = Predictor.copy()
-        if Predictor.sizes["T"] == Predictant.sizes["T"]:
-            Predictor["T"] = Predictant["T"]
-
-        Predictant = Predictant.transpose("T", "Y", "X")
-
-        # FIX 12: safe single-step extraction
-        Predictor_for_year_fp = Predictor_for_year.transpose("T", "features").isel(T=0)
-        T_forecast_coord      = Predictor_for_year["T"].values
-
-        y_test = xr.full_like(Predictant.isel(T=0), np.nan)
-
-        client = (
-            _get_compute_client(self.nb_cores)
-            if self.nb_cores and self.nb_cores > 1 else None
-        )
-        try:
-            result = xr.apply_ufunc(
-                self.fit_predict,
-                Predictor,
-                Predictant.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                Predictor_for_year_fp,
-                y_test.chunk({"Y": chunksize_y, "X": chunksize_x}),
-                input_core_dims=[("T", "features"), ("T",), ("features",), ()],
-                vectorize=True,
-                dask="parallelized",
-                output_core_dims=[("output",)],
-                output_dtypes=["float"],
-                dask_gufunc_kwargs={"output_sizes": {"output": 2}},
-            )
-            result_ = result.compute() if hasattr(result.data, "compute") else result
-        finally:
-            if client is not None:
-                _safe_close_client(client)
-
-        forecast_det = result_.isel(output=1)
-
-        year    = T_forecast_coord[0].astype("datetime64[Y]").astype(int) + 1970
-        month_1 = Predictant.isel(T=0).coords["T"].values.astype("datetime64[M]").astype(int) % 12 + 1
-        new_T   = np.datetime64(f"{year}-{month_1:02d}-01")
-
-        forecast_expanded = forecast_det.expand_dims(T=[new_T])
-        forecast_expanded["T"] = forecast_expanded["T"].astype("datetime64[ns]")
-
-        rainfall_clim  = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        terciles       = rainfall_clim.quantile([0.33, 0.67], dim="T")
-        T1_emp         = terciles.isel(quantile=0).drop_vars("quantile")
-        T2_emp         = terciles.isel(quantile=1).drop_vars("quantile")
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof            = max(int(rainfall_clim.sizes["T"]) - 1, 2)
-
-        dm = self.dist_method
-
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
-                raise ValueError("dist_method='bestfit' requires all four distribution arrays.")
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float],
-            )
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                forecast_expanded, error_variance, T1, T2, best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, dask="parallelized", kwargs={"dof": dof},
-                output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True},
-            )
-
-        elif dm == "nonparam":
-            # Direct numpy computation — avoids xarray T-alignment clash between
-            # forecast_expanded (T=1) and error_samples (T=n_years).
-            error_samples = (Predictant - hindcast_det).transpose("T", "Y", "X")
-            T1_np = T1_emp.values; T2_np = T2_emp.values
-            fc_np = forecast_det.values   # (Y, X) — no T dim
-
-            nY2, nX2 = fc_np.shape
-            prob_np = np.full((3, 1, nY2, nX2), np.nan, dtype=float)
-            es_np = error_samples.values
-            for iy_ in range(nY2):
-                for ix_ in range(nX2):
-                    bg_ = fc_np[iy_, ix_]
-                    if not np.isfinite(bg_): continue
-                    es_ = es_np[:, iy_, ix_]
-                    d_  = bg_ + es_; d_ = d_[np.isfinite(d_)]
-                    if not len(d_): continue
-                    pb_ = float(np.mean(d_ < T1_np[iy_, ix_]))
-                    pn_ = float(np.mean((d_ >= T1_np[iy_, ix_]) & (d_ < T2_np[iy_, ix_])))
-                    prob_np[0, 0, iy_, ix_] = pb_
-                    prob_np[1, 0, iy_, ix_] = pn_
-                    prob_np[2, 0, iy_, ix_] = 1.0 - (pb_ + pn_)
-
-            forecast_prob = xr.DataArray(
-                prob_np,
-                dims=("probability", "T", "Y", "X"),
-                coords={"probability": ["PB", "PN", "PA"],
-                        "T": forecast_expanded["T"].values,
-                        "Y": Predictant.coords["Y"],
-                        "X": Predictant.coords["X"]},
-            )
-            forecast_prob["T"] = forecast_prob["T"].astype("datetime64[ns]")
-            return forecast_expanded, forecast_prob.transpose("probability", "T", "Y", "X")
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        forecast_prob = forecast_prob.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
-        return forecast_expanded, forecast_prob.transpose("probability", "T", "Y", "X")
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                 hindcast_det, Predictor_for_year, best_code_da=None,
+                 best_shape_da=None, best_loc_da=None, best_scale_da=None):
+        return _operational_forecast(self, Predictant, clim_year_start, clim_year_end,
+            Predictor, hindcast_det, Predictor_for_year, parameters=(),
+            best_code_da=best_code_da, best_shape_da=best_shape_da,
+            best_loc_da=best_loc_da, best_scale_da=best_scale_da, raw_target=True)
 
 
 # ============================================================
@@ -3589,39 +2030,17 @@ class WAS_NegativeBinomial_Model(_WAS_CountProbMixin):
 
 class WAS_ZINB_Model(WAS_NegativeBinomial_Model):
     """
-    Zero-Inflated Negative Binomial (two-part, Dask-safe).
+    Zero-Inflated Negative Binomial fitted by joint mixture likelihood.
 
     P(Y=0|X) = pi(X) + (1-pi(X)) * NB(y=0 | mu(X), alpha)
     E[Y|X]   = (1 - pi(X)) * mu(X)
     """
 
-    def fit_predict(self, x, y, x_test, y_test):
-        x      = np.asarray(x, float)
-        y      = np.asarray(y, float)
-        x_test = np.asarray(x_test, float)
-
-        if x.ndim == 1:
-            x = x[:, None]
-        x, y = _safe_mask_xy(x, y)
-
-        if y.size < 8 or np.any(y < 0):
-            return np.array([np.nan, np.nan], dtype=float)
-
-        X       = _add_intercept(x) if self.add_intercept else x
-        y0      = (y == 0.0).astype(float)
-        gamma_  = _logit_irls_coef(y0, X)
-        beta, alpha = _nb2_irls_beta_alpha(y, X, alpha_init=self.alpha_init)
-
-        if x_test.ndim == 1:
-            x_test = x_test.reshape(1, -1)
-        Xtest  = _add_intercept(x_test) if self.add_intercept else x_test
-
-        mu   = np.maximum(np.exp(np.clip(Xtest @ beta, -700.0, 700.0)).squeeze(), 0.0)
-        pi   = np.clip((1.0 / (1.0 + np.exp(-np.clip(Xtest @ gamma_, -35.0, 35.0)))).squeeze(), 0.0, 1.0)
-        yhat = (1.0 - pi) * mu
-
-        err = (np.asarray(y_test, float) - yhat).squeeze()
-        return np.array([err, yhat], dtype=float).squeeze()
+    def fit_predict(self, x, y, x_test, y_test=None):
+        prediction = _count_mean_prediction("zinb", x, y, x_test,
+            add_intercept=self.add_intercept, alpha_init=self.alpha_init)
+        error = np.nan if y_test is None else float(np.asarray(y_test).reshape(-1)[0]) - prediction
+        return np.array([error, prediction])
 
 
 class WAS_HurdleNB_Model(WAS_NegativeBinomial_Model):
@@ -3629,48 +2048,15 @@ class WAS_HurdleNB_Model(WAS_NegativeBinomial_Model):
     Hurdle Negative Binomial (two-part, Dask-safe).
 
     P(Y>0|X) = p+(X)  via logistic regression.
-    Y|Y>0,X  ~ zero-truncated NB approximated by NB on positives.
+    Y|Y>0,X  ~ zero-truncated NB fitted with its normalized likelihood.
     E[Y|X]   = p+(X) * mu(X) / (1 - NB_P(Y=0|mu, alpha))
     """
 
-    def fit_predict(self, x, y, x_test, y_test):
-        x      = np.asarray(x, float)
-        y      = np.asarray(y, float)
-        x_test = np.asarray(x_test, float)
-
-        if x.ndim == 1:
-            x = x[:, None]
-        x, y = _safe_mask_xy(x, y)
-
-        if y.size < 8 or np.any(y < 0):
-            return np.array([np.nan, np.nan], dtype=float)
-
-        X      = _add_intercept(x) if self.add_intercept else x
-        y_pos  = (y > 0.0).astype(float)
-        gamma_ = _logit_irls_coef(y_pos, X)
-
-        mpos = y > 0.0
-        if np.sum(mpos) < 5:
-            return np.array([np.nan, np.nan], dtype=float)
-
-        beta, alpha = _nb2_irls_beta_alpha(y[mpos], X[mpos, :], alpha_init=self.alpha_init)
-
-        if x_test.ndim == 1:
-            x_test = x_test.reshape(1, -1)
-        Xtest = _add_intercept(x_test) if self.add_intercept else x_test
-
-        pplus = np.clip((1.0 / (1.0 + np.exp(-np.clip(Xtest @ gamma_, -35.0, 35.0)))).squeeze(), 0.0, 1.0)
-        mu    = np.maximum(np.exp(np.clip(Xtest @ beta, -700.0, 700.0)).squeeze(), 0.0)
-
-        alpha  = max(float(alpha), 1e-10)
-        r      = 1.0 / alpha
-        p_nb   = r / (r + mu + 1e-12)
-        P0     = np.power(p_nb, r)
-        trunc_mean = mu / np.clip(1.0 - P0, 1e-12, None)
-
-        yhat = pplus * trunc_mean
-        err  = (np.asarray(y_test, float) - yhat).squeeze()
-        return np.array([err, yhat], dtype=float).squeeze()
+    def fit_predict(self, x, y, x_test, y_test=None):
+        prediction = _count_mean_prediction("hurdle", x, y, x_test,
+            add_intercept=self.add_intercept, alpha_init=self.alpha_init)
+        error = np.nan if y_test is None else float(np.asarray(y_test).reshape(-1)[0]) - prediction
+        return np.array([error, prediction])
 
 # # Choose the model
 # model_nb   = WAS_NegativeBinomial_Model(nb_cores=8, dist_method="nonparam")
@@ -3737,7 +2123,7 @@ class _WAS_NonNeural_Base:
 
     def __init__(self, param_space=None, n_clusters=5, nb_cores=1,
                  dist_method="nonparam", hyperparam_optimizer="bayesian",
-                 n_trials=50, n_iter=50, mode="cluster"):
+                 n_trials=50, n_iter=50, mode="cluster", inner_cv=3, random_state=42):
         self.param_space = param_space or self._default_param_space()
         self._param_names = list(self.param_space.keys())
         self._int_params = {
@@ -3750,6 +2136,8 @@ class _WAS_NonNeural_Base:
         self.n_trials = n_trials
         self.n_iter = n_iter
         self.mode = mode
+        self.inner_cv = inner_cv
+        self.random_state = random_state
 
     # ----- to be provided by subclasses ------------------------------
     def _default_param_space(self):
@@ -3789,27 +2177,19 @@ class _WAS_NonNeural_Base:
     def _optimize_optuna(self, X, y):
         def objective(trial):
             params = self._cast_params(self._suggest_params(trial))
-            model = self._make_estimator(**params)
-            scores = cross_val_score(model, X, y, cv=3,
-                                     scoring="neg_mean_squared_error")
-            return scores.mean()
-
-        study = optuna.create_study(direction="maximize")
+            return _regression_cv_score(self, X, y, params)
+        study = optuna.create_study(direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=self.random_state))
         study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
         return study.best_params
 
     def _optimize_random(self, X, y):
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState(self.random_state)
         dists = self._param_distributions()
         best_score, best = -np.inf, None
         for _ in range(self.n_iter):
-            params = {n: d.rvs(random_state=rng) for n, d in dists.items()}
-            try:
-                model = self._make_estimator(**self._cast_params(params))
-                score = cross_val_score(model, X, y, cv=3,
-                                        scoring="neg_mean_squared_error").mean()
-            except Exception:
-                continue
+            params = self._cast_params({name: dist.rvs(random_state=rng) for name, dist in dists.items()})
+            score = _regression_cv_score(self, X, y, params)
             if score > best_score:
                 best_score, best = score, params
         return best
@@ -3823,11 +2203,19 @@ class _WAS_NonNeural_Base:
         """
         n = len(self._param_names)
         nan_out = np.full(n, np.nan)
-        mask = np.isfinite(y_vec) & np.all(np.isfinite(X_mat), axis=-1)
-        if np.sum(mask) < 10:  # need >= 10 valid time steps
+        y_vec = np.asarray(y_vec, float)
+        valid_y = np.isfinite(y_vec) if y_vec.ndim == 1 else np.isfinite(y_vec).any(axis=1)
+        mask = valid_y & np.all(np.isfinite(X_mat), axis=-1)
+        if np.sum(mask) < 2:
             return nan_out
 
         X_clean, y_clean = X_mat[mask], y_vec[mask]
+        # Constant fields have no tunable signal: choose legal parameters once.
+        columns = y_clean[:, None] if y_clean.ndim == 1 else y_clean
+        if all(np.unique(c[np.isfinite(c)]).size <= 1 for c in columns.T):
+            return np.array([float(self.param_space[name][0]) for name in self._param_names])
+        if np.sum(mask) < 10:  # Avoid unconstrained model selection on too few years.
+            return nan_out
         try:
             if self.hyperparam_optimizer == "random":
                 best = self._optimize_random(X_clean, y_clean)
@@ -3836,8 +2224,8 @@ class _WAS_NonNeural_Base:
             if best is None:
                 return nan_out
             return np.array([float(best[name]) for name in self._param_names])
-        except Exception:
-            return nan_out
+        except Exception as exc:
+            raise RuntimeError(f"{type(self).__name__} hyperparameter tuning failed") from exc
 
     # ----- core logic ------------------------------------------------
     def compute_hyperparameters(self, predictand, predictor,
@@ -3854,16 +2242,20 @@ class _WAS_NonNeural_Base:
         cluster_da : xarray.DataArray
             Cluster labels (cluster mode) or a 1/NaN validity mask (grid mode).
         """
-        predictor["T"] = predictand["T"]
-        predictand_st = standardize_timeseries(predictand, clim_year_start, clim_year_end)
+        predictor, predictand = _aligned_training(predictor, predictand)
+        if self.mode not in {"grid", "cluster"}:
+            raise ValueError("mode must be 'grid' or 'cluster'")
+        if self.mode == "cluster" and any(dim in predictor.dims for dim in ("Y", "X")):
+            raise ValueError("Spatial predictors require mode='grid' or explicit regional aggregation")
+        predictand_st = predictand  # scaling is fitted only inside each search fold
         names = self._param_names
 
         if self.mode == "grid":
-            chunk_y = int(np.ceil(len(predictand_st.Y) / self.nb_cores))
-            chunk_x = int(np.ceil(len(predictand_st.X) / self.nb_cores))
-            p_st_chunked = predictand_st.chunk({"Y": chunk_y, "X": chunk_x})
+            chunk_y = max(1, int(np.ceil(len(predictand_st.Y) / max(1, self.nb_cores))))
+            chunk_x = max(1, int(np.ceil(len(predictand_st.X) / max(1, self.nb_cores))))
+            p_st_chunked = predictand_st.chunk({"T": -1, "Y": chunk_y, "X": chunk_x})
 
-            client = _get_compute_client(self.nb_cores)
+            client = _get_compute_client(self.nb_cores) if self.nb_cores > 1 else None
             hp_array = xr.apply_ufunc(
                 self._optimize_single_cell,
                 p_st_chunked,
@@ -3873,7 +2265,7 @@ class _WAS_NonNeural_Base:
                 vectorize=True,
                 dask="parallelized",
                 output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"param": len(names)}},
+                dask_gufunc_kwargs={"output_sizes": {"param": len(names)}, "allow_rechunk": True},
             )
             hp_array = hp_array.compute()
             _safe_close_client(client)
@@ -3882,24 +2274,14 @@ class _WAS_NonNeural_Base:
                 {n: hp_array.isel(param=i, drop=True) for i, n in enumerate(names)}
             )
             cluster_da = xr.where(~np.isnan(hyper_ds[names[0]]), 1, np.nan)
+            _report_tuned("_WAS_NonNeural_Base", getattr(self, "verbose", True), cluster_da=cluster_da, **{v: hyper_ds[v] for v in hyper_ds.data_vars})
             return hyper_ds, cluster_da
 
         # ---- cluster mode ----
         print(f"{self.__class__.__name__}: cluster-wise optimization "
               f"({self.n_clusters} clusters)...")
-        kmeans = KMeans(n_clusters=self.n_clusters)
-        predictand_dropna = (
-            predictand.to_dataframe().reset_index().dropna().drop(columns=["T"])
-        )
-        variable_column = predictand_dropna.columns[2]
-        predictand_dropna["cluster"] = kmeans.fit_predict(
-            predictand_dropna[[variable_column]]
-        )
-
-        df_unique = predictand_dropna.drop_duplicates(subset=["Y", "X"])
-        dataset = df_unique.set_index(["Y", "X"]).to_xarray()
-        mask = xr.where(~np.isnan(predictand.isel(T=0)), 1, np.nan)
-        cluster_da = dataset["cluster"] * mask
+        cluster_da = geographical_cluster_map(
+            predictand, self.n_clusters, random_state=getattr(self, 'random_state', 42))
 
         x1, x2 = xr.align(predictand_st, cluster_da, join="outer")
         clusters = np.unique(x2)
@@ -3908,9 +2290,10 @@ class _WAS_NonNeural_Base:
 
         hyper_maps = {n: xr.full_like(cluster_da, np.nan, dtype=float) for n in names}
         for clus in clusters:
-            y_cluster = (
-                x1.where(x2 == clus).mean(dim=["Y", "X"], skipna=True).dropna(dim="T")
-            )
+            # Keep raw cell columns: train-only scaling and averaging happen
+            # within _regression_cv_score, never before its inner split.
+            y_cluster = x1.stack(cell=("Y", "X")).isel(
+                cell=np.flatnonzero(np.asarray(x2 == clus).ravel())).transpose("T", "cell")
             if len(y_cluster["T"]) > 0:
                 best = self._optimize_single_cell(
                     y_cluster.values, predictor.sel(T=y_cluster["T"]).values
@@ -3919,75 +2302,23 @@ class _WAS_NonNeural_Base:
                     hyper_maps[n] = hyper_maps[n].where(cluster_da != clus, best[i])
 
         hyper_ds = xr.Dataset(hyper_maps)
+        hyper_ds.attrs.update(tuning_grouping=cluster_da.attrs.get("grouping", "per-cell"),
+                              tuning_preprocessing="per-cell scaling fitted inside each inner search fold")
+        _report_tuned("_WAS_NonNeural_Base", getattr(self, "verbose", True), cluster_da=cluster_da, **{v: hyper_ds[v] for v in hyper_ds.data_vars})
         return hyper_ds, cluster_da
 
     def fit_predict(self, x, y, x_test, y_test, *param_values):
-        """
-        Fit the estimator on one grid cell and predict.
-
-        ``param_values`` are the per-cell hyperparameters, in the order of
-        ``self._param_names``. Returns ``[error, prediction]``.
-        """
+        if len(param_values) != len(self._param_names):
+            raise ValueError("One parameter value is required for every hyperparameter")
         params = dict(zip(self._param_names, param_values))
         if any(not np.isfinite(v) for v in params.values()):
-            return np.array([np.nan, np.nan]).squeeze()
-
-        model = self._make_estimator(**self._cast_params(params))
-        mask = np.isfinite(y) & np.all(np.isfinite(x), axis=-1)
-
-        if np.any(mask):
-            model.fit(x[mask, :], y[mask])
-            if x_test.ndim == 1:
-                x_test = x_test.reshape(1, -1)
-            preds = model.predict(x_test)
-            preds[preds < 0] = 0
-            error_ = y_test - preds
-            return np.array([error_, preds]).squeeze()
-        return np.array([np.nan, np.nan]).squeeze()
+            return np.array([np.nan, np.nan])
+        estimator = self._make_estimator(**self._cast_params(params))
+        return _regression_pair(estimator, x, y, x_test, y_test)
 
     def compute_model(self, X_train, y_train, X_test, y_test, hyperparams):
-        """
-        Fit & predict over the whole spatial domain, parallelised with Dask.
-
-        ``hyperparams`` is the Dataset returned by ``compute_hyperparameters``
-        (replaces Ridge's ``alpha`` map). Returns the prediction field
-        (dims Y, X).
-        """
-        chunksize_x = int(np.round(len(y_train.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(y_train.get_index("Y")) / self.nb_cores))
-
-        X_train["T"] = y_train["T"]
-        y_train = y_train.transpose("T", "Y", "X")
-        X_test = X_test.squeeze()
-        y_test = y_test.drop_vars("T").squeeze().transpose("Y", "X")
-
-        y_train, hyperparams = xr.align(y_train, hyperparams, join="outer")
-        y_test, hyperparams = xr.align(y_test, hyperparams, join="outer")
-
-        names = self._param_names
-        hp_chunked = [
-            hyperparams[n].chunk({"Y": chunksize_y, "X": chunksize_x}) for n in names
-        ]
-        core_dims = [("T", "features"), ("T",), ("features",), ()] + [() for _ in names]
-
-        client = _get_compute_client(self.nb_cores)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            X_train,
-            y_train.chunk({"Y": chunksize_y, "X": chunksize_x}),
-            X_test,
-            y_test.chunk({"Y": chunksize_y, "X": chunksize_x}),
-            *hp_chunked,
-            input_core_dims=core_dims,
-            vectorize=True,
-            dask="parallelized",
-            output_core_dims=[("output",)],
-            output_dtypes=["float"],
-            dask_gufunc_kwargs={"output_sizes": {"output": 2}},
-        )
-        result_ = result_da.compute()
-        _safe_close_client(client)
-        return result_.isel(output=1)
+        parameters = tuple(hyperparams[name] for name in self._param_names)
+        return _spatial_regression(self, X_train, y_train, X_test, y_test, parameters)
 
     # ----- probability calculation (identical to WAS_Ridge_Model) ----
     @staticmethod
@@ -3998,29 +2329,29 @@ class _WAS_NonNeural_Base:
         code = int(dist_code)
         try:
             if code == 1:
-                return (norm.ppf(0.33, loc=loc, scale=scale),
-                        norm.ppf(0.67, loc=loc, scale=scale))
+                return (norm.ppf(1.0 / 3.0, loc=loc, scale=scale),
+                        norm.ppf(2.0 / 3.0, loc=loc, scale=scale))
             elif code == 2:
-                return (lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                        lognorm.ppf(0.67, s=shape, loc=loc, scale=scale))
+                return (lognorm.ppf(1.0 / 3.0, s=shape, loc=loc, scale=scale),
+                        lognorm.ppf(2.0 / 3.0, s=shape, loc=loc, scale=scale))
             elif code == 3:
-                return (expon.ppf(0.33, loc=loc, scale=scale),
-                        expon.ppf(0.67, loc=loc, scale=scale))
+                return (expon.ppf(1.0 / 3.0, loc=loc, scale=scale),
+                        expon.ppf(2.0 / 3.0, loc=loc, scale=scale))
             elif code == 4:
-                return (gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                        gamma.ppf(0.67, a=shape, loc=loc, scale=scale))
+                return (gamma.ppf(1.0 / 3.0, a=shape, loc=loc, scale=scale),
+                        gamma.ppf(2.0 / 3.0, a=shape, loc=loc, scale=scale))
             elif code == 5:
-                return (weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                        weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale))
+                return (weibull_min.ppf(1.0 / 3.0, c=shape, loc=loc, scale=scale),
+                        weibull_min.ppf(2.0 / 3.0, c=shape, loc=loc, scale=scale))
             elif code == 6:
-                return (t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                        t.ppf(0.67, df=shape, loc=loc, scale=scale))
+                return (t.ppf(1.0 / 3.0, df=shape, loc=loc, scale=scale),
+                        t.ppf(2.0 / 3.0, df=shape, loc=loc, scale=scale))
             elif code == 7:
-                return (poisson.ppf(0.33, mu=shape, loc=loc),
-                        poisson.ppf(0.67, mu=shape, loc=loc))
+                return (poisson.ppf(1.0 / 3.0, mu=shape, loc=loc),
+                        poisson.ppf(2.0 / 3.0, mu=shape, loc=loc))
             elif code == 8:
-                return (nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                        nbinom.ppf(0.67, n=shape, p=scale, loc=loc))
+                return (nbinom.ppf(1.0 / 3.0, n=shape, p=scale, loc=loc),
+                        nbinom.ppf(2.0 / 3.0, n=shape, p=scale, loc=loc))
         except Exception:
             return np.nan, np.nan
         return np.nan, np.nan
@@ -4040,303 +2371,38 @@ class _WAS_NonNeural_Base:
             return -np.inf
 
     @staticmethod
-    def calculate_tercile_probabilities_bestfit(best_guess, error_variance,
-                                                T1, T2, dist_code, dof):
-        """Tercile probabilities using the climatological best-fit family."""
-        best_guess = np.asarray(best_guess, float)
-        error_variance = np.asarray(error_variance, dtype=float)
-        n_time = best_guess.size
-        out = np.full((3, n_time), np.nan, float)
-
-        if (np.all(np.isnan(best_guess)) or np.isnan(dist_code)
-                or np.isnan(T1) or np.isnan(T2) or np.isnan(error_variance)):
-            return out
-
-        code = int(dist_code)
-
-        if code == 1:
-            error_std = np.sqrt(error_variance)
-            out[0, :] = norm.cdf(T1, loc=best_guess, scale=error_std)
-            out[1, :] = (norm.cdf(T2, loc=best_guess, scale=error_std)
-                         - norm.cdf(T1, loc=best_guess, scale=error_std))
-            out[2, :] = 1 - norm.cdf(T2, loc=best_guess, scale=error_std)
-
-        elif code == 2:
-            sigma = np.sqrt(np.log(1 + error_variance / (best_guess ** 2)))
-            mu = np.log(best_guess) - sigma ** 2 / 2
-            out[0, :] = lognorm.cdf(T1, s=sigma, scale=np.exp(mu))
-            out[1, :] = (lognorm.cdf(T2, s=sigma, scale=np.exp(mu))
-                         - lognorm.cdf(T1, s=sigma, scale=np.exp(mu)))
-            out[2, :] = 1 - lognorm.cdf(T2, s=sigma, scale=np.exp(mu))
-
-        elif code == 3:
-            scale = np.sqrt(error_variance)
-            c1 = expon.cdf(T1, loc=best_guess, scale=scale)
-            c2 = expon.cdf(T2, loc=best_guess, scale=scale)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 4:
-            alpha = (best_guess ** 2) / error_variance
-            theta = error_variance / best_guess
-            c1 = gamma.cdf(T1, a=alpha, scale=theta)
-            c2 = gamma.cdf(T2, a=alpha, scale=theta)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 5:
-            for i in range(n_time):
-                M = best_guess[i]
-                V = error_variance
-                if V <= 0 or M <= 0:
-                    out[:, i] = np.nan
-                    continue
-                k = fsolve(_WAS_NonNeural_Base.weibull_shape_solver, 2.0, args=(M, V))[0]
-                if k <= 0:
-                    out[:, i] = np.nan
-                    continue
-                lambda_scale = M / gamma_function(1 + 1 / k)
-                c1 = weibull_min.cdf(T1, c=k, loc=0, scale=lambda_scale)
-                c2 = weibull_min.cdf(T2, c=k, loc=0, scale=lambda_scale)
-                out[0, i] = c1
-                out[1, i] = c2 - c1
-                out[2, i] = 1.0 - c2
-
-        elif code == 6:
-            if dof <= 2:
-                out[:, :] = np.nan
-            else:
-                loc = best_guess
-                scale = np.sqrt(error_variance * (dof - 2) / dof)
-                c1 = t.cdf(T1, df=dof, loc=loc, scale=scale)
-                c2 = t.cdf(T2, df=dof, loc=loc, scale=scale)
-                out[0, :] = c1
-                out[1, :] = c2 - c1
-                out[2, :] = 1.0 - c2
-
-        elif code == 7:
-            mu = best_guess
-            c1 = poisson.cdf(T1, mu=mu)
-            c2 = poisson.cdf(T2, mu=mu)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        elif code == 8:
-            p = np.where(error_variance > best_guess,
-                         best_guess / error_variance, np.nan)
-            n = np.where(error_variance > best_guess,
-                         (best_guess ** 2) / (error_variance - best_guess), np.nan)
-            c1 = nbinom.cdf(T1, n=n, p=p)
-            c2 = nbinom.cdf(T2, n=n, p=p)
-            out[0, :] = c1
-            out[1, :] = c2 - c1
-            out[2, :] = 1.0 - c2
-
-        else:
-            raise ValueError(f"Invalid distribution code: {dist_code}")
-
-        return out
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof, nonneg=False):
+        """Shared predictive CDF; moment matching and support follow one contract."""
+        from .was_linear_models import _regression_tercile_probabilities
+        return _regression_tercile_probabilities(best_guess, error_variance, T1, T2,
+                                               dist_code, dof, nonneg=nonneg)
 
     @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples,
-                                                      first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for tt in range(n_time):
-            if np.isnan(best_guess[tt]):
-                continue
-            dist = best_guess[tt] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, tt] = p_below
-            pred_prob[1, tt] = p_between
-            pred_prob[2, tt] = p_above
-        return pred_prob
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile, nonneg=False):
+        """Empirical CDF with finite errors, declared support and fixed events."""
+        return _residual_probabilities(best_guess, error_samples, first_tercile, second_tercile, nonneg=nonneg)
 
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
-                     best_code_da=None, best_shape_da=None,
-                     best_loc_da=None, best_scale_da=None):
-        """Tercile probabilities for deterministic hindcasts (identical to Ridge)."""
-        if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+                     best_code_da=None, best_shape_da=None, best_loc_da=None,
+                     best_scale_da=None, **probability_options):
+        """Calibrate hindcasts with outer reuse by default; inner needs explicit residuals.
 
-        Predictant = Predictant.transpose("T", "Y", "X")
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
-
-        clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        if clim.sizes.get("T", 0) < 3:
-            raise ValueError("Not enough years in climatology period for terciles.")
-
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
-
-        terciles_emp = clim.quantile([0.33, 0.67], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
-
-        dm = self.dist_method
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da,
-                                       best_loc_da, best_scale_da)):
-                raise ValueError("dist_method='bestfit' requires best_code_da, "
-                                 "best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized",
-                output_dtypes=[float, float],
-            )
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                hindcast_det, error_variance, T1, T2, best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, kwargs={"dof": dof}, dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3},
-                                    "allow_rechunk": True},
-            )
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            hindcast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                hindcast_det, error_samples, T1_emp, T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                exclude_dims=set(("T",)),
-                vectorize=True, dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3},
-                                    "allow_rechunk": True},
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        hindcast_prob = hindcast_prob.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-        return (hindcast_prob * mask).transpose("probability", "T", "Y", "X")
+        The held-out year's error is excluded. Use ``diagnostic=True`` explicitly
+        for a full-hindcast residual pool, which is unsuitable for skill scores.
+        """
+        from .was_probability_calibration import direct_hindcast_probabilities
+        probability_options.setdefault("tercile_reference", getattr(self, "tercile_reference", "climatology"))
+        return direct_hindcast_probabilities(self, Predictant, clim_year_start,
+            clim_year_end, hindcast_det, best_code_da, best_shape_da,
+            best_loc_da, best_scale_da, **probability_options)
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
-                 hindcast_det, Predictor_for_year, hyperparams,
-                 best_code_da=None, best_shape_da=None,
-                 best_loc_da=None, best_scale_da=None):
-        """End-to-end forecast for a single target year (deterministic + terciles)."""
-        y_test_dummy = xr.full_like(Predictant.isel(T=0), np.nan)
-
-        chunksize_x = int(np.round(len(Predictant.get_index("X")) / self.nb_cores))
-        chunksize_y = int(np.round(len(Predictant.get_index("Y")) / self.nb_cores))
-
-        Predictor["T"] = Predictant["T"]
-        Predictant = Predictant.transpose("T", "Y", "X")
-        Predictor_for_year_ = Predictor_for_year.squeeze()
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        Predictant_st, hyperparams = xr.align(Predictant_st, hyperparams, join="outer")
-
-        names = self._param_names
-        hp_chunked = [
-            hyperparams[n].chunk({"Y": chunksize_y, "X": chunksize_x}) for n in names
-        ]
-        core_dims = [("T", "features"), ("T",), ("features",), ()] + [() for _ in names]
-
-        client = _get_compute_client(self.nb_cores)
-        result_da = xr.apply_ufunc(
-            self.fit_predict,
-            Predictor,
-            Predictant_st.chunk({"Y": chunksize_y, "X": chunksize_x}),
-            Predictor_for_year_,
-            y_test_dummy.chunk({"Y": chunksize_y, "X": chunksize_x}),
-            *hp_chunked,
-            input_core_dims=core_dims,
-            vectorize=True,
-            dask="parallelized",
-            output_core_dims=[("output",)],
-            output_dtypes=["float"],
-            dask_gufunc_kwargs={"output_sizes": {"output": 2}},
-        )
-        result_ = result_da.compute()
-        _safe_close_client(client)
-        result_ = result_.isel(output=1)
-        result_ = reverse_standardize(result_, Predictant,
-                                      clim_year_start, clim_year_end)
-
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
-        rainfall_for_tercile = Predictant.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([0.33, 0.67], dim="T")
-        T1_emp = terciles.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles.isel(quantile=1).drop_vars("quantile")
-        error_variance = (Predictant - hindcast_det).var(dim="T")
-
-        forecast_expanded = result_.expand_dims(
-            T=[pd.Timestamp(Predictor_for_year.coords["T"].values[0]).to_pydatetime()]
-        )
-        year = Predictor_for_year.coords["T"].values[0].astype("datetime64[Y]").astype(int) + 1970
-        T_value_1 = Predictant.isel(T=0).coords["T"].values
-        month_1 = T_value_1.astype("datetime64[M]").astype(int) % 12 + 1
-        new_T_value = np.datetime64(f"{year}-{month_1:02d}-{1:02d}")
-
-        forecast_expanded = forecast_expanded.assign_coords(
-            T=xr.DataArray([new_T_value], dims=["T"])
-        )
-        forecast_expanded["T"] = forecast_expanded["T"].astype("datetime64[ns]")
-
-        dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
-        dm = self.dist_method
-
-        if dm == "bestfit":
-            if any(v is None for v in (best_code_da, best_shape_da,
-                                       best_loc_da, best_scale_da)):
-                raise ValueError("dist_method='bestfit' requires best_code_da, "
-                                 "best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = xr.apply_ufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized",
-                output_dtypes=[float, float],
-            )
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_bestfit,
-                forecast_expanded, error_variance, T1, T2, best_code_da,
-                input_core_dims=[("T",), (), (), (), ()],
-                output_core_dims=[("probability", "T")],
-                vectorize=True, dask="parallelized", kwargs={"dof": dof},
-                output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3},
-                                    "allow_rechunk": True},
-            )
-        elif dm == "nonparam":
-            error_samples = Predictant - hindcast_det
-            forecast_prob = xr.apply_ufunc(
-                self.calculate_tercile_probabilities_nonparametric,
-                forecast_expanded, error_samples, T1_emp, T2_emp,
-                input_core_dims=[("T",), ("T",), (), ()],
-                output_core_dims=[("probability", "T")],
-                exclude_dims=set(("T",)),
-                vectorize=True, dask="parallelized",
-                output_dtypes=[float],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3},
-                                    "allow_rechunk": True},
-            )
-        else:
-            raise ValueError(f"Invalid dist_method: {self.dist_method}")
-
-        forecast_prob = forecast_prob.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-        return forecast_expanded, forecast_prob.transpose("probability", "T", "Y", "X")
+                 hindcast_det, Predictor_for_year, hyperparams, best_code_da=None,
+                 best_shape_da=None, best_loc_da=None, best_scale_da=None):
+        return _operational_forecast(self, Predictant, clim_year_start, clim_year_end,
+            Predictor, hindcast_det, Predictor_for_year, parameters=tuple(hyperparams[name] for name in self._param_names),
+            best_code_da=best_code_da, best_shape_da=best_shape_da,
+            best_loc_da=best_loc_da, best_scale_da=best_scale_da, raw_target=False)
 
 
 # =====================================================================
@@ -4356,7 +2422,7 @@ class WAS_RandomForest_Model(_WAS_NonNeural_Base):
 
     def _make_estimator(self, **params):
         from sklearn.ensemble import RandomForestRegressor
-        return RandomForestRegressor(random_state=42, n_jobs=1, **params)
+        return RandomForestRegressor(random_state=self.random_state, n_jobs=1, **params)
 
 
 class WAS_ExtraTrees_Model(_WAS_NonNeural_Base):
@@ -4373,7 +2439,7 @@ class WAS_ExtraTrees_Model(_WAS_NonNeural_Base):
 
     def _make_estimator(self, **params):
         from sklearn.ensemble import ExtraTreesRegressor
-        return ExtraTreesRegressor(random_state=42, n_jobs=1, **params)
+        return ExtraTreesRegressor(random_state=self.random_state, n_jobs=1, **params)
 
 
 class WAS_GradientBoosting_Model(_WAS_NonNeural_Base):
@@ -4390,7 +2456,7 @@ class WAS_GradientBoosting_Model(_WAS_NonNeural_Base):
 
     def _make_estimator(self, **params):
         from sklearn.ensemble import GradientBoostingRegressor
-        return GradientBoostingRegressor(random_state=42, **params)
+        return GradientBoostingRegressor(random_state=self.random_state, **params)
 
 
 class WAS_AdaBoost_Model(_WAS_NonNeural_Base):
@@ -4404,7 +2470,7 @@ class WAS_AdaBoost_Model(_WAS_NonNeural_Base):
 
     def _make_estimator(self, **params):
         from sklearn.ensemble import AdaBoostRegressor
-        return AdaBoostRegressor(random_state=42, **params)
+        return AdaBoostRegressor(random_state=self.random_state, **params)
 
 
 class WAS_XGBoost_Model(_WAS_NonNeural_Base):
@@ -4426,7 +2492,7 @@ class WAS_XGBoost_Model(_WAS_NonNeural_Base):
     def _make_estimator(self, **params):
         from xgboost import XGBRegressor
         return XGBRegressor(
-            random_state=42, n_jobs=1, verbosity=0,
+            random_state=self.random_state, n_jobs=1, verbosity=0,
             objective="reg:squarederror", tree_method="hist", **params
         )
 
@@ -4449,7 +2515,7 @@ class WAS_LightGBM_Model(_WAS_NonNeural_Base):
 
     def _make_estimator(self, **params):
         from lightgbm import LGBMRegressor
-        return LGBMRegressor(random_state=42, n_jobs=1, verbosity=-1, **params)
+        return LGBMRegressor(random_state=self.random_state, n_jobs=1, verbosity=-1, subsample_freq=1, **params)
 
 
 class WAS_SVR_Model(_WAS_NonNeural_Base):
@@ -4560,6 +2626,7 @@ class _WAS_NonNeural_Classifier_Base:
         n_iter: int = 50,
         scoring: str = "neg_log_loss",
         random_state: int = 42,
+        inner_cv=3,
     ):
         self.n_clusters = int(n_clusters)
         self.nb_cores = int(nb_cores)
@@ -4568,6 +2635,7 @@ class _WAS_NonNeural_Classifier_Base:
         self.n_iter = int(n_iter)
         self.scoring = scoring
         self.random_state = int(random_state)
+        self.inner_cv = inner_cv
 
         self.param_space = self._default_param_space()
         self._param_names = list(self.param_space.keys())
@@ -4621,35 +2689,22 @@ class _WAS_NonNeural_Classifier_Base:
     # ------------------------------------------------------------------
     # Optimisers
     # ------------------------------------------------------------------
-    def _optimize_optuna(self, X: np.ndarray, y: np.ndarray) -> Optional[dict]:
+    def _optimize_optuna(self, X, y):
         def objective(trial):
             params = self._cast_params(self._suggest_params(trial))
-            model = self._make_estimator(**params)
-            scores = cross_val_score(
-                model, X, y, cv=3, scoring=self.scoring
-            )
-            return float(scores.mean())
-
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=self.random_state),
-        )
+            return _classifier_cv_score(self, X, y, params)
+        study = optuna.create_study(direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=self.random_state))
         study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
         return study.best_params
 
-    def _optimize_random(self, X: np.ndarray, y: np.ndarray) -> Optional[dict]:
+    def _optimize_random(self, X, y):
         rng = np.random.RandomState(self.random_state)
         dists = self._param_distributions()
         best_score, best = -np.inf, None
         for _ in range(self.n_iter):
-            params = {n: d.rvs(random_state=rng) for n, d in dists.items()}
-            try:
-                model = self._make_estimator(**self._cast_params(params))
-                score = float(
-                    cross_val_score(model, X, y, cv=3, scoring=self.scoring).mean()
-                )
-            except Exception:
-                continue
+            params = self._cast_params({name: dist.rvs(random_state=rng) for name, dist in dists.items()})
+            score = _classifier_cv_score(self, X, y, params)
             if score > best_score:
                 best_score, best = score, params
         return best
@@ -4667,11 +2722,14 @@ class _WAS_NonNeural_Classifier_Base:
         nan_out = np.full(n_params, np.nan)
 
         mask = np.isfinite(y_vec) & np.all(np.isfinite(X_mat), axis=-1)
-        if np.sum(mask) < 10:
+        if np.sum(mask) < 2:
             return nan_out
         X_c = X_mat[mask]
         y_c = y_vec[mask].astype(int)
-        if len(np.unique(y_c)) < 2:
+        if len(np.unique(y_c)) < 2 or all(name.startswith("_placeholder") for name in self._param_names):
+            # A one-class target or a parameter-free estimator needs no search.
+            return np.array([float(self.param_space[n][0]) for n in self._param_names])
+        if np.sum(mask) < 10:
             return nan_out
 
         try:
@@ -4682,21 +2740,22 @@ class _WAS_NonNeural_Classifier_Base:
             if best is None:
                 return nan_out
             return np.array([float(best[n]) for n in self._param_names])
-        except Exception:
-            return nan_out
+        except Exception as exc:
+            raise RuntimeError(f"{type(self).__name__} hyperparameter tuning failed") from exc
 
     # ------------------------------------------------------------------
     # 1) Tercile classification
     # ------------------------------------------------------------------
     @staticmethod
-    def _classify_pixel(y: np.ndarray, index_start: int, index_end: int):
-        """Convert a 1-D continuous series to tercile classes {0, 1, 2}."""
-        mask = np.isfinite(y)
-        if np.any(mask):
-            terciles = np.nanpercentile(y[index_start:index_end], [33, 67])
-            y_class = np.digitize(y, bins=terciles, right=True)
-            return y_class.astype(float), terciles[0], terciles[1]
-        return np.full(y.shape[0], np.nan), np.nan, np.nan
+    def _classify_pixel(y, index_start, index_end):
+        y = np.asarray(y, dtype=float)
+        reference = y[index_start:index_end]
+        if np.isfinite(reference).sum() < 3:
+            return np.full(y.shape, np.nan), np.nan, np.nan
+        terciles = np.quantile(reference[np.isfinite(reference)], [1.0/3.0, 2.0/3.0])
+        labels = np.digitize(y, terciles, right=True).astype(float)
+        labels[~np.isfinite(y)] = np.nan
+        return labels, float(terciles[0]), float(terciles[1])
 
     def compute_class(
         self,
@@ -4719,8 +2778,7 @@ class _WAS_NonNeural_Classifier_Base:
         terc33  : xr.DataArray (Y, X)    — 33rd-percentile threshold
         terc67  : xr.DataArray (Y, X)    — 67th-percentile threshold
         """
-        index_start = Predictant.get_index("T").get_loc(str(clim_year_start)).start
-        index_end   = Predictant.get_index("T").get_loc(str(clim_year_end)).stop
+        index_start, index_end = _climatology_positions(Predictant["T"], clim_year_start, clim_year_end)
 
         y_class, terc33, terc67 = xr.apply_ufunc(
             self._classify_pixel,
@@ -4745,26 +2803,9 @@ class _WAS_NonNeural_Classifier_Base:
             return np.nan
         return float(np.argmax(np.bincount(v, minlength=3)))
 
-    def _build_cluster_map(self, predictand: xr.DataArray) -> xr.DataArray:
-        """KMeans on climatological mean; NaN cells stay NaN."""
-        field = predictand.mean("T", skipna=True)
-        flat  = field.values.reshape(-1)
-        valid = np.isfinite(flat)
-
-        labels = np.full(flat.shape, np.nan)
-        if np.any(valid):
-            km = KMeans(
-                n_clusters=self.n_clusters,
-                random_state=self.random_state,
-                n_init=10,
-            )
-            labels[valid] = km.fit_predict(flat[valid].reshape(-1, 1)).astype(float)
-
-        cluster_2d = labels.reshape(field.values.shape)
-        cluster_da = xr.DataArray(
-            cluster_2d, coords=field.coords, dims=field.dims, name="cluster"
-        )
-        return cluster_da.where(np.isfinite(field))
+    def _build_cluster_map(self, predictand):
+        return geographical_cluster_map(predictand, self.n_clusters,
+                                   random_state=self.random_state)
 
     def compute_hyperparameters(
         self,
@@ -4791,7 +2832,9 @@ class _WAS_NonNeural_Classifier_Base:
         cluster_da : xr.DataArray(Y,X) — KMeans cluster labels.
         """
         predictor = predictor.copy()
-        predictor["T"] = predictand["T"]
+        predictor, predictand = _aligned_training(predictor, predictand)
+        if any(dim in predictor.dims for dim in ("Y", "X")):
+            raise ValueError("Classifier cluster tuning requires T,features predictors; aggregate spatial predictors explicitly")
 
         # Classify predictand into tercile classes
         y_class, _, _ = self.compute_class(predictand, clim_year_start, clim_year_end)
@@ -4830,262 +2873,37 @@ class _WAS_NonNeural_Classifier_Base:
                 hyper_maps[n] = hyper_maps[n].where(~mask_c, other=float(best[i]))
 
         hyper_ds = xr.Dataset(hyper_maps)
+        _report_tuned("_WAS_NonNeural_Classifier_Base", getattr(self, "verbose", True), cluster_da=cluster_da, **{v: hyper_ds[v] for v in hyper_ds.data_vars})
         return hyper_ds, cluster_da
 
     # ------------------------------------------------------------------
     # 3) Per-pixel fit + predict_proba
     # ------------------------------------------------------------------
     def fit_predict(self, x, y, x_test, *param_values):
-        """
-        Fit the classifier on one grid cell and return class probabilities.
-
-        Parameters
-        ----------
-        x            : (T, features) — training predictors
-        y            : (T,)          — training labels (0/1/2, possibly with NaN)
-        x_test       : (features,)   — predictor for the target time step
-        *param_values : scalars      — per-cell hyperparameters in _param_names order
-
-        Returns
-        -------
-        np.ndarray shape (3,) : [P(Below), P(Normal), P(Above)]
-        """
+        if len(param_values) != len(self._param_names):
+            raise ValueError("Missing classifier hyperparameter values")
         params = dict(zip(self._param_names, param_values))
-        if any(not np.isfinite(v) for v in params.values()):
+        if any(not np.isfinite(value) for value in params.values()):
             return np.full(3, np.nan)
-
-        est  = self._make_estimator(**self._cast_params(params))
-        mask = np.isfinite(y) & np.all(np.isfinite(x), axis=-1)
-        if not np.any(mask):
-            return np.full(3, np.nan)
-
-        x_c = x[mask, :]
-        y_c = y[mask].astype(int)
-        uniq = np.unique(y_c)
-
-        # Degenerate: only one class present in training window
-        if uniq.size < 2:
-            out = np.zeros(3)
-            out[int(uniq[0])] = 1.0
-            return out
-
-        try:
-            est.fit(x_c, y_c)
-        except Exception:
-            return np.full(3, np.nan)
-
-        if x_test.ndim == 1:
-            x_test = x_test.reshape(1, -1)
-
-        try:
-            proba = est.predict_proba(x_test).reshape(-1)
-        except Exception:
-            return np.full(3, np.nan)
-
-        # Safe classes_ extraction through optional Pipeline wrapper
-        clf = est
-        while isinstance(clf, Pipeline):
-            clf = clf.steps[-1][1]
-        classes = getattr(clf, "classes_", np.arange(len(proba)))
-
-        # Map variable classes_ layout → fixed positions {0, 1, 2}.
-        # Absent classes (not seen in training) receive probability 0, not NaN,
-        # so the output always sums to 1 over the classes that were trained on.
-        out = np.zeros(3)
-        for cls, p in zip(classes, proba):
-            if 0 <= int(cls) <= 2:
-                out[int(cls)] = p
-        return out
+        estimator = self._make_estimator(**self._cast_params(params))
+        return _classifier_probabilities(estimator, x, y, x_test)[0]
 
     # ------------------------------------------------------------------
     # 4) Parallel spatial classification (hindcast)
     # ------------------------------------------------------------------
-    def compute_model(
-        self,
-        X_train: xr.DataArray,
-        y_class: xr.DataArray,
-        X_test: xr.DataArray,
-        hyperparams: xr.Dataset,
-    ) -> xr.DataArray:
-        """
-        Classify every grid cell in parallel over the full hindcast period.
-
-        Parameters
-        ----------
-        X_train    : xr.DataArray (T, features) — historical predictors
-        y_class    : xr.DataArray (T, Y, X)     — tercile class labels {0,1,2}
-                     as returned by ``compute_class``
-        X_test     : xr.DataArray (T, features) or (features,)
-                     Predictors for the target time step(s)
-        hyperparams: xr.Dataset from ``compute_hyperparameters``
-
-        Returns
-        -------
-        xr.DataArray  dims (probability=['PB','PN','PA'], T, Y, X)
-        """
-        chunk_y = self._safe_chunk(len(y_class.get_index("Y")))
-        chunk_x = self._safe_chunk(len(y_class.get_index("X")))
-
-        X_train = X_train.copy()
-        X_train["T"] = y_class["T"]
-        y_class = y_class.transpose("T", "Y", "X")
-
-        # Normalise X_test to (T, features) and remember the T coordinate so
-        # it can be restored after apply_ufunc.  Do NOT use a bare .squeeze()
-        # here: when T=1 that would silently drop the T dimension, causing
-        # apply_ufunc to omit T from the output and the final transpose to fail.
-        X_test = X_test.transpose("T", "features")
-        n_test_steps  = X_test.sizes["T"]
-        T_test_coords = X_test["T"].values
-
-        if n_test_steps == 1:
-            # Pass a single (features,) vector to fit_predict; T will be
-            # re-attached via expand_dims after computation.
-            X_test_fp = X_test.isel(T=0)
-        else:
-            X_test_fp = X_test
-
-        y_class, hyperparams = xr.align(y_class, hyperparams, join="outer")
-
-        names     = self._param_names
-        hp_chunks = [
-            hyperparams[n].chunk({"Y": chunk_y, "X": chunk_x}) for n in names
-        ]
-        core_dims = (
-            [("T", "features"), ("T",), ("features",)]
-            + [() for _ in names]
-        )
-
-        client = (
-            _get_compute_client(self.nb_cores)
-            if self.nb_cores > 1
-            else None
-        )
-        try:
-            result = xr.apply_ufunc(
-                self.fit_predict,
-                X_train,
-                y_class.chunk({"Y": chunk_y, "X": chunk_x}),
-                X_test_fp,
-                *hp_chunks,
-                input_core_dims=core_dims,
-                output_core_dims=[("probability",)],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=["float"],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}},
-            )
-            result_ = result.compute() if hasattr(result.data, "compute") else result
-        finally:
-            if client is not None:
-                _safe_close_client(client)
-
-        result_ = result_.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-
-        # Restore the T dimension when it was collapsed by isel above
-        if "T" not in result_.dims:
-            result_ = result_.expand_dims(T=T_test_coords)
-
-        return result_.transpose("probability", "T", "Y", "X")
+    def compute_model(self, X_train, y_class, X_test, hyperparams):
+        """Return native probabilities for every supplied test date."""
+        return _spatial_classifier(self, X_train, y_class, X_test,
+                                  tuple(hyperparams[n] for n in self._param_names))
 
     # ------------------------------------------------------------------
     # 5) End-to-end single-year forecast
     # ------------------------------------------------------------------
-    def forecast(
-        self,
-        Predictant: xr.DataArray,
-        clim_year_start: int,
-        clim_year_end: int,
-        Predictor: xr.DataArray,
-        Predictor_for_year: xr.DataArray,
-        hyperparams: xr.Dataset,
-    ) -> xr.DataArray:
-        """
-        Classify → fit on full history → predict_proba for one target year.
-
-        Parameters
-        ----------
-        Predictant         : xr.DataArray (T, Y, X) — observed continuous predictand
-        clim_year_start    : int — first year of climatology
-        clim_year_end      : int — last  year of climatology
-        Predictor          : xr.DataArray (T, features) — historical predictors
-        Predictor_for_year : xr.DataArray (1, features) or (features,)
-        hyperparams        : xr.Dataset from ``compute_hyperparameters``
-
-        Returns
-        -------
-        xr.DataArray  dims (probability=['PB','PN','PA'], T=1, Y, X)
-        """
-        # 1) Classify continuous predictand → integer tercile class (T, Y, X)
+    def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                 Predictor_for_year, hyperparams):
+        """Fit historical classes and preserve actual dates of all future rows."""
         y_class, _, _ = self.compute_class(Predictant, clim_year_start, clim_year_end)
-
-        # 2) Align predictor T axis to match class array
-        Predictor = Predictor.copy()
-        Predictor["T"] = y_class["T"]
-
-        # 3) Ensure forecast predictor has a T dimension
-        X_test = Predictor_for_year
-        if "T" not in X_test.dims:
-            if (
-                "T" in Predictor_for_year.coords
-                and Predictor_for_year.coords["T"].size > 0
-            ):
-                t0 = pd.Timestamp(
-                    Predictor_for_year.coords["T"].values[0]
-                ).to_datetime64()
-            else:
-                t0 = pd.Timestamp(Predictor["T"].values[-1]).to_datetime64()
-            X_test = X_test.expand_dims(T=[t0])
-
-        chunk_y = self._safe_chunk(len(y_class.get_index("Y")))
-        chunk_x = self._safe_chunk(len(y_class.get_index("X")))
-
-        y_class, hyperparams = xr.align(y_class, hyperparams, join="outer")
-
-        names     = self._param_names
-        hp_chunks = [
-            hyperparams[n].chunk({"Y": chunk_y, "X": chunk_x}) for n in names
-        ]
-        core_dims = (
-            [("T", "features"), ("T",), ("features",)]
-            + [() for _ in names]
-        )
-
-        X_test_sq = X_test.transpose("T", "features").squeeze()
-
-        client = (
-            _get_compute_client(self.nb_cores)
-            if self.nb_cores > 1
-            else None
-        )
-        try:
-            proba = xr.apply_ufunc(
-                self.fit_predict,
-                Predictor,
-                y_class.chunk({"Y": chunk_y, "X": chunk_x}),
-                X_test_sq,
-                *hp_chunks,
-                input_core_dims=core_dims,
-                output_core_dims=[("probability",)],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=["float"],
-                dask_gufunc_kwargs={"output_sizes": {"probability": 3}},
-            )
-            proba_ = proba.compute() if hasattr(proba.data, "compute") else proba
-        finally:
-            if client is not None:
-                _safe_close_client(client)
-
-        proba_ = proba_.assign_coords(
-            probability=("probability", ["PB", "PN", "PA"])
-        )
-        if "T" not in proba_.dims:
-            proba_ = proba_.expand_dims(T=X_test["T"].values)
-
-        return proba_.transpose("probability", "T", "Y", "X")
+        return self.compute_model(Predictor, y_class, _forecast_times(Predictor_for_year), hyperparams)
 
 
 # ======================================================================
@@ -5106,7 +2924,7 @@ class WAS_KNN_Classifier_Model(_WAS_NonNeural_Classifier_Base):
     - Uses ``weights='distance'`` so closer neighbours dominate.
     - Wrapped in StandardScaler: KNN is distance-sensitive and scaling is mandatory.
     - ``predict_proba`` returns soft votes (weighted class proportion among k
-      neighbours), providing well-calibrated tercile probabilities.
+      neighbours). Their reliability must be evaluated on held-out years.
     """
 
     def _default_param_space(self) -> dict:
@@ -5146,7 +2964,8 @@ class WAS_SVC_Classifier_Model(_WAS_NonNeural_Classifier_Base):
     -----
     - ``class_weight='balanced'`` handles the roughly uniform, but occasionally
       skewed, class distribution in tercile data.
-    - Platt scaling adds a negligible overhead for seasonal grid sizes.
+    - Libsvm adds internal five-fold Platt calibration. This cost remains even
+      with outer residual calibration; these are separate procedures.
     """
 
     def _default_param_space(self) -> dict:
@@ -5189,7 +3008,7 @@ class WAS_RandomForest_Classifier_Model(_WAS_NonNeural_Classifier_Base):
     - ``class_weight='balanced_subsample'`` reweights classes per bootstrap
       sample, handling mild imbalance common in tercile label distributions.
     - ``predict_proba`` averages class fractions across trees — naturally
-      well-calibrated without additional post-processing.
+      not guaranteed calibrated; evaluate reliability on held-out years.
     - No feature scaling needed (tree-based, invariant to monotone transforms).
     """
 
@@ -5234,7 +3053,7 @@ class WAS_XGBoost_Classifier_Model(_WAS_NonNeural_Classifier_Base):
     - ``objective='multi:softprob'`` makes XGBoost return normalised class
       probabilities, identical in shape to sklearn's ``predict_proba``.
     - ``eval_metric='mlogloss'`` matches the default optimisation scorer.
-    - ``num_class`` is fixed to 3 (Below / Normal / Above).
+    - The training classes select binary or multiclass loss; outputs map back to three terciles.
     - ``use_label_encoder=False`` suppresses deprecation warnings in older
       XGBoost versions.
     """
@@ -5254,18 +3073,9 @@ class WAS_XGBoost_Classifier_Model(_WAS_NonNeural_Classifier_Base):
 
     def _make_estimator(self, **params):
         from xgboost import XGBClassifier
-
-        return XGBClassifier(
-            objective="multi:softprob",
-            num_class=3,
-            eval_metric="mlogloss",
-            tree_method="hist",
-            random_state=self.random_state,
-            n_jobs=1,
-            verbosity=0,
-            use_label_encoder=False,
-            **params,
-        )
+        # XGBoost chooses binary/multiclass loss from encoded training classes.
+        return XGBClassifier(tree_method="hist", random_state=self.random_state,
+                             n_jobs=1, verbosity=0, **params)
 
 
 class WAS_ExtraTrees_Classifier_Model(_WAS_NonNeural_Classifier_Base):
@@ -5296,7 +3106,7 @@ class WAS_ExtraTrees_Classifier_Model(_WAS_NonNeural_Classifier_Base):
       handling mild imbalance common in tercile label distributions.
     - No feature scaling needed (tree-based, invariant to monotone transforms).
     - ``predict_proba`` averages class fractions across trees — naturally
-      well-calibrated without additional post-processing.
+      not guaranteed calibrated; evaluate reliability on held-out years.
     """
 
     def _default_param_space(self) -> dict:
@@ -5431,7 +3241,8 @@ class WAS_LightGBM_Classifier_Model(_WAS_NonNeural_Classifier_Base):
 
     Notes
     -----
-    - ``objective='multiclass'`` + ``num_class=3`` gives calibrated soft-max
+    - The objective follows the training classes; soft-max probabilities require independent reliability assessment, not automatic calibration.
+      The output gives
       probabilities equivalent to sklearn's ``predict_proba``.
     - ``class_weight='balanced'`` handles tercile imbalance.
     - ``verbosity=-1`` suppresses LightGBM's verbose stdout output.
@@ -5454,12 +3265,11 @@ class WAS_LightGBM_Classifier_Model(_WAS_NonNeural_Classifier_Base):
         from lightgbm import LGBMClassifier
 
         return LGBMClassifier(
-            objective="multiclass",
-            num_class=3,
             class_weight="balanced",
             random_state=self.random_state,
             n_jobs=1,
             verbosity=-1,
+            subsample_freq=1,
             **params,
         )
 
@@ -5532,8 +3342,8 @@ class WAS_LinearDiscriminant_Classifier_Model(_WAS_NonNeural_Classifier_Base):
       rank-deficient covariance matrices arising from correlated predictors.
     - LDA assumes equal class covariances; with tercile data this is generally
       a reasonable approximation unless the climate signal is highly non-linear.
-    - Naturally calibrated: posterior probabilities come directly from the
-      Gaussian discriminant model.
+    - Gaussian discriminant posterior probabilities need an independent
+      reliability assessment; the model assumptions do not ensure calibration.
     - Auto-scaled via StandardScaler for numerical stability.
     """
 
@@ -5569,8 +3379,9 @@ class WAS_QuadraticDiscriminant_Classifier_Model(_WAS_NonNeural_Classifier_Base)
     With only ~30 training years the per-class covariance is estimated from
     ~10 samples — ill-conditioned without regularisation.  The ``reg_param``
     hyperparameter adds a fraction of the identity matrix to each class
-    covariance, interpolating between full QDA (``reg_param=0``) and LDA
-    (``reg_param=1``).
+    covariance, interpolating between full QDA (``reg_param=0``) and
+    identity covariance for every class (``reg_param=1``). This is not the
+    pooled sample covariance estimated by ordinary LDA.
 
     Hyperparameters tuned
     ---------------------
@@ -5580,9 +3391,8 @@ class WAS_QuadraticDiscriminant_Classifier_Model(_WAS_NonNeural_Classifier_Base)
     -----
     - Auto-scaled via StandardScaler for numerical stability in covariance
       estimation.
-    - When ``reg_param`` is tuned close to 1.0 the model effectively
-      degenerates to LDA; the HPO will choose the value that best calibrates
-      the log-loss on the cluster's class series.
+    - Near ``reg_param=1`` the class covariances approach the same identity
+      matrix. Tuning minimizes validation log-loss on the cluster class series.
     - QDA is more expressive than LDA but needs more data per class to be
       stable; ``reg_param`` is the primary safeguard.
     """

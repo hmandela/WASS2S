@@ -93,11 +93,11 @@ import pandas as pd
 from scipy.signal import find_peaks
 
 
-try:
+if __package__:
     from .highflow_utils import (clean_daily_series, canonical_doy, doy_to_md,
         window_dates, union_window_dates, hydrological_year_bounds,
         coverage_statistics, match_windows, window_day_set)
-except ImportError:
+else:
     from highflow_utils import (clean_daily_series, canonical_doy, doy_to_md,
         window_dates, union_window_dates, hydrological_year_bounds,
         coverage_statistics, match_windows, window_day_set)
@@ -121,6 +121,7 @@ class HighWaterConfig:
     # because genuine floods must not be treated as statistical outliers.
     negative_to_nan: bool = True
     missing_values: tuple[float, ...] = (-99.0, -999.0)
+    discharge_units: str = "m3 s-1"
 
     # Before constructing a station climatology, retain only calendar years with
     # at least this fraction of valid daily observations. This is essential for
@@ -239,6 +240,41 @@ class HighWaterConfig:
     # Pardé values >= highwater_parde_threshold. Such windows are explicitly
     # flagged as fallback_mode_window=True.
     include_unassigned_modes: bool = False
+
+
+    def __post_init__(self):
+        for name in ("min_reference_year_coverage", "min_climatology_year_fraction",
+                     "min_valid_fraction_mean", "min_valid_fraction_max",
+                     "min_hydrological_year_fraction", "bootstrap_min_overlap"):
+            if not 0 < float(getattr(self, name)) <= 1:
+                raise ValueError(f"{name} must be in (0, 1].")
+        if not 0 < self.bootstrap_ci < 1:
+            raise ValueError("bootstrap_ci must be in (0, 1).")
+        for name in ("smoothing_window_days", "lowflow_anchor_window_days"):
+            value = getattr(self, name)
+            if int(value) != value or not 1 <= value <= 365 or value % 2 != 1:
+                raise ValueError(f"{name} must be an odd integer in [1, 365].")
+        for name in ("min_reference_years", "min_mode_separation_days", "max_modes",
+                     "min_segment_length_days"):
+            value = getattr(self, name)
+            if int(value) != value or value < 1:
+                raise ValueError(f"{name} must be a positive integer.")
+        if self.min_segment_length_days > 121:
+            raise ValueError("At least three segments must fit within 365 days.")
+        if int(self.n_bootstrap) != self.n_bootstrap or self.n_bootstrap < 0:
+            raise ValueError("n_bootstrap must be a nonnegative integer.")
+        if int(self.max_climatology_gap_days) != self.max_climatology_gap_days or self.max_climatology_gap_days < 0:
+            raise ValueError("max_climatology_gap_days must be a nonnegative integer.")
+        if self.highwater_parde_threshold <= 0:
+            raise ValueError("highwater_parde_threshold must be positive.")
+        _discharge_to_m3s(self.discharge_units)
+
+def _discharge_to_m3s(units: str) -> float:
+    factors = {"m3 s-1": 1., "m3/s": 1., "m^3/s": 1.,
+               "L/s": .001, "l/s": .001, "ft3/s": .028316846592}
+    if units not in factors:
+        raise ValueError("discharge_units must be m3 s-1, m3/s, L/s, or ft3/s.")
+    return factors[units]
 
 
 # =============================================================================
@@ -751,7 +787,7 @@ def _build_highwater_windows(fit, q_rotated, parde_rotated, anchor_doy, mode_inf
              crosses_calendar_year=bool(sd>ed),crosses_hydrological_anchor=bool(end>365),
              mean_parde=float(pwin.mean()),max_parde=float(pwin.max()),
              climatological_mean_q=float(qwin.mean()),climatological_max_q=float(qwin.max()),
-             climatological_volume_q_day=vol,climatological_volume_m3=vol*86400,
+             climatological_volume_q_day=vol,climatological_volume_m3=vol*86400*_discharge_to_m3s(config.discharge_units),
              annual_volume_fraction=fraction,importance='minor' if fraction<config.minor_season_volume_fraction else 'major',
              n_modes_inside=len(inside),mode_positions=inside,weak_season_fallback=bool(fallback or no_mode)))
     for rank,j in enumerate(sorted(range(len(out)),key=lambda j:-out[j]['annual_volume_fraction']),1):
@@ -974,7 +1010,7 @@ def _build_mode_specific_windows(
             "climatological_mean_q": float(np.mean(qwin)),
             "climatological_max_q": float(np.max(qwin)),
             "climatological_volume_q_day": volume,
-            "climatological_volume_m3": float(volume * 86400.0),
+            "climatological_volume_m3": float(volume * 86400.0 * _discharge_to_m3s(config.discharge_units)),
             "annual_volume_fraction": float(volume / total_q),
         }
 

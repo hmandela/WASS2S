@@ -509,43 +509,35 @@ def predictant_mask(data):
     otherwise NaN.
     """
     mean_rainfall = data.mean(dim="T").squeeze()
-    mask = xr.where(mean_rainfall <= 20, np.nan, 1)
+    mask = xr.where(np.isfinite(mean_rainfall) & (mean_rainfall > 20), 1.0, np.nan)
     mask = mask.where(abs(mask.Y) <= 19.5, np.nan)
     return mask
 
 def extract_leading_eeof_component(data):
+    """Reconstruct the first ExtendedEOF mode using training data only.
+
+    PCA and embedding ranks are bounded by the actual sample and spatial
+    dimensions of the supplied fold. This helper is descriptive: fit it only
+    on training data when used inside a forecast experiment.
     """
-    extract leading eeof component using ExtendedEOF.
-
-    Parameters
-    ----------
-    data : xarray.DataArray
-        Input data array with time dimension 'T'.
-
-    Returns
-    -------
-    xarray.DataArray
-        Trended data array based on the first mode of ExtendedEOF.
-
-    Raises
-    ------
-    RuntimeError
-        If ExtendedEOF fitting fails.
-
-    Notes
-    -----
-    Missing values are filled with the time mean before fitting.
-    Uses ExtendedEOF with specified parameters (n_modes=2, tau=1, embedding=3, n_pca_modes=20).
-    """
+    nt = data.sizes.get("T", 0)
+    if nt < 4:
+        raise ValueError("ExtendedEOF needs at least four training times")
+    data_filled = data.fillna(data.mean(dim="T", skipna=True))
+    valid_features = int((data_filled.notnull().any("T") & (data_filled.std("T") > 0)).sum())
+    rank = min(22, nt - 1, valid_features)
+    if rank < 1:
+        raise ValueError("ExtendedEOF has no variable spatial feature")
+    embedding = min(3, nt - 2)
+    n_modes = min(2, nt - embedding, rank * embedding)
     try:
-        data_filled = data.fillna(data.mean(dim="T", skipna=True))
-        eeof = xe.single.ExtendedEOF(n_modes=2, tau=1, embedding=3, n_pca_modes=22)
+        eeof = xe.single.ExtendedEOF(n_modes=n_modes, tau=1,
+                                     embedding=embedding, n_pca_modes=rank)
         eeof.fit(data_filled, dim="T")
-        scores_ext = eeof.scores()
-        data_trends = eeof.inverse_transform(scores_ext.sel(mode=1))
-        return data_trends
-    except Exception as e:
-        raise RuntimeError(f"Failed to detrend data using ExtendedEOF: {e}")
+        return eeof.inverse_transform(eeof.scores().sel(mode=1))
+    except Exception as exc:
+        raise RuntimeError(f"ExtendedEOF failed for training shape {dict(data.sizes)}: {exc}") from exc
+
 
 def detrended_data(da, dim="T", min_valid=10):
     if dim not in da.dims:
@@ -652,7 +644,7 @@ def prepare_predictand(dir_to_save_Obs, variables_obs, year_start, year_end, sea
         return data_out.to_array().drop_vars("variable").squeeze().rename(param)
 
 
-def load_gridded_predictor(dir_to_data, variables_list, year_start, year_end, season=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None):
+def load_gridded_predictor(dir_to_data, variables_list, year_start, year_end, season=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None, preserve_members=False):
     """
     Load gridded predictor data for reanalysis or model.
 
@@ -677,6 +669,10 @@ def load_gridded_predictor(dir_to_data, variables_list, year_start, year_end, se
     year_forecast : int, optional
         Forecast year (required for forecast data if model=True).
 
+    preserve_members : bool, optional
+        Preserve a raw member dimension (number/M/member/realization aliases).
+        False retains the historical strict deterministic T,Y,X interface.
+
     Returns
     -------
     xarray.DataArray
@@ -698,7 +694,15 @@ def load_gridded_predictor(dir_to_data, variables_list, year_start, year_end, se
         filepath = f'{dir_to_data}/{center}_{variable}_{year_start}_{year_end}_{season_str}.nc'
     predictor = xr.open_dataset(filepath)
     predictor['T'] = predictor['T'].astype('datetime64[ns]')
-    return predictor.to_array().drop_vars("variable").squeeze("variable").rename("predictor").transpose('T', 'Y', 'X')
+    result = predictor.to_array().drop_vars("variable").squeeze("variable").rename("predictor")
+    if preserve_members:
+        from .was_ensemble_features import member_dimension
+        member_dim = member_dimension(result)
+        order = ('T', member_dim, 'Y', 'X') if member_dim is not None else ('T', 'Y', 'X')
+        # Reject ambiguous or additional dimensions rather than flattening them
+        # into members (especially model, lead and initialization dimensions).
+        return result.transpose(*order)
+    return result.transpose('T', 'Y', 'X')
 
 def compute_sst_indices(dir_to_data, indices, variables_list, year_start, year_end, season, clim_year_start=None, clim_year_end=None, others_zone=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None):
     """
@@ -897,10 +901,14 @@ def retrieve_several_zones_for_PCR(dir_to_data, indices_dict, variables_list, ye
     data_vars = [ds.rename(key) for key, ds in predictor.items()]
     return data_vars
 
-def retrieve_single_zone_for_PCR(dir_to_data, indices_dict, variables_list, year_start, year_end, season=None, clim_year_start=None, clim_year_end=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None, standardize=True):
+def retrieve_single_zone_for_PCR(dir_to_data, indices_dict, variables_list, year_start, year_end, season=None, clim_year_start=None, clim_year_end=None, model=False, month_of_initialization=None, lead_time=None, year_forecast=None, standardize=False):
     """
-    Retrieve data for a single zone for Principal Component Regression (PCR) with interpolation.
-skill_mask
+    Retrieve one interpolated PCR predictor region in physical units.
+
+    Interpolation acts on raw fields. For cross-validation, keep the default
+    ``standardize=False`` and let each fitted EOF learn its training-only
+    centering/scaling. The old False branch returned global anomalies; it now
+    returns raw values so held-out years cannot affect loaded training values.
     Parameters
     ----------
     dir_to_data : str
@@ -927,11 +935,15 @@ skill_mask
         List of lead times in months.
     year_forecast : int, optional
         Forecast year.
+    standardize : bool, default False
+        Explicit legacy convenience: standardize AFTER interpolation using the
+        supplied climatology. Use only with an independently fixed reference,
+        not as preprocessing before held-out cross-validation.
 
     Returns
     -------
     xarray.DataArray
-        Standardized and interpolated data array for the specified region.
+        Interpolated data array for the specified region, raw by default.
     """
     center, variable = parse_variable(variables_list)
     if model:
@@ -962,17 +974,16 @@ skill_mask
 
     new_resolution = {'Y': 1, 'X': 1}
 
-    if standardize:
-        data = standardize_timeseries(data, clim_year_start, clim_year_end)
-    else:
-        data = anomalize_timeseries(data, clim_year_start, clim_year_end)
-
+    if len(indices_dict) != 1:
+        raise ValueError("PCR single-zone retrieval requires exactly one region.")
     for idx, coords in indices_dict.items():
         _, lon_min, lon_max, lat_min, lat_max = coords
         var_region = data.sel(X=slice(lon_min, lon_max), Y=slice(lat_min, lat_max))
         Y_new = xr.DataArray(np.arange(lat_min, lat_max + 1, new_resolution['Y']), dims='Y')
         X_new = xr.DataArray(np.arange(lon_min, lon_max + 1, new_resolution['X']), dims='X')
         data_vars = var_region.interp(Y=Y_new, X=X_new, method='linear')
+    if standardize:
+        data_vars = standardize_timeseries(data_vars, clim_year_start, clim_year_end)
     return data_vars
 
 def plot_map(extent, title="Map", sst_indices=None, fig_size=(10, 8)):
@@ -1228,12 +1239,69 @@ def get_shapefile(country_code, admin_level=0, source="naturalearth"):
         return gpd.read_file(shp_file)
 
 
-def plot_prob_forecastsAlpha(dir_to_save, forecast_prob, model_name, 
+RCC_RAINFALL = {
+    "bn_colors": ["#FFB52E", "#FF9800", "#FF7A00", "#FF5500", "#FF3000", "#FF0000"],
+    "nn_colors": ["#E6FFFF", "#BFF9F5", "#8FEFEA", "#5DDFD8", "#2ACCC5", "#00B8B0"],
+    "an_colors": ["#C7F0AA", "#39CC0F", "#39AB06", "#157A40", "#0E5C30", "#093F21"],
+}
+RCC_TEMPERATURE = {
+    "bn_colors": ["#E6F2FF", "#B3D9FF", "#66B2FF", "#1A75CF", "#004C99", "#003366"],
+    "nn_colors": ["#E5FFFF", "#CCFFFF", "#99FFFF", "#7FFFFF", "#66FFFF", "#33FFFF"],
+    "an_colors": ["#FFE400", "#FFCC00", "#FF8B00", "#FF6600", "#FF0000", "#B30000"],
+}
+
+def plot_prob_forecasts_rcc(dir_to_save, forecast_prob, model_name, title = "Seasonal Forecast for Gulf of Guinea Countries \n Valid for March-April-May 2026, Issued February 27, 2026" ,
                         country_code="GHA", admin_level=0, source="naturalearth",
                         labels=["Below-Normal", "Near-Normal", "Above-Normal"], 
-                        reverse_cmap=True, hspace=None, logo=None, 
-                        logo_size=("10%", "10%"), logo_position="lower left", 
-                        sigma=None, res=None, stations_df=None, out="pdf", dynamic_scalebar=False):
+                        reverse_cmap=True, hspace=None, 
+                        logo=None, logo_size=("10%", "10%"), logo_position="lower left", 
+                        logo_left=None, logo_left_size=("12%", "12%"), 
+                        logo_right=None, logo_right_size=("12%", "12%"),
+                        sigma=None, res=None, stations_df=None, out="pdf", dynamic_scalebar=False, *,
+                        bn_colors=None, nn_colors=None, an_colors=None,
+                        probability_ticks=None, boundary_color="black",
+                        land_color="#fde0dd", ocean_color="#e0f3ff",
+                        lake_color=None, text_color="black",
+                        background_color="white", forecast_alpha=0.9):
+    """Plot dominant tercile probabilities; drop-in replacement in wass2s.utils.
+
+    Color lists run from low to high probability. Explicit lists override
+    reverse_cmap for that category. probability_ticks is an increasing sequence
+    of percentage boundaries (e.g. [40, 50, 60, 70, 80, 90, 100]); it overrides
+    dynamic_scalebar. Matching list/bin counts preserve exact supplied colors;
+    otherwise colors are interpolated. Existing calls keep their old defaults.
+    Other dependencies and project helpers are supplied by wass2s.utils.
+    """
+    def checked_colors(colors, name):
+        if colors is None:
+            return None
+        if isinstance(colors, str):
+            colors = [colors]
+        colors = list(colors)
+        if not colors or not all(mcolors.is_color_like(c) for c in colors):
+            raise ValueError(f"{name} must contain valid Matplotlib colors")
+        return colors
+
+    custom_colors = [checked_colors(bn_colors, "bn_colors"),
+                     checked_colors(nn_colors, "nn_colors"),
+                     checked_colors(an_colors, "an_colors")]
+    if len(labels) != 3:
+        raise ValueError("labels must contain three tercile labels")
+    if not 0 <= forecast_alpha <= 1:
+        raise ValueError("forecast_alpha must be between 0 and 1")
+    for color in (boundary_color, land_color, ocean_color, text_color,
+                  background_color, lake_color):
+        if color is not None and not mcolors.is_color_like(color):
+            raise ValueError(f"Invalid color: {color!r}")
+    if probability_ticks is not None:
+        probability_ticks = np.asarray(probability_ticks, dtype=float)
+        if (probability_ticks.ndim != 1 or len(probability_ticks) < 2
+                or not np.all(np.isfinite(probability_ticks))
+                or np.any(np.diff(probability_ticks) <= 0)
+                or probability_ticks[0] < 0 or probability_ticks[-1] > 100):
+            raise ValueError("probability_ticks must increase within [0, 100]")
+
+    forecast_prob = _mask_invalid_tercile_probabilities(forecast_prob)
 
     # 3. Spatial Smoothing
     if sigma:
@@ -1253,6 +1321,8 @@ def plot_prob_forecastsAlpha(dir_to_save, forecast_prob, model_name,
                                                 kwargs={'fill_value': 'extrapolate'}    
                                             )
     
+    forecast_prob = _mask_invalid_tercile_probabilities(forecast_prob)
+
     # 1. Automatic Shapefile Ingestion
     gdf = get_shapefile(country_code, admin_level, source)
     if gdf.crs != "EPSG:4326": gdf = gdf.to_crs("EPSG:4326")
@@ -1281,37 +1351,50 @@ def plot_prob_forecastsAlpha(dir_to_save, forecast_prob, model_name,
         cbar_ticks_nn = np.arange(35, 65 + 1, 5)
         cbar_ticks_an = np.arange(35, 85 + 1, 5)
 
+    if probability_ticks is not None:
+        cbar_ticks_bn = cbar_ticks_nn = cbar_ticks_an = probability_ticks
+    elif dynamic_scalebar and len(plotted_floats) > 0 and g_vmin == g_vmax:
+        # Constant forecasts still need at least one probability interval.
+        low = max(35, g_vmin - 5)
+        high = min(100, g_vmax + 5)
+        cbar_ticks_bn = cbar_ticks_nn = cbar_ticks_an = np.array([low, high])
+
     num_bins_bn = len(cbar_ticks_bn) - 1
     num_bins_nn = len(cbar_ticks_nn) - 1
     num_bins_an = len(cbar_ticks_an) - 1
     
     # 6. Plotting Infrastructure
-    fig = plt.figure(figsize=(12, 10))
+    fig = plt.figure(figsize=(12, 10), facecolor=background_color)
     gs = gridspec.GridSpec(2, 3, height_ratios=[10, 0.2], width_ratios=[1.2, 0.6, 1.2],hspace=hspace or -0.5, wspace=0.3)
     ax = fig.add_subplot(gs[0, :], projection=ccrs.PlateCarree())
     
+    ax.set_facecolor(background_color)
+
     # Zoom to shapefile
     bounds = gdf.total_bounds
     ax.set_extent([bounds[0]-0.1, bounds[2]+0.1, bounds[1]-0.1, bounds[3]+0.1])
 
     # ---- DISCRETE COLORMAP AND BOUNDARY NORM SETUP ----
     
-
     # Base Colors
     an_colors = ['#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443', '#006837', '#004529']
     bn_colors = ['#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026']
     nn_colors = ["#ffeda0", "#f7fcb9"]
     
     if reverse_cmap:
-        an_colors, bn_colors = bn_colors, an_colors
+        an_colors, bn_colors, nn_colors  = bn_colors, an_colors, nn_colors[::-1]
 
-    # Build discrete colormaps matching the exact number of required bins
-    cmaps = [
-        mcolors.LinearSegmentedColormap.from_list('BN', bn_colors, N=num_bins_bn),
-        mcolors.LinearSegmentedColormap.from_list('NN', nn_colors, N=num_bins_nn),
-        mcolors.LinearSegmentedColormap.from_list('AN', an_colors, N=num_bins_an)
-    ]
-    
+    palettes = [custom if custom is not None else default
+                for custom, default in zip(custom_colors, [bn_colors, nn_colors, an_colors])]
+    cmaps = []
+    for name, colors, bins in zip(["BN", "NN", "AN"], palettes,
+                                  [num_bins_bn, num_bins_nn, num_bins_an]):
+        if len(colors) == bins or len(colors) == 1:
+            cmap = mcolors.ListedColormap(colors, name=name, N=bins)
+        else:
+            cmap = mcolors.LinearSegmentedColormap.from_list(name, colors, N=bins)
+        cmaps.append(cmap)
+
     # Create BoundaryNorms to strictly enforce discrete color blocks
     norms = [
         mcolors.BoundaryNorm(cbar_ticks_bn, cmaps[0].N),
@@ -1331,35 +1414,56 @@ def plot_prob_forecastsAlpha(dir_to_save, forecast_prob, model_name,
         if np.any(~np.isnan(data.values)):
             im = ax.pcolormesh(forecast_prob.X, forecast_prob.Y, data, 
                                cmap=cmaps[i], norm=norms[i], 
-                               transform=ccrs.PlateCarree(), alpha=0.9, zorder=2)
+                               transform=ccrs.PlateCarree(), alpha=forecast_alpha, zorder=2)
         else:
             im = cm.ScalarMappable(norm=norms[i], cmap=cmaps[i])
             im.set_array([])
         ims.append(im)
 
     # 7. Add Boundary & Stations
-    ax.add_feature(ShapelyFeature(gdf.geometry, ccrs.PlateCarree(), facecolor='none', edgecolor='black', lw=1.5), zorder=5)
+    ax.add_feature(ShapelyFeature(gdf.geometry, ccrs.PlateCarree(), facecolor='none', edgecolor=boundary_color, lw=1.5), zorder=5)
     gl = ax.gridlines(draw_labels=True, linewidth=0.01, color='gray', alpha=0.8)
     gl.top_labels = False
     gl.right_labels = False
+    gl.xlabel_style = {"color": text_color}
+    gl.ylabel_style = {"color": text_color}
     
     if stations_df is not None:
         for col in stations_df.columns[1:]:
             lat, lon = stations_df.loc[0, col], stations_df.loc[1, col]
             if not np.isnan(lat):
                 ax.plot(lon, lat, 'ro', markersize=4, markeredgecolor='w', transform=ccrs.PlateCarree(), zorder=10)
-                txt = ax.text(lon + 0.02, lat + 0.02, col, fontsize=8, transform=ccrs.PlateCarree(), zorder=11)
+                txt = ax.text(lon + 0.02, lat + 0.02, col, fontsize=8, color=text_color, transform=ccrs.PlateCarree(), zorder=11)
                 txt.set_path_effects([path_effects.withStroke(linewidth=2, foreground='w')])
 
-    # 8. Add logo if provided
+    # ==========================================
+    # 8. ADD LOGOS (Inside and Outside Options)
+    # ==========================================
+    
+    # Original: Logo inside the map
     if logo is not None:
-        ax_logo = inset_axes(ax,
-                            width=logo_size[0],    
-                            height=logo_size[1],        
-                            loc=logo_position,
-                            borderpad=0)        
+        ax_logo = inset_axes(ax, width=logo_size[0], height=logo_size[1], 
+                             loc=logo_position, borderpad=0)        
         ax_logo.imshow(mpimg.imread(logo))
         ax_logo.axis("off") 
+
+    # New: Outside Left Logo
+    if logo_left is not None:
+        # bbox_to_anchor creates a bounding box starting slightly above the top-left of the axis (y=1.02)
+        ax_logo_l = inset_axes(ax, width=logo_left_size[0], height=logo_left_size[1],
+                               loc='lower left', bbox_to_anchor=(0.0, 1.06, 1, 1),
+                               bbox_transform=ax.transAxes, borderpad=0)
+        ax_logo_l.imshow(mpimg.imread(logo_left))
+        ax_logo_l.axis("off")
+
+    # New: Outside Right Logo
+    if logo_right is not None:
+        # Pinned to the lower right of the bounding box placed above the axis
+        ax_logo_r = inset_axes(ax, width=logo_right_size[0], height=logo_right_size[1],
+                               loc='lower right', bbox_to_anchor=(0.0, 1.06, 1, 1),
+                               bbox_transform=ax.transAxes, borderpad=0)
+        ax_logo_r.imshow(mpimg.imread(logo_right))
+        ax_logo_r.axis("off")
 
 
     # 9. Unified Discrete Colorbars with Inward Ticks
@@ -1373,23 +1477,63 @@ def plot_prob_forecastsAlpha(dir_to_save, forecast_prob, model_name,
         cb = plt.colorbar(ims[i], cax=cax, orientation='horizontal', 
                           spacing='uniform', ticks=current_ticks)
         
-        cb.set_label(f"{label} (%)", fontsize=10)
-        cb.set_ticklabels([f"{int(t)}" for t in current_ticks])
-        cb.ax.tick_params(axis='x', direction='in', length=6, color='black')
+        cb.set_label(f"{label} (%)", fontsize=10, color=text_color)
+        cb.set_ticklabels([f"{t:g}" for t in current_ticks])
+        cb.ax.tick_params(axis='x', direction='in', length=6, color=text_color, labelcolor=text_color)
         
         # INVERT THE BN AXIS (First loop iteration)s
         if i == 0:
             cax.invert_xaxis()
 
     # 10. Final Aesthetics
-    ax.set_title(f"Probabilistic Seasonal Forecast\n{model_name}", fontsize=14, pad=20, fontweight='bold')
-    ax.add_feature(cfeature.OCEAN.with_scale('50m'), facecolor='#e0f3ff')
-    ax.coastlines(resolution='10m')
+    # Dynamically increase title padding if top outside logos are active
+    t_pad = 30 if (logo_left is not None or logo_right is not None) else 20
+    ax.set_title(title.upper(), fontsize=14, pad=t_pad, fontweight='bold', color=text_color)
+
+    # Add Land colors
+    ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor=land_color, edgecolor=boundary_color, zorder=0) 
+    ax.add_feature(cfeature.OCEAN.with_scale('50m'), facecolor=ocean_color)
+    if lake_color is not None:
+        ax.add_feature(cfeature.LAKES.with_scale("50m"), facecolor=lake_color,
+                       edgecolor=boundary_color, zorder=3)
+    ax.coastlines(resolution='10m', color=boundary_color)
     
+    # bbox_inches='tight' will automatically ensure the outside logos and new padding are saved cleanly
     plt.savefig(os.path.join(dir_to_save, f"{model_name}.{out}"), dpi=300, bbox_inches='tight')
     plt.show()
     plt.close('all')
 
+# Usage
+# ---------
+# plot_prob_forecasts_rcc(
+#     dir_to_save,
+#     forecast_prob,
+#     model_name,
+#     country_code="BEN",
+#     **RCC_RAINFALL,
+#     probability_ticks=[40, 50, 60, 70, 80, 90, 100],
+#     boundary_color="#4E4E4E",
+#     lake_color="#73B2FF",
+#     land_color="#FFFFFF",
+#     background_color="#FFFFFF",
+#     text_color="#000000",
+#     forecast_alpha=1.0,
+# )
+
+def _mask_invalid_tercile_probabilities(forecast_prob):
+    """Keep complete probability simplexes for mapping without changing input.
+
+    A missing or invalid tercile must never become a coloured category through
+    ``max(skipna=True)``. The tolerance only accommodates probability sums
+    stored in single precision; invalid values are masked, not renormalized.
+    """
+    if "probability" not in forecast_prob.dims or forecast_prob.sizes["probability"] != 3:
+        raise ValueError("Tercile maps require exactly three probability layers.")
+    complete = np.isfinite(forecast_prob).all("probability")
+    bounded = ((forecast_prob >= 0.0) & (forecast_prob <= 1.0)).all("probability")
+    total = forecast_prob.sum("probability", skipna=False)
+    unit_mass = abs(total - 1.0) <= 1.0e-6
+    return forecast_prob.where(complete & bounded & unit_mass)
 
 def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, title = "Seasonal Forecast for Gulf of Guinea Countries \n Valid for March-April-May 2026, Issued February 27, 2026" ,
                         country_code="GHA", admin_level=0, source="naturalearth",
@@ -1399,6 +1543,8 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, title = "Seasona
                         logo_left=None, logo_left_size=("12%", "12%"), 
                         logo_right=None, logo_right_size=("12%", "12%"),
                         sigma=None, res=None, stations_df=None, out="pdf", dynamic_scalebar=False):
+
+    forecast_prob = _mask_invalid_tercile_probabilities(forecast_prob)
 
     # 3. Spatial Smoothing
     if sigma:
@@ -1418,6 +1564,8 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, title = "Seasona
                                                 kwargs={'fill_value': 'extrapolate'}    
                                             )
     
+    forecast_prob = _mask_invalid_tercile_probabilities(forecast_prob)
+
     # 1. Automatic Shapefile Ingestion
     gdf = get_shapefile(country_code, admin_level, source)
     if gdf.crs != "EPSG:4326": gdf = gdf.to_crs("EPSG:4326")
@@ -1568,7 +1716,9 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, title = "Seasona
     # Dynamically increase title padding if top outside logos are active
     t_pad = 30 if (logo_left is not None or logo_right is not None) else 20
     ax.set_title(title.upper(), fontsize=14, pad=t_pad, fontweight='bold')
-    
+
+    # Add Land colors
+    ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#fde0dd", edgecolor="black", zorder=0) 
     ax.add_feature(cfeature.OCEAN.with_scale('50m'), facecolor='#e0f3ff')
     ax.coastlines(resolution='10m')
     
@@ -1576,10 +1726,12 @@ def plot_prob_forecasts(dir_to_save, forecast_prob, model_name, title = "Seasona
     plt.savefig(os.path.join(dir_to_save, f"{model_name}.{out}"), dpi=300, bbox_inches='tight')
     plt.show()
     plt.close('all')
+    
 def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name, labels=["Below-Normal", "Near-Normal", "Above-Normal"], reverse_cmap=True, hspace=None, logo=None, logo_size=(None,None), logo_position="lower left", sigma=None, res=None):
     """
     Plot probabilistic forecasts with tercile categories using discrete block colorbars.
     """
+    forecast_prob = _mask_invalid_tercile_probabilities(forecast_prob)
 
     if res is not None:
         min_X = forecast_prob['X'].min().values
@@ -1614,6 +1766,8 @@ def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name, labels=["Below-
         sum_probs = forecast_prob_smoothed.sum('probability')
         forecast_prob_smoothed = forecast_prob_smoothed / sum_probs.where(sum_probs != 0, 1.0)
         forecast_prob = forecast_prob_smoothed
+
+    forecast_prob = _mask_invalid_tercile_probabilities(forecast_prob)
 
     # Step 1: Extract maximum probability and category
     max_prob = forecast_prob.max(dim="probability", skipna=True) 
@@ -1755,6 +1909,7 @@ def plot_prob_forecasts_(dir_to_save, forecast_prob, model_name, labels=["Below-
     plt.subplots_adjust(top=0.95, bottom=0.08, left=0.06, right=0.94, hspace=-0.6, wspace=0.2)
     plt.savefig(f"{dir_to_save}/{model_name_str.replace(' ', '_')}.pdf", dpi=300, bbox_inches='tight')
     plt.show()
+    
 def plot_det_forecasts(da2d: xr.DataArray, title: str, outpng: str = None):
     """Plot a 2D field (Y, X) on a PlateCarree map."""
     if not set(["Y", "X"]).issubset(set(da2d.dims)):
@@ -2383,73 +2538,123 @@ cessation_dryspell_criteria = {
 ########################## Extended seasonal forecast ##########################################
 qmap = WAS_Qmap()
 qmap_ = WAS_bias_correction()
-def proceed_seasonal_daily_bias_correction(dir_to_save_model, observation, hindcast_files, forecast_files, varname="PRCP", method='QUANT', wet_day=True, qstep=0.01, distr=None, transfun=None):
-    hindcast_files_={}
-    forecast_files_={}
-    os.makedirs(f"{dir_to_save_model}/corrected", exist_ok=True)
-    for i in hindcast_files.keys():
-        hcst = xr.open_dataset(hindcast_files[i])[varname]
-        fcst = xr.open_dataset(forecast_files[i])[varname]
-        corrected_hcst = []
-        corrected_fcst = []
-        save_path_hcst = f"{dir_to_save_model}/corrected/{os.path.basename(hindcast_files[i])}"
-        save_path_fcst = f"{dir_to_save_model}/corrected/{os.path.basename(forecast_files[i])}"
-        if not os.path.exists(save_path_hcst):
-            for month in range(1, 13):
-                obs_month = observation.sel(T=observation['T'].dt.month == month).interp(Y=hcst.Y, X=hcst.X, method="linear", kwargs={"fill_value": "extrapolate"})
-                mask = xr.where(~np.isnan(obs_month.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
-                hcst_month = hcst.sel(T=hcst['T'].dt.month == month)
-                obs_month['T'] = hcst_month['T']
-                # obs_month, hcst_month = xr.align(obs_month, hcst_month, join='inner')
-                fcst_month = fcst.sel(T=fcst['T'].dt.month == month)
-                if varname == "PRCP":
-                    if method in ['QUANT','RQUANT']:
-                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep)
-                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant, type='linear')
-                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant, type='linear')
-                    elif method == 'SSPLIN':
-                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep)
-                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant)
-                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant)
-                    elif method == 'PTF':
-                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep, transfun=transfun)
-                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant)
-                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant)
-                    elif method == 'DIST':                   
-                        fobj_quant = qmap.fitQmap(obs_month, hcst_month, method=method, wet_day=wet_day, qstep=qstep, distr=distr)
-                        hcst_month_corr = qmap.doQmap(hcst_month, fobj_quant)
-                        fcst_month_corr = qmap.doQmap(fcst_month, fobj_quant)  
-                    else:
-                        print('please choose method between QUANT','RQUANT','SSPLIN','DIST','PTF')
-                else:
-                    if method=='QUANT':
-                        fobj_quant = qmap_.fitBC(obs_month, hcst_month, method=method, qstep=qstep, nboot=20)
-                        hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant, type='linear')
-                        fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant, type='linear')
-                    elif method in ['MEAN','VARSCALE']:
-                        fobj_quant = qmap_.fitBC(obs_month, hcst_month, method=method)
-                        hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant)
-                        fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant)
-                    elif method=='DIST':
-                        fobj_quant = qmap_.fitBC(obs_month, hcst_month, method=method, qstep=qstep, distr=distr)
-                        hcst_month_corr = qmap_.doBC(hcst_month, fobj_quant)
-                        fcst_month_corr = qmap_.doBC(fcst_month, fobj_quant)
-                    else:
-                        print('please choose method between QUANT','MEAN','VARSCALE','DIST')
-                corrected_hcst.append(hcst_month_corr)
-                corrected_fcst.append(fcst_month_corr)
-            corrected_hcst_ = xr.concat(corrected_hcst, dim='T').sortby('T').fillna(0) * mask
-            corrected_fcst_ = xr.concat(corrected_fcst, dim='T').sortby('T').fillna(0) * mask
-            corrected_hcst_.to_dataset(name='corrected').to_netcdf(save_path_hcst)
-            corrected_fcst_.to_dataset(name='corrected').to_netcdf(save_path_fcst)
-            hindcast_files_[i] = save_path_hcst
-            forecast_files_[i] = save_path_fcst
-        else:
-            print(f"[SKIP] {save_path_hcst} already exists.")
-            print(f"[SKIP] {save_path_fcst} already exists.")
-            hindcast_files_[i] = save_path_hcst
-            forecast_files_[i] = save_path_fcst 
-    return hindcast_files_, forecast_files_
+def _monthly_bias_correct_arrays(observation, hindcast, forecast, varname="PRCP",
+        method="QUANT", wet_day=True, qstep=0.01, distr=None, transfun=None,
+        cross_validate_hindcast=True):
+    """Monthly distribution fits with exact calibration dates and spatial masks.
+
+    Historical outputs use leave-one-year-out calibration by default; forecast
+    outputs use all matching historical dates. Missing data are never set to rain
+    zero. Regridding is interpolation inside the observation domain only.
+    """
+    if not isinstance(observation, xr.DataArray):
+        raise TypeError("observation must be a DataArray.")
+    if set(observation.dims) != {"T", "Y", "X"}:
+        raise ValueError("Observation must have exactly dimensions T, Y, X.")
+    for dim in ("Y", "X"):
+        if not hindcast.get_index(dim).equals(forecast.get_index(dim)):
+            raise ValueError("Hindcast and forecast must share the same spatial grid.")
+    same_grid = all(observation.get_index(d).equals(hindcast.get_index(d)) for d in ("Y", "X"))
+    obs_grid = observation if same_grid else observation.interp(Y=hindcast.Y, X=hindcast.X)
+    obs_pair, hind_pair = xr.align(obs_grid, hindcast, join="inner", copy=False)
+    if not obs_pair.sizes["T"]:
+        raise ValueError("Observations and hindcast have no matching calibration dates.")
+    method = method.upper()
+    fit_kwargs, apply_kwargs = {}, {}
+    if varname.upper() == "PRCP":
+        if method not in {"QUANT", "RQUANT", "SSPLIN", "PTF", "DIST"}:
+            raise ValueError("Unknown precipitation bias-correction method.")
+        if method != "DIST":
+            fit_kwargs["wet_day"] = wet_day
+        fit_kwargs["qstep"] = qstep
+        if method == "PTF":
+            fit_kwargs["transfun"] = transfun or "power"
+        if method == "DIST":
+            fit_kwargs["distr"] = distr or "berngamma"
+        adapter = WAS_Qmap_CV
+    else:
+        if method not in {"QUANT", "MEAN", "VARSCALE", "DIST", "NORM"}:
+            raise ValueError("Unknown continuous-variable bias-correction method.")
+        if method == "QUANT":
+            fit_kwargs["qstep"] = qstep
+        if method == "DIST":
+            fit_kwargs["distr"] = distr or "normal"
+        adapter = WAS_bias_correction_CV
+    def model():
+        return adapter(method, fit_kwargs=fit_kwargs, apply_kwargs=apply_kwargs,
+            reduce_members=None, random_state=42)
+    hc_out = xr.full_like(hindcast, np.nan, dtype=float)
+    fc_out = xr.full_like(forecast, np.nan, dtype=float)
+    months = sorted(set(hindcast["T"].dt.month.values) | set(forecast["T"].dt.month.values))
+    for month in months:
+        hist = hind_pair.sel(T=hind_pair["T"].dt.month == month)
+        obsm = obs_pair.sel(T=obs_pair["T"].dt.month == month)
+        hc = hindcast.sel(T=hindcast["T"].dt.month == month)
+        fc = forecast.sel(T=forecast["T"].dt.month == month)
+        if hist.sizes["T"] < 2:
+            continue
+        fitted = model().fit(obsm, hist)
+        if fc.sizes["T"]:
+            fc_out.loc[{"T": fc["T"]}] = fitted.transform(fc).transpose(*forecast.dims)
+        if cross_validate_hindcast:
+            for year in np.unique(hc["T"].dt.year):
+                keep = hist["T"].dt.year != year
+                target = hc.sel(T=hc["T"].dt.year == year)
+                if int(keep.sum()) >= 2 and target.sizes["T"]:
+                    corrected = model().fit(obsm.sel(T=keep), hist.sel(T=keep)).transform(target)
+                    hc_out.loc[{"T": target["T"]}] = corrected.transpose(*hindcast.dims)
+        elif hc.sizes["T"]:
+            hc_out.loc[{"T": hc["T"]}] = fitted.transform(hc).transpose(*hindcast.dims)
+    hc_out.attrs.update({"bias_correction_method": method,
+        "validation": "leave_one_year_out" if cross_validate_hindcast else "in_sample_calibration"})
+    fc_out.attrs.update({"bias_correction_method": method, "calibration": "historical_only"})
+    return hc_out, fc_out
+
+
+def proceed_seasonal_daily_bias_correction(dir_to_save_model, observation,
+        hindcast_files, forecast_files, varname="PRCP", method="QUANT", wet_day=True,
+        qstep=0.01, distr=None, transfun=None, cross_validate_hindcast=True,
+        force=False):
+    """Correct monthly daily series; cache only a complete compatible output pair.
+
+    Set force=True when input observations or source files have changed. A cached
+    pair is checked for the correction parameters and historical validation scope.
+    """
+    import json
+    signature = json.dumps({"method": method.upper(), "wet_day": wet_day,
+        "qstep": qstep, "distr": distr, "transfun": transfun, "varname": varname,
+        "cross_validate_hindcast": bool(cross_validate_hindcast)}, sort_keys=True)
+    output_dir = Path(dir_to_save_model) / "corrected"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    corrected_hindcasts, corrected_forecasts = {}, {}
+    for key, source_hc in hindcast_files.items():
+        source_fc = forecast_files[key]
+        target_hc = output_dir / Path(source_hc).name
+        target_fc = output_dir / Path(source_fc).name
+        if target_hc == target_fc:
+            target_hc = output_dir / ("hindcast_" + Path(source_hc).name)
+            target_fc = output_dir / ("forecast_" + Path(source_fc).name)
+        cached = not force and target_hc.exists() and target_fc.exists()
+        if cached:
+            for target in (target_hc, target_fc):
+                try:
+                    with xr.open_dataset(target) as ds:
+                        cached &= ds.attrs.get("correction_signature") == signature
+                except (OSError, ValueError):
+                    cached = False
+        if not cached:
+            with xr.open_dataset(source_hc) as hds, xr.open_dataset(source_fc) as fds:
+                hc, fc = _monthly_bias_correct_arrays(observation, hds[varname], fds[varname],
+                    varname, method, wet_day, qstep, distr, transfun, cross_validate_hindcast)
+                for target, corrected in ((target_hc, hc), (target_fc, fc)):
+                    ds = corrected.to_dataset(name="corrected")
+                    ds.attrs["correction_signature"] = signature
+                    ds.to_netcdf(target)
+        corrected_hindcasts[key] = str(target_hc)
+        corrected_forecasts[key] = str(target_fc)
+    return corrected_hindcasts, corrected_forecasts
+
+
 
 
 def pre_process_biophysical_model(dir_to_save, hdcst_file_path, 

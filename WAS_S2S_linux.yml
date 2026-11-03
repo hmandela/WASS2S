@@ -2,7 +2,6 @@ name: WASS2S
 
 channels:
   - conda-forge
-  - hallkjc01
   - defaults
 
 dependencies:
@@ -12,7 +11,7 @@ dependencies:
   - numpy=1.26.*
   - scipy=1.11.3
   - pandas=2.2.*
-  - scikit-learn=1.5.*
+  - scikit-learn>=1.6
   - numba>=0.59,<0.61
   - llvmlite>=0.43,<0.44
   - statsmodels=0.14.*
@@ -55,7 +54,7 @@ dependencies:
   - python-cdo
 
   # --- Visualization ---
-  - matplotlib=3.7.3
+  - matplotlib>=3.8,<4
   - seaborn
   - bokeh
   - folium
@@ -67,7 +66,7 @@ dependencies:
 
   # --- Bayesian / Probabilistic ---
   - pymc=5.22.*
-  - arviz=0.21.*
+  - arviz>=0.22,<1
   - pytensor
 
   # --- Forecast Verification / Scores ---
@@ -75,7 +74,7 @@ dependencies:
   - xskillscore=0.0.26
 
   # --- Climate / Weather tools ---
-  - cdsapi=0.7.4
+  - cdsapi>=0.7.7
   - cftime
   - udunits2
 
@@ -91,9 +90,6 @@ dependencies:
   - requests
   - joblib
   - pyyaml
-
-  # --- Conda package from hallkjc01 ---
-  - xcast
 
   # --- Pip-only packages ---
   - pip:

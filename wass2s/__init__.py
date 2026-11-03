@@ -1,107 +1,303 @@
-"""wass2s — West Africa Seasonal Forecasting System.
+"""WASS2S public API; scientific families are imported when requested.
 
-This package exposes the full WASS2S modelling pipeline under a single
-namespace.  Every public symbol from the sub-modules listed below is
-re-exported here so that users only need::
-
-    from wass2s import *
-
-or::
-
-    import wass2s as w2s
-
-Sub-modules
------------
-was_verification
-    Deterministic and probabilistic verification scores (Pearson, Spearman,
-    GROC, RPSS, Brier, NSE, KGE, Taylor diagrams, …).
-was_analog
-    Analog-ensemble seasonal forecasting (SOM, correlation-, PCA-, KMeans-
-    and agglomerative-clustering methods).
-was_cca
-    Canonical Correlation Analysis (CCA) with xeofs — legacy ``WAS_CCA``
-    and leakage-free ``WAS_CCA_base``.
-was_cca_2
-    Kernel CCA variants (``WAS_KCCA``, ``WAS_KGCCA``, ``WAS_EOF_KCCA``)
-    built on cca-zoo.
-was_compute_predictand
-    Agroclimatic predictand computation: onset, cessation, and dry-spell
-    variants (``WAS_compute_onset``, ``WAS_compute_cessation``, …).
-was_download
-    ERA5, CHIRPS, TAMSAT, NMME, and agro-indicator download utilities
-    (``WAS_Download``).
-was_eof
-    Leakage-free EOF analysis with detrending, NaN-filling, and optional
-    per-field normalization (``WAS_EOF``).
-was_linear_models
-    Linear regression wrappers: OLS, Ridge, Lasso, LassoLars, ElasticNet,
-    Polynomial, Logistic, and Poisson models.
-was_machine_learning
-    Machine-learning wrappers: SVR, Random Forest, XGBoost, MLP, stacking
-    ensembles, and optimizer utilities.
-was_merge_predictand
-    Station–gridded merging methods: kriging, regression-kriging, conditional
-    merging, optimal interpolation, Barnes interpolation, Random Forest and
-    XGBoost merging (``WAS_Merging``, ``WAS_Merging_``).
-was_mme
-    Multi-model ensemble methods: weighted averaging, probabilistic weighting,
-    BMA variants, ELM, ELR, logistic, Gaussian process, and xcast wrappers.
-was_pcr
-    Principal Component Regression wrapping any WAS regression model
-    (``WAS_PCR``).
-utils
-    Shared utilities: standardization, anomalization, detrending, index
-    computation, predictor loading, shapefile retrieval, and forecast plotting.
-was_cross_validate
-    Leakage-free leave-one-out cross-validator for all model types
-    (``WAS_Cross_Validator``, ``CustomTimeSeriesSplit``).
-was_transformdata
-    Data transformation and skewness handling: Box-Cox, Yeo-Johnson,
-    distribution fitting, and quantile mapping (``WAS_TransformData``).
-was_bias_correction
-    Quantile-mapping bias correction suite (``WAS_Qmap``, ``WAS_bias_correction``).
-was_seasonal_analysis
-    ERA5-based seasonal diagnostic tools, Hovmöller plots, and interactive
-    C3S / BOM viewers (``C3SViewer``, ``BOMViewer``).
-ceac_agro
-    CEAC agroclimatic indicators: onset, cessation, dry/wet spells for both
-    station and gridded data (``CEAC_compute_onset``, ``CEAC_compute_cessation``, …).
+Explicit imports load only the requested family. Importing every public name
+with ``from wass2s import *`` requires all optional scientific dependencies.
 """
+from importlib import import_module as _import_module
 
-__version__ = "0.4.13"
+__version__ = "0.5.0"
 
-# Backward-compatibility shim: scipy removed scipy.interp in 1.14.
-import numpy as _np
-import scipy as _scipy
-if not hasattr(_scipy, "interp"):
-    _scipy.interp = _np.interp
+_PUBLIC_EXPORTS = {
+    'WAS_PBC': 'was_pbc',
+    'run_pbc_seasonal': 'was_pbc_cv',
+    'build_pbc_seasonal_features': 'was_pbc_data',
+    'WAS_TelNet': 'was_telnet',
+    'build_telnet_samples': 'was_telnet_data',
+    'AGERA5_DATASET': 'was_seasonal_analysis',
+    'ANALOG_NAMES': 'was_crossfit_adapters',
+    'BOMViewer': 'was_seasonal_analysis',
+    'BaseOptimizer': 'was_machine_learning',
+    'C3SViewer': 'was_seasonal_analysis',
+    'CAF_AgroClimateBase': 'ceac_agro',
+    'CCA_NAMES': 'was_crossfit_adapters',
+    'CEAC_compute_cessation': 'ceac_agro',
+    'CEAC_compute_cessation_dry_spell': 'ceac_agro',
+    'CEAC_compute_onset': 'ceac_agro',
+    'CEAC_compute_onset_dry_spell': 'ceac_agro',
+    'CEAC_count_dry_spells': 'ceac_agro',
+    'CEAC_count_wet_spells': 'ceac_agro',
+    'CrossFitConfig': 'was_crossfit',
+    'CrossFitResult': 'was_crossfit',
+    'CustomTimeSeriesSplit': 'was_cross_validate',
+    'DAILY_STATISTIC': 'was_seasonal_analysis',
+    'DAILY_UNIT': 'was_seasonal_analysis',
+    'DEFAULT_CRITERIA': 'ceac_agro',
+    'ERSSTV6_BASE_URL': 'was_seasonal_analysis',
+    'ETCCDIHeatWaveIndices': 'was_compute_predictand',
+    'ETCCDITempIndices': 'was_compute_predictand',
+    'ExtremeType': 'was_compute_predictand',
+    'Fold': 'was_crossfit',
+    'GloFASCorrectionEvaluationConfig': 'glofas_highflow_bias_correction',
+    'GloFASHighFlowBiasConfig': 'glofas_highflow_bias_correction',
+    'GloFASPixelMatchConfig': 'glofas_highflow_bias_correction',
+    'HPELMWrapper': 'was_mme',
+    'HeatWaveDefinition': 'was_compute_predictand',
+    'HeatWaveMetric': 'was_compute_predictand',
+    'HighWaterConfig': 'highwater_season_predictands_modeaware',
+    'KCCA_NAMES': 'was_crossfit_adapters',
+    'MARS': 'was_machine_learning',
+    'MMETruncationResult': 'was_mme',
+    'MME_REGRESSION_CV_NAMES': 'was_cross_validate',
+    'NOAA_SST_CMAP': 'was_seasonal_analysis',
+    'NORTH_ANCHOR': 'ceac_agro',
+    'OperationalArtifact': 'was_crossfit',
+    'PRECIP_SOURCES': 'was_seasonal_analysis',
+    'PictureDischargeData': 'highwater_season_predictands_modeaware',
+    'REGISTRY': 'was_crossfit_adapters',
+    'RegressionSpec': 'was_crossfit',
+    'SOUTH_ANCHOR': 'ceac_agro',
+    'SST_SOURCES': 'was_seasonal_analysis',
+    'SplitPlan': 'was_crossfit',
+    'TruncationResult': 'was_cca',
+    'VAR_CONFIG': 'was_seasonal_analysis',
+    'WASModelSpec': 'was_crossfit_adapters',
+    'WAS_AdaBoost_Classifier_Model': 'was_machine_learning',
+    'WAS_AdaBoost_Model': 'was_machine_learning',
+    'WAS_Analog': 'was_analog',
+    'WAS_Analog_Constructed': 'was_analog',
+    'WAS_Analog_EOF': 'was_analog',
+    'WAS_Analog_Hybrid': 'was_analog',
+    'WAS_Analog_KNN': 'was_analog',
+    'WAS_Analog_LearnedMetric': 'was_analog',
+    'WAS_Analog_LearnedSpatialMetric': 'was_analog',
+    'WAS_Analog_Regional': 'was_analog',
+    'WAS_Analog_Scientific': 'was_analog',
+    'WAS_Analog_Weighted': 'was_analog',
+    'WAS_Analog__': 'was_analog',
+    'WAS_BiasCorrection_Model': 'was_bias_correction',
+    'WAS_CCA': 'was_cca',
+    'WAS_CCA_Regularized': 'was_cca',
+    'WAS_CCA_Regularized_strict': 'was_cca',
+    'WAS_CCA_base': 'was_cca',
+    'WAS_CCA_op': 'was_cca',
+    'WAS_CCA_strict': 'was_cca',
+    'WAS_CrossFit': 'was_crossfit',
+    'WAS_Cross_Validator': 'was_cross_validate',
+    'WAS_Download': 'was_download',
+    'WAS_EOF': 'was_eof',
+    'WAS_EOF_KCCA': 'was_cca_2',
+    'WAS_ElasticNet_Model': 'was_linear_models',
+    'WAS_ExtraTrees_Classifier_Model': 'was_machine_learning',
+    'WAS_ExtraTrees_Model': 'was_machine_learning',
+    'WAS_GradientBoosting_Classifier_Model': 'was_machine_learning',
+    'WAS_GradientBoosting_Model': 'was_machine_learning',
+    'WAS_HeatWaveIndices': 'was_compute_predictand',
+    'WAS_HurdleNB_Model': 'was_machine_learning',
+    'WAS_Hydro': 'WAS_Hydro',
+    'WAS_KCCA': 'was_cca_2',
+    'WAS_KGCCA': 'was_cca_2',
+    'WAS_KNN_Classifier_Model': 'was_machine_learning',
+    'WAS_KNN_Model': 'was_machine_learning',
+    'WAS_KernelCCA_base': 'was_cca_2',
+    'WAS_LassoLars_Model': 'was_linear_models',
+    'WAS_Lasso_Model': 'was_linear_models',
+    'WAS_LightGBM_Classifier_Model': 'was_machine_learning',
+    'WAS_LightGBM_Model': 'was_machine_learning',
+    'WAS_LinearDiscriminant_Classifier_Model': 'was_machine_learning',
+    'WAS_LinearRegression_Model': 'was_linear_models',
+    'WAS_LogisticRegression_Model': 'was_machine_learning',
+    'WAS_MARS_Model': 'was_machine_learning',
+    'WAS_Merging': 'was_merge_predictand',
+    'WAS_Merging_Extended': 'was_merge_predictand',
+    'WAS_Min2009_ProbWeighted': 'was_mme',
+    'WAS_NaiveBayes_Classifier_Model': 'was_machine_learning',
+    'WAS_NegativeBinomial_Model': 'was_machine_learning',
+    'WAS_PCR': 'was_pcr',
+    'WAS_PoissonRegression': 'was_machine_learning',
+    'WAS_PolynomialRegression': 'was_machine_learning',
+    'WAS_PrecipIndices': 'was_compute_predictand',
+    'WAS_ProbWeighted': 'was_mme',
+    'WAS_ProbWeightedContinuous': 'was_mme',
+    'WAS_ProbWeightedRPS': 'was_mme',
+    'WAS_Qmap': 'was_bias_correction',
+    'WAS_Qmap_CV': 'was_bias_correction',
+    'WAS_Qmap_Model': 'was_bias_correction',
+    'WAS_QuadraticDiscriminant_Classifier_Model': 'was_machine_learning',
+    'WAS_RandomForest_Classifier_Model': 'was_machine_learning',
+    'WAS_RandomForest_Model': 'was_machine_learning',
+    'WAS_Ridge_Model': 'was_linear_models',
+    'WAS_SVC_Classifier_Model': 'was_machine_learning',
+    'WAS_SVR_Model': 'was_machine_learning',
+    'WAS_TempPercentileIndices': 'was_compute_predictand',
+    'WAS_TransformData': 'was_transformdata',
+    'WAS_Verification': 'was_verification',
+    'WAS_XGBoost_Classifier_Model': 'was_machine_learning',
+    'WAS_XGBoost_Model': 'was_machine_learning',
+    'WAS_ZINB_Model': 'was_machine_learning',
+    'WAS_bias_correction': 'was_bias_correction',
+    'WAS_bias_correction_CV': 'was_bias_correction',
+    'WAS_compute_cessation': 'was_compute_predictand',
+    'WAS_compute_cessation_dry_spell': 'was_compute_predictand',
+    'WAS_compute_onset': 'was_compute_predictand',
+    'WAS_compute_onset_dry_spell': 'was_compute_predictand',
+    'WAS_count_dry_spells': 'was_compute_predictand',
+    'WAS_count_rainy_days': 'was_compute_predictand',
+    'WAS_count_wet_spells': 'was_compute_predictand',
+    'WAS_mme_CCA': 'was_mme',
+    'WAS_mme_CCA_eeof': 'was_mme',
+    'WAS_mme_ELR': 'was_mme',
+    'WAS_mme_ElasticNet': 'was_mme',
+    'WAS_mme_ExpertKnowledge': 'was_mme',
+    'WAS_mme_ExtraTrees': 'was_mme',
+    'WAS_mme_FastBMA': 'was_mme',
+    'WAS_mme_FullBMA': 'was_mme',
+    'WAS_mme_HistGradientBoosting': 'was_mme',
+    'WAS_mme_Kharin2017': 'was_mme',
+    'WAS_mme_MARS': 'was_mme',
+    'WAS_mme_MLP': 'was_mme',
+    'WAS_mme_MVA': 'was_mme',
+    'WAS_mme_NGR_Gaussian': 'was_mme',
+    'WAS_mme_NGR_NonGaussian': 'was_mme',
+    'WAS_mme_PCR': 'was_mme',
+    'WAS_mme_PLS': 'was_mme',
+    'WAS_mme_RF': 'was_mme',
+    'WAS_mme_Ridge': 'was_mme',
+    'WAS_mme_SVR': 'was_mme',
+    'WAS_mme_UNet': 'was_mme_unet',
+    'WAS_mme_ResCNN': 'was_mme_rescnn',
+    'WAS_mme_UNetPP': 'was_mme_unet_variants',
+    'WAS_mme_RISEUNet': 'was_mme_unet_variants',
+    'WAS_mme_Weighted': 'was_mme',
+    'WAS_mme_WeightedContinuous': 'was_mme',
+    'WAS_mme_XGBoosting': 'was_mme',
+    'WAS_mme_gaussian_process': 'was_mme',
+    'WAS_mme_hpELM': 'was_mme',
+    'WAS_mme_logistic': 'was_mme',
+    'annual_target_to_picture_format': 'highwater_season_predictands_modeaware',
+    'anomalize_timeseries': 'utils',
+    'apply_detrend_data': 'utils',
+    'apply_gauged_highflow_corrections': 'glofas_highflow_bias_correction',
+    'apply_propagated_factors': 'glofas_highflow_bias_correction',
+    'apply_propagated_highflow_factors': 'glofas_highflow_bias_correction',
+    'associate_stations_to_hybas': 'glofas_highflow_bias_correction',
+    'bootstrap_window_uncertainty': 'highwater_season_predictands_modeaware',
+    'build_daily_climatology': 'highwater_season_predictands_modeaware',
+    'build_hybas_digraph': 'glofas_highflow_bias_correction',
+    'build_iridl_url_ersst': 'utils',
+    'build_method_ranking': 'glofas_highflow_bias_correction',
+    'capture_constructors': 'was_crossfit_adapters',
+    'censored_normal_mean_var': 'was_mme',
+    'check_tercile_calibration': 'was_cca',
+    'choose_hydrological_anchor': 'highwater_season_predictands_modeaware',
+    'circular_seasonality_metrics': 'highwater_season_predictands_modeaware',
+    'compute_annual_predictands': 'highwater_season_predictands_modeaware',
+    'compute_oos_tercile_probabilities': 'was_mme',
+    'compute_other_indices': 'utils',
+    'compute_sst_indices': 'utils',
+    'conditional_nonnegative_clip': 'was_cca',
+    'crps_censored_normal': 'was_mme',
+    'crps_gaussian': 'was_mme',
+    'crps_truncated_normal': 'was_mme',
+    'decode_cf': 'utils',
+    'detect_climatological_modes': 'highwater_season_predictands_modeaware',
+    'detrended_data': 'utils',
+    'download_daily_climatology': 'was_seasonal_analysis',
+    'download_daily_data': 'was_seasonal_analysis',
+    'download_data': 'was_seasonal_analysis',
+    'download_file': 'utils',
+    'empirical_tercile_probabilities_from_training': 'was_mme',
+    'et0_fao56_daily': 'utils',
+    'evaluate_glofas_highflow_correction': 'glofas_highflow_bias_correction',
+    'evaluate_pixel_matches': 'glofas_highflow_bias_correction',
+    'extract_all_hybas_glofas_outlets': 'glofas_highflow_bias_correction',
+    'extract_glofas_discharge_at_matches': 'glofas_highflow_bias_correction',
+    'extract_leading_eeof_component': 'utils',
+    'extraterrestrial_radiation': 'utils',
+    'fallback_report': 'was_compute_predictand',
+    'fit_gauged_highflow_corrections': 'glofas_highflow_bias_correction',
+    'fit_one_grid_min_crps': 'was_mme',
+    'fit_piecewise_constant_slopes': 'highwater_season_predictands_modeaware',
+    'fit_station_highwater_regime': 'highwater_season_predictands_modeaware',
+    'fix_time_coord': 'utils',
+    'get_best_models': 'utils',
+    'get_shapefile': 'utils',
+    'get_shapefile_': 'utils',
+    'inv_boxcox': 'was_transformdata',
+    'inv_yeojohnson': 'was_transformdata',
+    'load_gridded_predictor': 'utils',
+    'main_daily_driver': 'was_seasonal_analysis',
+    'main_driver': 'was_seasonal_analysis',
+    'make_hybas_outlet_targets': 'glofas_highflow_bias_correction',
+    'match_hybas_outlets_to_glofas': 'glofas_highflow_bias_correction',
+    'migrated_models': 'was_crossfit_adapters',
+    'myfill': 'was_mme',
+    'ordinal_groc': 'was_groc',
+    'outlet_xarray_to_picture': 'glofas_highflow_bias_correction',
+    'parse_variable': 'utils',
+    'plot_date': 'utils',
+    'plot_det_forecasts': 'utils',
+    'plot_georeferenced_forecast_map': 'utils',
+    'plot_hovmoller': 'was_seasonal_analysis',
+    'plot_map': 'utils',
+    'plot_maps': 'was_seasonal_analysis',
+    'plot_period_map': 'was_seasonal_analysis',
+    'plot_prob_forecasts': 'utils',
+    'plot_prob_forecastsAlpha': 'utils',
+    'plot_prob_forecasts_': 'utils',
+    'plot_station_diagnostic': 'highwater_season_predictands_modeaware',
+    'plot_tercile': 'utils',
+    'polygons_to_prob_ds': 'utils',
+    'pre_process_biophysical_model': 'utils',
+    'predictant_mask': 'utils',
+    'prepare_glofas_hybas_matching': 'glofas_highflow_bias_correction',
+    'prepare_predictand': 'utils',
+    'prepare_series': 'highwater_season_predictands_modeaware',
+    'proceed_seasonal_daily_bias_correction': 'utils',
+    'process_all_stations': 'highwater_season_predictands_modeaware',
+    'process_daily': 'was_seasonal_analysis',
+    'process_datasets_for_mme': 'was_mme',
+    'process_model_for_other_params': 'utils',
+    'process_variable': 'was_seasonal_analysis',
+    'propagate_multiplicative_factors_network': 'glofas_highflow_bias_correction',
+    'read_picture_discharge_csv': 'highwater_season_predictands_modeaware',
+    'retrieve_several_zones_for_PCR': 'utils',
+    'retrieve_single_zone_for_PCR': 'utils',
+    'reverse_standardize': 'utils',
+    'score_fold_probabilities': 'was_crossfit',
+    'select_highflow_windows': 'glofas_highflow_bias_correction',
+    'sensitivity_analysis_station': 'highwater_season_predictands_modeaware',
+    'spatial_highflow_cross_validation': 'glofas_highflow_bias_correction',
+    'spatial_mask': 'was_cca',
+    'spatiotemporal_highflow_cross_validation': 'glofas_highflow_bias_correction',
+    'standardize_timeseries': 'utils',
+    'svp': 'utils',
+    'temperature_percentile_index': 'was_climate_extremes',
+    'temporal_highflow_cross_validation': 'glofas_highflow_bias_correction',
+    'to_iridl_lat': 'utils',
+    'to_iridl_lon': 'utils',
+    'truncated_normal_mean_var': 'was_mme',
+    'tune_mme_cca_truncation': 'was_mme',
+    'tune_truncation': 'was_cca',
+    'verify_station_network': 'utils',
+    'warmup': 'was_verification',
+    'write_results': 'highwater_season_predictands_modeaware',
+}
 
-from wass2s.was_verification import *
-from wass2s.was_analog import *
-from wass2s.was_cca import *
-from wass2s.was_compute_predictand import *
-from wass2s.was_download import *
-from wass2s.was_eof import *
-from wass2s.was_linear_models import *
-from wass2s.was_machine_learning import *
-from wass2s.was_merge_predictand import *
-from wass2s.was_mme import *
-from wass2s.was_pcr import *
-from wass2s.utils import *
-from wass2s.was_cross_validate import *
-from wass2s.was_transformdata import *
-from wass2s.was_bias_correction import *
-from wass2s.was_seasonal_analysis import *
-from wass2s.was_cca_2 import *
-# agro
-from wass2s.was_compute_predictand import *
-from wass2s.ceac_agro import *
-# hydro
-# from wass2s.highwater_season_predictands_modeaware import *
-# from wass2s.glofas_highflow_bias_correction import *
-# from wass2s.WAS_Hydro import *
+__all__ = sorted(_PUBLIC_EXPORTS)
 
-from wass2s.WAS_Hydro import * 
-from wass2s.highflow_outlet_aggregation import *
-from wass2s.highflow_seasonal_evaluation import *
 
+def __getattr__(name):
+    module = _PUBLIC_EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    try:
+        value = getattr(_import_module(f".{module}", __name__), name)
+    except AttributeError as exc:
+        # A from-import treats AttributeError as a missing public name and hides its cause.
+        raise ImportError(f"Cannot load {name} from {__name__}.{module}: {exc}") from exc
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

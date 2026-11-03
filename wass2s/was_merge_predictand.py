@@ -44,7 +44,14 @@ from sklearn.metrics import mean_squared_error
 from sklearn.linear_model import LinearRegression
 from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import GridSearchCV
-from wass2s.utils import *
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.compose import TransformedTargetRegressor
+from scipy.spatial import cKDTree
+try:
+    import cartopy.crs as ccrs
+except ImportError:
+    ccrs = None
 
 
 class WAS_Merging:
@@ -71,92 +78,15 @@ class WAS_Merging:
                 series.at[idx] += increment * i
         return series
 
-    def transform_cpt(
-        self,
-        df: pd.DataFrame,
-        missing_value: float = -999.0
-    ) -> xr.DataArray:
+    def transform_cpt(self, df, missing_value=-999.0):
+        """Parse CPT LAT/LON or CDT LON/LAT/ELEV metadata without moving gauges."""
+        return _station_input_dataset(df, self.date_month_day, missing_value)
 
-        # --- 1) Extract metadata: first 2 rows (LAT, LON) ---
-        metadata = (
-            df
-            .iloc[:2]
-            .set_index("STATION")  # -> index = ["LAT", "LON"]
-            .T
-            .reset_index()         # station names in 'index'
-        )
-        metadata.columns = ["STATION", "LAT", "LON"]
-        
-        # Adjust duplicates in LAT / LON
-        metadata["LAT"] = self.adjust_duplicates(metadata["LAT"])
-        metadata["LON"] = self.adjust_duplicates(metadata["LON"])
-        
-        # --- 2) Extract the data part: from row 2 downward ---
-        data_part = df.iloc[2:].copy()
-        data_part = data_part.rename(columns={"STATION": "YEAR"})
-        data_part["YEAR"] = data_part["YEAR"].astype(int)
-        
-        # --- 3) Convert wide -> long ---
-        long_data = data_part.melt(
-            id_vars="YEAR",
-            var_name="STATION",
-            value_name="VALUE"
-        )
-        
-        # --- 4) Turn YEAR into a date (e.g. YYYY-08-01) ---
-        long_data["DATE"] = pd.to_datetime(
-            long_data["YEAR"].astype(str) + f"-{self.date_month_day}",
-            format="%Y-%m-%d"
-        )
-        
-        # --- 5) Merge with metadata on STATION to attach (LAT, LON) ---
-        final_df = pd.merge(long_data, metadata, on="STATION", how="left")
-        
-        # --- 6) Convert to xarray DataArray ---
-        rainfall_data_array = (
-            final_df[["DATE", "LAT", "LON", "VALUE"]]
-            .set_index(["DATE", "LAT", "LON"])
-            .to_xarray()
-            .rename({"VALUE": "Observation", "LAT": "Y", "LON": "X", "DATE": "T"})
-        )
-        # Optional: mask out missing_value
-        if missing_value is not None:
-            rainfall_data_array = rainfall_data_array.where(rainfall_data_array != missing_value)
-            
-        return rainfall_data_array
 
-    def transform_cdt(self, df: pd.DataFrame) -> xr.DataArray:
+    def transform_cdt(self, df, missing_value=-999.0):
+        """Parse daily CDT station series, preserving physical coordinates."""
+        return _station_input_dataset(df, self.date_month_day, missing_value)
 
-        # --- 1) Extract metadata (first 3 rows: LON, LAT, ELEV) ---
-        metadata = df.iloc[:3].set_index("ID").T.reset_index()
-        metadata.columns = ["STATION", "LON", "LAT", "ELEV"]
-        
-        # Adjust duplicates
-        metadata["LON"] = self.adjust_duplicates(metadata["LON"])
-        metadata["LAT"] = self.adjust_duplicates(metadata["LAT"])
-        metadata["ELEV"] = self.adjust_duplicates(metadata["ELEV"])
-        
-        # --- 2) Extract actual data from row 3 onward, rename ID -> DATE ---
-        data_part = df.iloc[3:].rename(columns={"ID": "DATE"})
-        
-        # Melt to long form
-        data_long = data_part.melt(id_vars=["DATE"], var_name="STATION", value_name="VALUE")
-        
-        # --- 3) Merge with metadata to attach (LON, LAT, ELEV) ---
-        final_df = pd.merge(data_long, metadata, on="STATION", how="left")
-        
-        # Ensure 'DATE' is a proper datetime (assuming "YYYYmmdd" format)
-        final_df["DATE"] = pd.to_datetime(final_df["DATE"], format="%Y%m%d", errors="coerce")
-        
-        # --- 4) Convert to xarray, rename coords ---
-        rainfall_data_array = (
-            final_df[["DATE", "LAT", "LON", "VALUE"]]
-            .set_index(["DATE", "LAT", "LON"])
-            .to_xarray()
-            .rename({"VALUE": "Observation", "LAT": "Y", "LON": "X", "DATE": "T"})
-        )
-        
-        return rainfall_data_array
 
     def auto_select_kriging_parameters(
         self,
@@ -185,7 +115,7 @@ class WAS_Merging:
             variogram_models = ['linear', 'power', 'gaussian', 'spherical', 'exponential']
         
         # Suppress warnings for cleaner output
-        warnings.filterwarnings("ignore")
+        # Preserve warnings: failed or degenerate scientific fits must remain visible.
         
         kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
         best_score = np.inf
@@ -256,751 +186,31 @@ class WAS_Merging:
 
         return best_model, best_nlags, ok_best, results_df
 
-    def simple_bias_adjustment(
-        self,
-        missing_value: float = -999.0,
-        do_cross_validation: bool = False
-    ) -> (xr.DataArray, pd.DataFrame or None):
-        """
-        Performs spatial bias adjustment for each time slice. Optionally does
-        leave-one-out (LOO) cross-validation to compute RMSE at each time.
+    def simple_bias_adjustment(self, missing_value=-999.0, do_cross_validation=False):
+        """Numerically consistent implementation through the shared merging engine."""
+        return _legacy_sba(self, missing_value, do_cross_validation)
 
-        Returns
-        -------
-        xr.DataArray
-            Concatenated bias-adjusted values along the time dimension.
-        pd.DataFrame or None
-            A DataFrame containing the LOO RMSE for each time if do_cross_validation=True.
-            Otherwise, returns None.
-        """
-        # 1. Read & transform CSV data
-        df = self.df # pd.read_csv(self.input_csv_path, sep="\t")
-        df_seas = self.transform_cpt(df, missing_value=missing_value)
 
-        # 2. Read gridded NetCDF data
-        estim = self.da #xr.open_dataset(self.input_nc_path)
-        estim.name = "Estimation"
-        mask = estim.mean(dim="T").squeeze()
-        mask = xr.where(np.isnan(mask), np.nan, 1)
-        
-        # 3. Interpolate NetCDF data onto station coordinates
-        estim_stations = estim.interp(
-            X=df_seas.coords['X'],
-            Y=df_seas.coords['Y'],
-        )
-        
-        # 4. Align on time
-        df_seas['T'] = df_seas['T'].astype('datetime64[ns]')
-        estim_stations['T'] = estim_stations['T'].astype('datetime64[ns]')
-        estim['T'] = estim['T'].astype('datetime64[ns]')
+    def regression_kriging(self, missing_value=-999.0, do_cross_validation=False):
+        """Numerically consistent implementation through the shared merging engine."""
+        return _legacy_rk(self, missing_value, do_cross_validation)
 
-        df_seas, estim_stations = xr.align(df_seas, estim_stations)
 
-        sp_bias_adj = []
-        cv_rmse_records = []
+    def neural_network_kriging_(self, missing_value=-999.0, do_cross_validation=False):
+        """Numerically consistent implementation through the shared merging engine."""
+        return _legacy_nn(self, missing_value, do_cross_validation)
 
-        # 5. Process each time step
-        for t_val in df_seas['T'].values:
-            # a. Merge data for the same time
-            merged_df = pd.merge(
-                df_seas.sel(T=t_val).to_dataframe(),
-                estim_stations.sel(T=t_val).to_dataframe(),
-                on=["T", "Y", "X"],
-                how="outer"
-            ).reset_index()
 
-            station_var = list(df_seas.data_vars.keys())[0]
-            estim_var = "Estimation" #list(estim_stations.data_vars.keys())[0]
-            
-            # b. Keep only rows with station data
-            merged_df = merged_df.dropna(subset=[station_var])
-            if merged_df.empty:
-                continue
+    def neural_network_kriging(self, missing_value=-999.0, do_cross_validation=False):
+        """Numerically consistent implementation through the shared merging engine."""
+        return _legacy_nn(self, missing_value, do_cross_validation)
 
-            # c. Compute residuals
-            merged_df['residuals'] = merged_df[station_var] - merged_df[estim_var]
-            merged_df = merged_df.dropna(subset=['residuals'])
-            merged_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-            if merged_df['residuals'].isna().all():
-                continue
-
-            print(f"\nYear = {t_val}, number in-situ = {merged_df.shape[0]}")
-
-            # d. Auto-select kriging parameters
-            best_variogram, best_nlags, ok_model, cv_results = self.auto_select_kriging_parameters(
-                merged_df,
-                x_col='X',
-                y_col='Y',
-                z_col='residuals',
-                variogram_models=['linear', 'power', 'gaussian', 'spherical', 'exponential'],
-                nlags_range=range(3, 10),
-                n_splits=5,
-                random_state=42,
-                verbose=False,
-                enable_plotting=False
-            )
-
-            # LOO cross-validation
-            loo_rmse = np.nan
-            if do_cross_validation:
-                X_data = merged_df['X'].values
-                Y_data = merged_df['Y'].values
-                Z_data = merged_df['residuals'].values
-                n_points = len(merged_df)
-
-                loo_predictions = []
-                for j in range(n_points):
-                    train_mask = np.ones(n_points, dtype=bool)
-                    train_mask[j] = False
-
-                    X_train = X_data[train_mask]
-                    Y_train = Y_data[train_mask]
-                    Z_train = Z_data[train_mask]
-
-                    ok_loo = OrdinaryKriging(
-                        X_train,
-                        Y_train,
-                        Z_train,
-                        variogram_model=best_variogram,
-                        nlags=best_nlags
-                    )
-                    zhat, _ = ok_loo.execute('points', [X_data[j]], [Y_data[j]])
-                    loo_predictions.append(zhat[0])
-
-                loo_errors = Z_data - np.array(loo_predictions)
-                loo_rmse = np.sqrt(np.nanmean(loo_errors**2))
-                print(f"  LOO RMSE for T={t_val}: {loo_rmse:.4f}")
-
-                cv_rmse_records.append({
-                    'time': t_val,
-                    'LOO_RMSE': loo_rmse,
-                    'num_stations': n_points
-                })
-
-            # e. Krige residuals over the entire grid
-            z_pred, ss = ok_model.execute('grid', estim.X.values, estim.Y.values)
-            z_pred_da = xr.DataArray(
-                z_pred,
-                coords={'Y': estim['Y'], 'X': estim['X']},
-                dims=['Y', 'X']
-            )
-            z_pred_da['T'] = t_val
-
-            # f. Add residual field to the original dataset slice
-            if isinstance(estim, xr.Dataset):
-                estim_i = estim.sel(T=t_val).to_array().drop_vars('variable')
-            else:
-                estim_i = estim.sel(T=t_val)
-                
-            tmp = estim_i + z_pred_da
-            tmp = xr.where(tmp < 0, 0, tmp)  # floor negative values at zero
-            sp_bias_adj.append(tmp)
-
-        # 6. Concatenate along time dimension
-        if sp_bias_adj:
-            result = xr.concat(sp_bias_adj, dim="T")
-        else:
-            result = xr.DataArray()
-
-        if do_cross_validation and cv_rmse_records:
-            cv_df = pd.DataFrame(cv_rmse_records)
-        else:
-            cv_df = None
-
-        return result*mask, cv_df
-
-    def regression_kriging(
-        self,
-        missing_value: float = -999.0,
-        do_cross_validation: bool = False
-    ) -> (xr.DataArray, pd.DataFrame or None):
-        """
-        Performs spatial bias adjustment for each time slice using:
-          1) Linear Regression
-          2) Kriging of residuals
-
-        Optionally performs LOO cross-validation for each time.
-        """
-        df = self.df # pd.read_csv(self.input_csv_path, sep="\t")
-        df_seas = self.transform_cpt(df,  missing_value=missing_value)
-        
-        estim = self.da # xr.open_dataset(self.input_nc_path)
-        estim.name = "Estimation"
-        mask = estim.mean(dim="T").squeeze()
-        mask = xr.where(np.isnan(mask), np.nan, 1)
-        
-        gridx, gridy = np.meshgrid(estim.X.values, estim.Y.values)
-
-        estim_stations = estim.interp(
-            X=df_seas.coords['X'],
-            Y=df_seas.coords['Y'],
-        )
-
-        df_seas['T'] = df_seas['T'].astype('datetime64[ns]')
-        estim_stations['T'] = estim_stations['T'].astype('datetime64[ns]')
-        estim['T'] = estim['T'].astype('datetime64[ns]')
-
-        df_seas, estim_stations = xr.align(df_seas, estim_stations)
-
-        sp_regress_krig = []
-        cv_rmse_records = []
-
-        for t_val in df_seas['T'].values:
-            merged_df = pd.merge(
-                df_seas.sel(T=t_val).to_dataframe(),
-                estim_stations.sel(T=t_val).to_dataframe(),
-                on=["T", "Y", "X"],
-                how="outer"
-            ).reset_index()
-            
-            station_var = list(df_seas.data_vars.keys())[0]
-            estim_var = "Estimation" #list(estim_stations.data_vars.keys())[0]
-
-            # Drop rows with no station observation
-            merged_df = merged_df.dropna(subset=[station_var])
-            if merged_df.empty:
-                continue
-
-            X = merged_df[['X', 'Y', estim_var]].fillna(0)
-            y = merged_df[[station_var]].fillna(0)
-
-            # 1) Linear regression
-            reg_model = LinearRegression()
-            reg_model.fit(X, y)
-
-            merged_df['regression_prediction'] = reg_model.predict(X)
-            merged_df['residuals'] = merged_df[station_var] - merged_df['regression_prediction']
-            merged_df = merged_df.dropna(subset=['residuals'])
-            
-            merged_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-            if merged_df['residuals'].isna().all():
-                continue
-            print(f"\nYear = {t_val}, number in-situ = {merged_df.shape[0]}")
-
-            # 2) Auto-select kriging parameters
-            best_variogram, best_nlags, ok_model, cv_results = self.auto_select_kriging_parameters(
-                merged_df,
-                x_col='X',
-                y_col='Y',
-                z_col='residuals',
-                variogram_models=['linear', 'power', 'gaussian', 'spherical', 'exponential'],
-                nlags_range=range(3, 10),
-                n_splits=5,
-                random_state=42,
-                verbose=False,
-                enable_plotting=False
-            )
-
-            # Cross-validation on residuals could go here if desired.
-
-            # Krige the residual field
-            z_pred, ss = ok_model.execute('grid', estim.X.values, estim.Y.values)
-
-            # Predict from the regression model on the entire grid
-            # We assume the "estim_var" is the variable needed for regression
-            reg_input = estim.sel(T=t_val).to_dataframe().reset_index()[['X', 'Y',estim_var]].fillna(0)
-            regression_pred_grid = reg_model.predict(reg_input)
-            regression_pred_grid = regression_pred_grid.reshape(gridx.shape)
-
-            final_prediction_ok = regression_pred_grid + z_pred
-            final_prediction_ok = np.where(final_prediction_ok < 0, 0, final_prediction_ok)
-
-            final_prediction_da = xr.DataArray(
-                final_prediction_ok,
-                coords={'Y': estim['Y'], 'X': estim['X']},
-                dims=['Y', 'X']
-            )
-            final_prediction_da['T'] = t_val
-
-            sp_regress_krig.append(final_prediction_da)
-
-        if sp_regress_krig:
-            result = xr.concat(sp_regress_krig, dim="T")
-        else:
-            result = xr.DataArray()
-
-        if do_cross_validation and cv_rmse_records:
-            cv_df = pd.DataFrame(cv_rmse_records)
-        else:
-            cv_df = None
-
-        return result*mask, cv_df
-
-    def neural_network_kriging_(
-        self,
-        missing_value: float = -999.0,
-        do_cross_validation: bool = False
-    ) -> (xr.DataArray, pd.DataFrame or None):
-        """
-        Performs spatial bias adjustment for each time slice using:
-          1) Neural Network
-          2) Kriging of residuals
-
-        Optionally performs LOO cross-validation for each time.
-        """
-        df = self.df # pd.read_csv(self.input_csv_path, sep="\t")
-        df_seas = self.transform_cpt(self.df,  missing_value=missing_value)
-        
-        estim = self.da # xr.open_dataset(self.input_nc_path)
-        estim.name = "Estimation"
-        mask = estim.mean(dim="T").squeeze()
-        mask = xr.where(np.isnan(mask), np.nan, 1)
-
-        
-        gridx, gridy = np.meshgrid(estim.X.values, estim.Y.values)
-
-        estim_stations = estim.interp(
-            X=df_seas.coords['X'],
-            Y=df_seas.coords['Y'],
-        )
-        
-        df_seas['T'] = df_seas['T'].astype('datetime64[ns]')
-        estim_stations['T'] = estim_stations['T'].astype('datetime64[ns]')
-        estim['T'] = estim['T'].astype('datetime64[ns]')
-
-        df_seas, estim_stations = xr.align(df_seas, estim_stations)
-
-        df_seas_ = standardize_timeseries(df_seas)
-        estim_stations_ = standardize_timeseries(estim_stations)
-        estim_ = standardize_timeseries(estim)
-        
-        sp_neural_krig = []
-        cv_rmse_records = []
-
-        for t_val in df_seas['T'].values:
-            merged_df = pd.merge(
-                df_seas_.sel(T=t_val).to_dataframe(),
-                estim_stations_.sel(T=t_val).to_dataframe(),
-                on=["T", "Y", "X"],
-                how="outer"
-            ).reset_index()
-            
-            station_var = list(df_seas_.data_vars.keys())[0]
-            estim_var = "Estimation" #list(estim_stations.data_vars.keys())[0]
-
-            # Drop rows with no station observation or no grid estimate
-            merged_df = merged_df.dropna(subset=[station_var, estim_var])
-            
-            if merged_df.empty:
-                continue
-
-            X_vals = merged_df[['X', 'Y', estim_var]].fillna(0).to_numpy()
-            y_vals = merged_df[[station_var]].fillna(0).to_numpy().ravel()
-
-            # Perform hyperparameter tuning for the MLPRegressor
-            param_grid = {
-                'hidden_layer_sizes': [(5,), (10,), (10, 50), (100, 50), (150, 75)],
-                'activation': ['relu', 'tanh'],
-                'solver': ['adam'],
-                'max_iter': [5000, 10000],
-            }
-            base_model = MLPRegressor(random_state=42)
-            grid_search = GridSearchCV(base_model, 
-                                       param_grid, 
-                                       cv=3,
-                                       scoring='neg_mean_squared_error',
-                                       n_jobs=-1)
-            grid_search.fit(X_vals, y_vals)
-            nn_model = grid_search.best_estimator_
-
-            # nn_model = MLPRegressor(
-            #     hidden_layer_sizes=(100, 50),
-            #     activation='relu',
-            #     solver='adam',
-            #     max_iter=5000,
-            #     random_state=42
-            # )
-            # nn_model.fit(X_vals, y_vals)
-
-            merged_df['neural_prediction'] = nn_model.predict(X_vals)
-            merged_df['residuals'] = merged_df[station_var] - merged_df['neural_prediction']
-            merged_df = merged_df.dropna(subset=['residuals'])
-            merged_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-            if merged_df['residuals'].isna().all():
-                continue
-            print(f"\nYear = {t_val}, number in-situ = {merged_df.shape[0]}")
-
-            best_variogram, best_nlags, ok_model, cv_results = self.auto_select_kriging_parameters(
-                merged_df,
-                x_col='X',
-                y_col='Y',
-                z_col='residuals',
-                variogram_models=['linear', 'power', 'gaussian', 'spherical', 'exponential'],
-                nlags_range=range(3, 10),
-                n_splits=5,
-                random_state=42,
-                verbose=False,
-                enable_plotting=False
-            )
-
-            # (Optional) LOO cross-validation 
-
-            # Predict residuals over the entire grid
-            z_pred, ss = ok_model.execute('grid', estim.X.values, estim.Y.values)
-
-            # Predict from the NN model on the entire grid
-            nn_input = estim_.sel(T=t_val).to_dataframe().reset_index()[['X', 'Y', estim_var]].fillna(0)
-            nn_pred_grid = nn_model.predict(nn_input)
-            nn_pred_grid = nn_pred_grid.reshape(gridx.shape)
-
-            # Combine the NN prediction + Kriged residuals
-            final_prediction_ok = nn_pred_grid + z_pred
-            final_prediction_ok = np.where(final_prediction_ok < 0, 0, final_prediction_ok)
-            
-            final_prediction_da = xr.DataArray(
-                final_prediction_ok,
-                coords={'Y': estim['Y'], 'X': estim['X']},
-                dims=['Y', 'X']
-            )
-            final_prediction_da['T'] = t_val
-
-            sp_neural_krig.append(final_prediction_da)
-
-        if sp_neural_krig:
-            result = xr.concat(sp_neural_krig, dim="T")
-        else:
-            result = xr.DataArray()
-
-        result = reverse_standardize(result, estim)
-
-        if do_cross_validation and cv_rmse_records:
-            cv_df = pd.DataFrame(cv_rmse_records)
-        else:
-            cv_df = None
-
-        return result*mask, cv_df
-
-    def neural_network_kriging(
-        self,
-        missing_value: float = -999.0,
-        do_cross_validation: bool = False
-    ) -> (xr.DataArray, pd.DataFrame | None):
-        """
-        Performs a two-step spatial bias adjustment for each time slice, leveraging:
-        
-        1) **Neural Network** (MLPRegressor) to capture non-linear relationships between
-           the large-scale estimations (predictors) and in-situ observations (predictands).
-        2) **Kriging** of the residuals (observation - NN_prediction) to spatially interpolate
-           the remaining error structure under the assumption that these residuals are 
-           stationary and exhibit spatial autocorrelation.
-        
-        Parameters
-        ----------
-        missing_value : float, optional
-            Value used to fill missing data in the input station dataset, by default -999.0
-        do_cross_validation : bool, optional
-            Whether or not to perform cross-validation (e.g., leave-one-out or k-fold) 
-            during kriging parameter selection, by default False.
-    
-        Returns
-        -------
-        xr.DataArray
-            Bias-adjusted field over the domain, with the same spatial dimensions as the 
-            original input (and time dimension if applicable).
-        pd.DataFrame or None
-            If `do_cross_validation=True`, returns a DataFrame with RMSE records from CV; 
-            otherwise, None.
-    
-        Notes
-        -----
-        - The hyperparameter search for the MLP uses GridSearchCV with MSE-based scoring.
-        - Kriging assumes the residuals are reasonably stationary and spatially correlated.
-        """
-    
-        df = self.df  # Station data (already loaded)
-        df_seas = self.transform_cpt(self.df, missing_value=missing_value)
-    
-        # Load or reference the gridded dataset
-        estim = self.da
-        estim.name = "Estimation"
-    
-        # Create a mask for valid points (non-NaN across time)
-        mask = estim.mean(dim="T").squeeze()
-        mask = xr.where(np.isnan(mask), np.nan, 1)
-    
-        gridx, gridy = np.meshgrid(estim.X.values, estim.Y.values)
-    
-        # 1) Interpolate the model estimates to the station locations for direct comparison
-        estim_stations = estim.interp(
-            X=df_seas.coords['X'],
-            Y=df_seas.coords['Y'],
-        )
-    
-        # Ensure consistent datetime64 dtypes
-        df_seas['T'] = df_seas['T'].astype('datetime64[ns]')
-        estim_stations['T'] = estim_stations['T'].astype('datetime64[ns]')
-        estim['T'] = estim['T'].astype('datetime64[ns]')
-    
-        # Align station data and interpolated estimates along T
-        df_seas, estim_stations = xr.align(df_seas, estim_stations)
-    
-        # (Optional) Standardize data so that NN training deals with normalized values
-        df_seas_ = standardize_timeseries(df_seas)
-        estim_stations_ = standardize_timeseries(estim_stations)
-        estim_ = standardize_timeseries(estim)
-    
-        sp_neural_krig = []
-        cv_rmse_records = []
-    
-        # 2) Loop over each time slice
-        for t_val in df_seas['T'].values:
-            # Merge station data with model-based data for this time
-            merged_df = pd.merge(
-                df_seas_.sel(T=t_val).to_dataframe(),
-                estim_stations_.sel(T=t_val).to_dataframe(),
-                on=["T", "Y", "X"],
-                how="outer"
-            ).reset_index()
-    
-            station_var = list(df_seas_.data_vars.keys())[0]
-            estim_var = "Estimation"
-    
-            # Drop rows with no station observation or no estimate
-            merged_df = merged_df.dropna(subset=[station_var, estim_var])
-    
-            if merged_df.empty:
-                continue
-    
-            # Prepare inputs and labels for the Neural Network
-            X_vals = merged_df[['X', 'Y', estim_var]].fillna(0).to_numpy()
-            y_vals = merged_df[[station_var]].fillna(0).to_numpy().ravel()
-    
-            # 2a) Hyperparameter tuning for the MLPRegressor
-            param_grid = {
-                'hidden_layer_sizes': [(5,), (10,), (10, 50), (100, 50), (150, 75)],
-                'activation': ['relu', 'tanh'],
-                'solver': ['adam'],
-                'max_iter': [5000, 10000],
-            }
-            base_model = MLPRegressor(random_state=42)
-            grid_search = GridSearchCV(
-                base_model, 
-                param_grid, 
-                cv=3,
-                scoring='neg_mean_squared_error',
-                n_jobs=-1
-            )
-            grid_search.fit(X_vals, y_vals)
-    
-            nn_model = grid_search.best_estimator_
-    
-            # Compute station residuals = Observed - NN_prediction
-            merged_df['neural_prediction'] = nn_model.predict(X_vals)
-            merged_df['residuals'] = merged_df[station_var] - merged_df['neural_prediction']
-            merged_df = merged_df.dropna(subset=['residuals'])
-            merged_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-            if merged_df['residuals'].isna().all():
-                continue
-    
-            print(f"\nTime = {t_val}, station count = {merged_df.shape[0]}")
-    
-            # 2b) Auto-selection of Kriging parameters, 
-            #     e.g., best variogram model & nlags via cross-validation
-            best_variogram, best_nlags, ok_model, cv_results = self.auto_select_kriging_parameters(
-                merged_df,
-                x_col='X',
-                y_col='Y',
-                z_col='residuals',
-                variogram_models=['linear', 'power', 'gaussian', 'spherical', 'exponential'],
-                nlags_range=range(3, 10),
-                n_splits=5,
-                random_state=42,
-                verbose=False,
-                enable_plotting=False
-            )
-    
-            # 2c) Krige the residuals over the grid
-            z_pred, ss = ok_model.execute('grid', estim.X.values, estim.Y.values)
-    
-            # Get the NN model's predictions on the full domain
-            nn_input = estim_.sel(T=t_val).to_dataframe().reset_index()[['X', 'Y', estim_var]].fillna(0)
-            nn_pred_grid = nn_model.predict(nn_input)
-            nn_pred_grid = nn_pred_grid.reshape(gridx.shape)
-    
-            # Combine NN prediction + kriged residual
-            final_prediction_ok = nn_pred_grid + z_pred
-            final_prediction_ok = np.where(final_prediction_ok < 0, 0, final_prediction_ok)
-    
-            # Create an xarray DataArray
-            final_prediction_da = xr.DataArray(
-                final_prediction_ok,
-                coords={'Y': estim['Y'], 'X': estim['X']},
-                dims=['Y', 'X']
-            )
-            final_prediction_da['T'] = t_val
-    
-            sp_neural_krig.append(final_prediction_da)
-    
-        # 3) Concatenate results over time dimension
-        if sp_neural_krig:
-            result = xr.concat(sp_neural_krig, dim="T")
-        else:
-            result = xr.DataArray()
-    
-        # 4) Reverse the standardization to get back to original scale
-        result = reverse_standardize(result, estim)
-    
-        # 5) If cross-validation was enabled, return records
-        if do_cross_validation and cv_rmse_records:
-            cv_df = pd.DataFrame(cv_rmse_records)
-        else:
-            cv_df = None
-    
-        # Apply mask to keep only valid domain
-        return result * mask, cv_df
 
     
-    def multiplicative_bias(
-        self,
-        missing_value: float = -999.0,
-        do_cross_validation: bool = False
-    ) -> (xr.DataArray, pd.DataFrame or None):
+    def multiplicative_bias(self, missing_value=-999.0, do_cross_validation=False):
+        """Numerically consistent implementation through the shared merging engine."""
+        return _legacy_multiplicative(self, missing_value, do_cross_validation)
 
-        """
-        Apply multiplicative bias correction to gridded predictions using ground observations.
-
-        This method performs bias adjustment for each time step by comparing standardized observations
-        and model estimates, interpolating residuals using kriging, and applying a multiplicative correction
-        across the spatial domain.
-
-        Parameters
-        ----------
-        missing_value : float, optional
-            Value used to represent missing data in the input observational CSV, by default -999.0.
-        do_cross_validation : bool, optional
-            If True, perform Leave-One-Out Cross-Validation to estimate kriging performance, by default False.
-
-        Returns
-        -------
-        xr.DataArray
-            The bias-corrected spatial dataset over time (with dimensions: T, Y, X), masked over valid areas.
-        pd.DataFrame or None
-            DataFrame containing LOOCV RMSE per time step, or None if cross-validation was not performed.
-        """
-
-        df = self.df # pd.read_csv(self.input_csv_path, sep="\t")
-        df_seas = self.transform_cpt(self.df,  missing_value=missing_value)  
-        
-        estim = self.da # xr.open_dataset(self.input_nc_path)
-        mask = estim.mean(dim="T").squeeze()
-        mask = xr.where(np.isnan(mask), np.nan, 1)
-                
-        gridx, gridy = np.meshgrid(estim.X.values, estim.Y.values)
-
-        estim_stations = estim.interp(
-            X=df_seas.coords['X'],
-            Y=df_seas.coords['Y'],
-        )
-
-        f_hdcst = []
-        [f_hdcst.append((df_seas.sel(T=df_seas['T'] != df_seas['T'].isel(T=i)).mean("T") / estim_stations.sel(T=estim_stations['T'] != estim_stations['T'].isel(T=i)).mean("T"))) for i in range(0,len(estim_stations['T']))]
-        
-        f_hdcst = xr.concat(f_hdcst, dim="T") 
-        f_hdcst['T'] = estim_stations['T']
-        
-        df_seas['T'] = df_seas['T'].astype('datetime64[ns]')
-        f_hdcst['T'] = f_hdcst['T'].astype('datetime64[ns]')
-        estim['T'] = estim['T'].astype('datetime64[ns]')
-
-
-        sp_mult_bias = []
-        cv_rmse_records = []
-
-        for t_val in df_seas['T'].values:
-            
-            merged_df = f_hdcst.sel(T=t_val).to_dataframe().reset_index()
-            merged_df = merged_df[~merged_df["Observation"].isna() & np.isfinite(merged_df["Observation"])]
-
-            if merged_df.empty:
-                continue
-
-            if merged_df['Observation'].isna().all():
-                continue
-
-            print(f"\nYear = {t_val}, number in-situ = {merged_df.shape[0]}")
-
-            # d. Auto-select kriging parameters
-            best_variogram, best_nlags, ok_model, cv_results = self.auto_select_kriging_parameters(
-                merged_df,
-                x_col='X',
-                y_col='Y',
-                z_col='Observation',
-                variogram_models=['linear', 'power', 'gaussian', 'spherical', 'exponential'],
-                nlags_range=range(3, 10),
-                n_splits=5,
-                random_state=42,
-                verbose=False,
-                enable_plotting=False
-            )
-
-            # (Optional) LOO cross-validation
-            loo_rmse = np.nan
-            if do_cross_validation:
-                X_data = merged_df['X'].values
-                Y_data = merged_df['Y'].values
-                Z_data = merged_df['Observation'].values
-                n_points = len(merged_df)
-
-                loo_predictions = []
-                for j in range(n_points):
-                    train_mask = np.ones(n_points, dtype=bool)
-                    train_mask[j] = False
-
-                    X_train = X_data[train_mask]
-                    Y_train = Y_data[train_mask]
-                    Z_train = Z_data[train_mask]
-
-                    ok_loo = OrdinaryKriging(
-                        X_train,
-                        Y_train,
-                        Z_train,
-                        variogram_model=best_variogram,
-                        nlags=best_nlags
-                    )
-                    zhat, _ = ok_loo.execute('points', [X_data[j]], [Y_data[j]])
-                    loo_predictions.append(zhat[0])
-
-                loo_errors = Z_data - np.array(loo_predictions)
-                loo_rmse = np.sqrt(np.nanmean(loo_errors**2))
-                print(f"  LOO RMSE for T={t_val}: {loo_rmse:.4f}")
-
-                cv_rmse_records.append({
-                    'time': t_val,
-                    'LOO_RMSE': loo_rmse,
-                    'num_stations': n_points
-                })
-
-            # e. Krige residuals over the entire grid
-            z_pred, ss = ok_model.execute('grid', estim.X.values, estim.Y.values)
-            z_pred_da = xr.DataArray(
-                z_pred,
-                coords={'Y': estim['Y'], 'X': estim['X']},
-                dims=['Y', 'X']
-            )
-            z_pred_da['T'] = t_val
-
-            # f. Add residual field to the original dataset slice
-            if isinstance(estim, xr.Dataset):
-                estim_i = estim.sel(T=t_val).to_array().drop_vars('variable')
-            else:
-                estim_i = estim.sel(T=t_val)
-                
-            tmp = estim_i*z_pred_da
-            tmp = xr.where(tmp < 0, 0, tmp)  # floor negative values at zero
-            sp_mult_bias.append(tmp)
-
-        # 6. Concatenate along time dimension
-        if sp_mult_bias:
-            result = xr.concat(sp_mult_bias, dim="T")
-        else:
-            result = xr.DataArray()
-
-        if do_cross_validation and cv_rmse_records:
-            cv_df = pd.DataFrame(cv_rmse_records)
-        else:
-            cv_df = None
-        return result*mask, cv_df
 
     def plot_merging_comparaison(self, df_Obs, da_estimated, da_corrected, missing_value = -999.0):
         
@@ -1075,7 +285,10 @@ import warnings
 import numpy as np
 import pandas as pd
 import xarray as xr
-import xgboost as xgb
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -1090,7 +303,7 @@ from sklearn.linear_model import LinearRegression
 from pykrige.ok import OrdinaryKriging
 from pykrige.uk import UniversalKriging
 
-warnings.filterwarnings("ignore")
+# Preserve warnings: failed or degenerate scientific fits must remain visible.
 
 
 class WAS_Merging_Extended:
@@ -1164,21 +377,22 @@ class WAS_Merging_Extended:
         return da[varname]
 
     def _validate_grids(self):
+        if set(self.da.dims) != {"T", "Y", "X"}:
+            raise ValueError("da must have exactly the named dimensions T, Y, X.")
         for d in ("T", "Y", "X"):
-            if d not in self.da.dims:
-                raise ValueError("da must have dims (T, Y, X) with coords 'T','Y','X'.")
+            if not self.da.get_index(d).is_unique:
+                raise ValueError(f"Coordinate {d!r} must be unique.")
+        self.da = self.da.transpose("T", "Y", "X")
         if self.dem is not None:
-            if not isinstance(self.dem, xr.DataArray):
-                raise TypeError("dem must be an xarray.DataArray.")
-            if ("Y" not in self.dem.dims) or ("X" not in self.dem.dims):
-                raise ValueError("dem must have dims (Y, X).")
-            try:
-                self.dem = self.dem.interp(Y=self.da["Y"], X=self.da["X"])
-            except Exception:
-                pass
+            if not isinstance(self.dem, xr.DataArray) or set(self.dem.dims) != {"Y", "X"}:
+                raise ValueError("dem must be a DataArray with exactly dimensions Y, X.")
+            self.dem = self.dem.transpose("Y", "X").interp(Y=self.da.Y, X=self.da.X)
 
-    def _mask_like_estim(self, estim: xr.DataArray) -> xr.DataArray:
-        return xr.where(np.isnan(estim.mean(dim="T")), np.nan, 1.0)
+
+    def _mask_like_estim(self, estim):
+        # Preserve missingness separately for every date, including transient gaps.
+        return xr.where(np.isfinite(estim), 1.0, np.nan)
+
 
     def _expand_T(self, da2d: xr.DataArray, t) -> xr.DataArray:
         return da2d.expand_dims(T=[t])
@@ -1200,107 +414,15 @@ class WAS_Merging_Extended:
         return series
 
 
-    def transform_cpt(
-        self,
-        df: pd.DataFrame,
-        missing_value: float = -999.0
-    ) -> xr.Dataset:
-        """
-        Convert a CPT‑format station data frame to an xarray Dataset.
-        Expects first two rows: station names, then latitudes, then longitudes.
-        (The second row is used for LAT, the third for LON – but here we assume
-         the input has exactly two metadata rows: first row station names,
-         second row LAT, third row LON. The class will handle it as in the first version.)
-        """
-        # --- 1) Extract metadata: first 2 rows (LAT, LON) ---
-        metadata = (
-            df
-            .iloc[:2]
-            .set_index("STATION")  # -> index = ["LAT", "LON"]
-            .T
-            .reset_index()         # station names in 'index'
-        )
-        metadata.columns = ["STATION", "LAT", "LON"]
+    def transform_cpt(self, df, missing_value=-999.0):
+        """Parse CPT LAT/LON or CDT LON/LAT/ELEV metadata without moving gauges."""
+        return _station_input_dataset(df, self.date_month_day, missing_value)
 
-        # Adjust duplicates in LAT / LON
-        metadata["LAT"] = self.adjust_duplicates(metadata["LAT"])
-        metadata["LON"] = self.adjust_duplicates(metadata["LON"])
 
-        # --- 2) Extract the data part: from row 2 downward ---
-        data_part = df.iloc[2:].copy()
-        data_part = data_part.rename(columns={"STATION": "YEAR"})
-        data_part["YEAR"] = data_part["YEAR"].astype(int)
+    def transform_cdt(self, df, missing_value=-999.0):
+        """Parse daily CDT station series, preserving physical coordinates."""
+        return _station_input_dataset(df, self.date_month_day, missing_value)
 
-        # --- 3) Convert wide -> long ---
-        long_data = data_part.melt(
-            id_vars="YEAR",
-            var_name="STATION",
-            value_name="VALUE"
-        )
-
-        # --- 4) Turn YEAR into a date (e.g. YYYY-08-01) ---
-        long_data["DATE"] = pd.to_datetime(
-            long_data["YEAR"].astype(str) + f"-{self.date_month_day}",
-            format="%Y-%m-%d"
-        )
-
-        # --- 5) Merge with metadata on STATION to attach (LAT, LON) ---
-        final_df = pd.merge(long_data, metadata, on="STATION", how="left")
-
-        # --- 6) Convert to xarray Dataset (single variable "Observation") ---
-        ds = (
-            final_df[["DATE", "LAT", "LON", "VALUE"]]
-            .set_index(["DATE", "LAT", "LON"])
-            .to_xarray()
-            .rename({"VALUE": "Observation", "LAT": "Y", "LON": "X", "DATE": "T"})
-        )
-        # Optional: mask out missing_value
-        if missing_value is not None:
-            ds = ds.where(ds["Observation"] != missing_value)
-
-        return ds
-
-    def transform_cdt(
-        self,
-        df: pd.DataFrame,
-        missing_value: float = -999.0
-    ) -> xr.Dataset:
-        """
-        Convert a CDT‑format station data frame to an xarray Dataset.
-        Expects first three rows: station names, longitudes, latitudes, elevations.
-        """
-        # --- 1) Extract metadata (first 3 rows: LON, LAT, ELEV) ---
-        metadata = df.iloc[:3].set_index("ID").T.reset_index()
-        metadata.columns = ["STATION", "LON", "LAT", "ELEV"]
-
-        # Adjust duplicates
-        metadata["LON"] = self.adjust_duplicates(metadata["LON"])
-        metadata["LAT"] = self.adjust_duplicates(metadata["LAT"])
-        metadata["ELEV"] = self.adjust_duplicates(metadata["ELEV"])
-
-        # --- 2) Extract actual data from row 3 onward, rename ID -> DATE ---
-        data_part = df.iloc[3:].rename(columns={"ID": "DATE"})
-
-        # Melt to long form
-        data_long = data_part.melt(id_vars=["DATE"], var_name="STATION", value_name="VALUE")
-
-        # --- 3) Merge with metadata to attach (LON, LAT, ELEV) ---
-        final_df = pd.merge(data_long, metadata, on="STATION", how="left")
-
-        # Ensure 'DATE' is a proper datetime (assuming "YYYYmmdd" format)
-        final_df["DATE"] = pd.to_datetime(final_df["DATE"], format="%Y%m%d", errors="coerce")
-
-        # --- 4) Convert to xarray Dataset ---
-        ds = (
-            final_df[["DATE", "LAT", "LON", "VALUE"]]
-            .set_index(["DATE", "LAT", "LON"])
-            .to_xarray()
-            .rename({"VALUE": "Observation", "LAT": "Y", "LON": "X", "DATE": "T"})
-        )
-        if missing_value is not None:
-            ds = ds.where(ds["Observation"] != missing_value)
-
-        return ds
 
     # --------------------- projection ---------------------
 
@@ -1379,7 +501,7 @@ class WAS_Merging_Extended:
         df["Xp"] = Xp
         df["Yp"] = Yp
 
-        return df.dropna(subset=["Observation", "Estimation", "Xp", "Yp"])
+        return df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Observation", "Estimation", "Xp", "Yp"])
 
     # --------------------- kriging selection + cache ---------------------
 
@@ -1391,76 +513,21 @@ class WAS_Merging_Extended:
         return f"{method}:global"
 
     def _fit_ok(self, x, y, z, variogram_model, nlags):
-        return OrdinaryKriging(
-            x, y, z,
-            variogram_model=variogram_model,
-            nlags=int(nlags),
-            enable_plotting=False,
-            verbose=False,
-        )
+        x, y, z = (np.asarray(v, float) for v in (x, y, z))
+        if not (np.isfinite(x).all() and np.isfinite(y).all() and np.isfinite(z).all()):
+            raise ValueError("Kriging inputs must be finite.")
+        # Zero residual variance is a valid limiting case, not an optimizer failure.
+        if np.ptp(z) <= np.finfo(float).eps * max(1.0, np.max(np.abs(z))) * 16:
+            return _ConstantKriging(float(np.mean(z)))
+        return OrdinaryKriging(x, y, z, variogram_model=variogram_model,
+                               nlags=int(nlags), enable_plotting=False, verbose=False,
+                               pseudo_inv=True)
 
-    def auto_select_kriging_parameters(
-        self,
-        df: pd.DataFrame,
-        method_key: str,
-        t=None,
-        x_col: str = "Xp",
-        y_col: str = "Yp",
-        z_col: str = "residuals",
-        variogram_models=None,
-        nlags_range=range(3, 10),
-        n_splits=5,
-        random_state=42,
-    ):
-        df = df[[x_col, y_col, z_col]].dropna().copy()
-        if len(df) < max(5, n_splits):
-            raise ValueError("Not enough points for kriging.")
 
-        x = df[x_col].values.astype(float)
-        y = df[y_col].values.astype(float)
-        z = df[z_col].values.astype(float)
+    def auto_select_kriging_parameters(self, *args, **kwargs):
+        """Select and fit the variogram using the shared spatial CV implementation."""
+        return _auto_select_kriging_parameters_scientific(self, *args, **kwargs)
 
-        # fixed parameters
-        if (not self.kriging_cv) and (self.kriging_fixed is not None):
-            vm = self.kriging_fixed.get("variogram_model", "spherical")
-            nl = int(self.kriging_fixed.get("nlags", 6))
-            return self._fit_ok(x, y, z, vm, nl), {"variogram": vm, "nlags": nl, "cv_mse": None}
-
-        # cache hit
-        cid = self._kriging_cache_id(method_key, t=t)
-        if cid and (cid in self._kriging_param_cache):
-            vm, nl = self._kriging_param_cache[cid]
-            return self._fit_ok(x, y, z, vm, nl), {"variogram": vm, "nlags": nl, "cv_mse": "cached"}
-
-        if variogram_models is None:
-            variogram_models = ["linear", "power", "gaussian", "spherical", "exponential"]
-
-        kf = KFold(n_splits=min(n_splits, len(df)), shuffle=True, random_state=random_state)
-
-        best_score = np.inf
-        best_model = None
-        best_nlags = None
-
-        for model in variogram_models:
-            for nlags in nlags_range:
-                errs = []
-                for tr, te in kf.split(df):
-                    try:
-                        ok = self._fit_ok(x[tr], y[tr], z[tr], model, nlags)
-                        z_pred, _ = ok.execute("points", x[te], y[te])
-                        z_pred = np.asarray(z_pred, float).ravel()
-                        errs.append(mean_squared_error(z[te], z_pred))
-                    except Exception:
-                        errs.append(np.inf)
-                mse = float(np.mean(errs))
-                if mse < best_score:
-                    best_score, best_model, best_nlags = mse, model, int(nlags)
-
-        if cid:
-            self._kriging_param_cache[cid] = (best_model, best_nlags)
-
-        ok_best = self._fit_ok(x, y, z, best_model, best_nlags)
-        return ok_best, {"variogram": best_model, "nlags": best_nlags, "cv_mse": best_score}
 
     def _krige_grid_points(self, df_planar: pd.DataFrame, z_col: str, estim: xr.DataArray, method_key: str, t=None):
         ok, info = self.auto_select_kriging_parameters(df_planar, method_key=method_key, t=t, z_col=z_col)
@@ -1538,8 +605,10 @@ class WAS_Merging_Extended:
                 estim_t = estim.sel(T=t).values
                 dem_t = dem2d.values
                 X_grid = np.column_stack([estim_t.ravel(), dem_t.ravel()])
-                X_grid = np.nan_to_num(X_grid, nan=0.0)
-                trend = reg.predict(X_grid).reshape(estim.sizes["Y"], estim.sizes["X"])
+                valid_grid = np.isfinite(X_grid).all(axis=1)
+                trend = np.full(len(X_grid), np.nan)
+                trend[valid_grid] = reg.predict(X_grid[valid_grid])
+                trend = trend.reshape(estim.sizes["Y"], estim.sizes["X"])
 
                 m_df["residuals"] = m_df["Observation"] - reg.predict(m_df[["Estimation", "DEM"]].values)
             else:
@@ -1550,6 +619,9 @@ class WAS_Merging_Extended:
                 trend = reg.predict(estim_t_no_nan.reshape(-1, 1)).reshape(estim.sizes["Y"], estim.sizes["X"])
                 m_df["residuals"] = m_df["Observation"] - reg.predict(m_df[["Estimation"]].values)
 
+            # Inner variogram CV must refit the regression as well as kriging.
+            m_df.attrs["residual_model"] = "RK"
+            m_df.attrs["residual_features"] = ["Estimation", "DEM"] if reg.n_features_in_ == 2 else ["Estimation"]
             try:
                 z_res, info = self._krige_grid_points(m_df, "residuals", estim, method_key="RK", t=t)
             except Exception:
@@ -1622,6 +694,10 @@ class WAS_Merging_Extended:
             if self.verbose:
                 print(f"\nYear = {pd.to_datetime(t).year}, number in-situ = {m_df.shape[0]}")
 
+            if "DEM" in drift_terms:
+                m_df = m_df.dropna(subset=["DEM"])
+            if len(m_df) < 5:
+                continue
             specified_drift = []
             if "Estimation" in drift_terms:
                 specified_drift.append(m_df["Estimation"].values.astype(float))
@@ -1646,14 +722,18 @@ class WAS_Merging_Extended:
                 if "DEM" in drift_terms:
                     grid_drifts.append(self.dem.values.ravel().astype(float))
 
-                z_pred_flat, _ = uk.execute(
-                    "points",
-                    xp_grid, yp_grid,
-                    specified_drift_arrays=grid_drifts,
-                )
-                z_pred = np.asarray(z_pred_flat, dtype=float).reshape(estim.sizes["Y"], estim.sizes["X"])
-            except Exception:
-                z_pred = estim.sel(T=t).values
+                valid = np.isfinite(estim.sel(T=t).values.ravel())
+                for drift in grid_drifts:
+                    valid &= np.isfinite(drift)
+                z_pred_flat = np.full(xp_grid.shape, np.nan)
+                if valid.any():
+                    zp, _ = uk.execute("points", xp_grid[valid], yp_grid[valid],
+                        specified_drift_arrays=[v[valid] for v in grid_drifts])
+                    z_pred_flat[valid] = np.asarray(zp, float)
+                z_pred = z_pred_flat.reshape(estim.sizes["Y"], estim.sizes["X"])
+            except Exception as exc:
+                warnings.warn(f"KED failed for {t}: {exc}", RuntimeWarning)
+                z_pred = np.full_like(estim.sel(T=t).values, np.nan, dtype=float)
 
             res2d = xr.DataArray(z_pred, coords=[estim["Y"], estim["X"]], dims=["Y", "X"])
             out.append(self._expand_T(np.maximum(res2d, 0), t))
@@ -1664,6 +744,10 @@ class WAS_Merging_Extended:
         return xr.concat(out, dim="T") * mask, diag
 
     def optimal_interpolation(self, missing_value=-999.0, L_m: float = 150_000.0, epsilon: float = 0.1, chunk_size: int | None = None):
+        if L_m <= 0 or epsilon < 0:
+            raise ValueError("Invalid positive spatial scale or regularization parameter.")
+        if chunk_size is not None and int(chunk_size) < 1:
+            raise ValueError("chunk_size must be positive.")
         obs = self.transform_cpt(self.df, missing_value)
         estim = self.da
         mask = self._mask_like_estim(estim)
@@ -1716,6 +800,10 @@ class WAS_Merging_Extended:
         return xr.concat(out, dim="T") * mask, diag
 
     def barnes_interpolation(self, missing_value=-999.0, kappa_m: float = 200_000.0, gamma: float = 0.3, chunk_size: int | None = None):
+        if kappa_m <= 0 or not 0 < gamma <= 1:
+            raise ValueError("Invalid positive spatial scale or regularization parameter.")
+        if chunk_size is not None and int(chunk_size) < 1:
+            raise ValueError("chunk_size must be positive.")
         obs = self.transform_cpt(self.df, missing_value)
         estim = self.da
         mask = self._mask_like_estim(estim)
@@ -1821,18 +909,18 @@ class WAS_Merging_Extended:
         if (self.dem is not None) and ("DEM" in g_df.columns):
             feats.append("DEM")
 
-        obs_xy = g_df[["Yp", "Xp"]].values.astype(float)
-        stn_xy = self.unique_stations
-        dmat = cdist(obs_xy, stn_xy, metric="euclidean")
-
-        k = int(min(k_nearest, dmat.shape[1]))
-        knn = np.partition(dmat, kth=k - 1, axis=1)[:, :k]
-        knn.sort(axis=1)
-
-        for i in range(k):
-            col = f"DIST_{i+1}"
-            g_df[col] = knn[:, i]
-            feats.append(col)
+        # Distance features to the training network are deterministic covariates.
+        # No rainfall values enter this feature construction.
+        k = max(0, min(int(k_nearest), len(self.unique_stations)))
+        if k:
+            knn, _ = cKDTree(self.unique_stations).query(g_df[["Yp", "Xp"]].values, k=list(range(1, k + 1)))
+            for i in range(k):
+                col = f"DIST_{i+1}"
+                g_df[col] = knn[:, i]
+                feats.append(col)
+        g_df = g_df.replace([np.inf, -np.inf], np.nan).dropna(subset=feats + ["Observation"])
+        if g_df.empty:
+            raise ValueError("No finite station training samples remain.")
 
         return g_df, feats, estim, obs, k
 
@@ -1843,10 +931,10 @@ class WAS_Merging_Extended:
         yp_grid = self._grid_cache["yp_flat"]
         grid_xy = np.column_stack([yp_grid, xp_grid]).astype(float)
 
-        d_grid = cdist(grid_xy, self.unique_stations, metric="euclidean")
-        k = int(min(k_nearest, d_grid.shape[1]))
-        knn_grid = np.partition(d_grid, kth=k - 1, axis=1)[:, :k]
-        knn_grid.sort(axis=1)
+        k = max(0, min(int(k_nearest), len(self.unique_stations)))
+        knn_grid = np.empty((len(grid_xy), 0))
+        if k:
+            knn_grid, _ = cKDTree(self.unique_stations).query(grid_xy, k=list(range(1, k + 1)))
 
         t_common = np.intersect1d(obs["T"].values, estim["T"].values)
         out = []
@@ -1865,7 +953,11 @@ class WAS_Merging_Extended:
             for i in range(k):
                 X_pred[f"DIST_{i+1}"] = knn_grid[:, i]
 
-            pred = model.predict(X_pred[feats]).reshape(estim.sizes["Y"], estim.sizes["X"])
+            valid = np.isfinite(X_pred[feats].to_numpy(float)).all(axis=1)
+            flat = np.full(len(X_pred), np.nan)
+            if valid.any():
+                flat[valid] = model.predict(X_pred.loc[valid, feats])
+            pred = flat.reshape(estim.sizes["Y"], estim.sizes["X"])
             da2d = xr.DataArray(np.maximum(pred, 0), coords=[estim["Y"], estim["X"]], dims=["Y", "X"])
             out.append(self._expand_T(da2d, t))
 
@@ -1873,316 +965,72 @@ class WAS_Merging_Extended:
             return xr.DataArray(np.nan)
         return xr.concat(out, dim="T") * mask
 
-    def random_forest_merging(self, missing_value=-999.0, k_nearest=10):
+    def random_forest_merging(self, missing_value=-999.0, k_nearest=10,
+                              n_estimators=300, n_jobs=1, random_state=42):
         g_df, feats, estim, obs, k = self._prepare_ml(missing_value, k_nearest=k_nearest)
-        model = RandomForestRegressor(
-            n_estimators=1200,
-            max_features="sqrt",
-            min_samples_leaf=3,
-            n_jobs=-1,
-            random_state=42,
-        )
+        model = RandomForestRegressor(n_estimators=int(n_estimators), max_features=1.0,
+            min_samples_leaf=3, n_jobs=n_jobs, random_state=random_state)
         model.fit(g_df[feats], g_df["Observation"])
-        return self._predict_grid(model, estim, obs, feats, k_nearest=k), {"method": "RF", "n_samples": len(g_df), "k_nearest": k}
+        return self._predict_grid(model, estim, obs, feats, k), {
+            "method": "RF", "n_samples": len(g_df), "k_nearest": k,
+            "evaluation": "fitted reconstruction; use validate_merging_methods for held-out skill"}
 
-    def xgboost_merging(self, missing_value=-999.0, tune=True, k_nearest=10):
+
+    def xgboost_merging(self, missing_value=-999.0, tune=True, k_nearest=10,
+                        n_estimators=300, n_jobs=1, random_state=42):
+        if xgb is None:
+            raise ImportError("xgboost is required for xgboost_merging.")
         g_df, feats, estim, obs, k = self._prepare_ml(missing_value, k_nearest=k_nearest)
-
+        base = xgb.XGBRegressor(n_estimators=int(n_estimators), learning_rate=0.05,
+            max_depth=3, subsample=0.9, colsample_bytree=0.9,
+            objective="reg:squarederror", random_state=random_state, n_jobs=1)
+        params = None
         if tune:
-            p_grid = {
-                "max_depth": [3, 5, 7],
-                "learning_rate": [0.02, 0.05, 0.1],
-                "subsample": [0.8, 1.0],
-                "colsample_bytree": [0.8, 1.0],
-            }
-            base = xgb.XGBRegressor(
-                n_estimators=600,
-                objective="reg:squarederror",
-                random_state=42,
-                n_jobs=-1,
-            )
-            gs = GridSearchCV(base, p_grid, cv=3, n_jobs=-1)
-            gs.fit(g_df[feats], g_df["Observation"])
-            model = gs.best_estimator_
-            info = {"method": "XGB", "best_params": gs.best_params_, "n_samples": len(g_df), "k_nearest": k}
-        else:
-            model = xgb.XGBRegressor(
-                n_estimators=900,
-                learning_rate=0.05,
-                max_depth=5,
-                subsample=0.9,
-                colsample_bytree=0.9,
-                objective="reg:squarederror",
-                random_state=42,
-                n_jobs=-1,
-            )
-            model.fit(g_df[feats], g_df["Observation"])
-            info = {"method": "XGB", "best_params": None, "n_samples": len(g_df), "k_nearest": k}
+            groups = pd.DatetimeIndex(g_df["T"]).year.to_numpy()
+            if len(np.unique(groups)) < 2:
+                # A single date supports spatial tuning only; disclose this scope.
+                groups = np.array([_cv_station_key(x, y) for x, y in zip(g_df.Xp, g_df.Yp)])
+            if len(np.unique(groups)) < 2:
+                raise ValueError("XGB tuning requires at least two independent groups.")
+            splitter = _GroupKFold(n_splits=min(3, len(np.unique(groups))))
+            # No network features during inner tuning: recomputing a network built
+            # from all gauges would leak held-out station presence into spatial CV.
+            cv_feats = [f for f in feats if not f.startswith("DIST_")]
+            search = GridSearchCV(base, {"max_depth": [2, 3, 5], "learning_rate": [0.03, 0.1]},
+                cv=splitter, scoring="neg_mean_squared_error", n_jobs=n_jobs)
+            search.fit(g_df[cv_feats], g_df["Observation"], groups=groups)
+            params = search.best_params_
+            base.set_params(**params)
+        base.set_params(n_jobs=n_jobs)
+        base.fit(g_df[feats], g_df["Observation"])
+        return self._predict_grid(base, estim, obs, feats, k), {
+            "method": "XGB", "best_params": params, "n_samples": len(g_df), "k_nearest": k,
+            "evaluation": "fitted reconstruction; use held-out validation for skill"}
 
-        return self._predict_grid(model, estim, obs, feats, k_nearest=k), info
 
     # --------------------- helper for validation features ---------------------
 
     def _add_knn_features(self, df, k_nearest, train_stations_only=False):
-        """
-        Add k‑nearest distance features to a station DataFrame.
-        If train_stations_only=True, uses self.unique_stations (already computed from training).
-        Otherwise, computes unique stations from the current DataFrame.
-        """
         df = df.copy()
         if not train_stations_only:
-            # Compute unique stations from this DataFrame (training set)
-            stn_unique = df[["Yp", "Xp"]].drop_duplicates().reset_index(drop=True)
-            self.unique_stations = stn_unique.values.astype(float)
-        else:
-            # Use already stored unique stations (from training)
-            pass
-
-        obs_xy = df[["Yp", "Xp"]].values.astype(float)
-        dmat = cdist(obs_xy, self.unique_stations, metric="euclidean")
-        k = int(min(k_nearest, dmat.shape[1]))
-        knn = np.partition(dmat, kth=k - 1, axis=1)[:, :k]
-        knn.sort(axis=1)
-
-        for i in range(k):
-            col = f"DIST_{i+1}"
-            df[col] = knn[:, i]
+            self.unique_stations = df[["Yp", "Xp"]].drop_duplicates().to_numpy(float)
+        if self.unique_stations is None or not len(self.unique_stations):
+            raise ValueError("Training station network is empty.")
+        k = max(0, min(int(k_nearest), len(self.unique_stations)))
+        if k:
+            distance, _ = cKDTree(self.unique_stations).query(
+                df[["Yp", "Xp"]].to_numpy(float), k=list(range(1, k + 1)))
+            for i in range(k):
+                df[f"DIST_{i+1}"] = distance[:, i]
         return df, k
+
 
     # --------------------- validation (LOYO) ---------------------
 
-    def validate_merging_methods(self, missing_value=-999.0, min_points_year=5, k_nearest=10):
-        """
-        Leave-one-year-out validation of all merging methods at station points.
+    def validate_merging_methods(self, *args, **kwargs):
+        """See the shared validator for temporal/spatial scope and coverage checks."""
+        return _validate_merging_methods_scientific(self, *args, **kwargs)
 
-        Parameters
-        ----------
-        missing_value : float
-            Missing value indicator for observations (passed to transform_cpt).
-        min_points_year : int
-            Minimum number of test points required to include a year.
-        k_nearest : int
-            Number of nearest stations to use for RF/XGB feature engineering.
-
-        Returns
-        -------
-        pd.DataFrame
-            Mean RMSE per method, sorted ascending.
-        """
-        obs = self.transform_cpt(self.df, missing_value)   # Dataset
-        estim = self.da
-        years = np.unique(pd.to_datetime(obs["T"].values).year)
-
-        results = []
-
-        for yr in years:
-            is_test = (pd.to_datetime(obs["T"].values).year == yr)
-            t_test = obs["T"].values[is_test]
-            t_train = obs["T"].values[~is_test]
-
-            if len(t_test) == 0 or len(t_train) == 0:
-                continue
-
-            # Collect training and test data frames for this year
-            train_rows, test_rows = [], []
-            for t in np.intersect1d(t_train, estim["T"].values):
-                df_t = self._station_df_for_time(obs, estim, t, add_dem=False)
-                if not df_t.empty:
-                    train_rows.append(df_t)
-            for t in np.intersect1d(t_test, estim["T"].values):
-                df_t = self._station_df_for_time(obs, estim, t, add_dem=False)
-                if not df_t.empty:
-                    test_rows.append(df_t)
-
-            if not train_rows or not test_rows:
-                continue
-
-            train_df = pd.concat(train_rows, ignore_index=True)
-            test_df = pd.concat(test_rows, ignore_index=True)
-
-            if len(test_df) < min_points_year:
-                continue
-
-            # ----- Simple Bias Adjustment (SBA) -----
-            try:
-                tr = train_df.copy()
-                tr["residuals"] = tr["Observation"] - tr["Estimation"]
-                ok, _ = self.auto_select_kriging_parameters(tr, method_key="VAL_SBA", z_col="residuals")
-                z_pred, _ = ok.execute("points", test_df["Xp"].values, test_df["Yp"].values)
-                pred = test_df["Estimation"].values + np.asarray(z_pred, float).ravel()
-                rmse = float(np.sqrt(mean_squared_error(test_df["Observation"], pred)))
-                results.append({"Year": int(yr), "Method": "SBA", "RMSE": rmse})
-            except Exception:
-                pass
-
-            # ----- Regression Kriging (RK) -----
-            try:
-                reg = LinearRegression().fit(train_df[["Estimation"]].values, train_df["Observation"].values)
-                tr = train_df.copy()
-                tr["residuals"] = tr["Observation"] - reg.predict(tr[["Estimation"]].values)
-                ok, _ = self.auto_select_kriging_parameters(tr, method_key="VAL_RK", z_col="residuals")
-                z_pred, _ = ok.execute("points", test_df["Xp"].values, test_df["Yp"].values)
-                pred = reg.predict(test_df[["Estimation"]].values) + np.asarray(z_pred, float).ravel()
-                rmse = float(np.sqrt(mean_squared_error(test_df["Observation"], pred)))
-                results.append({"Year": int(yr), "Method": "RK", "RMSE": rmse})
-            except Exception:
-                pass
-
-            # ----- Conditional Merging (CM) -----
-            try:
-                ok_obs, _ = self.auto_select_kriging_parameters(train_df, method_key="VAL_CM_obs", z_col="Observation")
-                ok_est, _ = self.auto_select_kriging_parameters(train_df, method_key="VAL_CM_est", z_col="Estimation")
-                z_obs, _ = ok_obs.execute("points", test_df["Xp"].values, test_df["Yp"].values)
-                z_est, _ = ok_est.execute("points", test_df["Xp"].values, test_df["Yp"].values)
-                pred = np.asarray(z_obs, float).ravel() + (test_df["Estimation"].values - np.asarray(z_est, float).ravel())
-                rmse = float(np.sqrt(mean_squared_error(test_df["Observation"], pred)))
-                results.append({"Year": int(yr), "Method": "CM", "RMSE": rmse})
-            except Exception:
-                pass
-
-            # ----- Kriging with External Drift (KED) -----
-            try:
-                uk = UniversalKriging(
-                    train_df["Xp"].values.astype(float),
-                    train_df["Yp"].values.astype(float),
-                    train_df["Observation"].values.astype(float),
-                    variogram_model="linear",
-                    drift_terms=["specified"],
-                    specified_drift=[train_df["Estimation"].values.astype(float)],
-                    enable_plotting=False,
-                    verbose=False,
-                )
-                z_pred, _ = uk.execute(
-                    "points",
-                    test_df["Xp"].values.astype(float),
-                    test_df["Yp"].values.astype(float),
-                    specified_drift_arrays=[test_df["Estimation"].values.astype(float)],
-                )
-                pred = np.asarray(z_pred, float).ravel()
-                rmse = float(np.sqrt(mean_squared_error(test_df["Observation"], pred)))
-                results.append({"Year": int(yr), "Method": "KED", "RMSE": rmse})
-            except Exception:
-                pass
-
-            # ----- Optimal Interpolation (OI) -----
-            try:
-                stn_xy_train = self._xy_stack(train_df["Yp"].values, train_df["Xp"].values)
-                res_train = (train_df["Observation"].values - train_df["Estimation"].values).astype(float)
-                dist_stn = cdist(stn_xy_train, stn_xy_train)
-                L_m = 150_000.0   # default length scale (meters)
-                eps = 0.1
-                C = np.exp(-(dist_stn**2) / (2.0 * L_m**2)) + eps * np.eye(len(stn_xy_train))
-                w = solve(C, res_train, assume_a="pos")
-
-                stn_xy_test = self._xy_stack(test_df["Yp"].values, test_df["Xp"].values)
-                dist_te = cdist(stn_xy_test, stn_xy_train)
-                Wg = np.exp(-(dist_te**2) / (2.0 * L_m**2))
-                res_pred = Wg @ w
-                pred = test_df["Estimation"].values + res_pred
-                rmse = float(np.sqrt(mean_squared_error(test_df["Observation"], pred)))
-                results.append({"Year": int(yr), "Method": "OI", "RMSE": rmse})
-            except Exception:
-                pass
-
-            # ----- Barnes Interpolation -----
-            try:
-                stn_xy_train = self._xy_stack(train_df["Yp"].values, train_df["Xp"].values)
-                res_train = (train_df["Observation"].values - train_df["Estimation"].values).astype(float)
-
-                dist_te = cdist(stn_xy_test, stn_xy_train)   # using test points already computed
-                kappa = 200_000.0
-                gamma = 0.3
-
-                w1 = np.exp(-(dist_te**2) / kappa**2)
-                s1 = np.sum(w1, axis=1)
-                s1[s1 == 0] = 1e-12
-                z1 = (w1 @ res_train) / s1
-
-                dist_stn = cdist(stn_xy_train, stn_xy_train)
-                w1s = np.exp(-(dist_stn**2) / kappa**2)
-                s1s = np.sum(w1s, axis=1)
-                s1s[s1s == 0] = 1e-12
-                z1s = (w1s @ res_train) / s1s
-                new_res = res_train - z1s
-
-                w2 = np.exp(-(dist_te**2) / (gamma * kappa)**2)
-                s2 = np.sum(w2, axis=1)
-                s2[s2 == 0] = 1e-12
-                z2 = (w2 @ new_res) / s2
-
-                res_pred = z1 + z2
-                pred = test_df["Estimation"].values + res_pred
-                rmse = float(np.sqrt(mean_squared_error(test_df["Observation"], pred)))
-                results.append({"Year": int(yr), "Method": "Barnes", "RMSE": rmse})
-            except Exception:
-                pass
-
-            # ----- Random Forest (RF) -----
-            try:
-                train_f, k_used = self._add_knn_features(train_df, k_nearest)
-                test_f, _ = self._add_knn_features(test_df, k_nearest, train_stations_only=True)
-
-                feats = ["X", "Y", "Estimation"] + [f"DIST_{i+1}" for i in range(k_used)]
-
-                if self.dem is not None:
-                    xp_tr = xr.DataArray(train_f["X"].values, dims="points")
-                    yp_tr = xr.DataArray(train_f["Y"].values, dims="points")
-                    train_f["DEM"] = np.asarray(self.dem.interp(X=xp_tr, Y=yp_tr).values, float)
-                    xp_te = xr.DataArray(test_f["X"].values, dims="points")
-                    yp_te = xr.DataArray(test_f["Y"].values, dims="points")
-                    test_f["DEM"] = np.asarray(self.dem.interp(X=xp_te, Y=yp_te).values, float)
-                    feats.append("DEM")
-
-                rf = RandomForestRegressor(
-                    n_estimators=800,
-                    max_features="sqrt",
-                    min_samples_leaf=3,
-                    n_jobs=-1,
-                    random_state=42,
-                )
-                rf.fit(train_f[feats], train_f["Observation"])
-                pred = rf.predict(test_f[feats])
-                rmse = float(np.sqrt(mean_squared_error(test_f["Observation"], pred)))
-                results.append({"Year": int(yr), "Method": "RF", "RMSE": rmse})
-            except Exception:
-                pass
-
-            # ----- XGBoost (XGB) -----
-            try:
-                train_f, k_used = self._add_knn_features(train_df, k_nearest)
-                test_f, _ = self._add_knn_features(test_df, k_nearest, train_stations_only=True)
-
-                feats = ["X", "Y", "Estimation"] + [f"DIST_{i+1}" for i in range(k_used)]
-
-                if self.dem is not None:
-                    xp_tr = xr.DataArray(train_f["X"].values, dims="points")
-                    yp_tr = xr.DataArray(train_f["Y"].values, dims="points")
-                    train_f["DEM"] = np.asarray(self.dem.interp(X=xp_tr, Y=yp_tr).values, float)
-                    xp_te = xr.DataArray(test_f["X"].values, dims="points")
-                    yp_te = xr.DataArray(test_f["Y"].values, dims="points")
-                    test_f["DEM"] = np.asarray(self.dem.interp(X=xp_te, Y=yp_te).values, float)
-                    feats.append("DEM")
-
-                xgb_model = xgb.XGBRegressor(
-                    n_estimators=700,
-                    learning_rate=0.05,
-                    max_depth=5,
-                    subsample=0.9,
-                    colsample_bytree=0.9,
-                    objective="reg:squarederror",
-                    random_state=42,
-                    n_jobs=-1,
-                )
-                xgb_model.fit(train_f[feats], train_f["Observation"])
-                pred = xgb_model.predict(test_f[feats])
-                rmse = float(np.sqrt(mean_squared_error(test_f["Observation"], pred)))
-                results.append({"Year": int(yr), "Method": "XGB", "RMSE": rmse})
-            except Exception:
-                pass
-
-        if not results:
-            return pd.DataFrame(columns=["Method", "RMSE"])
-        return pd.DataFrame(results).groupby("Method")["RMSE"].mean().sort_values()
 
     # --------------------- plotting ---------------------
 
@@ -2251,3 +1099,673 @@ class WAS_Merging_Extended:
 
         plt.tight_layout()
         plt.show()
+
+# =============================================================================
+# Scientific spatial cross-validation layer (2026-08-26)
+# =============================================================================
+# Appended to preserve every historical public method.  The enhanced
+# validate_merging_methods() accepts temporal, random, station and spatially
+# blocked validation strategies without changing old calls (default remains LOYO).
+
+from sklearn.model_selection import GroupKFold as _GroupKFold, LeaveOneGroupOut as _LeaveOneGroupOut
+from sklearn.cluster import KMeans as _KMeans
+
+
+def _cv_station_key(x, y):
+    return f"{float(x):.7f}_{float(y):.7f}"
+
+
+def _collect_merging_cv_rows(self, missing_value=-999.0):
+    obs=self.transform_cpt(self.df, missing_value)
+    estim=self.da
+    rows=[]
+    common=np.intersect1d(obs["T"].values, estim["T"].values)
+    for t in common:
+        d=self._station_df_for_time(obs,estim,t,add_dem=False)
+        if d.empty:
+            continue
+        d=d.copy()
+        d["TIME"]=pd.Timestamp(t)
+        d["YEAR"]=int(pd.Timestamp(t).year)
+        d["STATION_KEY"]=[_cv_station_key(x,y) for x,y in zip(d["X"],d["Y"])]
+        rows.append(d)
+    if not rows:
+        return pd.DataFrame()
+    full=pd.concat(rows,ignore_index=True)
+    keys=sorted(full["STATION_KEY"].dropna().unique().tolist())
+    key_to_id={k:i for i,k in enumerate(keys)}
+    full["STATION_ID"]=full["STATION_KEY"].map(key_to_id).astype(int)
+    return full
+
+
+def _resolve_regional_labels(df, regional_labels=None, n_regions=5, random_state=42):
+    st=(df[["STATION_ID","STATION_KEY","Xp","Yp"]]
+        .drop_duplicates("STATION_ID").sort_values("STATION_ID").copy())
+    if st.empty:
+        return pd.Series(dtype=object)
+    if regional_labels is None:
+        k=max(2,min(int(n_regions),len(st))) if len(st)>1 else 1
+        if k==1:
+            lab=np.zeros(len(st),dtype=int)
+        else:
+            lab=_KMeans(n_clusters=k,random_state=int(random_state),n_init=20).fit_predict(st[["Xp","Yp"]].values)
+        return pd.Series(lab,index=st["STATION_ID"].values)
+
+    mapping={}
+    if callable(regional_labels):
+        vals=regional_labels(st.copy())
+        if len(vals)!=len(st):
+            raise ValueError("regional_labels callable must return one label per unique station.")
+        return pd.Series(np.asarray(vals),index=st["STATION_ID"].values)
+    if isinstance(regional_labels,pd.DataFrame):
+        cols=set(regional_labels.columns)
+        if {"STATION_ID","REGION"}.issubset(cols):
+            mapping=dict(zip(regional_labels["STATION_ID"],regional_labels["REGION"]))
+        elif {"STATION_KEY","REGION"}.issubset(cols):
+            bykey=dict(zip(regional_labels["STATION_KEY"],regional_labels["REGION"]))
+            mapping={int(r.STATION_ID):bykey.get(r.STATION_KEY,np.nan) for r in st.itertuples()}
+        else:
+            raise ValueError("regional_labels DataFrame needs STATION_ID/REGION or STATION_KEY/REGION.")
+    elif isinstance(regional_labels,pd.Series):
+        mapping=regional_labels.to_dict()
+    elif isinstance(regional_labels,dict):
+        mapping=regional_labels
+    else:
+        arr=np.asarray(regional_labels)
+        if arr.size!=len(st):
+            raise ValueError("regional_labels array must match the number of unique stations.")
+        return pd.Series(arr,index=st["STATION_ID"].values)
+
+    out={}
+    for r in st.itertuples():
+        if r.STATION_ID in mapping:
+            out[r.STATION_ID]=mapping[r.STATION_ID]
+        elif r.STATION_KEY in mapping:
+            out[r.STATION_ID]=mapping[r.STATION_KEY]
+        else:
+            out[r.STATION_ID]=np.nan
+    ser=pd.Series(out)
+    if ser.isna().any():
+        missing=ser[ser.isna()].index.tolist()
+        raise ValueError(f"regional_labels missing station ids: {missing[:10]}")
+    return ser
+
+
+def _merging_cv_splits(df, strategy="loyo", n_splits=5, random_state=42,
+                        spatial_block_size_km=150.0, regional_labels=None, n_regions=5):
+    strategy=str(strategy).lower().replace("-","_")
+    aliases={"leave_one_year_out":"loyo","leave_one_station_out":"loso",
+             "spatial":"spatial_block","regional":"regional_block","kfold":"random"}
+    strategy=aliases.get(strategy,strategy)
+    idx=np.arange(len(df))
+    if len(df) < 2:
+        raise ValueError("At least two samples are needed for validation.")
+    if strategy=="random":
+        k=max(2,min(int(n_splits),len(df)))
+        splitter=KFold(n_splits=k,shuffle=True,random_state=int(random_state))
+        return [(tr,te,f"fold_{i+1}") for i,(tr,te) in enumerate(splitter.split(idx))]
+    if strategy=="loyo":
+        groups=df["YEAR"].to_numpy()
+        spl=_LeaveOneGroupOut()
+        return [(tr,te,f"year_{int(groups[te[0]])}") for tr,te in spl.split(idx,groups=groups)]
+    if strategy=="loso":
+        groups=df["STATION_ID"].to_numpy()
+        spl=_LeaveOneGroupOut()
+        return [(tr,te,f"station_{int(groups[te[0]])}") for tr,te in spl.split(idx,groups=groups)]
+    if strategy=="spatial_block":
+        if float(spatial_block_size_km) <= 0:
+            raise ValueError("spatial_block_size_km must be positive.")
+        size=float(spatial_block_size_km)*1000.0
+        bx=np.floor((df["Xp"].to_numpy()-df["Xp"].min())/size).astype(np.int64)
+        by=np.floor((df["Yp"].to_numpy()-df["Yp"].min())/size).astype(np.int64)
+        _,groups=np.unique(np.column_stack([bx,by]),axis=0,return_inverse=True)
+        ng=len(np.unique(groups))
+        if ng<2:
+            raise ValueError("spatial_block produced <2 blocks; reduce spatial_block_size_km.")
+        k=max(2,min(int(n_splits),ng))
+        spl=_GroupKFold(n_splits=k)
+        return [(tr,te,f"spatial_fold_{i+1}") for i,(tr,te) in enumerate(spl.split(idx,groups=groups))]
+    if strategy=="regional_block":
+        station_region=_resolve_regional_labels(df,regional_labels,n_regions,random_state)
+        groups=df["STATION_ID"].map(station_region).to_numpy()
+        if pd.isna(groups).any():
+            raise ValueError("Some stations do not have a regional label.")
+        if len(np.unique(groups))<2:
+            raise ValueError("regional_block needs at least two regions.")
+        spl=_LeaveOneGroupOut()
+        return [(tr,te,f"region_{groups[te[0]]}") for tr,te in spl.split(idx,groups=groups)]
+    raise ValueError("cv_strategy must be one of: 'loyo', 'random', 'loso', 'spatial_block', 'regional_block'.")
+
+
+def _safe_rmse(obs,pred):
+    obs=np.asarray(obs,float); pred=np.asarray(pred,float)
+    keep=np.isfinite(obs)&np.isfinite(pred)
+    if keep.sum()==0: return np.nan
+    return float(np.sqrt(np.mean((obs[keep]-pred[keep])**2)))
+
+
+def _geostat_predict_one(self, method, train_df, test_df, fold_key="cv"):
+    if train_df.empty or test_df.empty:
+        return np.full(len(test_df),np.nan)
+    method=method.upper()
+    if method=="SBA":
+        tr=train_df.copy(); tr["residuals"]=tr["Observation"]-tr["Estimation"]
+        ok,_=self.auto_select_kriging_parameters(tr,method_key=f"{fold_key}_SBA",z_col="residuals")
+        z,_=ok.execute("points",test_df["Xp"].values,test_df["Yp"].values)
+        return test_df["Estimation"].values+np.asarray(z,float).ravel()
+    if method in {"RK", "NN"}:
+        features = ["Estimation"] if method == "RK" else ["Xp", "Yp", "Estimation"]
+        reg = LinearRegression() if method == "RK" else _merging_neural_regressor()
+        reg.fit(train_df[features].values, train_df["Observation"].values)
+        tr=train_df.copy(); tr["residuals"]=tr["Observation"]-reg.predict(tr[features].values)
+        tr.attrs["residual_model"] = method
+        tr.attrs["residual_features"] = features
+        ok,_=self.auto_select_kriging_parameters(tr,method_key=f"{fold_key}_{method}",z_col="residuals")
+        z,_=ok.execute("points",test_df["Xp"].values,test_df["Yp"].values)
+        return reg.predict(test_df[features].values)+np.asarray(z,float).ravel()
+    if method=="CM":
+        oko,_=self.auto_select_kriging_parameters(train_df,method_key=f"{fold_key}_CMo",z_col="Observation")
+        oke,_=self.auto_select_kriging_parameters(train_df,method_key=f"{fold_key}_CMe",z_col="Estimation")
+        zo,_=oko.execute("points",test_df["Xp"].values,test_df["Yp"].values)
+        ze,_=oke.execute("points",test_df["Xp"].values,test_df["Yp"].values)
+        return np.asarray(zo,float).ravel()+(test_df["Estimation"].values-np.asarray(ze,float).ravel())
+    if method=="KED":
+        uk=UniversalKriging(train_df["Xp"].values.astype(float),train_df["Yp"].values.astype(float),
+                            train_df["Observation"].values.astype(float),variogram_model="linear",
+                            drift_terms=["specified"],specified_drift=[train_df["Estimation"].values.astype(float)],
+                            enable_plotting=False,verbose=False)
+        z,_=uk.execute("points",test_df["Xp"].values.astype(float),test_df["Yp"].values.astype(float),
+                       specified_drift_arrays=[test_df["Estimation"].values.astype(float)])
+        return np.asarray(z,float).ravel()
+    st=self._xy_stack(train_df["Yp"].values,train_df["Xp"].values)
+    te=self._xy_stack(test_df["Yp"].values,test_df["Xp"].values)
+    res=(train_df["Observation"].values-train_df["Estimation"].values).astype(float)
+    if method=="OI":
+        ds=cdist(st,st); L=150000.0; eps=0.1
+        C=np.exp(-(ds**2)/(2.0*L**2))+eps*np.eye(len(st)); w=solve(C,res,assume_a="pos")
+        return test_df["Estimation"].values + np.exp(-(cdist(te,st)**2)/(2.0*L**2))@w
+    if method=="BARNES":
+        dte=cdist(te,st); kappa=200000.0; gamma=0.3
+        w1=np.exp(-(dte**2)/kappa**2); s1=w1.sum(1); s1[s1==0]=1e-12; z1=(w1@res)/s1
+        dst=cdist(st,st); w1s=np.exp(-(dst**2)/kappa**2); ss=w1s.sum(1); ss[ss==0]=1e-12
+        z1s=(w1s@res)/ss; new=res-z1s
+        w2=np.exp(-(dte**2)/(gamma*kappa)**2); s2=w2.sum(1); s2[s2==0]=1e-12; z2=(w2@new)/s2
+        return test_df["Estimation"].values+z1+z2
+    raise ValueError(method)
+
+
+def _geostat_predict(self, method, train_df, test_df, fold_key, same_time=True, min_train_points=5):
+    if not same_time:
+        raise ValueError("Spatial merging requires contemporaneous training gauges; pooled years are not equivalent.")
+    pred = np.full(len(test_df), np.nan)
+    for t, sub in test_df.groupby("TIME", sort=False):
+        tr = train_df[train_df["TIME"] == t]
+        if len(tr) < int(min_train_points):
+            continue
+        # Every fit and variogram selection uses only this outer training fold.
+        vals = _geostat_predict_one(self, method, tr, sub, f"{fold_key}_{pd.Timestamp(t).date()}")
+        pred[test_df.index.get_indexer(sub.index)] = vals
+    return np.maximum(pred, 0.0)
+
+
+
+def _ml_predict(self, method, train_df, test_df, k_nearest=10, random_state=42):
+    train_f, k_used = self._add_knn_features(train_df, k_nearest)
+    test_f, _ = self._add_knn_features(test_df, k_nearest, train_stations_only=True)
+    feats = ["X", "Y", "Estimation"] + [f"DIST_{i+1}" for i in range(k_used)]
+    if self.dem is not None:
+        for d in (train_f, test_f):
+            xp = xr.DataArray(d["X"].values, dims="points")
+            yp = xr.DataArray(d["Y"].values, dims="points")
+            d["DEM"] = np.asarray(self.dem.interp(X=xp, Y=yp).values, float)
+        feats.append("DEM")
+    keep_train = np.isfinite(train_f[feats + ["Observation"]].to_numpy(float)).all(axis=1)
+    keep_test = np.isfinite(test_f[feats].to_numpy(float)).all(axis=1)
+    out = np.full(len(test_f), np.nan)
+    if keep_train.sum() < 5 or not keep_test.any():
+        return out
+    if method == "RF":
+        mdl = RandomForestRegressor(n_estimators=300, max_features=1.0,
+            min_samples_leaf=3, n_jobs=1, random_state=int(random_state))
+    else:
+        if xgb is None:
+            raise ImportError("xgboost is required to validate XGB.")
+        mdl = xgb.XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=3,
+            subsample=0.9, colsample_bytree=0.9, objective="reg:squarederror",
+            random_state=int(random_state), n_jobs=1)
+    mdl.fit(train_f.loc[keep_train, feats], train_f.loc[keep_train, "Observation"])
+    out[keep_test] = mdl.predict(test_f.loc[keep_test, feats])
+    return np.maximum(out, 0.0)
+
+
+
+def _validate_merging_methods_scientific(
+    self, missing_value=-999.0, min_points_year=5, k_nearest=10,
+    cv_strategy="loyo", n_splits=5, random_state=42,
+    spatial_block_size_km=150.0, regional_labels=None, n_regions=5,
+    methods=("SBA", "RK", "CM", "KED", "OI", "Barnes", "RF", "XGB"),
+    per_time_geostatistics=True, kriging_cv_strategy="match", return_details=False,
+):
+    """Evaluate held-out station predictions and report all failures/coverage.
+
+    LOYO tests temporal transfer of RF/XGB. Same-time spatial merging (SBA, RK,
+    NN, CM, KED, OI, Barnes) has no training gauge in a held-out year, hence is
+    explicitly non-evaluable under LOYO. Use LOSO/spatial/regional blocks for
+    these methods. No pooled-year spatial covariance is substituted silently.
+    Scores are sqrt(total held-out squared error / number of valid predictions).
+    Methods with incomplete coverage have a NaN headline score; their conditional
+    error on successful predictions remains available as Partial_RMSE in attrs.
+    """
+    if not per_time_geostatistics:
+        raise ValueError("Pooled historical spatial residuals are not a synchronous merging method.")
+    all_df = _collect_merging_cv_rows(self, missing_value)
+    aliases = {"leave_one_year_out": "loyo", "leave_one_station_out": "loso",
+               "spatial": "spatial_block", "regional": "regional_block", "kfold": "random"}
+    strategy = str(cv_strategy).lower().replace("-", "_")
+    strategy = aliases.get(strategy, strategy)
+    absent = object()
+    old = {key: getattr(self, key, absent) for key in (
+        "kriging_cv_strategy", "kriging_spatial_block_size_km", "kriging_n_regions",
+        "_kriging_param_cache", "unique_stations")}
+    records = []
+    selected = [str(m).upper() for m in methods]
+    geostat = {"SBA", "RK", "NN", "CM", "KED", "OI", "BARNES"}
+    if any(m not in geostat | {"RF", "XGB"} for m in selected):
+        raise ValueError("Unknown merging validation method.")
+    kcv = str(kriging_cv_strategy).lower().replace("-", "_")
+    if kcv == "match":
+        kcv = strategy if strategy in {"random", "loso", "spatial_block", "regional_block"} else "random"
+    try:
+        self.kriging_cv_strategy = kcv
+        self.kriging_spatial_block_size_km = float(spatial_block_size_km)
+        self.kriging_n_regions = int(n_regions)
+        self._kriging_param_cache = {}
+        splits = [] if all_df.empty else _merging_cv_splits(all_df, strategy, n_splits,
+            random_state, spatial_block_size_km, regional_labels, n_regions)
+        for fold_i, (tr_idx, te_idx, label) in enumerate(splits, 1):
+            tr = all_df.iloc[tr_idx].copy().reset_index(drop=True)
+            te = all_df.iloc[te_idx].copy().reset_index(drop=True)
+            for m in selected:
+                pred = np.full(len(te), np.nan)
+                status, error = "ok", ""
+                if strategy == "loyo" and m in geostat:
+                    status = "not_applicable_no_contemporaneous_gauges"
+                elif len(tr) < 5 or (strategy == "loyo" and len(te) < int(min_points_year)):
+                    status = "insufficient_samples"
+                else:
+                    try:
+                        if m in geostat:
+                            pred = _geostat_predict(self, m, tr, te, label, min_train_points=5)
+                        else:
+                            pred = _ml_predict(self, m, tr, te, k_nearest, random_state)
+                    except Exception as exc:
+                        status, error = "failed", str(exc)
+                pred = np.maximum(np.asarray(pred, float), 0.0)
+                observed = te.Observation.to_numpy(float)
+                keep = np.isfinite(pred) & np.isfinite(observed)
+                n = int(keep.sum())
+                sse = float(np.sum((observed[keep] - pred[keep]) ** 2))
+                if status == "ok" and n != len(te):
+                    status = "partial" if n else "no_predictions"
+                records.append({"Fold": label, "FoldIndex": fold_i, "Strategy": strategy,
+                    "Method": m, "RMSE": np.sqrt(sse / n) if n else np.nan, "SSE": sse,
+                    "N_test": n, "N_train": len(tr), "N_test_total": len(te),
+                    "Status": status, "Error": error})
+    finally:
+        for key, value in old.items():
+            if value is absent:
+                if hasattr(self, key):
+                    delattr(self, key)
+            else:
+                setattr(self, key, value)
+    cols = ["Fold", "FoldIndex", "Strategy", "Method", "RMSE", "SSE", "N_test", "N_train",
+            "N_test_total", "Status", "Error"]
+    details = pd.DataFrame(records, columns=cols)
+    scores, coverage, partial = {}, {}, {}
+    for m in selected:
+        d = details[details.Method == m]
+        n, total = int(d.N_test.sum()), int(d.N_test_total.sum())
+        coverage[m] = n / total if total else 0.0
+        partial[m] = float(np.sqrt(d.SSE.sum() / n)) if n else np.nan
+        scores[m] = partial[m] if total and n == total else np.nan
+    summary = pd.Series(scores, name="RMSE", dtype=float).sort_values()
+    summary.index.name = "Method"
+    summary.attrs.update({"cv_strategy": strategy, "n_folds": int(details.Fold.nunique()),
+        "kriging_cv_strategy": kcv, "Coverage": coverage, "Partial_RMSE": partial,
+        "score": "pooled RMSE; headline score requires complete coverage"})
+    return (summary, details) if return_details else summary
+
+
+
+# Public helper so notebooks can inspect exactly which rows a strategy withholds.
+def _merging_cv_plan_public(self, missing_value=-999.0, cv_strategy="loyo", n_splits=5,
+                            random_state=42, spatial_block_size_km=150.0,
+                            regional_labels=None, n_regions=5):
+    df=_collect_merging_cv_rows(self,missing_value)
+    splits=_merging_cv_splits(df,cv_strategy,n_splits,random_state,
+                              spatial_block_size_km,regional_labels,n_regions)
+    rows=[]
+    for i,(tr,te,label) in enumerate(splits,1):
+        test=df.iloc[te]
+        rows.append({"Fold":label,"FoldIndex":i,"N_train":len(tr),"N_test":len(te),
+                     "TestStations":int(test["STATION_ID"].nunique()),
+                     "TestYears":int(test["YEAR"].nunique())})
+    return pd.DataFrame(rows)
+
+
+WAS_Merging_Extended.validate_merging_methods=_validate_merging_methods_scientific
+WAS_Merging_Extended.cv_plan=_merging_cv_plan_public
+
+# -----------------------------------------------------------------------------
+# Spatially-aware variogram tuning (replaces the historical random KFold only)
+# -----------------------------------------------------------------------------
+def _point_cv_splits(df, x_col, y_col, strategy, n_splits, random_state,
+                     spatial_block_size_km=150.0, n_regions=5):
+    strategy=str(strategy or "random").lower().replace("-","_")
+    aliases={"kfold":"random","spatial":"spatial_block","regional":"regional_block",
+             "leave_one_station_out":"loso"}
+    strategy=aliases.get(strategy,strategy)
+    idx=np.arange(len(df))
+    if len(df) < 2:
+        raise ValueError("At least two samples are needed for validation.")
+    if strategy=="random":
+        k=max(2,min(int(n_splits),len(df)))
+        return list(KFold(n_splits=k,shuffle=True,random_state=int(random_state)).split(idx))
+    # At a single analysis time every coordinate is a station.  For pooled data,
+    # identical coordinates are kept in the same group.
+    keys=np.array([_cv_station_key(a,b) for a,b in zip(df[x_col],df[y_col])],dtype=object)
+    if strategy=="loso":
+        return list(_LeaveOneGroupOut().split(idx,groups=keys))
+    if strategy=="spatial_block":
+        if float(spatial_block_size_km) <= 0:
+            raise ValueError("spatial_block_size_km must be positive.")
+        size=float(spatial_block_size_km)*1000.0
+        x=df[x_col].to_numpy(float); y=df[y_col].to_numpy(float)
+        bx=np.floor((x-x.min())/size).astype(np.int64); by=np.floor((y-y.min())/size).astype(np.int64)
+        _,g=np.unique(np.column_stack([bx,by]),axis=0,return_inverse=True)
+        ng=len(np.unique(g))
+        if ng < 2:
+            raise ValueError("Inner spatial CV has fewer than two blocks; reduce block size.")
+        return list(_GroupKFold(n_splits=max(2,min(int(n_splits),ng))).split(idx,groups=g))
+    if strategy=="regional_block":
+        k=max(2,min(int(n_regions),len(df)))
+        g=_KMeans(n_clusters=k,random_state=int(random_state),n_init=20).fit_predict(df[[x_col,y_col]].to_numpy(float))
+        return list(_LeaveOneGroupOut().split(idx,groups=g))
+    raise ValueError("kriging cv_strategy must be random, loso, spatial_block, or regional_block.")
+
+
+def _auto_select_kriging_parameters_scientific(
+    self, df, method_key, t=None, x_col="Xp", y_col="Yp", z_col="residuals",
+    variogram_models=None, nlags_range=range(3,10), n_splits=5, random_state=42,
+    cv_strategy=None, spatial_block_size_km=150.0, n_regions=5,
+):
+    residual_model = df.attrs.get("residual_model")
+    residual_features = df.attrs.get("residual_features", [])
+    cols = list(dict.fromkeys([x_col, y_col, z_col] +
+        (["Observation"] + list(residual_features) if residual_model else [])))
+    df = df[cols].replace([np.inf, -np.inf], np.nan).dropna().copy()
+    if len(df)<max(5,min(int(n_splits),len(df))):
+        raise ValueError("Not enough points for kriging.")
+    x=df[x_col].to_numpy(float); y=df[y_col].to_numpy(float); z=df[z_col].to_numpy(float)
+    if not self.kriging_cv:
+        fixed = self.kriging_fixed or {}
+        vm=fixed.get("variogram_model","spherical"); nl=int(fixed.get("nlags",6))
+        return self._fit_ok(x,y,z,vm,nl),{"variogram":vm,"nlags":nl,"cv_mse":None,"cv_strategy":"fixed"}
+    strategy=str(cv_strategy or getattr(self,"kriging_cv_strategy","random")).lower().replace("-","_")
+    block_km=float(getattr(self,"kriging_spatial_block_size_km",spatial_block_size_km))
+    regions=int(getattr(self,"kriging_n_regions",n_regions))
+    cid=self._kriging_cache_id(method_key,t=t)
+    if cid: cid=f"{cid}|{strategy}|{block_km:g}|{regions}"
+    if cid and cid in self._kriging_param_cache:
+        vm,nl=self._kriging_param_cache[cid]
+        return self._fit_ok(x,y,z,vm,nl),{"variogram":vm,"nlags":nl,"cv_mse":"cached","cv_strategy":strategy}
+    if variogram_models is None:
+        variogram_models=["linear","power","gaussian","spherical","exponential"]
+    splits=_point_cv_splits(df,x_col,y_col,strategy,n_splits,random_state,block_km,regions)
+    if not splits: raise ValueError("No valid kriging CV split could be built.")
+    # Regressions and their normalisations are refitted once per inner fold,
+    # then reused across variogram candidates (no held-out residual leakage).
+    residual_folds = []
+    for tr, te in splits:
+        if len(tr) < 3 or len(te) < 1:
+            continue
+        if residual_model:
+            reg = LinearRegression() if residual_model == "RK" else _merging_neural_regressor()
+            reg.fit(df.iloc[tr][residual_features].to_numpy(), df.iloc[tr].Observation.to_numpy())
+            train_z = df.iloc[tr].Observation.to_numpy() - reg.predict(df.iloc[tr][residual_features].to_numpy())
+            test_z = df.iloc[te].Observation.to_numpy() - reg.predict(df.iloc[te][residual_features].to_numpy())
+        else:
+            train_z, test_z = z[tr], z[te]
+        residual_folds.append((tr, te, train_z, test_z))
+    best_score=np.inf; best_model=None; best_nlags=None
+    for model_name in variogram_models:
+        for nlags in nlags_range:
+            squared_errors, n_valid = [], 0
+            for tr, te, train_z, test_z in residual_folds:
+                try:
+                    ok=self._fit_ok(x[tr],y[tr],train_z,model_name,nlags)
+                    zp,_=ok.execute("points",x[te],y[te]); zp=np.asarray(zp,float).ravel()
+                    if not np.isfinite(zp).all():
+                        raise ValueError("Non-finite inner validation predictions.")
+                    squared_errors.append(float(np.sum((test_z-zp)**2)))
+                except Exception:
+                    squared_errors.append(np.inf)
+                n_valid += len(te)
+            mse=float(np.sum(squared_errors) / n_valid) if n_valid else np.inf
+            if mse<best_score:
+                best_score,best_model,best_nlags=mse,model_name,int(nlags)
+    if best_model is None:
+        raise RuntimeError("No variogram configuration could be fitted under the requested CV strategy.")
+    if cid: self._kriging_param_cache[cid]=(best_model,best_nlags)
+    return self._fit_ok(x,y,z,best_model,best_nlags),{
+        "variogram":best_model,"nlags":best_nlags,"cv_mse":best_score,
+        "cv_strategy":strategy,"n_cv_folds":len(splits),
+    }
+
+
+def _set_kriging_cv_strategy_public(self, strategy="random", spatial_block_size_km=150.0, n_regions=5):
+    strategy=str(strategy).lower().replace("-","_")
+    if strategy not in {"random","loso","spatial_block","regional_block"}:
+        raise ValueError("strategy must be random, loso, spatial_block, or regional_block.")
+    self.kriging_cv_strategy=strategy
+    self.kriging_spatial_block_size_km=float(spatial_block_size_km)
+    self.kriging_n_regions=int(n_regions)
+    # Cached variogram choices are strategy-dependent; clear them on strategy change.
+    self._kriging_param_cache={}
+    return self
+
+WAS_Merging_Extended.auto_select_kriging_parameters=_auto_select_kriging_parameters_scientific
+WAS_Merging_Extended.set_kriging_cv_strategy=_set_kriging_cv_strategy_public
+
+def _cv_station_table_public(self, missing_value=-999.0):
+    """Return stable station identifiers/coordinates used by LOSO/regional CV."""
+    df=_collect_merging_cv_rows(self,missing_value)
+    if df.empty:
+        return pd.DataFrame(columns=["STATION_ID","STATION_KEY","X","Y","Xp","Yp"])
+    return (df[["STATION_ID","STATION_KEY","X","Y","Xp","Yp"]]
+            .drop_duplicates("STATION_ID").sort_values("STATION_ID").reset_index(drop=True))
+
+WAS_Merging_Extended.cv_station_table=_cv_station_table_public
+
+# Backward-compatible bridge: old WAS_Merging notebooks can request the new CV
+# without migrating construction code.  Actual prediction methods remain untouched.
+def _legacy_merging_extended(self):
+    return WAS_Merging_Extended(
+        self.df, self.da, date_month_day=getattr(self,"date_month_day","08-01"),
+        verbose=False,
+    )
+
+def _legacy_validate_merging_methods(self,*args,**kwargs):
+    return _legacy_merging_extended(self).validate_merging_methods(*args,**kwargs)
+
+def _legacy_merging_cv_plan(self,*args,**kwargs):
+    return _legacy_merging_extended(self).cv_plan(*args,**kwargs)
+
+def _legacy_merging_station_table(self,*args,**kwargs):
+    return _legacy_merging_extended(self).cv_station_table(*args,**kwargs)
+
+WAS_Merging.validate_merging_methods=_legacy_validate_merging_methods
+WAS_Merging.cv_plan=_legacy_merging_cv_plan
+WAS_Merging.cv_station_table=_legacy_merging_station_table
+
+
+def _station_input_dataset(df, date_month_day="08-01", missing_value=-999.0):
+    """Convert wide station data without fabricating or nudging station locations.
+
+    Coincident gauge records are averaged per date at their common physical point;
+    separate gauges on the same latitude or longitude retain exact coordinates.
+    """
+    id_col = "STATION" if "STATION" in df.columns else "ID" if "ID" in df.columns else None
+    if id_col is None:
+        raise ValueError("Station table requires STATION (CPT) or ID (CDT).")
+    labels = df[id_col].astype(str).str.strip().str.upper()
+    metadata = labels.isin(["LAT", "LON", "ELEV"])
+    meta = df.loc[metadata].copy()
+    meta[id_col] = labels[metadata]
+    if not {"LAT", "LON"}.issubset(set(meta[id_col])):
+        raise ValueError("Explicit LAT and LON metadata rows are required.")
+    if meta[id_col].duplicated().any():
+        raise ValueError("Duplicate station metadata rows.")
+    coords = meta.set_index(id_col).T
+    for c in ("LAT", "LON"):
+        coords[c] = pd.to_numeric(coords[c], errors="raise")
+    if not (np.isfinite(coords[["LAT", "LON"]]).all().all()
+            and coords.LAT.between(-90, 90).all() and coords.LON.between(-180, 360).all()):
+        raise ValueError("Station latitude/longitude coordinates are invalid.")
+    data = df.loc[~metadata].rename(columns={id_col: "DATE"}).melt(
+        id_vars="DATE", var_name="STATION", value_name="Observation")
+    raw = data.DATE.astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    if raw.str.fullmatch(r"\d{4}").all():
+        dates = pd.to_datetime(raw + "-" + date_month_day, errors="raise")
+    elif raw.str.fullmatch(r"\d{8}").all():
+        dates = pd.to_datetime(raw, format="%Y%m%d", errors="raise")
+    else:
+        dates = pd.to_datetime(raw, errors="raise")
+    data["T"] = dates
+    data["Observation"] = pd.to_numeric(data.Observation, errors="coerce")
+    data = data.join(coords[["LAT", "LON"]], on="STATION").rename(columns={"LAT": "Y", "LON": "X"})
+    bad = ~np.isfinite(data.Observation)
+    if missing_value is not None:
+        bad |= data.Observation == missing_value
+    data.loc[bad, "Observation"] = np.nan
+    if data.duplicated(["T", "Y", "X"]).any():
+        warnings.warn("Coincident gauges are averaged per date at their true location.", RuntimeWarning)
+    return data.groupby(["T", "Y", "X"], sort=True).Observation.mean().to_xarray().to_dataset()
+
+
+class _ConstantKriging:
+    """Exact constant-field limit of ordinary kriging, with zero residual variance."""
+    def __init__(self, value):
+        self.value = value
+
+    def execute(self, style, x, y, **kwargs):
+        shape = (len(y), len(x)) if style == "grid" else np.asarray(x).shape
+        return np.full(shape, self.value, dtype=float), np.zeros(shape, dtype=float)
+
+
+def _merging_neural_regressor():
+    return TransformedTargetRegressor(
+        regressor=make_pipeline(StandardScaler(), MLPRegressor(
+            hidden_layer_sizes=(10,), activation="tanh", solver="lbfgs",
+            alpha=1.0, max_iter=500, random_state=42)),
+        transformer=StandardScaler())
+
+
+def _legacy_spatial_method(self, method, missing_value=-999.0, do_cross_validation=False):
+    merger = _legacy_merging_extended(self)
+    # Legacy methods return (field, optional time-level CV DataFrame).
+    obs = merger.transform_cpt(self.df, missing_value)
+    times = np.intersect1d(obs["T"].values, merger.da["T"].values)
+    fields, records = [], []
+    for t in times:
+        train = merger._station_df_for_time(obs, merger.da, t)
+        values = np.full((merger.da.sizes["Y"], merger.da.sizes["X"]), np.nan)
+        if len(train) >= 5:
+            flat_est = merger.da.sel(T=t).values.ravel()
+            test = pd.DataFrame({"Xp": merger._grid_cache["xp_flat"],
+                "Yp": merger._grid_cache["yp_flat"], "Estimation": flat_est})
+            good = np.isfinite(flat_est)
+            try:
+                prediction = _geostat_predict_one(merger, method, train, test.loc[good],
+                    fold_key=f"production_{pd.Timestamp(t).date()}")
+                values.ravel()[good] = np.maximum(prediction, 0.0)
+            except Exception as exc:
+                warnings.warn(f"{method} failed for {t}: {exc}", RuntimeWarning)
+            if do_cross_validation:
+                predicted = np.full(len(train), np.nan)
+                for j in range(len(train)):
+                    tr = train.drop(train.index[j])
+                    if len(tr) < 5:
+                        continue
+                    try:
+                        predicted[j] = np.maximum(_geostat_predict_one(merger, method,
+                            tr, train.iloc[[j]], fold_key=f"loo_{pd.Timestamp(t).date()}_{j}"), 0)[0]
+                    except Exception:
+                        pass
+                n = int(np.isfinite(predicted).sum())
+                records.append({"time": t, "LOO_RMSE": _safe_rmse(train.Observation, predicted)
+                    if n == len(train) else np.nan, "num_stations": len(train),
+                    "N_valid": n, "Coverage": n / len(train)})
+        fields.append(xr.DataArray(values, dims=("Y", "X"),
+            coords={"Y": merger.da.Y, "X": merger.da.X}).expand_dims(T=[t]))
+    output = xr.concat(fields, dim="T").reindex(T=merger.da["T"]) if fields else xr.full_like(merger.da, np.nan)
+    output.attrs = dict(merger.da.attrs)
+    return output, pd.DataFrame(records) if do_cross_validation else None
+
+
+def _legacy_sba(self, missing_value=-999.0, do_cross_validation=False):
+    return _legacy_spatial_method(self, "SBA", missing_value, do_cross_validation)
+
+
+def _legacy_rk(self, missing_value=-999.0, do_cross_validation=False):
+    return _legacy_spatial_method(self, "RK", missing_value, do_cross_validation)
+
+
+def _legacy_nn(self, missing_value=-999.0, do_cross_validation=False):
+    return _legacy_spatial_method(self, "NN", missing_value, do_cross_validation)
+
+
+def _legacy_multiplicative(self, missing_value=-999.0, do_cross_validation=False):
+    """Leave-one-year-out ratio-of-means correction on paired historical data.
+
+    This is temporal bias correction, not a synchronous station assimilation.
+    Held-out rainfall never enters its ratio or spatial interpolation.
+    """
+    merger = _legacy_merging_extended(self)
+    data = _collect_merging_cv_rows(merger, missing_value)
+    fields, records = [], []
+    for t in merger.da["T"].values:
+        field = xr.full_like(merger.da.sel(T=t), np.nan)
+        year = pd.Timestamp(t).year
+        train = data[data.YEAR != year] if not data.empty else data
+        if len(train):
+            pooled = train.groupby(["X", "Y", "Xp", "Yp"], as_index=False)[["Observation", "Estimation"]].mean()
+            valid = (pooled.Estimation > np.finfo(float).eps) & (pooled.Observation >= 0)
+            pooled = pooled.loc[valid].copy()
+            pooled["ratio"] = pooled.Observation / pooled.Estimation
+            if len(pooled) >= 5:
+                try:
+                    ok, _ = merger.auto_select_kriging_parameters(pooled,
+                        method_key=f"MULT_train_without_{year}", z_col="ratio")
+                    ratio, _ = ok.execute("points", merger._grid_cache["xp_flat"], merger._grid_cache["yp_flat"])
+                    ratio = np.maximum(np.asarray(ratio, float).reshape(field.shape), 0.0)
+                    field = merger.da.sel(T=t) * ratio
+                    if do_cross_validation:
+                        test = data[data.TIME == pd.Timestamp(t)]
+                        pred_ratio, _ = ok.execute("points", test.Xp.to_numpy(), test.Yp.to_numpy())
+                        pred = test.Estimation.to_numpy() * np.maximum(np.asarray(pred_ratio, float), 0)
+                        records.append({"time": t, "LOO_RMSE": _safe_rmse(test.Observation, pred),
+                            "num_stations": len(test), "CV_scope": "leave_one_year_out_actual_rainfall"})
+                except Exception as exc:
+                    warnings.warn(f"Multiplicative correction failed for {t}: {exc}", RuntimeWarning)
+        fields.append(field.expand_dims(T=[t]))
+    output = xr.concat(fields, dim="T") if fields else xr.full_like(merger.da, np.nan)
+    output.attrs = dict(merger.da.attrs)
+    return output, pd.DataFrame(records) if do_cross_validation else None
+
+
+WAS_Merging.simple_bias_adjustment = _legacy_sba
+WAS_Merging.regression_kriging = _legacy_rk
+WAS_Merging.neural_network_kriging = _legacy_nn
+WAS_Merging.neural_network_kriging_ = _legacy_nn
+WAS_Merging.multiplicative_bias = _legacy_multiplicative

@@ -1,3 +1,4 @@
+from wass2s.was_scientific_utils import noleap_dayofyear, calendar_day_percentiles, align_predictor_target
 """Agroclimatic predictand computation from daily rainfall.
 
 Implements West African rainfall season onset, cessation, and dry-spell
@@ -17,7 +18,10 @@ WAS_compute_cessation
 WAS_compute_cessation_dry_spell
     Cessation detection with a dry-spell termination criterion.
 """
-from dask.distributed import Client
+try:
+    from dask.distributed import Client
+except Exception:  # optional for the Numba engine
+    Client = None
 
 # ---------------------------------------------------------------------------
 # Shared Dask client: created once per process and reused across ALL calls,
@@ -91,7 +95,10 @@ import numpy as np
 import random
 import datetime
 from joblib import Parallel, delayed
-import dask.array as da
+try:
+    import dask.array as da
+except Exception:  # optional for the Numba engine
+    da = None
 from typing import Optional, Union, List, Dict, Tuple
 import warnings
 from scipy import stats
@@ -268,7 +275,10 @@ class WAS_compute_onset:
         return day_of_year_value
 
     def rainf_zone(self, daily_data):
-        annual_rainfall = daily_data.resample(T="YE").sum(skipna=True).mean(dim='T')
+        fixed = _fixed_zone_mask(self, daily_data)
+        if fixed is not None:
+            return fixed
+        annual_rainfall = _zone_reference_rainfall(self, daily_data)
         mask_5 = annual_rainfall.where(abs(annual_rainfall.Y) <= 8, np.nan)
         mask_5 = xr.where(np.isnan(mask_5), np.nan, 5) 
         mask_4 = xr.where(
@@ -741,7 +751,10 @@ class WAS_compute_onset_dry_spell:
         return final_df
 
     def rainf_zone(self, daily_data):
-        annual_rainfall = daily_data.resample(T="YE").sum(skipna=True).mean(dim='T')
+        fixed = _fixed_zone_mask(self, daily_data)
+        if fixed is not None:
+            return fixed
+        annual_rainfall = _zone_reference_rainfall(self, daily_data)
         mask_5 = annual_rainfall.where(abs(annual_rainfall.Y) <= 8, np.nan)
         mask_5 = xr.where(np.isnan(mask_5), np.nan, 5) 
         mask_4 = xr.where(
@@ -1435,7 +1448,10 @@ class WAS_compute_cessation:
         return df_final
 
     def rainf_zone(self, daily_data):
-        annual_rainfall = daily_data.resample(T="YE").sum(skipna=True).mean(dim='T')
+        fixed = _fixed_zone_mask(self, daily_data)
+        if fixed is not None:
+            return fixed
+        annual_rainfall = _zone_reference_rainfall(self, daily_data)
         mask_5 = annual_rainfall.where(abs(annual_rainfall.Y) <= 8, np.nan)
         mask_5 = xr.where(np.isnan(mask_5), np.nan, 5) 
         mask_4 = xr.where(
@@ -1791,7 +1807,10 @@ class WAS_compute_cessation_dry_spell:
         return final_df
 
     def rainf_zone(self, daily_data):
-        annual_rainfall = daily_data.resample(T="YE").sum(skipna=True).mean(dim='T')
+        fixed = _fixed_zone_mask(self, daily_data)
+        if fixed is not None:
+            return fixed
+        annual_rainfall = _zone_reference_rainfall(self, daily_data)
         mask_5 = annual_rainfall.where(abs(annual_rainfall.Y) <= 8, np.nan)
         mask_5 = xr.where(np.isnan(mask_5), np.nan, 5) 
         mask_4 = xr.where(
@@ -3618,7 +3637,7 @@ class ExtremeType(Enum):
 
 class WAS_TempPercentileIndices:
     """
-    Implementation of ETCCDI temperature percentile-based extreme indices.
+    Temperature percentile indices with ETCCDI year-replacement bootstrap.
 
     Computes the annual percentage of days/nights exceeding (hot) or falling below (cold)
     a specified percentile threshold, using a 5-day centered window for percentile calculation
@@ -3691,7 +3710,11 @@ class WAS_TempPercentileIndices:
         var_type: str = 'TMAX',          # 'TMAX' or 'TMIN'
         extreme_type: str = 'hot',         # 'hot' or 'cold'
         bootstrap_samples: int = 10,
-        min_base_years: int = 15
+        min_base_years: int = 15,
+        in_base_bootstrap: bool = True,
+        min_valid_fraction: float = 1.0,
+        quantile_method: str = "median_unbiased",
+        random_state: int = 42
     ):
         """
         Parameters
@@ -3720,6 +3743,10 @@ class WAS_TempPercentileIndices:
         self.extreme_type = ExtremeType(extreme_type.lower())
         self.bootstrap_samples = bootstrap_samples
         self.min_base_years = min_base_years
+        self.in_base_bootstrap = bool(in_base_bootstrap)
+        self.min_valid_fraction = float(min_valid_fraction)
+        self.quantile_method = quantile_method
+        self.random_state = random_state
         
         # Validate inputs
         self._validate_inputs()
@@ -3803,13 +3830,18 @@ class WAS_TempPercentileIndices:
         """
         # Pivot to wide format (stations as columns)
         wide = temp_data.pivot(index="DATE", columns="STATION", values="VALUE")
+        if wide.index.hasnans:
+            raise ValueError("Daily dates must be finite")
+        wide = wide.where(np.isfinite(wide))
         
-        # Handle leap days: map February 29 to February 28
-        doy_series = wide.index.dayofyear.replace(366, 365)
+        # Fit on 365 calendar days; February 29 uses February 28 thresholds.
+        wide = wide.loc[~((wide.index.month == 2) & (wide.index.day == 29))]
+        doy_series = noleap_dayofyear(wide.index)
         wide_doy = wide.copy()
         wide_doy.index = doy_series
         
         # For each day of year (1-365), use 5-day centered window
+        rng = np.random.default_rng(self.random_state)
         thresholds = {}
         ci_lower = {}
         ci_upper = {}
@@ -3830,29 +3862,23 @@ class WAS_TempPercentileIndices:
                 threshold_values = np.nanpercentile(
                     window_data.values, 
                     self.percentile, 
-                    axis=0
+                    axis=0, method=self.quantile_method
                 )
                 thresholds[doy] = threshold_values
                 
                 # Bootstrap confidence intervals if requested
                 if confidence:
-                    n_bootstrap = min(self.bootstrap_samples, len(window_data))
+                    if self.bootstrap_samples < 1:
+                        raise ValueError("bootstrap_samples must be positive")
+                    # Confidence resampling preserves each year's five-day block.
+                    window_years = wide.index.year[window_mask]
+                    unique_years = np.unique(window_years)
                     bootstrap_samples = []
-                    
-                    for _ in range(n_bootstrap):
-                        idx = np.random.choice(
-                            len(window_data), 
-                            size=len(window_data), 
-                            replace=True
-                        )
-                        sample = window_data.iloc[idx]
-                        sample_percentile = np.nanpercentile(
-                            sample.values, 
-                            self.percentile, 
-                            axis=0
-                        )
-                        bootstrap_samples.append(sample_percentile)
-                    
+                    for _ in range(self.bootstrap_samples):
+                        chosen = rng.choice(unique_years, size=len(unique_years), replace=True)
+                        sample = np.concatenate([window_data.values[window_years == year] for year in chosen])
+                        bootstrap_samples.append(np.nanpercentile(
+                            sample, self.percentile, axis=0, method=self.quantile_method))
                     bootstrap_array = np.array(bootstrap_samples)
                     ci_lower[doy] = np.nanpercentile(bootstrap_array, 2.5, axis=0)
                     ci_upper[doy] = np.nanpercentile(bootstrap_array, 97.5, axis=0)
@@ -3868,6 +3894,7 @@ class WAS_TempPercentileIndices:
         
         if confidence:
             ci_lower_df = pd.DataFrame(ci_lower, index=wide.columns).T
+            ci_lower_df.index.name = "DOY"
             ci_lower_df = ci_lower_df.reset_index().melt(
                 id_vars="DOY",
                 var_name="STATION",
@@ -3875,6 +3902,7 @@ class WAS_TempPercentileIndices:
             )
             
             ci_upper_df = pd.DataFrame(ci_upper, index=wide.columns).T
+            ci_upper_df.index.name = "DOY"
             ci_upper_df = ci_upper_df.reset_index().melt(
                 id_vars="DOY",
                 var_name="STATION",
@@ -3897,7 +3925,7 @@ class WAS_TempPercentileIndices:
         For cold extremes: days when temperature < percentile (e.g., TX10p, TN10p)
         """
         # Merge thresholds with data
-        temp_data["DOY"] = temp_data["DATE"].dt.dayofyear.replace(366, 365)
+        temp_data["DOY"] = noleap_dayofyear(temp_data["DATE"])
         merged = pd.merge(temp_data, thresholds, on=["STATION", "DOY"], how="left")
         
         # Determine if day is extreme based on extreme type
@@ -3911,142 +3939,49 @@ class WAS_TempPercentileIndices:
             merged["EXTREME_TYPE"] = "cold"
         
         # Preserve NaN values from original data
-        merged.loc[merged["VALUE"].isna(), "IS_EXTREME"] = np.nan
+        merged.loc[merged["VALUE"].isna() | merged["THRESHOLD"].isna(), "IS_EXTREME"] = np.nan
         
         return merged
     
-    def compute_insitu(
-        self, 
-        df_cdt: pd.DataFrame,
-        return_confidence: bool = False
-    ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
-        """
-        Compute index for in-situ (station) data.
-        """
-        # Transform to long format
+    def compute_insitu(self, df_cdt, return_confidence=False):
+        """Use the identical calendar, bootstrap and coverage rules as grids."""
         df = self.transform_cdt(df_cdt)
-        
-        # Filter base period
-        base_start = int(self.base_period.start)
-        base_stop = int(self.base_period.stop)
-        df_base = df[
-            df["DATE"].dt.year.between(base_start, base_stop)
-        ].copy()
-        
-        # Validate base period
-        self._validate_base_period(df_base["DATE"].dt.year.values)
-        
-        # Calculate thresholds
+        data, meta = _station_temperature_array(df)
+        result = self.compute(data, parallel=False).to_dataframe(name=self.index_name).reset_index()
+        result['YEAR'] = result['T'].dt.year
+        result = result.rename(columns={'station':'STATION'}).merge(meta, on='STATION', validate='many_to_one')
+        output = self._format_to_cdt(result)
         if return_confidence:
-            thresholds, ci_lower, ci_upper = self._calculate_percentile_thresholds(
-                df_base, confidence=True
-            )
-        else:
-            thresholds = self._calculate_percentile_thresholds(df_base, confidence=False)
-        
-        # Calculate extreme days
-        df_extreme = self._calculate_extreme_days(df, thresholds)
-        
-        # Apply seasonal filter if specified
-        if self.season:
-            df_extreme = df_extreme[df_extreme["DATE"].dt.month.isin(self.season)]
-        
-        # Group by year and station
-        df_extreme["YEAR"] = df_extreme["DATE"].dt.year
-        
-        # Calculate percentage of extreme days
-        result = df_extreme.groupby(["STATION", "YEAR", "LAT", "LON"]).apply(
-            lambda x: (x["IS_EXTREME"].sum() / x["IS_EXTREME"].notna().sum()) * 100
-            if x["IS_EXTREME"].notna().sum() > 0 else np.nan
-        ).reset_index()
-        
-        result.columns = ["STATION", "YEAR", "LAT", "LON", self.index_name]
-        
-        # Format to CDT
-        result_cdt = self._format_to_cdt(result)
-        
-        if return_confidence:
-            return result_cdt, (ci_lower, ci_upper)
-        
-        return result_cdt
+            lo, hi = int(str(self.base_period.start)[:4]), int(str(self.base_period.stop)[:4])
+            base = df[df.DATE.dt.year.between(lo, hi)]
+            _, low, high = self._calculate_percentile_thresholds(base, confidence=True)
+            return output, (low, high)
+        return output
     
-    def compute(
-        self, 
-        ds: Union[xr.Dataset, xr.DataArray],
-        var_name: Optional[str] = None,
-        # chunk_size: Optional[Dict[str, int]] = None,
-        parallel: bool = True,
-        nb_cores: int = 4
-    ) -> xr.DataArray:
+    def compute(self, ds, var_name=None, parallel=True, nb_cores=4):
+        """Annual temperature percentile index with in-base resampling.
+
+        Defaults: exhaustive year-replacement bootstrap, type-8 quantiles,
+        and all selected days required. See valid_day_fraction coordinate.
         """
-        Compute index for xarray data (gridded).
-        """
-        # Extract DataArray
-        if isinstance(ds, xr.Dataset):
-            if var_name is None:
-                var_name = self.var_type
-            da = ds[var_name]
-        else:
-            da = ds
-        
-        # Standardize dimension names
+        from .was_climate_extremes import temperature_percentile_index
+        da = ds[var_name or self.var_type] if isinstance(ds, xr.Dataset) else ds
         da = self._standardize_dims(da)
-        
-        # Apply seasonal mask if specified
-        if self.season:
-            da = da.where(da.time.dt.month.isin(self.season), drop=True)
-        
-        # Handle chunking for Dask
-        if parallel: # and hasattr(da.data, 'chunks'):
-            chunk_size = {'y': int(np.round(len(da.get_index("y")) / nb_cores)), 'x': int(np.round(len(da.get_index("x")) / nb_cores))}
-            da = da.chunk({'time': -1, **chunk_size})
-            
-        # Select base period
-        da_base = da.sel(time=self.base_period)
-        
-        # Validate base period
-        base_years = np.unique(da_base.time.dt.year.values)
-        self._validate_base_period(base_years)
-        
-        # Calculate thresholds using 5-day centered window
-        windowed = da_base.rolling(time=5, center=True, min_periods=1).construct("window")
-        
-        # Calculate percentile
-        thresholds = windowed.groupby("time.dayofyear").quantile(
-            self.percentile / 100.0,
-            dim=["time", "window"],
-            method='linear',
-            skipna=True
-        )
-        
-        # Handle leap days
-        doy = da.time.dt.dayofyear
-        doy_fixed = xr.where(doy == 366, 365, doy)
-        
-        # Map thresholds to all time steps
-        full_thresholds = thresholds.sel(dayofyear=doy_fixed)
-        full_thresholds = full_thresholds.drop_vars("dayofyear")
-        full_thresholds = full_thresholds.assign_coords(time=da.time)
-        
-        # Identify extreme days based on extreme type
-        if self.extreme_type == ExtremeType.HOT:
-            # Hot extremes: temperature > percentile
-            is_extreme = (da > full_thresholds).astype(float)
-        elif self.extreme_type == ExtremeType.COLD:
-            # Cold extremes: temperature < percentile
-            is_extreme = (da < full_thresholds).astype(float)
-        
-        # Preserve NaN values
-        is_extreme = is_extreme.where(da.notnull())
-        
-        # Calculate annual percentage of extreme days
-        result = is_extreme.resample(time='YS').mean(dim='time', skipna=True) * 100
-        
-        # Set metadata
+        if parallel:
+            chunks = {d:max(1, int(np.ceil(da.sizes[d] / max(1, nb_cores))))
+                      for d in da.dims if d != 'time'}
+            da = da.chunk({'time': -1, **chunks})
+        years = da.time.dt.year.values
+        base_start, base_stop = int(str(self.base_period.start)[:4]), int(str(self.base_period.stop)[:4])
+        self._validate_base_period(years[(years >= base_start) & (years <= base_stop)])
+        result = temperature_percentile_index(
+            da, base_period=self.base_period, percentile=self.percentile,
+            hot=self.extreme_type == ExtremeType.HOT, season=self.season,
+            in_base_bootstrap=self.in_base_bootstrap,
+            min_valid_fraction=self.min_valid_fraction, quantile_method=self.quantile_method)
         result.name = self.index_name
         result.attrs.update(self._get_metadata())
-        
-        return result.compute().drop_vars("quantile").rename({"time": "T", "x": "X", "y": "Y"})
+        return result.compute().rename({d:n for d,n in [('time','T'),('x','X'),('y','Y')] if d in result.dims})
     
     def _standardize_dims(self, da: xr.DataArray) -> xr.DataArray:
         """Standardize dimension names."""
@@ -4061,8 +3996,8 @@ class WAS_TempPercentileIndices:
         
         # Identify spatial dimensions
         spatial_pairs = [
-            (['lat', 'y', 'latitude', 'Y'], 'lat'),
-            (['lon', 'x', 'longitude', 'X'], 'lon')
+            (['lat', 'y', 'latitude', 'Y'], 'y'),
+            (['lon', 'x', 'longitude', 'X'], 'x')
         ]
         
         for candidates, std_name in spatial_pairs:
@@ -4102,7 +4037,10 @@ class WAS_TempPercentileIndices:
             'extreme_type': self.extreme_type.value,
             'season': self.season if self.season else 'all months',
             'method': '5-day centered window percentile',
-            'reference': 'ETCCDI Climate Change Indices (2009)',
+            'reference': 'Zhang et al. 2005 year-replacement bootstrap' if self.in_base_bootstrap else 'ETCCDI-like (no in-base-period bootstrap)',
+            'in_base_bootstrap': int(self.in_base_bootstrap),
+            'quantile_method': self.quantile_method,
+            'min_valid_fraction': self.min_valid_fraction,
             'calculation': f'Annual percentage of days when {self.var_type} is {">" if self.extreme_type == ExtremeType.HOT else "<"} {self.percentile}th percentile of base period'
         }
     
@@ -4359,131 +4297,47 @@ class WAS_PrecipIndices:
         
         return thresholds
     
-    def compute_insitu(self, df_cdt: pd.DataFrame) -> pd.DataFrame:
-        """
-        Compute index for in-situ (station) data in CDT format.
-        
-        Parameters
-        ----------
-        df_cdt : pd.DataFrame
-            Input data in CDT format
-        
-        Returns
-        -------
-        pd.DataFrame
-            Result in CDT format
-        """
-        # Transform to long format
+    def compute_insitu(self, df_cdt):
+        """CDT station path uses the same strict totals as the gridded path."""
         df = self.transform_cdt(df_cdt)
-        
-        # Compute thresholds from base period
-        thresholds = self._compute_percentile_threshold(df)
-        
-        # Merge thresholds with data
-        df = pd.merge(df, thresholds, on="STATION", how="left")
-        
-        # Identify extreme precipitation days
-        df["EXTREME"] = np.where(
-            (df["VALUE"] >= self.wet_day_threshold) & 
-            (df["VALUE"] > df["THRESHOLD"]),
-            df["VALUE"],
-            0.0
-        )
-        
-        # Apply seasonal filter if specified
-        if self.season:
-            df = df[df["DATE"].dt.month.isin(self.season)]
-        
-        # Group by year and station
-        df["YEAR"] = df["DATE"].dt.year
-        result = df.groupby(["STATION", "YEAR", "LAT", "LON"])["EXTREME"] \
-                   .sum(min_count=1) \
-                   .reset_index()
-        result.rename(columns={"EXTREME": self.index_name}, inplace=True)
-        
-        # Convert back to CDT format
+        data, meta = _station_temperature_array(df)
+        result = self.compute(data, parallel=False).to_dataframe(name=self.index_name).reset_index()
+        result['YEAR'] = result['T'].dt.year
+        result = result.rename(columns={'station':'STATION'}).merge(meta, on='STATION', validate='many_to_one')
         return self._format_to_cdt(result)
     
-    def compute(
-        self, 
-        da: xr.DataArray,
-        # chunk_size: Optional[Dict[str, int]] = None,
-        parallel: bool = True,
-        nb_cores: int = 4
-    ) -> xr.DataArray:
-        """
-        Compute index for xarray DataArray (gridded data).
-        
-        Parameters
-        ----------
-        da : xr.DataArray
-            Precipitation DataArray with dimensions (time, y, x) or (time, lat, lon)
-        chunk_size : dict, optional
-            Chunk sizes for parallel processing, e.g., {'y': 100, 'x': 100}
-        parallel : bool
-            Whether to use Dask for parallel processing
-        
-        Returns
-        -------
-        xr.DataArray
-            Annual index values
-        """
-        # Rename dimensions to standard names if needed
-        da = self._standardize_dims(da)
+    def compute(self, da, parallel=True, nb_cores=4):
+        """Strict annual extreme-rain totals; a missing day is never dry.
 
-        
-        # Apply seasonal mask if specified
+        Thresholds use all wet days of the annual reference, identically for
+        stations and grids. Seasonal selection applies to the output only.
+        """
+        da = _daily_rainfall_mm(_complete_daily_calendar(self._standardize_dims(da)))
+        da = da.where(np.isfinite(da) & (da >= 0))
+        if parallel:
+            chunks = {d:max(1, int(np.ceil(da.sizes[d] / max(1, nb_cores))))
+                      for d in da.dims if d != 'time'}
+            da = da.chunk({'time':-1, **chunks})
+        lo, hi = int(str(self.base_period.start)[:4]), int(str(self.base_period.stop)[:4])
+        base = da.where((da.time.dt.year>=lo)&(da.time.dt.year<=hi),drop=True)
+        if not base.sizes['time']:
+            raise ValueError('Empty base period')
+        self._validate_base_period(base.time.dt.year.values)
+        threshold = base.where(base >= self.wet_day_threshold).quantile(
+            self.percentile/100., dim='time', skipna=True, method='median_unbiased')
+        extreme = xr.where((da >= self.wet_day_threshold)&(da > threshold), da, 0.)
+        extreme = extreme.where(da.notnull() & threshold.notnull())
         if self.season:
-            da = da.where(da.time.dt.month.isin(self.season), drop=True)
-        
-        # Handle chunking for Dask
-        if parallel:# and hasattr(da.data, 'chunks'):
-            chunk_size = {'y': int(np.round(len(da.get_index("y")) / nb_cores)), 'x': int(np.round(len(da.get_index("x")) / nb_cores))}
-            da = da.chunk({'time': -1, **chunk_size})
-        
-        # Select base period
-        da_base = da.sel(time=self.base_period)
-        
-        # Get wet days in base period
-        wet_base = da_base.where(da_base >= self.wet_day_threshold)
-        
-        # Validate base period
-        base_years = np.unique(da_base.time.dt.year.values)
-        self._validate_base_period(base_years)
-        
-        # Compute percentile threshold from base period wet days
-        # Using method='linear' for consistency with ETCCDI
-        threshold = wet_base.quantile(
-            self.percentile / 100.0, 
-            dim=['time'],
-            method='linear',
-            skipna=True
-        )
-        
-        # Identify extreme precipitation days
-        # Condition: precipitation >= wet_day_threshold AND > threshold
-        extreme = xr.where(
-            (da >= self.wet_day_threshold) & (da > threshold),
-            da,
-            0.0
-        )
-        
-        # Handle leap days by using 'YS' (year start) resampling
-        # This avoids issues with February 29th
-        result = extreme.resample(time='YS').sum(dim='time', min_count=1)
-        
-        # Rename result
+            extreme = extreme.where(extreme.time.dt.month.isin(self.season),drop=True)
+        result = extreme.resample(time='YS').sum('time', skipna=False)
         result.name = self.index_name
-        result.attrs.update({
-            'long_name': f'Annual total precipitation when daily precipitation > {self.percentile}th percentile',
-            'units': da.attrs.get('units', 'mm'),
-            'base_period': f'{self.base_period.start}-{self.base_period.stop}',
-            'percentile': self.percentile,
-            'wet_day_threshold': self.wet_day_threshold,
-            'season': self.season if self.season else 'all months'
-        })
-        
-        return result.compute().drop_vars("quantile").rename({"time": "T", "x": "X", "y": "Y"})
+        result.attrs.update(long_name=f'Total precipitation above wet-day {self.percentile}th percentile',
+                            units=da.attrs.get('units','mm'),base_period=f'{lo}-{hi}',
+                            percentile=self.percentile,wet_day_threshold=self.wet_day_threshold,
+                            season=self.season or 'all months',quantile_method='median_unbiased',
+                            coverage='all selected days required')
+        return result.compute().drop_vars('quantile',errors='ignore').rename(
+            {d:n for d,n in [('time','T'),('x','X'),('y','Y')] if d in result.dims})
     
     def _standardize_dims(self, da: xr.DataArray) -> xr.DataArray:
         """Standardize dimension names."""
@@ -4513,7 +4367,7 @@ class WAS_PrecipIndices:
             da = da.rename(dim_map)
         
         # Ensure required dimensions exist
-        required_dims = ['time', 'y', 'x']
+        required_dims = ['time']
         for dim in required_dims:
             if dim not in da.dims:
                 raise ValueError(f"DataArray must have '{dim}' dimension. Found: {list(da.dims)}")
@@ -4719,50 +4573,8 @@ class WAS_HeatWaveIndices:
     # -------------------------------------------------------------------------
     # Threshold computation (day-of-year)
     # -------------------------------------------------------------------------
-    def _compute_thresholds_dayofyear(
-        self,
-        da: xr.DataArray,
-        percentile: float,
-        parallel: bool,
-        nb_cores: int,
-    ) -> xr.DataArray:
-        """
-        Returns thresholds(dayofyear, lat, lon) for da(time, lat, lon).
-        Compatible across xarray versions (no dask_gufunc_kwargs).
-        """
-
-        # chunk across space (optional)
-        if parallel and self._is_dask(da):
-            ny, nx = int(da.sizes["lat"]), int(da.sizes["lon"])
-            cy, cx = self._choose_spatial_chunks(ny, nx, nb_cores)
-            da = da.chunk({"lat": cy, "lon": cx})
-
-        # critical: time must be single chunk for quantile core dim
-        if parallel and self._is_dask(da):
-            da = da.chunk({"time": -1})
-
-        # 5-day centered window
-        w = da.rolling(time=5, center=True, min_periods=1).construct("window")
-        if parallel and self._is_dask(w):
-            # window is tiny; keep single-chunk
-            w = w.chunk({"window": -1})
-
-        q = float(percentile) / 100.0
-
-        thr = w.groupby("time.dayofyear").quantile(
-            q,
-            dim=["time", "window"],
-            method="linear",
-            skipna=True,
-        )
-
-        # clean possible quantile dim/coord
-        if "quantile" in thr.dims:
-            thr = thr.isel(quantile=0, drop=True)
-        if "quantile" in thr.coords:
-            thr = thr.drop_vars("quantile")
-
-        return thr
+    def _compute_thresholds_dayofyear(self, da, percentile, parallel, nb_cores):
+        return calendar_day_percentiles(da, float(percentile)/100.0)
 
     # -------------------------------------------------------------------------
     # 1D run logic (correct ETCCDI spell counting)
@@ -4844,8 +4656,8 @@ class WAS_HeatWaveIndices:
         da_tx = self._standardize_dims(da_tx)
 
         # seasonal filter
-        if self.season:
-            da_tx = da_tx.where(da_tx["time"].dt.month.isin(self.season), drop=True)
+        # Reinsert missing dates to break runs and preserve calendar windows.
+        da_tx = _complete_daily_calendar(da_tx)
 
         # spatial chunking early (time chunk enforced where needed)
         if parallel and self._is_dask(da_tx):
@@ -4863,22 +4675,21 @@ class WAS_HeatWaveIndices:
 
         # map thresholds to each time
         doy = da_tx["time"].dt.dayofyear
-        doy_fixed = xr.where(doy == 366, 365, doy)
+        doy_fixed = noleap_dayofyear(da_tx["time"])
 
         tx_thr_full = tx_thr_doy.sel(dayofyear=doy_fixed)
         tx_thr_full = tx_thr_full.drop_vars("dayofyear", errors="ignore")
         tx_thr_full = tx_thr_full.assign_coords(time=da_tx["time"])
 
         is_hot_tx = (da_tx > tx_thr_full).astype(np.float32)
-        is_hot_tx = is_hot_tx.where(da_tx.notnull())
+        is_hot_tx = is_hot_tx.where(da_tx.notnull() & tx_thr_full.notnull())
 
         # --- optional TN compound
         if (ds_tn is not None) and self.require_both_tx_tn:
             da_tn = self._extract_da(ds_tn, ["TMIN", "tasmin", "TN"])
             da_tn = self._standardize_dims(da_tn)
 
-            if self.season:
-                da_tn = da_tn.where(da_tn["time"].dt.month.isin(self.season), drop=True)
+            da_tn = _complete_daily_calendar(da_tn)
 
             if parallel and self._is_dask(da_tn):
                 # align spatial chunking with TX if possible
@@ -4895,14 +4706,14 @@ class WAS_HeatWaveIndices:
             )
 
             doy_tn = da_tn["time"].dt.dayofyear
-            doy_tn_fixed = xr.where(doy_tn == 366, 365, doy_tn)
+            doy_tn_fixed = noleap_dayofyear(da_tn["time"])
 
             tn_thr_full = tn_thr_doy.sel(dayofyear=doy_tn_fixed)
             tn_thr_full = tn_thr_full.drop_vars("dayofyear", errors="ignore")
             tn_thr_full = tn_thr_full.assign_coords(time=da_tn["time"])
 
             is_hot_tn = (da_tn > tn_thr_full).astype(np.float32)
-            is_hot_tn = is_hot_tn.where(da_tn.notnull())
+            is_hot_tn = is_hot_tn.where(da_tn.notnull() & tn_thr_full.notnull())
 
             is_hot = ((is_hot_tx == 1) & (is_hot_tn == 1)).astype(np.float32)
             is_hot = is_hot.where(is_hot_tx.notnull() & is_hot_tn.notnull())
@@ -4910,6 +4721,8 @@ class WAS_HeatWaveIndices:
             is_hot = (is_hot_tx == 1).astype(np.float32)
             is_hot = is_hot.where(is_hot_tx.notnull())
 
+        if self.season:
+            is_hot = is_hot.where(is_hot['time'].dt.month.isin(self.season))
         # for apply_ufunc core dim safety: time single chunk
         if parallel and self._is_dask(is_hot):
             is_hot = is_hot.chunk({"time": -1})
@@ -4938,6 +4751,10 @@ class WAS_HeatWaveIndices:
                 output_dtypes=[np.int32],
             )
 
+            # Exact event counts require all selected calendar days. Outside
+            # the selected season NaNs break runs but are not missing inputs.
+            required = np.isin(hot_yr["time"].dt.month, self.season or list(range(1,13)))
+            out_yr = out_yr.where(hot_yr.isel(time=np.flatnonzero(required)).notnull().all("time"))
             out_yr = out_yr.expand_dims(time=[pd.Timestamp(f"{int(yr)}-01-01")])
             annual_list.append(out_yr)
 
@@ -4965,7 +4782,8 @@ class WAS_HeatWaveIndices:
             "min_consecutive_days": self.min_consecutive_days,
             "season": self.season if self.season else "all months",
             "require_both_tx_tn": self.require_both_tx_tn,
-            "reference": "ETCCDI Climate Change Indices",
+            "reference": "ETCCDI-like (no in-base-period bootstrap)",
+            "leap_day_policy": "Feb 29 uses Feb 28 threshold; excluded from reference",
             "definition": self._definition(metric),
         }
 
@@ -5048,3 +4866,1068 @@ class ETCCDIHeatWaveIndices:
             season=season,
             require_both_tx_tn=True,
         )
+# =============================================================================
+# Scientific / Numba acceleration layer (2026-08-26)
+# =============================================================================
+# This layer is appended intentionally so the public historical classes and their
+# constructors remain import-compatible with old notebooks.  It replaces only the
+# gridded compute kernels.  Set WAS_PREDICTAND_ENGINE=legacy to reproduce the
+# historical Python/Dask implementation (including its historical index convention).
+
+import os as _os
+
+try:
+    from numba import njit as _njit, prange as _prange, set_num_threads as _set_num_threads
+    _NUMBA_PREDICTAND_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _NUMBA_PREDICTAND_AVAILABLE = False
+    _prange = range
+    def _njit(*args, **kwargs):
+        if args and callable(args[0]):
+            return args[0]
+        return lambda f: f
+    def _set_num_threads(n):
+        return None
+
+
+def _predictand_engine(engine=None):
+    if engine is None:
+        engine = _os.environ.get("WAS_PREDICTAND_ENGINE", "auto")
+    engine = str(engine).lower()
+    if engine == "auto":
+        return "numba" if _NUMBA_PREDICTAND_AVAILABLE else "python"
+    if engine not in {"numba", "legacy"}:
+        raise ValueError("engine must be 'auto', 'numba', or 'legacy'.")
+    if engine == "numba" and not _NUMBA_PREDICTAND_AVAILABLE:
+        return "python"
+    return engine
+
+
+@_njit(cache=True, nogil=True)
+def _any_finite_1d(x):
+    for i in range(x.size):
+        if np.isfinite(x[i]):
+            return True
+    return False
+
+
+@_njit(cache=True, nogil=True)
+def _onset_index_strict(x, start_doy, cumulative, dry_days, rain_thr, end_doy):
+    """Return zero-based onset index; -1 means no defensible onset."""
+    n = x.size
+    if n < 3 or not _any_finite_1d(x):
+        return -1
+    if not (np.isfinite(start_doy) and np.isfinite(cumulative) and
+            np.isfinite(dry_days) and np.isfinite(rain_thr) and np.isfinite(end_doy)):
+        return -1
+    start = max(0, int(start_doy) - 1)       # DOY -> Python index
+    end = min(n - 1, int(end_doy) - 1)
+    ndry = max(0, int(dry_days))
+    # Need previous/current/next, while allowing the first candidate day to be start.
+    c0 = max(1, start + 1)
+    c1 = min(end, n - 2)
+    if c0 > c1:
+        return -1
+
+    for center in range(c0, c1 + 1):
+        p = center - 1
+        q = center
+        r = center + 1
+        if not (np.isfinite(x[p]) and np.isfinite(x[q]) and np.isfinite(x[r])):
+            # The first onset cannot be identified across an unobserved candidate.
+            return -1
+        c1d = x[p]
+        c2d = x[p] + x[q]
+        c3d = c2d + x[r]
+        if c1d < cumulative and c2d < cumulative and c3d < cumulative:
+            continue
+
+        # Historical WAS rule: onset is the rainiest day of the triggering 3-day window.
+        onset = p
+        vmax = x[p]
+        if x[q] > vmax:
+            onset = q; vmax = x[q]
+        if x[r] > vmax:
+            onset = r
+
+        # Reject a false start when a fully observed dry sequence of length ndry+1
+        # occurs during the subsequent 30 days. Missing values are treated as unknown,
+        # not automatically dry.
+        false_start = False
+        if onset + 30 >= n:
+            return -1  # incomplete confirmation window
+        last = onset + 30
+        for k in range(onset + 1, last + 1):
+            if not np.isfinite(x[k]):
+                return -1  # absence of a false start cannot be established
+        window_len = ndry + 1
+        if window_len > 0:
+            max_s = last - window_len + 1
+            for s in range(onset + 1, max_s + 1):
+                all_dry = True
+                all_valid = True
+                for k in range(s, s + window_len):
+                    if not np.isfinite(x[k]):
+                        all_valid = False
+                        all_dry = False
+                        break
+                    if x[k] >= rain_thr:
+                        all_dry = False
+                        break
+                if all_valid and all_dry:
+                    false_start = True
+                    break
+        if not false_start:
+            return onset
+    return -1
+
+
+@_njit(cache=True, nogil=True)
+def _longest_dry_run(x, start, end_exclusive, rain_thr):
+    n = x.size
+    start = max(0, start)
+    end_exclusive = min(n, end_exclusive)
+    if start >= end_exclusive:
+        return -1
+    best = 0
+    cur = 0
+    valid_seen = False
+    for k in range(start, end_exclusive):
+        v = x[k]
+        if not np.isfinite(v):
+            return -1  # exact longest duration is unidentified
+        valid_seen = True
+        if v < rain_thr:
+            cur += 1
+            if cur > best:
+                best = cur
+        else:
+            cur = 0
+    return best if valid_seen else -1
+
+
+@_njit(cache=True, nogil=True)
+def _cessation_index_strict(x, dry_soil_doy, search_start_doy, etp, capacity, end_doy):
+    """Return zero-based cessation index when soil reserve reaches 0, else -1."""
+    n = x.size
+    if n == 0 or not _any_finite_1d(x):
+        return -1
+    if not (np.isfinite(dry_soil_doy) and np.isfinite(search_start_doy) and
+            np.isfinite(etp) and np.isfinite(capacity) and np.isfinite(end_doy)):
+        return -1
+    dry0 = max(0, int(dry_soil_doy) - 1)
+    start = min(n - 1, max(0, int(search_start_doy) - 1))
+    end = min(n - 1, max(0, int(end_doy) - 1))
+    if dry0 > start or start > end:
+        return -1
+    ru = 0.0
+    cap = max(0.0, float(capacity))
+    for k in range(dry0, start + 1):
+        if not np.isfinite(x[k]):
+            return -1  # the soil-water balance cannot skip an unknown forcing
+        ru += x[k] - etp
+        if ru < 0.0: ru = 0.0
+        elif ru > cap: ru = cap
+    # Preserve the operational definition: search strictly after search_start.
+    for k in range(start + 1, end + 1):
+        if not np.isfinite(x[k]):
+            return -1  # the soil-water balance cannot skip an unknown forcing
+        ru += x[k] - etp
+        if ru < 0.0: ru = 0.0
+        elif ru > cap: ru = cap
+        if ru <= 0.0:
+            return k
+    # Do not manufacture a cessation at end_search if the balance never reaches zero.
+    return -1
+
+
+@_njit(cache=True, nogil=True)
+def _dry_spell_after_onset_strict(x, start_doy, cumulative, dry_days, rain_thr, end_doy, n_after):
+    onset = _onset_index_strict(x, start_doy, cumulative, dry_days, rain_thr, end_doy)
+    if onset < 0:
+        return np.nan
+    best = _longest_dry_run(x, onset, min(x.size, onset + int(n_after) + 1), rain_thr)
+    return np.nan if best < 0 else float(best)
+
+
+@_njit(cache=True, nogil=True)
+def _dry_spell_between_onset_cessation_strict(
+    x, onset_start_doy, cumulative, dry_days, rain_thr, onset_end_doy,
+    cessation_start_doy, dry_soil_doy, etp, capacity, cessation_end_doy, n_after
+):
+    onset = _onset_index_strict(x, onset_start_doy, cumulative, dry_days, rain_thr, onset_end_doy)
+    if onset < 0:
+        return np.nan
+    cess = _cessation_index_strict(x, dry_soil_doy, cessation_start_doy, etp, capacity, cessation_end_doy)
+    if cess < 0 or cess <= onset + int(n_after):
+        return np.nan
+    best = _longest_dry_run(x, onset + int(n_after), cess, rain_thr)
+    return np.nan if best < 0 else float(best)
+
+
+@_njit(cache=True, nogil=True)
+def _count_spell_exact(x, onset_doy, cessation_doy, run_length, threshold, wet, input_is_doy=True):
+    if not _any_finite_1d(x) or not np.isfinite(onset_doy) or not np.isfinite(cessation_doy):
+        return np.nan
+    if input_is_doy:
+        start = int(onset_doy) - 1
+        end = int(cessation_doy) - 1
+    else:
+        start = int(onset_doy)
+        end = int(cessation_doy)
+    if start < 0 or end < 0 or start >= x.size:
+        return np.nan
+    end = min(end, x.size - 1)
+    if end < start:
+        return np.nan
+    target = max(1, int(run_length))
+    count = 0
+    cur = 0
+    for k in range(start, end + 1):
+        v = x[k]
+        if not np.isfinite(v):
+            return np.nan  # unknown days can join or extend a spell
+        cond = (v >= threshold) if wet else (v < threshold)
+        if cond:
+            cur += 1
+        else:
+            if cur == target: count += 1
+            cur = 0
+    if cur == target: count += 1
+    return float(count)
+
+
+@_njit(cache=True, nogil=True)
+def _count_rain_days_strict(x, onset_doy, cessation_doy, threshold, input_is_doy=True):
+    if not _any_finite_1d(x) or not np.isfinite(onset_doy) or not np.isfinite(cessation_doy):
+        return np.nan
+    start = int(onset_doy) - 1 if input_is_doy else int(onset_doy)
+    end = int(cessation_doy) - 1 if input_is_doy else int(cessation_doy)
+    if start < 0 or end < 0 or start >= x.size:
+        return np.nan
+    end = min(end, x.size - 1)
+    if end < start:
+        return np.nan
+    count = 0
+    for k in range(start, end + 1):
+        if not np.isfinite(x[k]):
+            return np.nan
+        if x[k] >= threshold:
+            count += 1
+    return float(count)
+
+
+@_njit(cache=True, nogil=True, parallel=True)
+def _grid_onset(rain, zones, start, cumulative, dry_days, rain_thr, end):
+    nt, ny, nx = rain.shape
+    out = np.full((ny, nx), np.nan)
+    nzone = start.size
+    for flat in _prange(ny * nx):
+        iy = flat // nx; ix = flat - iy * nx
+        z = zones[iy, ix]
+        if z < 0 or z >= nzone:
+            continue
+        idx = _onset_index_strict(rain[:, iy, ix], start[z], cumulative[z], dry_days[z], rain_thr[z], end[z])
+        if idx >= 0:
+            out[iy, ix] = float(idx + 1)  # public output is true 1-based DOY
+    return out
+
+
+@_njit(cache=True, nogil=True, parallel=True)
+def _grid_onset_dry(rain, zones, start, cumulative, dry_days, rain_thr, end, n_after):
+    nt, ny, nx = rain.shape
+    out = np.full((ny, nx), np.nan)
+    nzone = start.size
+    for flat in _prange(ny * nx):
+        iy = flat // nx; ix = flat - iy * nx
+        z = zones[iy, ix]
+        if z < 0 or z >= nzone: continue
+        out[iy, ix] = _dry_spell_after_onset_strict(
+            rain[:,iy,ix], start[z], cumulative[z], dry_days[z], rain_thr[z], end[z], n_after[z])
+    return out
+
+
+@_njit(cache=True, nogil=True, parallel=True)
+def _grid_cessation(rain, zones, dry0, start, etp, cap, end):
+    nt, ny, nx = rain.shape
+    out = np.full((ny, nx), np.nan)
+    nzone = start.size
+    for flat in _prange(ny * nx):
+        iy = flat // nx; ix = flat - iy * nx
+        z = zones[iy, ix]
+        if z < 0 or z >= nzone: continue
+        idx = _cessation_index_strict(rain[:,iy,ix], dry0[z], start[z], etp[z], cap[z], end[z])
+        if idx >= 0: out[iy,ix] = float(idx + 1)
+    return out
+
+
+@_njit(cache=True, nogil=True, parallel=True)
+def _grid_cessation_dry(rain, zones, ostart, cumulative, dry_days, rain_thr, oend,
+                         cstart, dry0, etp, cap, cend, n_after):
+    nt, ny, nx = rain.shape
+    out = np.full((ny, nx), np.nan)
+    nzone = ostart.size
+    for flat in _prange(ny * nx):
+        iy = flat // nx; ix = flat - iy * nx
+        z = zones[iy,ix]
+        if z < 0 or z >= nzone: continue
+        out[iy,ix] = _dry_spell_between_onset_cessation_strict(
+            rain[:,iy,ix], ostart[z], cumulative[z], dry_days[z], rain_thr[z], oend[z],
+            cstart[z], dry0[z], etp[z], cap[z], cend[z], n_after[z])
+    return out
+
+
+@_njit(cache=True, nogil=True, parallel=True)
+def _grid_spell_count(rain, onset, cessation, run_length, threshold, wet, input_is_doy):
+    nt, ny, nx = rain.shape
+    out=np.full((ny,nx),np.nan)
+    for flat in _prange(ny*nx):
+        iy=flat//nx; ix=flat-iy*nx
+        out[iy,ix]=_count_spell_exact(rain[:,iy,ix],onset[iy,ix],cessation[iy,ix],run_length,threshold,wet,input_is_doy)
+    return out
+
+
+@_njit(cache=True, nogil=True, parallel=True)
+def _grid_rainy_count(rain, onset, cessation, threshold, input_is_doy):
+    nt, ny, nx = rain.shape
+    out=np.full((ny,nx),np.nan)
+    for flat in _prange(ny*nx):
+        iy=flat//nx; ix=flat-iy*nx
+        out[iy,ix]=_count_rain_days_strict(rain[:,iy,ix],onset[iy,ix],cessation[iy,ix],threshold,input_is_doy)
+    return out
+
+
+def _zone_codes_from_mask(mask):
+    vals=np.asarray(mask.values)
+    out=np.full(vals.shape,-1,dtype=np.int16)
+    finite=np.isfinite(vals)
+    if np.any(finite): out[finite]=np.rint(vals[finite]).astype(np.int16)
+    return np.ascontiguousarray(out)
+
+
+def _criteria_arrays(criteria, year, mapping):
+    """Build dense numeric criterion vectors indexed by zone id."""
+    maxz=max(int(z) for z in criteria)
+    out={key:np.full(maxz+1,np.nan,dtype=np.float64) for key in mapping}
+    for z,cfg in criteria.items():
+        z=int(z)
+        for key,spec in mapping.items():
+            src,kind=spec
+            val=cfg[src]
+            if kind=="doy":
+                date=pd.Timestamp(f"{int(year):04d}-{val}")
+                val=float(date.dayofyear)
+            out[key][z]=float(val)
+    return out
+
+
+
+def _complete_daily_calendar(data, time_dim="time"):
+    """Reject duplicate/subdaily records and expose all absent calendar dates."""
+    dates = pd.DatetimeIndex(data[time_dim].values)
+    if dates.empty:
+        raise ValueError("Daily series is empty")
+    if dates.hasnans or dates.has_duplicates or not dates.equals(dates.normalize()):
+        raise ValueError("Daily dates must be unique and labelled at midnight")
+    full = pd.date_range(f"{dates.min().year}-01-01", f"{dates.max().year}-12-31", freq="D")
+    return data.sortby(time_dim).reindex({time_dim:full})
+
+
+def _year_cube(da, year):
+    yd=da.sel(T=str(int(year))).transpose("T","Y","X")
+    dates = pd.DatetimeIndex(yd["T"].values)
+    if dates.has_duplicates or not dates.is_monotonic_increasing:
+        raise ValueError("Daily T must be sorted and unique")
+    if not dates.equals(dates.normalize()):
+        raise ValueError("Daily observations must be labelled at midnight")
+    # Kernels consume true day-of-year indices, not positions in a shortened year.
+    full_year = pd.date_range(f"{int(year)}-01-01", f"{int(year)}-12-31", freq="D")
+    yd = yd.reindex(T=full_year)
+    # one year at a time: bounded memory, no Python loop over pixels
+    if hasattr(yd.data,"compute"):
+        yd=yd.compute()
+    return yd, np.ascontiguousarray(np.asarray(yd.values,dtype=np.float64))
+
+
+def _set_numba_threads_safe(nb_cores):
+    if _NUMBA_PREDICTAND_AVAILABLE:
+        try: _set_num_threads(max(1,int(nb_cores)))
+        except Exception: pass
+
+
+def _target_stamp_for_zone(criteria, year, zone, key):
+    return np.datetime64(f"{int(year):04d}-{criteria[int(zone)][key]}","ns")
+
+
+def _resolve_fallback_options(self, legacy_random_fallback=None, random_state=None, fallback_window_days=None):
+    """Resolve optional legacy imputation; the default preserves missing events.
+
+    ``legacy_random_fallback=True`` explicitly enables the historical WASS2S convention:
+    when no onset/cessation is found before ``end_search``, draw a date uniformly
+    from the last ``fallback_window_days`` days of the search window.  The default
+    random_state=None intentionally keeps the historical run-to-run randomness;
+    pass an integer seed for reproducible scientific experiments.
+    """
+    if legacy_random_fallback is None:
+        legacy_random_fallback = bool(getattr(self, "legacy_random_fallback", False))
+    if fallback_window_days is None:
+        fallback_window_days = int(getattr(self, "fallback_window_days", 5))
+    if random_state is None:
+        random_state = getattr(self, "random_state", None)
+    return bool(legacy_random_fallback), random_state, max(0, int(fallback_window_days))
+
+
+_FALLBACK_STATS = {"filled": 0, "eligible": 0, "calls": 0}
+
+
+def _random_fallback_map(out, rain, zones, end_by_zone, rng, window_days=5,
+                         report=True):
+    """Fill unresolved valid cells with a random DOY near ``end_search``.
+
+    Only cells with a valid agro-climatic zone and at least one finite rainfall
+    value are eligible.  Invalid/ocean/no-data cells remain NaN.
+
+    This manufactures dates and is retained only for explicitly requested
+    legacy reproduction. The default leaves unresolved events missing.
+    """
+    ans=np.asarray(out,dtype=float).copy()
+    finite_any=np.any(np.isfinite(rain),axis=0)
+    filled = eligible = 0
+    for z in np.unique(zones[zones>=0]):
+        zi=int(z)
+        if zi<0 or zi>=len(end_by_zone) or not np.isfinite(end_by_zone[zi]):
+            continue
+        hi=max(1,min(int(rain.shape[0]),int(round(float(end_by_zone[zi])))))
+        lo=max(1,hi-int(window_days))
+        mask=(zones==zi)&finite_any&(~np.isfinite(ans))
+        n=int(mask.sum())
+        if n:
+            ans[mask]=rng.integers(lo,hi+1,size=n)
+            filled += n
+        eligible += int(((zones==zi)&finite_any).sum())
+    if report:
+        _FALLBACK_STATS["filled"] += filled
+        _FALLBACK_STATS["eligible"] += eligible
+        _FALLBACK_STATS["calls"] += 1
+        if eligible and filled:
+            print(f"[fallback] {filled}/{eligible} cellules non résolues "
+                  f"({100.0*filled/eligible:.1f} %) remplies par tirage aléatoire "
+                  f"sur les {int(window_days)} derniers jours de la fenêtre; "
+                  "ces dates ne sont pas des observations.", flush=True)
+    return ans
+
+
+def fallback_report():
+    """Cumulative share of onset/cessation dates that were drawn, not observed."""
+    st = dict(_FALLBACK_STATS)
+    st["fraction"] = (st["filled"] / st["eligible"]) if st["eligible"] else 0.0
+    return st
+
+
+@_njit(cache=True, nogil=True, parallel=True)
+def _grid_longest_dry_after_onset_map(rain, zones, onset_doy, n_after, rain_thr):
+    nt,ny,nx=rain.shape
+    out=np.full((ny,nx),np.nan)
+    for flat in _prange(ny*nx):
+        iy=flat//nx; ix=flat-iy*nx
+        z=zones[iy,ix]
+        if z<0 or z>=n_after.size or not np.isfinite(onset_doy[iy,ix]):
+            continue
+        onset=max(0,int(onset_doy[iy,ix])-1)
+        best=_longest_dry_run(rain[:,iy,ix],onset,min(nt,onset+int(n_after[z])+1),rain_thr[z])
+        if best>=0:
+            out[iy,ix]=float(best)
+    return out
+
+
+@_njit(cache=True, nogil=True, parallel=True)
+def _grid_longest_dry_between_maps(rain, zones, onset_doy, cessation_doy, n_after, rain_thr):
+    nt,ny,nx=rain.shape
+    out=np.full((ny,nx),np.nan)
+    for flat in _prange(ny*nx):
+        iy=flat//nx; ix=flat-iy*nx
+        z=zones[iy,ix]
+        if z<0 or z>=n_after.size or not np.isfinite(onset_doy[iy,ix]) or not np.isfinite(cessation_doy[iy,ix]):
+            continue
+        onset=int(onset_doy[iy,ix])-1
+        cess=int(cessation_doy[iy,ix])-1
+        start=onset+int(n_after[z])
+        if onset<0 or cess<=start:
+            continue
+        best=_longest_dry_run(rain[:,iy,ix],start,cess,rain_thr[z])
+        if best>=0:
+            out[iy,ix]=float(best)
+    return out
+
+
+# Keep historical methods accessible for exact reproduction.
+_legacy_onset_compute = WAS_compute_onset.compute
+_legacy_onset_scalar = WAS_compute_onset.onset_function
+_legacy_onsetdry_compute = WAS_compute_onset_dry_spell.compute
+_legacy_cess_compute = WAS_compute_cessation.compute
+_legacy_cessdry_compute = WAS_compute_cessation_dry_spell.compute
+_legacy_countdry_compute = WAS_count_dry_spells.compute
+_legacy_countwet_compute = WAS_count_wet_spells.compute
+_legacy_countrain_compute = WAS_count_rainy_days.compute
+
+
+def _legacy_random_scalar_end(self, end_value):
+    use, seed, window=_resolve_fallback_options(self)
+    if not use or not np.isfinite(end_value):
+        return np.nan
+    hi=max(1,int(end_value)); lo=max(1,hi-window)
+    if seed is None:
+        # Deliberately use the historical Python RNG when no seed was requested.
+        return float(random.randint(lo,hi))
+    rng=getattr(self,"_fallback_rng",None)
+    if rng is None or getattr(self,"_fallback_rng_seed",None)!=int(seed):
+        rng=np.random.default_rng(int(seed)); self._fallback_rng=rng; self._fallback_rng_seed=int(seed)
+    return float(rng.integers(lo,hi+1))
+
+
+def _onset_scalar_public(self,x,idebut,cumul,nbsec,jour_pluvieux,irch_fin):
+    idx=_onset_index_strict(np.asarray(x,dtype=np.float64),idebut,cumul,nbsec,jour_pluvieux,irch_fin)
+    return _legacy_random_scalar_end(self,irch_fin) if idx<0 else float(idx+1)
+
+def _onset_dry_scalar_public(self,x,idebut,cumul,nbsec,jour_pluvieux,irch_fin,nbjour):
+    arr=np.asarray(x,dtype=np.float64)
+    idx=_onset_index_strict(arr,idebut,cumul,nbsec,jour_pluvieux,irch_fin)
+    if idx<0:
+        fb=_legacy_random_scalar_end(self,irch_fin)
+        if not np.isfinite(fb): return np.nan
+        idx=int(fb)-1
+    best=_longest_dry_run(arr,idx,min(arr.size,idx+int(nbjour)+1),jour_pluvieux)
+    return np.nan if best<0 else float(best)
+
+def _cess_scalar_public(self,x,ijour_dem_cal,idebut,ETP,Cap_ret_maxi,irch_fin):
+    idx=_cessation_index_strict(
+        np.asarray(x,dtype=np.float64),ijour_dem_cal,idebut,ETP,Cap_ret_maxi,irch_fin)
+    return _legacy_random_scalar_end(self,irch_fin) if idx<0 else float(idx+1)
+
+def _cess_dry_scalar_public(self,x,idebut1,cumul,nbsec,jour_pluvieux,irch_fin1,
+                             idebut2,ijour_dem_cal,ETP,Cap_ret_maxi,irch_fin2,nbjour):
+    arr=np.asarray(x,dtype=np.float64)
+    oi=_onset_index_strict(arr,idebut1,cumul,nbsec,jour_pluvieux,irch_fin1)
+    if oi<0:
+        fb=_legacy_random_scalar_end(self,irch_fin1)
+        if not np.isfinite(fb): return np.nan
+        oi=int(fb)-1
+    ci=_cessation_index_strict(arr,ijour_dem_cal,idebut2,ETP,Cap_ret_maxi,irch_fin2)
+    if ci<0:
+        fb=_legacy_random_scalar_end(self,irch_fin2)
+        if not np.isfinite(fb): return np.nan
+        ci=int(fb)-1
+    start=oi+int(nbjour)
+    if ci<=start: return np.nan
+    best=_longest_dry_run(arr,start,ci,jour_pluvieux)
+    return np.nan if best<0 else float(best)
+
+
+def _onset_compute_public(self,daily_data,nb_cores,engine=None,legacy_random_fallback=None,random_state=None,fallback_window_days=None):
+    if _predictand_engine(engine)=="legacy":
+        return _legacy_onset_compute(self,daily_data,nb_cores)
+    use_fb, seed, win=_resolve_fallback_options(self,legacy_random_fallback,random_state,fallback_window_days)
+    rng=np.random.default_rng(seed)
+    _set_numba_threads_safe(nb_cores)
+    data=daily_data.transpose("T","Y","X")
+    zones_da=self.rainf_zone(data); zones=_zone_codes_from_mask(zones_da)
+    valid=np.unique(zones[zones>=0])
+    if valid.size==0: raise ValueError("No valid zones found in the mask.")
+    anchor=int(valid.max()); years=np.unique(data["T"].dt.year.values.astype(int)); results=[]; stamps=[]
+    mapping={"start":("start_search","doy"),"cum":("cumulative","num"),
+             "dry":("number_dry_days","num"),"thr":("thrd_rain_day","num"),
+             "end":("end_search","doy")}
+    for year in years:
+        yd,arr=_year_cube(data,year); c=_criteria_arrays(self.criteria,year,mapping)
+        out=_grid_onset(arr,zones,c["start"],c["cum"],c["dry"],c["thr"],c["end"])
+        if use_fb:
+            out=_random_fallback_map(out,arr,zones,c["end"],rng,win)
+        results.append(xr.DataArray(out,coords={"Y":data.Y,"X":data.X},dims=("Y","X")))
+        stamps.append(_target_stamp_for_zone(self.criteria,year,anchor,"start_search"))
+    ans=xr.concat(results,dim=xr.DataArray(stamps,dims="T",name="T")); ans.name="Onset"
+    ans.attrs.update({"date_convention":"day_of_year_1_based","engine":_predictand_engine(engine),
+                      "legacy_random_fallback":bool(use_fb),"fallback_window_days":int(win),
+                      "fallback":"random_last_days" if use_fb else "nan",
+                      "random_state":seed if seed is not None else "unseeded"})
+    return ans
+
+
+def _onsetdry_compute_public(self,daily_data,nb_cores,engine=None,legacy_random_fallback=None,random_state=None,fallback_window_days=None):
+    if _predictand_engine(engine)=="legacy": return _legacy_onsetdry_compute(self,daily_data,nb_cores)
+    use_fb, seed, win=_resolve_fallback_options(self,legacy_random_fallback,random_state,fallback_window_days)
+    rng=np.random.default_rng(seed)
+    _set_numba_threads_safe(nb_cores); data=daily_data.transpose("T","Y","X")
+    zones_da=self.rainf_zone(data); zones=_zone_codes_from_mask(zones_da); valid=np.unique(zones[zones>=0])
+    if valid.size==0: raise ValueError("No valid zones found in the mask.")
+    anchor=int(valid.max()); years=np.unique(data["T"].dt.year.values.astype(int)); results=[]; stamps=[]
+    mapping={"start":("start_search","doy"),"cum":("cumulative","num"),"dry":("number_dry_days","num"),
+             "thr":("thrd_rain_day","num"),"end":("end_search","doy"),"n":("nbjour","num")}
+    for year in years:
+        yd,arr=_year_cube(data,year); c=_criteria_arrays(self.criteria,year,mapping)
+        if use_fb:
+            onset=_grid_onset(arr,zones,c["start"],c["cum"],c["dry"],c["thr"],c["end"])
+            onset=_random_fallback_map(onset,arr,zones,c["end"],rng,win)
+            out=_grid_longest_dry_after_onset_map(arr,zones,onset,c["n"],c["thr"])
+        else:
+            out=_grid_onset_dry(arr,zones,c["start"],c["cum"],c["dry"],c["thr"],c["end"],c["n"])
+        results.append(xr.DataArray(out,coords={"Y":data.Y,"X":data.X},dims=("Y","X")))
+        stamps.append(_target_stamp_for_zone(self.criteria,year,anchor,"start_search"))
+    ans=xr.concat(results,dim=xr.DataArray(stamps,dims="T",name="T")); ans.name="Onset_dryspell"
+    ans.attrs.update({"engine":_predictand_engine(engine),"legacy_random_fallback":bool(use_fb),"fallback_window_days":int(win),
+                      "random_state":seed if seed is not None else "unseeded"}); return ans
+
+
+def _cess_compute_public(self,daily_data,nb_cores,engine=None,legacy_random_fallback=None,random_state=None,fallback_window_days=None):
+    if _predictand_engine(engine)=="legacy": return _legacy_cess_compute(self,daily_data,nb_cores)
+    use_fb, seed, win=_resolve_fallback_options(self,legacy_random_fallback,random_state,fallback_window_days)
+    rng=np.random.default_rng(seed)
+    _set_numba_threads_safe(nb_cores); data=daily_data.transpose("T","Y","X")
+    zones_da=self.rainf_zone(data); zones=_zone_codes_from_mask(zones_da); valid=np.unique(zones[zones>=0])
+    if valid.size==0: raise ValueError("No valid zones found in the mask.")
+    anchor=int(valid.max()); years=np.unique(data["T"].dt.year.values.astype(int)); results=[]; stamps=[]
+    mapping={"dry0":("date_dry_soil","doy"),"start":("start_search","doy"),"etp":("ETP","num"),
+             "cap":("Cap_ret_maxi","num"),"end":("end_search","doy")}
+    for year in years:
+        yd,arr=_year_cube(data,year); c=_criteria_arrays(self.criteria,year,mapping)
+        out=_grid_cessation(arr,zones,c["dry0"],c["start"],c["etp"],c["cap"],c["end"])
+        if use_fb:
+            out=_random_fallback_map(out,arr,zones,c["end"],rng,win)
+        results.append(xr.DataArray(out,coords={"Y":data.Y,"X":data.X},dims=("Y","X")))
+        stamps.append(_target_stamp_for_zone(self.criteria,year,anchor,"start_search"))
+    ans=xr.concat(results,dim=xr.DataArray(stamps,dims="T",name="T")); ans.name="Cessation"
+    ans.attrs.update({"date_convention":"day_of_year_1_based","engine":_predictand_engine(engine),
+                      "legacy_random_fallback":bool(use_fb),"fallback_window_days":int(win),
+                      "fallback":"random_last_days" if use_fb else "nan",
+                      "random_state":seed if seed is not None else "unseeded"}); return ans
+
+
+def _cessdry_compute_public(self,daily_data,nb_cores,engine=None,legacy_random_fallback=None,random_state=None,fallback_window_days=None):
+    if _predictand_engine(engine)=="legacy": return _legacy_cessdry_compute(self,daily_data,nb_cores)
+    use_fb, seed, win=_resolve_fallback_options(self,legacy_random_fallback,random_state,fallback_window_days)
+    rng=np.random.default_rng(seed)
+    _set_numba_threads_safe(nb_cores); data=daily_data.transpose("T","Y","X")
+    zones_da=self.rainf_zone(data); zones=_zone_codes_from_mask(zones_da); valid=np.unique(zones[zones>=0])
+    if valid.size==0: raise ValueError("No valid zones found in the mask.")
+    anchor=int(valid.max()); years=np.unique(data["T"].dt.year.values.astype(int)); results=[]; stamps=[]
+    mapping={"os":("start_search1","doy"),"cum":("cumulative","num"),"dry":("number_dry_days","num"),
+             "thr":("thrd_rain_day","num"),"oe":("end_search1","doy"),"cs":("start_search2","doy"),
+             "dry0":("date_dry_soil","doy"),"etp":("ETP","num"),"cap":("Cap_ret_maxi","num"),
+             "ce":("end_search2","doy"),"n":("nbjour","num")}
+    for year in years:
+        yd,arr=_year_cube(data,year); c=_criteria_arrays(self.criteria,year,mapping)
+        if use_fb:
+            onset=_grid_onset(arr,zones,c["os"],c["cum"],c["dry"],c["thr"],c["oe"])
+            onset=_random_fallback_map(onset,arr,zones,c["oe"],rng,win)
+            cess=_grid_cessation(arr,zones,c["dry0"],c["cs"],c["etp"],c["cap"],c["ce"])
+            cess=_random_fallback_map(cess,arr,zones,c["ce"],rng,win)
+            out=_grid_longest_dry_between_maps(arr,zones,onset,cess,c["n"],c["thr"])
+        else:
+            out=_grid_cessation_dry(arr,zones,c["os"],c["cum"],c["dry"],c["thr"],c["oe"],c["cs"],c["dry0"],c["etp"],c["cap"],c["ce"],c["n"])
+        results.append(xr.DataArray(out,coords={"Y":data.Y,"X":data.X},dims=("Y","X")))
+        stamps.append(_target_stamp_for_zone(self.criteria,year,anchor,"start_search2"))
+    ans=xr.concat(results,dim=xr.DataArray(stamps,dims="T",name="T")); ans.name="Cessation_dryspell"
+    ans.attrs.update({"engine":_predictand_engine(engine),"legacy_random_fallback":bool(use_fb),"fallback_window_days":int(win),
+                      "random_state":seed if seed is not None else "unseeded"}); return ans
+
+
+def _spell_compute_common(self,daily_data,onset_date,cessation_date,run_length,threshold,nb_cores,wet,engine=None,date_convention="doy"):
+    if _predictand_engine(engine)=="legacy":
+        fn=_legacy_countwet_compute if wet else _legacy_countdry_compute
+        return fn(self,daily_data,onset_date,cessation_date,run_length,threshold,nb_cores)
+    _set_numba_threads_safe(nb_cores)
+    target_on=onset_date.transpose("T","Y","X"); target_ce=align_predictor_target(cessation_date, target_on, mode="season_year").transpose("T","Y","X")
+    data=daily_data.sel(Y=target_on.Y,X=target_on.X).transpose("T","Y","X")
+    input_is_doy=str(date_convention).lower() not in {"index","index0","zero_based"}
+    results=[]
+    for ti,tv in enumerate(target_on["T"].values):
+        year=int(pd.Timestamp(tv).year); yd,arr=_year_cube(data,year)
+        on=np.asarray(target_on.isel(T=ti).values,dtype=np.float64); ce=np.asarray(target_ce.isel(T=ti).values,dtype=np.float64)
+        out=_grid_spell_count(arr,np.ascontiguousarray(on),np.ascontiguousarray(ce),int(run_length),float(threshold),bool(wet),bool(input_is_doy))
+        results.append(xr.DataArray(out,coords={"Y":target_on.Y,"X":target_on.X},dims=("Y","X")))
+    ans=xr.concat(results,dim=target_on["T"]); ans.name="Count_wetspell" if wet else "Count_dryspell"; ans.attrs["engine"]=_predictand_engine(engine); return ans
+
+
+def _dry_compute_public(self,daily_data,onset_date,cessation_date,dry_spell_length,dry_threshold,nb_cores,engine=None,date_convention="doy"):
+    return _spell_compute_common(self,daily_data,onset_date,cessation_date,dry_spell_length,dry_threshold,nb_cores,False,engine,date_convention)
+
+
+def _wet_compute_public(self,daily_data,onset_date,cessation_date,wet_spell_length,wet_threshold,nb_cores,engine=None,date_convention="doy"):
+    return _spell_compute_common(self,daily_data,onset_date,cessation_date,wet_spell_length,wet_threshold,nb_cores,True,engine,date_convention)
+
+
+def _rainy_compute_public(self,daily_data,onset_date,cessation_date,rain_threshold,nb_cores,engine=None,date_convention="doy"):
+    if _predictand_engine(engine)=="legacy": return _legacy_countrain_compute(self,daily_data,onset_date,cessation_date,rain_threshold,nb_cores)
+    _set_numba_threads_safe(nb_cores); target_on=onset_date.transpose("T","Y","X"); target_ce=align_predictor_target(cessation_date, target_on, mode="season_year").transpose("T","Y","X")
+    data=daily_data.sel(Y=target_on.Y,X=target_on.X).transpose("T","Y","X"); input_is_doy=str(date_convention).lower() not in {"index","index0","zero_based"}; results=[]
+    for ti,tv in enumerate(target_on["T"].values):
+        year=int(pd.Timestamp(tv).year); yd,arr=_year_cube(data,year)
+        on=np.ascontiguousarray(np.asarray(target_on.isel(T=ti).values,dtype=np.float64)); ce=np.ascontiguousarray(np.asarray(target_ce.isel(T=ti).values,dtype=np.float64))
+        out=_grid_rainy_count(arr,on,ce,float(rain_threshold),bool(input_is_doy)); results.append(xr.DataArray(out,coords={"Y":target_on.Y,"X":target_on.X},dims=("Y","X")))
+    ans=xr.concat(results,dim=target_on["T"]); ans.name="Count_rainy_days"; ans.attrs["engine"]=_predictand_engine(engine); return ans
+
+
+# Numba-compiled spell statistic for heat-wave indices.
+@_njit(cache=True, nogil=True)
+def _spell_stats_numba(arr, minlen):
+    n=arr.size; wsdi=0; events=0; maxlen=0; cur=0
+    for i in range(n):
+        hot=np.isfinite(arr[i]) and arr[i]==1
+        if hot:
+            cur+=1
+        else:
+            if cur>=minlen:
+                wsdi+=cur; events+=1; maxlen=max(maxlen,cur)
+            cur=0
+    if cur>=minlen:
+        wsdi+=cur; events+=1; maxlen=max(maxlen,cur)
+    return int(wsdi),int(events),int(maxlen)
+
+
+# Optional constructor controls; all additions have defaults so historical calls stay valid.
+_orig_onset_init_numba = WAS_compute_onset.__init__
+_orig_onsetdry_init_numba = WAS_compute_onset_dry_spell.__init__
+_orig_cess_init_numba = WAS_compute_cessation.__init__
+_orig_cessdry_init_numba = WAS_compute_cessation_dry_spell.__init__
+
+
+def _init_predictand_fallback(obj, original_init, user_criteria=None,
+                               legacy_random_fallback=False, random_state=None,
+                               fallback_window_days=5):
+    original_init(obj, user_criteria)
+    obj.legacy_random_fallback=bool(legacy_random_fallback)
+    obj.random_state=random_state
+    obj.fallback_window_days=max(0,int(fallback_window_days))
+
+
+def _onset_init_public(self,user_criteria=None,legacy_random_fallback=False,random_state=None,fallback_window_days=5, *, zone_reference_period=None, zone_mask=None):
+    _init_predictand_fallback(self,_orig_onset_init_numba,user_criteria,legacy_random_fallback,random_state,fallback_window_days)
+    _configure_zoning(self, zone_reference_period, zone_mask)
+
+def _onsetdry_init_public(self,user_criteria=None,legacy_random_fallback=False,random_state=None,fallback_window_days=5, *, zone_reference_period=None, zone_mask=None):
+    _init_predictand_fallback(self,_orig_onsetdry_init_numba,user_criteria,legacy_random_fallback,random_state,fallback_window_days)
+    _configure_zoning(self, zone_reference_period, zone_mask)
+
+def _cess_init_public(self,user_criteria=None,legacy_random_fallback=False,random_state=None,fallback_window_days=5, *, zone_reference_period=None, zone_mask=None):
+    _init_predictand_fallback(self,_orig_cess_init_numba,user_criteria,legacy_random_fallback,random_state,fallback_window_days)
+    _configure_zoning(self, zone_reference_period, zone_mask)
+
+def _cessdry_init_public(self,user_criteria=None,legacy_random_fallback=False,random_state=None,fallback_window_days=5, *, zone_reference_period=None, zone_mask=None):
+    _init_predictand_fallback(self,_orig_cessdry_init_numba,user_criteria,legacy_random_fallback,random_state,fallback_window_days)
+    _configure_zoning(self, zone_reference_period, zone_mask)
+
+WAS_compute_onset.__init__=_onset_init_public
+WAS_compute_onset_dry_spell.__init__=_onsetdry_init_public
+WAS_compute_cessation.__init__=_cess_init_public
+WAS_compute_cessation_dry_spell.__init__=_cessdry_init_public
+
+# Bind corrected accelerated methods while retaining historical class names.
+WAS_compute_onset.onset_function = _onset_scalar_public
+WAS_compute_onset.compute = _onset_compute_public
+WAS_compute_onset_dry_spell.dry_spell_onset_function = _onset_dry_scalar_public
+WAS_compute_onset_dry_spell.dry_spell_onset_function_ = _onset_dry_scalar_public
+WAS_compute_onset_dry_spell.compute = _onsetdry_compute_public
+WAS_compute_cessation.cessation_function = _cess_scalar_public
+WAS_compute_cessation.compute = _cess_compute_public
+WAS_compute_cessation_dry_spell.dry_spell_cessation_function = _cess_dry_scalar_public
+WAS_compute_cessation_dry_spell.compute = _cessdry_compute_public
+WAS_count_dry_spells.count_dry_spells = staticmethod(lambda x,onset,cessation,dry_spell_length,dry_threshold: _count_spell_exact(np.asarray(x,dtype=np.float64),onset,cessation,dry_spell_length,dry_threshold,False,True))
+WAS_count_dry_spells.compute = _dry_compute_public
+WAS_count_wet_spells.count_wet_spells = staticmethod(lambda x,onset_date,cessation_date,wet_spell_length,wet_threshold: _count_spell_exact(np.asarray(x,dtype=np.float64),onset_date,cessation_date,wet_spell_length,wet_threshold,True,True))
+WAS_count_wet_spells.compute = _wet_compute_public
+WAS_count_rainy_days.count_rainy_days = staticmethod(lambda x,onset_date,cessation_date,rain_threshold: _count_rain_days_strict(np.asarray(x,dtype=np.float64),onset_date,cessation_date,rain_threshold,True))
+WAS_count_rainy_days.compute = _rainy_compute_public
+WAS_HeatWaveIndices._spell_stats_1d = staticmethod(_spell_stats_numba)
+
+
+# Reference zoning is explicit and can be frozen before any hindcast scoring.
+def _configure_zoning(self, period, mask):
+    if period is not None and mask is not None:
+        raise ValueError('Choose zone_reference_period or zone_mask, not both')
+    if period is not None and (not isinstance(period, slice) or period.start is None or period.stop is None):
+        raise ValueError('zone_reference_period needs inclusive year bounds')
+    self.zone_reference_period = period
+    self.zone_mask = None if mask is None else mask.copy(deep=True)
+
+
+def _fixed_zone_mask(self, data):
+    mask = getattr(self, 'zone_mask', None)
+    if mask is None:
+        return None
+    if set(mask.dims) != {'Y','X'}:
+        raise ValueError('zone_mask must have only Y,X dimensions')
+    for dim in ('Y','X'):
+        if not mask.get_index(dim).equals(data.get_index(dim)):
+            raise ValueError('zone_mask coordinates must exactly match the predictand grid')
+    values = np.asarray(mask.values)
+    valid = values[np.isfinite(values)]
+    if not np.isin(valid, list(self.criteria)).all():
+        raise ValueError('zone_mask has unknown or noninteger criterion codes')
+    result = mask.transpose('Y','X').copy(deep=True)
+    result.attrs['zoning'] = 'fixed reference map'
+    return result
+
+
+def _zone_reference_rainfall(self, data):
+    ref = _complete_daily_calendar(data, 'T')
+    period = getattr(self, 'zone_reference_period', None)
+    if period is not None:
+        lo, hi = int(str(period.start)[:4]), int(str(period.stop)[:4])
+        ref = ref.where((ref["T"].dt.year >= lo)&(ref["T"].dt.year <= hi),drop=True)
+        if not ref.sizes['T']:
+            raise ValueError('zone_reference_period has no dates in the input')
+    ref = ref.where(np.isfinite(ref) & (ref >= 0))
+    annual = ref.resample(T='YE').sum(skipna=False).mean('T',skipna=True)
+    annual.attrs['zone_reference_period'] = f'{int(ref["T"].dt.year.min())}-{int(ref["T"].dt.year.max())}'
+    return annual
+
+
+def _fit_zones(self, reference_data):
+    """Freeze zones from this training/reference archive; return self."""
+    previous = self.zone_mask
+    self.zone_mask = None
+    try:
+        fitted = self.rainf_zone(reference_data).copy(deep=True)
+    except Exception:
+        self.zone_mask = previous
+        raise
+    self.zone_mask = fitted
+    return self
+
+
+for _zone_class in (WAS_compute_onset, WAS_compute_onset_dry_spell,
+                    WAS_compute_cessation, WAS_compute_cessation_dry_spell):
+    _zone_class.fit_zones = _fit_zones
+
+
+def _station_temperature_array(df):
+    """Keep station identity separate from spatial coordinates (no jitter)."""
+    if df.duplicated(['STATION','DATE']).any():
+        raise ValueError('Station daily dates must be unique')
+    wide = df.pivot(index='DATE',columns='STATION',values='VALUE')
+    data = xr.DataArray(wide.to_numpy(dtype=float),dims=('time','station'),
+                        coords={'time':wide.index.to_numpy(),'station':wide.columns.to_numpy()})
+    meta = df[['STATION','LAT','LON']].drop_duplicates()
+    if meta.STATION.duplicated().any():
+        raise ValueError('Station coordinates change within the archive')
+    return data, meta
+
+
+def _daily_rainfall_mm(data):
+    """Normalize daily rainfall amounts/rates before wet-day thresholds.
+
+    Each input record represents one daily amount or a mean rate over that
+    complete day. Unknown units are rejected; absent units retain historical
+    millimetres with an explicit assumption. Output totals always use mm.
+    """
+    original = str(data.attrs.get('units', '')).strip()
+    units = original.lower().replace(' ', '').replace('**', '').replace('^', '')
+    units = units.replace('−','-').replace('²','2').replace('⁻','-').replace('¹','1')
+    factors = {'':1., 'mm':1., 'mm/day':1., 'mm/d':1., 'mmday-1':1., 'mmd-1':1.,
+               'm':1000., 'm/day':1000., 'm/d':1000., 'mday-1':1000., 'md-1':1000.,
+               'kgm-2':1., 'kgm-2day-1':1., 'kgm-2d-1':1.,
+               'kgm-2s-1':86400., 'kg/m2/s':86400., 'mm/s':86400.,
+               'mms-1':86400., 'm/s':86400000., 'ms-1':86400000.}
+    if units not in factors:
+        raise ValueError(f'Unsupported daily precipitation units: {original!r}')
+    out = data * factors[units]
+    out.attrs = dict(data.attrs, units='mm', source_units=original or 'assumed mm per day')
+    return out
+
+
+# The station path shares the strict grid kernels and reference zoning. Station
+# identifiers, rather than coordinate perturbations, distinguish colocated gauges.
+def _parse_daily_station_predictands(daily_df):
+    """Read labelled CDT metadata without moving stations or inventing rain."""
+    if not isinstance(daily_df, pd.DataFrame) or daily_df.shape[1] < 2:
+        raise ValueError('Daily CDT input must contain a date/metadata column and stations')
+    if not daily_df.columns.is_unique:
+        raise ValueError('Station identifiers must be unique')
+    stations = [str(s).strip() for s in daily_df.columns[1:]]
+    if len(set(stations)) != len(stations) or any(not s or s == 'STATION' for s in stations):
+        raise ValueError('Station identifiers must be nonempty, unique and distinct from STATION')
+    labels = daily_df.iloc[:, 0].astype(str).str.strip()
+    tags = labels.str.upper()
+    metadata = {}
+    for name in ('LAT', 'LON'):
+        rows = np.flatnonzero(np.asarray(tags == name))
+        if len(rows) != 1:
+            raise ValueError(f'CDT input needs exactly one {name} metadata row')
+        values = pd.to_numeric(daily_df.iloc[int(rows[0]), 1:], errors='coerce').to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError(f'Station {name} coordinates must be numeric and finite')
+        metadata[name] = values
+    if np.any(np.abs(metadata['LAT']) > 90) or np.any((metadata['LON'] < -180) | (metadata['LON'] > 360)):
+        raise ValueError('Station latitude/longitude coordinates are outside their physical ranges')
+    take = ~tags.isin(['LAT', 'LON', 'ELEV'])
+    date_strings = labels[take].str.replace(r'\.0+$', '', regex=True)
+    dates = pd.to_datetime(date_strings, format='%Y%m%d', errors='coerce')
+    if dates.isna().any():
+        alternative = pd.to_datetime(date_strings, format='ISO8601', errors='coerce')
+        dates = dates.fillna(alternative)
+    dates = pd.DatetimeIndex(dates)
+    if dates.empty or dates.hasnans or dates.has_duplicates or not dates.equals(dates.normalize()):
+        raise ValueError('Station daily dates must be nonempty, finite, unique and labelled at midnight')
+    values = daily_df.loc[take].iloc[:, 1:].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float, copy=True)
+    values[~np.isfinite(values) | (values < 0)] = np.nan
+    data = xr.DataArray(values, dims=('T', 'station'), coords={'T': dates.to_numpy(), 'station': stations})
+    return _complete_daily_calendar(data, 'T'), metadata
+
+
+def _station_reference_mask(mask, latitude, longitude):
+    """Select only an exactly colocated reference cell, without interpolation."""
+    if not isinstance(mask, xr.DataArray) or set(mask.dims) != {'Y', 'X'}:
+        raise ValueError('zone_mask must be a DataArray with only Y,X dimensions')
+    for dim, value in (('Y', latitude), ('X', longitude)):
+        index = mask.get_index(dim)
+        if not index.is_unique or index.hasnans or value not in index:
+            raise ValueError(f'zone_mask coordinates must include station {dim}={value} exactly')
+    return mask.sel(Y=[latitude], X=[longitude]).copy(deep=True)
+
+
+def _station_event_compute_insitu(self, daily_df):
+    """Compute station events with the same daily kernels and zones as grids.
+
+    Accept the historical CDT table (LAT/LON/ELEV rows and daily dates).
+    Return the historical CPT layout: STATION column, LAT and LON rows,
+    then calendar years. Missing/undetected events are encoded as -999 only
+    at this output boundary. Coordinate-identical stations remain separate.
+    A fixed zone map must contain each station coordinate exactly.
+    """
+    import copy
+    data, metadata = _parse_daily_station_predictands(daily_df)
+    years = np.unique(data['T'].dt.year.values).astype(int)
+    result = {'STATION': ['LAT', 'LON', *years.tolist()]}
+    for i, station in enumerate(data.station.values):
+        latitude, longitude = metadata['LAT'][i], metadata['LON'][i]
+        model = copy.copy(self)
+        if getattr(self, 'zone_mask', None) is not None:
+            model.zone_mask = _station_reference_mask(self.zone_mask, latitude, longitude)
+        rain = data.sel(station=station, drop=True).expand_dims(Y=[latitude], X=[longitude]).transpose('T', 'Y', 'X')
+        zones = model.rainf_zone(rain)
+        # A station with no complete reference year has no identified zone.
+        # Preserve it as missing instead of dropping it or failing other gauges.
+        if np.isfinite(zones.values).any():
+            model.zone_mask = zones.copy(deep=True)
+            estimates = model.compute(rain, nb_cores=1, engine='auto')
+            series = pd.Series(estimates.values.reshape(-1), index=estimates['T'].dt.year.values)
+            values = series.reindex(years).to_numpy(dtype=float)
+        else:
+            values = np.full(len(years), np.nan)
+        result[str(station)] = [float(latitude), float(longitude), *np.where(np.isfinite(values), values, -999.).tolist()]
+    output = pd.DataFrame(result)
+    output.attrs.update(missing_value=-999., station_identity='column identifier; coordinates unchanged',
+                        kernel='shared strict daily grid kernel',
+                        zoning='fixed map' if getattr(self, 'zone_mask', None) is not None else
+                               ('explicit reference period' if getattr(self, 'zone_reference_period', None) is not None else 'supplied archive'))
+    return output
+
+
+for _station_event_class in (WAS_compute_onset, WAS_compute_onset_dry_spell,
+                             WAS_compute_cessation, WAS_compute_cessation_dry_spell):
+    _station_event_class.compute_insitu = _station_event_compute_insitu
+
+
+def _parse_station_event_cpt(table, label):
+    """Validate CPT station/year keys and return day-of-year event matrices."""
+    import calendar
+    if not isinstance(table, pd.DataFrame) or table.shape[1] < 2 or not table.columns.is_unique:
+        raise ValueError(f'{label} CPT needs unique station columns')
+    stations = [str(s).strip() for s in table.columns[1:]]
+    if len(set(stations)) != len(stations) or any(not s or s == 'STATION' for s in stations):
+        raise ValueError(f'{label} CPT has invalid station identifiers')
+    labels = table.iloc[:, 0].astype(str).str.strip()
+    tags = labels.str.upper()
+    metadata = {}
+    for name in ('LAT', 'LON'):
+        rows = np.flatnonzero(np.asarray(tags == name))
+        if len(rows) != 1:
+            raise ValueError(f'{label} CPT needs exactly one {name} metadata row')
+        metadata[name] = pd.to_numeric(table.iloc[int(rows[0]), 1:], errors='coerce').to_numpy(dtype=float)
+        if not np.isfinite(metadata[name]).all():
+            raise ValueError(f'{label} CPT coordinates must be numeric and finite')
+    take = ~tags.isin(['LAT', 'LON'])
+    raw_years = pd.to_numeric(labels[take], errors='coerce').to_numpy(dtype=float)
+    if (not len(raw_years) or not np.isfinite(raw_years).all() or
+            np.any(raw_years != np.floor(raw_years)) or np.any((raw_years < 1) | (raw_years > 9999))):
+        raise ValueError(f'{label} CPT years must be finite calendar-year integers')
+    years = raw_years.astype(int)
+    if len(np.unique(years)) != len(years):
+        raise ValueError(f'{label} CPT station/year pairs must be unique')
+    values = table.loc[take].iloc[:, 1:].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float, copy=True)
+    values[np.isin(values, [-99., -999.]) | ~np.isfinite(values)] = np.nan
+    for row, year in enumerate(years):
+        finite = values[row, np.isfinite(values[row])]
+        if np.any((finite < 1) | (finite > 365 + calendar.isleap(int(year))) | (finite != np.floor(finite))):
+            raise ValueError(f'{label} CPT values must be valid 1-based days of year or missing')
+    return pd.DataFrame(values, index=years, columns=stations), metadata
+
+
+def _station_count_compute_insitu(self, daily_df, onset_df_cpt, cessation_df_cpt,
+                                  *, kind, threshold, run_length=None):
+    """Match observations and event bounds by station/year before strict counts."""
+    if not np.isfinite(threshold) or threshold < 0:
+        raise ValueError('Rain threshold must be finite and non-negative')
+    if run_length is not None and (not np.isfinite(run_length) or run_length < 1 or int(run_length) != run_length):
+        raise ValueError('Spell length must be a positive integer')
+    rain, metadata = _parse_daily_station_predictands(daily_df)
+    onset, onset_meta = _parse_station_event_cpt(onset_df_cpt, 'Onset')
+    cessation, cessation_meta = _parse_station_event_cpt(cessation_df_cpt, 'Cessation')
+    if set(onset.columns) != set(cessation.columns) or set(onset.index) != set(cessation.index):
+        raise ValueError('Onset and cessation must contain identical station/year keys')
+    if not set(onset.columns).issubset(set(rain.station.values)):
+        raise ValueError('CPT station identifiers must exist in the daily observations')
+    # Metadata must identify the same location in all three files.
+    rain_index = {str(station): i for i, station in enumerate(rain.station.values)}
+    for name in ('LAT', 'LON'):
+        omap = dict(zip(onset.columns, onset_meta[name]))
+        cmap = dict(zip(cessation.columns, cessation_meta[name]))
+        for station in onset.columns:
+            expected = metadata[name][rain_index[station]]
+            if omap[station] != expected or cmap[station] != expected:
+                raise ValueError(f'CPT {name} coordinates must exactly match daily station {station!r}')
+    years = np.sort(onset.index.to_numpy(dtype=int))
+    cessation = cessation.reindex(index=years, columns=onset.columns)
+    onset = onset.reindex(index=years)
+    output = {'STATION': ['LAT', 'LON', *years.tolist()]}
+    for station in onset.columns:
+        values = []
+        for year in years:
+            sample = rain.sel(station=station).where(rain['T'].dt.year == year, drop=True).values
+            sample = np.ascontiguousarray(sample, dtype=float)
+            begin, end = float(onset.loc[year, station]), float(cessation.loc[year, station])
+            if kind == 'rainy':
+                value = _count_rain_days_strict(sample, begin, end, float(threshold), True)
+            else:
+                value = _count_spell_exact(sample, begin, end, int(run_length), float(threshold), kind == 'wet', True)
+            values.append(float(value))
+        i = rain_index[station]
+        output[station] = [float(metadata['LAT'][i]), float(metadata['LON'][i]), *values]
+    result = pd.DataFrame(output)
+    # Historical counting outputs use NaN (onset/cessation exports use -999).
+    result.attrs.update(missing_value=np.nan, date_convention='day_of_year_1_based',
+                        kernel='shared strict daily counting kernel',
+                        station_identity='column identifier; coordinates unchanged')
+    return result
+
+
+def _station_dry_count_insitu(self, daily_df, onset_df_cpt, cessation_df_cpt,
+                              dry_spell_length, dry_threshold=1.0):
+    return _station_count_compute_insitu(self, daily_df, onset_df_cpt, cessation_df_cpt,
+                                        kind='dry', threshold=dry_threshold, run_length=dry_spell_length)
+
+
+def _station_wet_count_insitu(self, daily_df, onset_df_cpt, cessation_df_cpt,
+                              wet_spell_length, wet_threshold=1.0):
+    return _station_count_compute_insitu(self, daily_df, onset_df_cpt, cessation_df_cpt,
+                                        kind='wet', threshold=wet_threshold, run_length=wet_spell_length)
+
+
+def _station_rainy_count_insitu(self, daily_df, onset_df_cpt, cessation_df_cpt,
+                                rain_threshold=0.85):
+    return _station_count_compute_insitu(self, daily_df, onset_df_cpt, cessation_df_cpt,
+                                        kind='rainy', threshold=rain_threshold)
+
+
+WAS_count_dry_spells.compute_insitu = _station_dry_count_insitu
+WAS_count_wet_spells.compute_insitu = _station_wet_count_insitu
+WAS_count_rainy_days.compute_insitu = _station_rainy_count_insitu

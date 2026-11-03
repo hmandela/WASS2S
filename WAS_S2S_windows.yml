@@ -1,7 +1,6 @@
 name: WASS2S
 
 channels:
-  - hallkjc01
   - conda-forge
   - defaults
 

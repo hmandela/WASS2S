@@ -24,9 +24,9 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-try:
+if __package__:
     from .highflow_utils import window_dates, canonical_doy
-except ImportError:
+else:
     from highflow_utils import window_dates, canonical_doy
 
 
@@ -513,22 +513,23 @@ def aggregate_series(series: pd.Series, components: Sequence[dict], anchor: int,
             good=N>0 and n>0 and coverage>=cfg.min_valid_fraction
             # Do not count the low-water gap between two ALL components as
             # consecutive missing high-water days.
-            splits=np.flatnonzero(np.diff(dates.asi8)>86_400_000_000_000)+1 if N else []
+            splits=np.flatnonzero(np.diff(dates.as_unit('ns').asi8)>86_400_000_000_000)+1 if N else []
             maxgap=max((_max_missing_run(v) for v in np.split(valid,splits)),default=0) if N else 0
             if cfg.max_missing_run_days is not None:good=good and maxgap<=cfg.max_missing_run_days
             if good:
                 value={'mean':np.nanmean,'max':np.nanmax,'sum':np.nansum}[cfg.statistic](arr)
             else:value=np.nan
         else:
+            # Normalize pandas2/3 datetime resolutions before nanosecond arithmetic.
             # Integrate the intersection of each input interval with the UNION
             # of all expected days. No double counting at HW/MODE boundaries.
             overlap=np.zeros(len(q),float)
             if N:
-                cuts=np.flatnonzero(np.diff(dates.asi8)>86_400_000_000_000)+1
-                for chunk in np.split(dates.asi8,cuts):
+                cuts=np.flatnonzero(np.diff(dates.as_unit('ns').asi8)>86_400_000_000_000)+1
+                for chunk in np.split(dates.as_unit('ns').asi8,cuts):
                     lo=chunk[0];hi=chunk[-1]+86_400_000_000_000
-                    overlap+=np.maximum(0,np.minimum(be.asi8,hi)-np.maximum(bs.asi8,lo))/1e9
-            seconds=(be.asi8-bs.asi8)/1e9
+                    overlap+=np.maximum(0,np.minimum(be.as_unit('ns').asi8,hi)-np.maximum(bs.as_unit('ns').asi8,lo))/1e9
+            seconds=(be.as_unit('ns').asi8-bs.as_unit('ns').asi8)/1e9
             partial=(overlap>0)&(overlap<seconds-1e-6)
             approximation=bool(partial.any())
             rejected=bool(approximation and cfg.partial_interval_policy=='reject')

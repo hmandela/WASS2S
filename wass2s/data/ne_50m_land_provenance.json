@@ -1,0 +1,11 @@
+{
+  "name": "Natural Earth 1:50m land",
+  "version": "4.1.0",
+  "source": "https://naturalearth.s3.amazonaws.com/50m_physical/ne_50m_land.zip",
+  "license": "public domain",
+  "license_url": "https://www.naturalearthdata.com/about/terms-of-use/",
+  "source_archive_sha256": "0b8e670cf80dce9cbebe2a193bc44ba5602758c22e1fa603980553646d7ff162",
+  "asset_sha256": "b2f1d62622c511f206a20b169c33b38b58ca782a9508e157b4e8ca809bd0c9b6",
+  "geometries": 1420,
+  "conversion": "All original polygon coordinates preserved; GeometryCollection; gzip mtime=0."
+}

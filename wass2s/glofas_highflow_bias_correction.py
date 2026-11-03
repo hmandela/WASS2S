@@ -55,11 +55,11 @@ import xarray as xr
 import geopandas as gpd
 from scipy.stats import rankdata
 import networkx as nx
-try:
+if __package__:
     from .highflow_utils import (area_to_km2, clean_daily_series, window_dates,
         coverage_statistics, hydrological_year_bounds, match_windows, doy_to_md,
         wrap_doy, canonical_doy)
-except ImportError:
+else:
     from highflow_utils import (area_to_km2, clean_daily_series, window_dates,
         coverage_statistics, hydrological_year_bounds, match_windows, doy_to_md,
         wrap_doy, canonical_doy)
@@ -262,8 +262,8 @@ def validate_glofas_auxiliary(discharge,uparea,*,discharge_variable=None,uparea_
     UNKNOWN; users must then verify product provenance themselves.
     """
     q=_pick_dataarray(discharge,discharge_variable);a=_pick_dataarray(uparea,uparea_variable)
-    try:from .highflow_utils import align_spatial_grid
-    except ImportError:from highflow_utils import align_spatial_grid
+    if __package__:from .highflow_utils import align_spatial_grid
+    else:from highflow_utils import align_spatial_grid
     q,x,y=_normalize_xy_names(q)
     align_spatial_grid(a,q,y,x)
     def version(obj,da):
@@ -1780,10 +1780,10 @@ def _training_series(series,ecfg,purge=None,*,climatology=False):
 def _choose_cv_window(q,bcfg,ecfg,cache,key):
     """Refit all preprocessing, modes and breakpoints on allowed data only."""
     if key in cache:return cache[key]
-    try:
+    if __package__:
         from .highwater_season_predictands_modeaware import HighWaterConfig,fit_station_highwater_regime
         from .highflow_window_regionalization import _window_from_regime
-    except ImportError:
+    else:
         from highwater_season_predictands_modeaware import HighWaterConfig,fit_station_highwater_regime
         from highflow_window_regionalization import _window_from_regime
     hc=replace(ecfg.highflow_config or HighWaterConfig(),n_bootstrap=0,
@@ -1824,10 +1824,10 @@ def _cv_window_definitions(target,stations,obs,sim,windows,station_hybas,bcfg,ec
     if kind=='temporal':
         return refs,dict(window_source='training_observations',window_validation='refit')
     if target not in models:raise ValueError('No model window at withheld station')
-    try:
+    if __package__:
         from .highflow_window_regionalization import GridWindowConfig,_predict_timing_target,corrected_grid_windows
         from .highflow_topkriging import build_supports_from_hybas
-    except ImportError:
+    else:
         from highflow_window_regionalization import GridWindowConfig,_predict_timing_target,corrected_grid_windows
         from highflow_topkriging import build_supports_from_hybas
     tc=ecfg.timing_transfer_config or GridWindowConfig(scope=bcfg.correction_scope,selector=bcfg.selector)
@@ -1867,9 +1867,9 @@ def _topkrige_logfactor(target_station,donor_factors,station_hybas,basins,bias_c
     exp(predicted log factor) is a geometric/median-type factor, not an unbiased
     lognormal arithmetic mean. Its MSE is conditional on the covariance model.
     """
-    try:
+    if __package__:
         from .highflow_topkriging import TopKrigingConfig,build_supports_from_hybas,fit_point_variogram,topkriging_predict
-    except ImportError:
+    else:
         from highflow_topkriging import TopKrigingConfig,build_supports_from_hybas,fit_point_variogram,topkriging_predict
     meta=station_hybas.set_index('station',drop=False)
     if target_station not in meta.index:return dict(factor=np.nan,status='TARGET_NOT_MAPPED')
@@ -1907,8 +1907,8 @@ def _run_highflow_cv(kind,observations,glofas_at_stations,windows,station_summar
     if ecfg.window_validation=='refit' and kind!='temporal' and ecfg.timing_transfer_config is not None:
         tc=ecfg.timing_transfer_config
         if tc.transfer_method=='topkriging' and not tc.allow_disc_approximation:
-            try:from .highflow_topkriging import build_supports_from_hybas
-            except ImportError:from highflow_topkriging import build_supports_from_hybas
+            if __package__:from .highflow_topkriging import build_supports_from_hybas
+            else:from highflow_topkriging import build_supports_from_hybas
             mm=meta.dropna(subset=['HYBAS_ID'])
             ecfg._timing_supports=build_supports_from_hybas(mm.HYBAS_ID.astype(int).tolist(),basins,
                                   names=mm.station.tolist(),config=tc.topkriging_config)

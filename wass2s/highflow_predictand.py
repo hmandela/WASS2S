@@ -340,7 +340,7 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
         basins=None, outlets=None, hydrosheds=None, hybas_level=None,
         observations=None, observation_variable='Observation', station_attributes=None,
         variable=None, config=None, aggregation_config=None, highflow_config=None,
-        match_config=None, periods=None, output_format='both', years=None):
+        match_config=None, periods=None, output_format='both', years=None, glofas_matching=None):
     """Build the seasonal target; observations are genuinely optional.
 
     No network access: pass ``hydrosheds=hydro.download_hydrosheds(...)`` or
@@ -351,6 +351,7 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
     catalogue. In the no-OBS branch, raw and final seasonal values are identical.
     """
     cfg=config or PredictandConfig();cfg.validate()
+    matching_context = glofas_matching.context if glofas_matching is not None else None
     acfg=aggregation_config or AggregationConfig(negative_as_missing=True)
     acfg.validate()
     if acfg.time_support!='daily':raise ValueError('Predictand detection expects daily GloFAS; use aggregate_highflow_field for bounded predictor intervals')
@@ -381,6 +382,8 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
         if not isinstance(monthly_cfg,MonthlyBiasConfig):raise TypeError('monthly_bias must be MonthlyBiasConfig')
         monthly_cfg.validate()
     def reference_series(series):
+        if matching_context is not None:
+            series = series.where(matching_context.mask(series.index))
         # Apply GLOBAL outer-fold exclusions before estimating any regime.
         # Dynamic leave-one-month-out exclusions concern only factor fitting.
         if monthly_cfg is not None and monthly_cfg.window_protocol=='refit_excluding':
@@ -414,7 +417,7 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
     else:up=glofas_uparea
     version=validate_glofas_auxiliary(q,up)
     up=align_spatial_grid(up,q)
-    mc=match_config or GloFASPixelMatchConfig()
+    mc=match_config or (glofas_matching.physical_config if glofas_matching is not None else GloFASPixelMatchConfig())
     if __package__:
         from .highflow_outlet_selection import prepare_prediction_outlets, _canonical_columns
     else:
@@ -422,8 +425,18 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
     # Keep the entire supplied polygon topology. Only prediction targets are
     # filtered. This helper also retains all rejected candidate-point matches.
     basins=_canonical_columns(basins)  # copy; preserve every polygon/network node
-    prepared=prepare_prediction_outlets(outlets,basins,up,config=cfg,
-        match_config=mc,level=hybas_level)
+    if glofas_matching is None:
+        prepared=prepare_prediction_outlets(outlets,basins,up,config=cfg,
+            match_config=mc,level=hybas_level)
+    else:
+        if __package__:
+            from .glofas_matching_integration import matching_for_application
+        else:
+            from glofas_matching_integration import matching_for_application
+        glofas_matching = matching_for_application(glofas_matching,q,up,basins,outlets,
+            cfg,mc,station_attributes,monthly_cfg)
+        prepared=glofas_matching.prepared_outlets
+
     tab=prepared.outlets
     matches,alternatives,pixelmap=prepared.matches,prepared.alternatives,prepared.pixel_mapping
     import geopandas as gpd
@@ -457,6 +470,10 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
             if unknown:raise ValueError(f'Unknown excluded station names: {sorted(unknown)}')
             st={str(name):info for name,info in st.items() if str(name) not in excluded}
             if not st:raise ValueError('No observation stations remain after monthly excluded_stations')
+        if matching_context is not None:
+            st={str(name):info for name,info in st.items()
+                if str(name) not in set(map(str,matching_context.excluded_stations))}
+            if not st:raise ValueError('No observation station remains in the shared matching/training context')
         meta=[];cat=[]
         for name,info in st.items():
             name=str(name)
@@ -481,11 +498,29 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
             # Physical metadata come from observations; only additional mapping
             # attributes are accepted here, avoiding unexplained coordinate edits.
             meta=meta.merge(attrs.drop(columns=[c for c in ('X','Y','ELEV') if c in attrs]),on='station',how='left',validate='one_to_one')
-        station_meta=associate_stations_to_hybas(meta,basins,hybas_outlets=outlet_geometry,config=mc)
-        station_meta['outlet_id']=station_meta.station.astype(str)
-        if not cfg.allow_station_area_proxy:
-            station_meta.loc[station_meta.area_source!='station_area','station_hybas_status']='STATION_AREA_REQUIRED'
-        station_matches,station_alts,sm=_make_glofas_mapping(station_meta,q,up,mc)
+        if glofas_matching is None:
+            station_meta=associate_stations_to_hybas(meta,basins,hybas_outlets=outlet_geometry,config=mc)
+            station_meta['outlet_id']=station_meta.station.astype(str)
+            if not cfg.allow_station_area_proxy:
+                station_meta.loc[station_meta.area_source!='station_area','station_hybas_status']='STATION_AREA_REQUIRED'
+            station_matches,station_alts,sm=_make_glofas_mapping(station_meta,q,up,mc)
+        else:
+            names=meta.station.astype(str).tolist()
+            known=glofas_matching.station_metadata.set_index('station',drop=False)
+            if not set(names).issubset(known.index):
+                raise ValueError('Observations contain stations absent from the frozen mapping')
+            station_meta=known.loc[names].reset_index(drop=True).copy()
+            # No new gauge position is silently accepted when reusing a mapping.
+            verify=meta.set_index('station')
+            for _,r in station_meta.iterrows():
+                if r.X!=verify.loc[r.station,'X'] or r.Y!=verify.loc[r.station,'Y']:
+                    raise ValueError('Gauge coordinates changed after matching')
+            station_matches=glofas_matching.station_matches.set_index('station',drop=False).loc[names].reset_index(drop=True).copy()
+            station_alts=glofas_matching.station_candidates.copy()
+            if len(station_alts):station_alts=station_alts[station_alts.entity.isin(['station:'+x for x in names])].copy()
+            sm=pd.DataFrame(dict(outlet_id=station_matches.outlet_id,
+                source_x=station_matches.glofas_lon,source_y=station_matches.glofas_lat,
+                status=np.where(station_matches.match_status.isin(mc.accepted_match_statuses),'OK',station_matches.match_status)))
         station_meta['matched_source_x'] = station_matches.glofas_lon.to_numpy()
         station_meta['matched_source_y'] = station_matches.glofas_lat.to_numpy()
         station_extract=station_meta[['outlet_id','X','Y']].copy()
@@ -502,8 +537,10 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
         if cfg.propagation_method in {'network','hybrid'}:
             graph=build_hybas_digraph(basins)
 
+    learning_obs = ({name:series.where(matching_context.mask(series.index))
+                     for name,series in obs_series.items()} if matching_context is not None else obs_series)
     if monthly_cfg is not None and monthly_cfg.window_source=='corrected_glofas':
-        precorrected=correct_monthly_outlets(daily,obs_series,station_sim,monthly_station_meta,tab,
+        precorrected=correct_monthly_outlets(daily,learning_obs,station_sim,monthly_station_meta,tab,
             config=monthly_cfg,propagation_config=cfg,calibration_period=pr.calibration,
             basins=basins,graph=graph)
 
@@ -556,7 +593,8 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
             prepared=prepared,catalog=catalog,provenance=provenance,station_cat=station_cat,
             station_regimes=station_regimes,local_regimes=local_regimes,boot=boot,failures=failures,
             station_matches=station_matches,station_alts=station_alts,extract_audit=extract_audit,
-            version=version,precorrected=precorrected,output_format=output_format)
+            version=version,precorrected=precorrected,output_format=output_format,
+            learning_obs=learning_obs, glofas_matching=glofas_matching)
     final=copy.copy(raw);final.values=raw.values.copy(deep=True);final.diagnostics=raw.diagnostics.copy()
     # Index available calibration years widely enough to include cross-year
     # windows. The expected dates decide actual eligibility, not year labels.
@@ -568,7 +606,7 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
         if cachekey not in models:
             dc=station_cat[(station_cat.outlet_id==name)&station_cat.window_id.isin(keys)]
             if len(dc)!=len(keys):return None
-            o=obs_series[name];g=station_sim[name]
+            o=learning_obs[name];g=station_sim[name]
             years_fit=list(range(min(o.index.min().year,g.index.min().year)-1,max(o.index.max().year,g.index.max().year)+1))
             pair=_paired_aggregates(o,g,dc.to_dict('records'),int(dc.anchor_doy.iloc[0]),years_fit,acfg,pr.calibration)
             pair['station']=name;pair['window_key']='+'.join(keys)
@@ -703,6 +741,10 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
         config=cfg,periods=pr,highflow_config=hw,
         resolved_reference_source=source,observation_validation_available=source=='observations',
         network_audit=dict(graph.graph) if graph is not None else {})
+    if glofas_matching is not None:
+        formatted['glofas_matching']=glofas_matching
+        formatted['matching_provenance']=glofas_matching.context.as_dict()
+        formatted['matching_network_audit']=glofas_matching.network.audit
     return formatted
 
 
@@ -710,7 +752,7 @@ def build_highflow_predictand(hydro, *, glofas_discharge, glofas_uparea=None,
 def _finish_monthly_predictand(*, daily, raw, obs_series, station_sim, monthly_station_meta,
         tab, cfg, monthly_cfg, pr, hw, basins, graph, prepared, catalog, provenance,
         station_cat, station_regimes, local_regimes, boot, failures, station_matches,
-        station_alts, extract_audit, version, precorrected, output_format):
+        station_alts, extract_audit, version, precorrected, output_format, learning_obs=None, glofas_matching=None):
     """Monthly DAILY branch. No second seasonal-magnitude calibration is run."""
     if __package__:
         from .highflow_monthly_bias import correct_monthly_outlets, aggregate_corrected_like
@@ -719,7 +761,7 @@ def _finish_monthly_predictand(*, daily, raw, obs_series, station_sim, monthly_s
     prov=pd.DataFrame(provenance)
     skip=prov.loc[prov.window_source.isin(['glofas_direct','glofas_fallback']),'outlet_id'].tolist()
     application=daily.sel(T=slice(*pr.application))
-    monthly=precorrected or correct_monthly_outlets(application,obs_series,station_sim,
+    monthly=precorrected or correct_monthly_outlets(application,learning_obs if learning_obs is not None else obs_series,station_sim,
         monthly_station_meta,tab,config=monthly_cfg,propagation_config=cfg,
         calibration_period=pr.calibration,basins=basins,graph=graph,skip_outlets=skip)
     corrected=monthly['corrected'].sel(T=slice(*pr.application))
@@ -772,6 +814,10 @@ def _finish_monthly_predictand(*, daily, raw, obs_series, station_sim, monthly_s
         result['daily_corrected']=corrected.assign_coords(
             X=('outlet',tab.X.to_numpy()),Y=('outlet',tab.Y.to_numpy()),
             HYBAS_ID=('outlet',tab.HYBAS_ID.to_numpy(dtype='int64')))
+    if glofas_matching is not None:
+        result['glofas_matching']=glofas_matching
+        result['matching_provenance']=glofas_matching.context.as_dict()
+        result['matching_network_audit']=glofas_matching.network.audit
     return result
 
 

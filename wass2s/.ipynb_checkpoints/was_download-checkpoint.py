@@ -92,6 +92,72 @@ def _download_atomic(url, path, max_retries=3, retry_delay=5, timeout=180):
     return False
 
 
+
+
+
+def _require_c3s_processing_version(path):
+    """Reject ambiguous pre-correction caches without silently downloading."""
+    with xr.open_dataset(path) as cached:
+        version = cached.attrs.get("wass2s_processing_version")
+    if version != "calendar-rates-20260911":
+        raise ValueError(
+            f"C3S cache {path} lacks the current lead/calendar/unit provenance. "
+            "It was not re-downloaded. Rebuild explicitly with force_download=True "
+            "after preserving any required original; old values cannot be relabelled safely."
+        )
+
+
+def _c3s_monthly_mean(data):
+    """Seasonal mean of monthly mean fields, weighted by calendar-day counts."""
+    from calendar import monthrange
+    if "forecastMonth" not in data.dims:
+        raise ValueError("Monthly C3S aggregation needs forecastMonth")
+    if "valid_time" in data.coords and "forecastMonth" in data.valid_time.dims:
+        days = data.valid_time.dt.days_in_month
+    else:
+        name = next((k for k in ("forecast_reference_time", "indexing_time", "time") if k in data.coords), None)
+        if name is None:
+            raise ValueError("Monthly means need valid_time or a forecast initialization")
+        if data[name].dt.calendar not in {"standard", "gregorian", "proleptic_gregorian"}:
+            raise ValueError("Non-Gregorian calendars require explicit valid_time")
+        leads = np.asarray(data.forecastMonth.values)
+        if not np.all(np.isfinite(leads)) or not np.all(leads == leads.astype(int)) or np.any(leads < 1):
+            raise ValueError("CDS forecastMonth must contain positive integers")
+        rows = []
+        for value in np.atleast_1d(data[name].values):
+            ref = pd.Timestamp(value)
+            row = []
+            for lead in leads.astype(int):
+                year, month0 = divmod(ref.year * 12 + ref.month - 1 + lead - 1, 12)
+                row.append(monthrange(year, month0 + 1)[1])
+            rows.append(row)
+        if data[name].ndim == 0:
+            days = xr.DataArray(rows[0], dims="forecastMonth", coords={"forecastMonth":data.forecastMonth})
+        else:
+            days = xr.DataArray(rows, dims=(name,"forecastMonth"), coords={name:data[name],"forecastMonth":data.forecastMonth})
+    out = (data * days).sum("forecastMonth", skipna=False, keep_attrs=True) / days.sum("forecastMonth")
+    out.attrs = dict(data.attrs, aggregation="calendar-day-weighted mean of monthly means")
+    if isinstance(out, xr.Dataset):
+        for name in out.data_vars:
+            out[name].attrs = dict(data[name].attrs)
+    return out
+
+
+def _save_netcdf_atomic(dataset, path):
+    """Materialize before replacing a cache; failed writes leave it intact."""
+    import tempfile
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_path = tempfile.mkstemp(prefix=path.name + ".", suffix=".part", dir=path.parent)
+    os.close(descriptor)
+    try:
+        dataset.load().to_netcdf(temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
 def _remove_quiet(path):
     import os
 
@@ -100,6 +166,405 @@ def _remove_quiet(path):
             os.remove(path)
     except OSError as exc:
         print(f"[WARN] Could not remove {path}: {exc}")
+
+
+
+
+class _CCSRUnavailableError(RuntimeError):
+    """The selected CCSR model, variable, or complete season is unavailable."""
+
+
+def _ccsr_model_spec(model_id, cfsv2_sample="pentad_samples"):
+    """Resolve WASS2S identifiers to explicit CCSR products and member labels.
+
+    CanSIPS-IC4 follows the official ECCC member ordering in both archives:
+    GEM5.2-NEMO = 1..20; CanESM5 = 21..40.  Selection is by label, not position.
+    """
+    if cfsv2_sample not in ("pentad_samples", "early_month_samples"):
+        raise ValueError("ccsr_cfsv2_sample must be 'pentad_samples' or 'early_month_samples'.")
+    models = {
+        "CFSV2_1": (f"NOAA-NCEP/CFSv2/{cfsv2_sample}", "CFSv2", None, False),
+        "CMC1_1": ("ECCC/CanSIPS-IC4", "CanESM5", tuple(range(21, 41)), False),
+        "CMC2_1": ("ECCC/CanSIPS-IC4", "GEM5.2-NEMO", tuple(range(1, 21)), False),
+        "NASA_1": ("NASA-GMAO/GEOSS2S", "GEOSS2S", None, False),
+        "GFDL_1": ("NOAA-GFDL/SPEAR", "SPEAR", None, False),
+        "NCAR_CCSM4_1": ("COLA-RSMAS/CCSM4", "CCSM4", None, True),
+        "NCAR_CESM1_1": ("COLA-RSMAS/CESM1", "CESM1", None, True),
+    }
+    if model_id not in models:
+        raise _CCSRUnavailableError(
+            f"No member-resolved CCSR product is mapped to {model_id}. "
+            "NMME_1 is a multi-model mean, not an individual member archive."
+        )
+    path, version, members, combined = models[model_id]
+    return {"path": path, "model": version, "members": members, "combined": combined}
+
+
+def _ccsr_is_not_found(exc):
+    """Only a proven missing endpoint is an availability failure."""
+    import re
+    response = getattr(exc, "response", None)
+    if response is not None and getattr(response, "status_code", None) == 404:
+        return True
+    text = str(exc)
+    return bool(
+        re.search(r"\b(?:HTTP(?: Error)?[: /]*|status(?: code)?[: =]*)404\b", text, re.I)
+        or "NetCDF: file not found" in text
+    )
+
+
+def _ccsr_gregorian_dates(coordinate, name):
+    """Decode only Gregorian calendars; do not reinterpret 360-day dates."""
+    import numpy as np
+    import pandas as pd
+    calendar_name = coordinate.encoding.get("calendar", coordinate.attrs.get("calendar", "standard"))
+    try:
+        calendar_name = coordinate.dt.calendar
+    except (AttributeError, TypeError):
+        pass
+    if calendar_name not in ("standard", "gregorian", "proleptic_gregorian"):
+        raise ValueError(f"CCSR {name} calendar {calendar_name!r} is not Gregorian.")
+    values = np.asarray(coordinate.values)
+    if np.issubdtype(values.dtype, np.number):
+        raise ValueError(f"CCSR {name} dates must be CF-decoded before seasonal aggregation.")
+    result = []
+    for value in values.reshape(-1):
+        if hasattr(value, "year") and not isinstance(value, np.datetime64):
+            result.append(pd.Timestamp(value.year, value.month, value.day,
+                                       getattr(value, "hour", 0), getattr(value, "minute", 0),
+                                       getattr(value, "second", 0)).to_datetime64())
+        else:
+            result.append(pd.Timestamp(value).to_datetime64())
+    dates = np.asarray(result, dtype="datetime64[ns]").reshape(values.shape)
+    if np.isnat(dates).any():
+        raise ValueError(f"CCSR {name} contains missing dates.")
+    return dates
+
+
+def _ccsr_geographic_indices(dataset, area):
+    """Return bounded coordinate indexes, including a dateline-crossing box."""
+    import numpy as np
+    bounds = np.asarray(area, dtype=float)
+    if bounds.shape != (4,) or not np.isfinite(bounds).all():
+        raise ValueError("area must be finite [North, West, South, East].")
+    north, west, south, east = bounds
+    if not (-90 <= south <= north <= 90):
+        raise ValueError("area must satisfy -90 <= South <= North <= 90.")
+    for dimension in ("Y", "X"):
+        if dimension not in dataset.coords or dataset[dimension].dims != (dimension,):
+            raise ValueError(f"CCSR requires a one-dimensional {dimension} coordinate.")
+    y = np.asarray(dataset.Y.values, dtype=float)
+    x = ((np.asarray(dataset.X.values, dtype=float) + 180) % 360) - 180
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise ValueError("CCSR spatial coordinates contain non-finite values.")
+    yindices = np.flatnonzero((y >= south) & (y <= north))
+    if abs(east - west) >= 360:
+        xindices = np.arange(x.size)
+    else:
+        west = (west + 180) % 360 - 180
+        east = (east + 180) % 360 - 180
+        inside = ((x >= west) & (x <= east)) if west <= east else ((x >= west) | (x <= east))
+        xindices = np.flatnonzero(inside)
+    if not xindices.size or not yindices.size:
+        raise ValueError("The requested area contains no CCSR grid cell.")
+    # Preserve a single representative if a source repeats a cyclic meridian.
+    _, unique = np.unique(x[xindices], return_index=True)
+    xindices = xindices[np.sort(unique)]
+    return {"Y": yindices, "X": xindices}
+
+
+def _ccsr_seasonal_member_values(selected, variable, remote_variable, init_date, leads):
+    """Aggregate complete monthly series for each individual member."""
+    import re
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+    if "target" not in selected:
+        raise ValueError("CCSR monthly data need the target(S,L) coordinate.")
+    target = selected["target"]
+    if set(target.dims) != {"S", "L"}:
+        raise ValueError("CCSR target must have dimensions S,L.")
+    actual = _ccsr_gregorian_dates(target.transpose("S", "L"), "target")
+    start = pd.Timestamp(init_date)
+    expected = np.asarray([
+        (start + pd.DateOffset(months=int(lead))).to_datetime64()
+        for lead in leads
+    ], dtype="datetime64[ns]")[None, :]
+    if not np.array_equal(actual, expected):
+        raise ValueError("CCSR target dates disagree with initialization plus zero-based lead months.")
+    ends = np.asarray([
+        (pd.Timestamp(value) + pd.offsets.MonthBegin(1)).to_datetime64()
+        for value in expected[0]
+    ], dtype="datetime64[ns]")[None, :]
+    if "target_bnds" in selected:
+        bounds = selected["target_bnds"]
+        extra = [dimension for dimension in bounds.dims if dimension not in ("S", "L")]
+        if len(extra) != 1 or bounds.sizes[extra[0]] != 2:
+            raise ValueError("CCSR target_bnds must contain two bounds per S,L.")
+        dates = _ccsr_gregorian_dates(bounds.transpose("S", "L", extra[0]), "target_bnds")
+        if not np.array_equal(dates[:, :, 0], expected) or not np.array_equal(dates[:, :, 1], ends):
+            raise ValueError("CCSR target_bnds must cover complete Gregorian target months.")
+    days = xr.DataArray(
+        ((ends - expected) / np.timedelta64(1, "D")).astype(float),
+        dims=("S", "L"), coords={"S": selected.S, "L": selected.L},
+    )
+    data = selected[remote_variable]
+    if set(data.dims) != {"S", "M", "L", "Y", "X"}:
+        raise ValueError(f"CCSR {remote_variable} must have dimensions S,M,L,Y,X; found {data.dims}.")
+    if np.isinf(np.asarray(data.values)).any():
+        raise ValueError("CCSR contains infinite data values.")
+    original_units = str(data.attrs.get("units", "")).strip()
+    units = re.sub(r"[\s_\^*]", "", original_units.lower()).replace("−", "-")
+    units = units.replace("per", "/")
+    if variable == "PRCP":
+        if units in ("mm/day", "mmday-1", "mm/d", "mmd-1", "kgm-2day-1", "kgm-2d-1"):
+            daily = data
+        elif units in ("mm/s", "mms-1", "kgm-2s-1", "kg/m2/s"):
+            daily = data * 86400.0
+        elif units in ("m/day", "mday-1", "m/d", "md-1"):
+            daily = data * 1000.0
+        elif units in ("m/s", "ms-1"):
+            daily = data * 86400000.0
+        elif units in ("mm/month", "mmmonth-1"):
+            daily = data / days
+        elif units == "mm" and re.search(r"\btime\s*:\s*sum\b", str(data.attrs.get("cell_methods", ""))):
+            daily = data / days
+        else:
+            raise ValueError(f"Unsupported or ambiguous CCSR precipitation units {original_units!r}.")
+        result = (daily * days).sum("L", skipna=False)
+        output_units = "mm"
+        aggregation = "sum of complete monthly precipitation amounts per ensemble member"
+    else:
+        if units in ("k", "kelvin", "degk", "degreekelvin", "degreeskelvin"):
+            data = data - 273.15
+        elif units not in ("c", "°c", "degc", "celsius", "degreecelsius", "degreescelsius", "degreec", "degreesc"):
+            raise ValueError(f"Unsupported CCSR temperature units {original_units!r}.")
+        result = (data * days).sum("L", skipna=False) / days.sum("L")
+        output_units = "degC"
+        aggregation = "calendar-day-weighted mean of complete monthly means per ensemble member"
+    result = result.rename({"S": "T"}).rename(variable)
+    # Monthly auxiliary coordinates do not describe an aggregated season.
+    result = result.drop_vars([name for name in result.coords if name not in ("T", "M", "Y", "X")])
+    result = result.assign_coords(X=((result.X + 180) % 360) - 180).sortby("X").sortby("Y")
+    result = result.transpose("T", "M", "Y", "X")
+    result.attrs = dict(units=output_units, source_units=original_units,
+                        source_variable=remote_variable, aggregation=aggregation)
+    return result
+
+
+def _ccsr_download_season(model_id, variable, years, init_month, leads, area, ensemble_mean,
+                          *, base_url="https://forecast.ccsr.columbia.edu/data/NMME",
+                          cfsv2_sample="pentad_samples", opener=None, engine="netcdf4"):
+    """Download bounded monthly CCSR slices and return WASS2S seasonal data.
+
+    ``leads`` contains zero-based month offsets: April + [3,4,5] = JAS.
+    Hindcasts are preferred; the forecast archive fills only missing requested
+    initializations.  A requested year with no finite complete member season is
+    unavailable, never a silently shortened time series.  Spatially incomplete
+    cells remain NaN.  Ensemble reduction follows per-member seasonal aggregation.
+    """
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+    if isinstance(ensemble_mean, str):
+        ensemble_mean = ensemble_mean.strip().lower()
+        if ensemble_mean == "none":
+            ensemble_mean = None
+    if ensemble_mean not in (None, "mean", "median"):
+        raise ValueError("ensemble_mean must be None, 'mean', or 'median'.")
+    if engine not in ("netcdf4", "pydap"):
+        raise ValueError("ccsr_engine must be 'netcdf4' or 'pydap'.")
+    spec = _ccsr_model_spec(model_id, cfsv2_sample)
+    remote_variable = {"PRCP": "pr", "TEMP": "tas", "TMAX": "tasmax", "TMIN": "tasmin", "SST": "tos"}.get(variable)
+    if remote_variable is None:
+        raise _CCSRUnavailableError(f"CCSR variable {variable!r} is not mapped.")
+    try:
+        requested_years = np.asarray(list(years), dtype=float)
+        requested_leads = np.asarray(list(leads), dtype=float)
+        month = float(init_month)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("CCSR years, initialization month, and leads must be integers.") from exc
+    if (requested_years.ndim != 1 or requested_years.size == 0
+            or not np.isfinite(requested_years).all()
+            or not np.equal(requested_years, np.floor(requested_years)).all()
+            or (requested_years < 1).any()):
+        raise ValueError("CCSR years must be a non-empty sequence of positive integers.")
+    if (requested_leads.ndim != 1 or requested_leads.size == 0
+            or not np.isfinite(requested_leads).all()
+            or not np.equal(requested_leads, np.floor(requested_leads)).all()
+            or (requested_leads < 0).any()
+            or len(np.unique(requested_leads)) != len(requested_leads)):
+        raise ValueError("CCSR leads must contain distinct non-negative integer month offsets.")
+    if not np.isfinite(month) or month != int(month) or not 1 <= month <= 12:
+        raise ValueError("CCSR initialization month must be an integer from 1 to 12.")
+    requested_years = sorted(set(requested_years.astype(int).tolist()))
+    requested_leads = np.sort(requested_leads.astype(int))
+    month = int(month)
+    open_dataset = xr.open_dataset if opener is None else opener
+    partitions = ("combined",) if spec["combined"] else ("hindcast", "forecast")
+    seasons, origins, urls = {}, {}, []
+    for partition in partitions:
+        pending = [year for year in requested_years if year not in seasons]
+        if not pending:
+            break
+        suffix = remote_variable if partition == "combined" else f"{partition}/{remote_variable}"
+        url = f"{str(base_url).rstrip('/')}/{spec['path']}/{suffix}"
+        opened = None
+        try:
+            opened = open_dataset(url, decode_times=True, engine=engine)
+            if remote_variable not in opened:
+                raise ValueError(f"CCSR endpoint {url} does not contain {remote_variable}.")
+            for dimension in ("S", "L", "M", "Y", "X"):
+                if dimension not in opened.coords or opened[dimension].dims != (dimension,):
+                    raise ValueError(f"CCSR requires coordinate {dimension}({dimension}).")
+            dates = _ccsr_gregorian_dates(opened.S, "S")
+            index = pd.DatetimeIndex(dates)
+            if index.has_duplicates or not ((index.day == 1) & (index.hour == 0)
+                                             & (index.minute == 0) & (index.second == 0)).all():
+                raise ValueError("CCSR S must contain unique first-of-month initializations.")
+            if not np.isfinite(np.asarray(opened.M.values, dtype=float)).all() or len(np.unique(opened.M.values)) != opened.sizes["M"]:
+                raise ValueError("CCSR ensemble member labels must be finite and unique.")
+            selected_years = [year for year in pending if pd.Timestamp(year, month, 1) in index]
+            if not selected_years:
+                continue
+            available_leads = np.asarray(opened.L.values)
+            if len(np.unique(available_leads)) != len(available_leads):
+                raise ValueError("CCSR lead labels must be unique.")
+            if not np.isin(requested_leads, available_leads).all():
+                raise _CCSRUnavailableError(f"CCSR {model_id} has no requested leads {requested_leads.tolist()} in {partition}.")
+            selection = _ccsr_geographic_indices(opened, area)
+            selection["L"] = [int(np.flatnonzero(available_leads == lead)[0]) for lead in requested_leads]
+            if spec["members"] is not None:
+                expected_members = np.arange(1, 41)
+                if not np.array_equal(np.sort(np.asarray(opened.M.values)), expected_members):
+                    raise ValueError("CCSR CanSIPS-IC4 member labels must be exactly 1..40 before selecting its component model.")
+                selection["M"] = [int(np.flatnonzero(opened.M.values == member)[0]) for member in spec["members"]]
+            for year in selected_years:
+                initialization = pd.Timestamp(year, month, 1)
+                selection["S"] = [int(index.get_loc(initialization))]
+                # Restrict time, lead, members, and geography before data transfer.
+                subset = opened.isel(selection).load()
+                season = _ccsr_seasonal_member_values(subset, variable, remote_variable,
+                                                      initialization, requested_leads)
+                if not np.isfinite(np.asarray(season.values)).any():
+                    continue
+                seasons[year] = season
+                origins[year] = partition
+                if url not in urls:
+                    urls.append(url)
+        except Exception as exc:
+            if not _ccsr_is_not_found(exc):
+                raise
+        finally:
+            if opened is not None:
+                opened.close()
+    missing = [year for year in requested_years if year not in seasons]
+    if missing:
+        raise _CCSRUnavailableError(
+            f"CCSR {model_id}.{variable} has no complete finite season for initialization "
+            f"month {month:02d}, years {missing}, leads {requested_leads.tolist()}. "
+            "No partial archive was returned."
+        )
+    # Archive partitions must share a spatial grid: only the member axis may
+    # be enlarged during concatenation.  An outer spatial union would silently
+    # invent missing cells and could change regional statistics.
+    first_season = seasons[requested_years[0]]
+    for year in requested_years[1:]:
+        for dimension in ("Y", "X"):
+            if not np.array_equal(seasons[year][dimension].values,
+                                  first_season[dimension].values):
+                raise ValueError(
+                    f"CCSR {model_id} spatial {dimension} coordinates differ between "
+                    "requested initializations; align the source grids explicitly."
+                )
+    # Different archive partitions may expose different member counts.  Keep
+    # actual labels and mark absent members with NaN; never replicate members.
+    combined = xr.concat([seasons[year] for year in requested_years], dim="T", join="outer")
+    combined = combined.assign_coords(source_partition=("T", [origins[year] for year in requested_years]))
+    if ensemble_mean is not None:
+        combined = getattr(combined, ensemble_mean)("M", skipna=True, keep_attrs=True)
+    result = combined.to_dataset(name=variable)
+    result.attrs = {
+        "wass2s_nmme_source": "ccsr",
+        "wass2s_ccsr_processing_version": "ccsr-calendar-members-20260916",
+        "wass2s_model_id": model_id,
+        "wass2s_source_model": spec["model"],
+        "wass2s_source_product": spec["path"],
+        "wass2s_source_urls": "\n".join(urls),
+        "wass2s_ensemble_statistic": "members" if ensemble_mean is None else ensemble_mean,
+        "wass2s_initialization_month": month,
+        "wass2s_lead_month_offsets": ",".join(str(value) for value in requested_leads),
+        "wass2s_requested_years": ",".join(str(value) for value in requested_years),
+        "wass2s_requested_area": ",".join(str(float(value)) for value in area),
+        "wass2s_calendar": "proleptic_gregorian",
+        "wass2s_missing_month_policy": "complete season required per member and grid cell",
+    }
+    if spec["members"] is not None:
+        result.attrs["wass2s_source_member_labels"] = ",".join(map(str, spec["members"]))
+    return result
+
+
+def _ccsr_request_key(model_id, variable, years, month, leads, area, base_url, sampling):
+    """Canonical request provenance: filenames alone omit years and geography."""
+    import json
+    import numpy as np
+
+    def integers(values, name, minimum):
+        numeric = np.asarray(list(values), dtype=float)
+        if (numeric.ndim != 1 or not numeric.size or not np.isfinite(numeric).all()
+                or (numeric != np.floor(numeric)).any() or (numeric < minimum).any()
+                or len(np.unique(numeric)) != len(numeric)):
+            raise ValueError(f"CCSR {name} must contain distinct integers >= {minimum}.")
+        return sorted(numeric.astype(int).tolist())
+
+    init_month = integers([month], "initialization month", 1)[0]
+    if init_month > 12:
+        raise ValueError("CCSR initialization month must be in 1..12.")
+    if sampling not in ("pentad_samples", "early_month_samples"):
+        raise ValueError("ccsr_cfsv2_sample must be 'pentad_samples' or 'early_month_samples'.")
+    bounds = np.asarray(area, dtype=float)
+    if bounds.shape != (4,) or not np.isfinite(bounds).all() or not (-90 <= bounds[2] <= bounds[0] <= 90):
+        raise ValueError("CCSR area must be finite [North, West, South, East], with -90 <= South <= North <= 90.")
+    return json.dumps({
+        "version": "ccsr-members-calendar-20260916", "model": model_id,
+        "variable": variable, "years": integers(years, "years", 1),
+        "month": init_month, "leads": integers(leads, "leads", 0),
+        "area": bounds.tolist(), "base_url": str(base_url).rstrip("/"),
+        "sampling": sampling if model_id == "CFSV2_1" else None,
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def _ccsr_cache_matches(path, request_key, statistic):
+    """Reuse only an identical CCSR request with the requested member semantics."""
+    import json
+    import warnings
+    from pathlib import Path
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+    if not Path(path).is_file():
+        return False
+    request = json.loads(request_key)
+    try:
+        with xr.open_dataset(path) as cached:
+            variable = cached.get(request["variable"])
+            dims = ("T", "M", "Y", "X") if statistic == "members" else ("T", "Y", "X")
+            expected_dates = pd.to_datetime([f"{year:04d}-{request['month']:02d}-01" for year in request["years"]])
+            matches = (
+                cached.attrs.get("wass2s_ccsr_request") == request_key
+                and cached.attrs.get("wass2s_processing_version") == request["version"]
+                and cached.attrs.get("wass2s_nmme_source") == "ccsr"
+                and cached.attrs.get("wass2s_ensemble_statistic") == statistic
+                and variable is not None and variable.dims == dims
+                and all(cached.sizes[dim] > 0 for dim in dims)
+                and np.array_equal(cached.T.values, expected_dates.values)
+            )
+            if matches:
+                return True
+    except (OSError, ValueError, KeyError):
+        pass
+    warnings.warn(f"Ignoring incompatible CCSR cache {path}: source, request or ensemble representation differs.", RuntimeWarning)
+    return False
 
 
 def _as_tuple(value, default):
@@ -145,6 +610,153 @@ def _standardize_latlon_da(da, area=None):
     if drop:
         da = da.drop_vars(drop, errors="ignore")
     return da
+
+# Helpers used only by the complementary downloaders.
+def _was_cache_key(**identity):
+    """Deterministic configuration key; never pass tokens/passwords here."""
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _was_complete_monthly_axis(out, year_start, year_end, closed_only=True):
+    """Expose absent edge months too; a missing month is never silently omitted."""
+    first = pd.Timestamp(int(year_start), 1, 1)
+    last = pd.Timestamp(int(year_end), 12, 1)
+    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    last_allowed = now.normalize().replace(day=1)
+    if closed_only:
+        last_allowed -= pd.offsets.MonthBegin(1)
+    last = min(last, last_allowed)
+    if first > last:
+        raise ValueError("No eligible calendar month in the requested period.")
+    times = pd.date_range(first, last, freq="MS")
+    out = out.reindex(T=times)
+    out["N_VALID_DAYS"] = out["N_VALID_DAYS"].fillna(0).astype("int16")
+    out["DAILY_COVERAGE"] = out["DAILY_COVERAGE"].fillna(0).astype("float32")
+    out["EXPECTED_DAYS"] = ("T", times.days_in_month.to_numpy(dtype="int16"))
+    return out
+
+
+def _was_concat_files(files, time_dim="T", max_eager_bytes=512 * 1024**2):
+    """Lazy concatenation with Dask; explicit bounded-memory fallback otherwise.
+
+    The caller must close the returned Dataset. No spatial outer join and no
+    silent duplicate timestamp removal are allowed.
+    """
+    import importlib.util
+    files = list(files)
+    if not files:
+        raise ValueError("No files available for concatenation.")
+    if importlib.util.find_spec("dask") is not None:
+        out = xr.open_mfdataset(files, combine="nested", concat_dim=time_dim,
+                               chunks={time_dim: 31}, parallel=False,
+                               join="exact", data_vars="minimal", coords="minimal", compat="equals")
+        close = out.close
+        try:
+            out = out.sortby(time_dim)
+            if not out.get_index(time_dim).is_unique:
+                raise ValueError("Duplicate timestamps across cache files; inspect overlapping source periods.")
+            out.set_close(close)
+            return out
+        except Exception:
+            close()
+            raise
+    total = 0
+    for path in files:
+        with xr.open_dataset(path) as item:
+            total += item.nbytes
+    # Concatenation needs additional copies, hence a conservative small ceiling.
+    if total > max_eager_bytes:
+        raise ImportError(f"Dask is needed to assemble {total / 1024**2:.1f} MiB of data safely. Install dask[array].")
+    arrays = []
+    for path in files:
+        with xr.open_dataset(path) as item:
+            arrays.append(item.load())
+    out = xr.concat(arrays, dim=time_dim, join="exact", data_vars="minimal", coords="minimal", compat="equals").sortby(time_dim)
+    if not out.get_index(time_dim).is_unique:
+        raise ValueError("Duplicate timestamps across cache files; inspect overlapping source periods.")
+    return out
+
+
+def _was_monthly_rainfall(ds, threshold=1.0, complete_months_only=True, now=None):
+    """Calendar-month sums with full-calendar denominator and per-pixel QC.
+
+    A relaxed threshold accepts an observed PARTIAL sum; no extrapolation to
+    the missing days is performed. Duplicate dates are rejected.
+    """
+    if not 0 < float(threshold) <= 1:
+        raise ValueError("min_daily_coverage must be in (0, 1].")
+    if not ds.sizes.get("T", 0):
+        raise ValueError("Empty daily dataset.")
+    times = pd.DatetimeIndex(ds["T"].values)
+    if not times.is_unique or not times.equals(times.normalize()):
+        raise ValueError("Daily totals require one unique, midnight-labelled date per observation.")
+    now = pd.Timestamp.now(tz="UTC").tz_localize(None) if now is None else pd.Timestamp(now)
+    if now.tzinfo is not None:
+        now = now.tz_convert("UTC").tz_localize(None)
+    ds = ds.sortby("T")
+    if complete_months_only:
+        ds = ds.sel(T=slice(None, now.normalize().replace(day=1) - pd.Timedelta(days=1)))
+    if not ds.sizes.get("T", 0):
+        raise ValueError("No closed calendar month in the daily data.")
+    pr = ds["PRCP"].where(np.isfinite(ds["PRCP"]) & (ds["PRCP"] >= 0))
+    total = pr.resample(T="MS").sum(skipna=True, min_count=1)
+    n = pr.notnull().resample(T="MS").sum().fillna(0).astype("int16")
+    expected = xr.DataArray(pd.DatetimeIndex(total["T"].values).days_in_month.to_numpy(dtype="int16"),
+                            dims="T", coords={"T": total["T"]}, name="EXPECTED_DAYS")
+    cov = (n / expected).astype("float32")
+    total = total.where(cov >= float(threshold)).astype("float32")
+    total.attrs.update(units="mm/month", aggregation="sum of available daily totals; not scaled for missing days")
+    cov.attrs.update(units="1", long_name="Fraction of calendar days with a finite nonnegative rainfall value")
+    result = xr.Dataset(dict(PRCP=total, N_VALID_DAYS=n, DAILY_COVERAGE=cov, EXPECTED_DAYS=expected))
+    result.attrs.update(min_daily_coverage=float(threshold), WASS2S_dimensions="T,Y,X", missing_day_scaling="none")
+    return result
+
+
+def _was_permanent_http_error(exc):
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None:
+        status = getattr(exc, "code", None)  # urllib HTTPError
+    return status in {400, 401, 403, 404, 405, 410, 422}
+
+
+def _was_write_netcdf(obj, path, *, encoding=None, compute=True, **kwargs):
+    """Atomic replacement; never leave a half-written final NetCDF file.
+
+    netCDF4/h5netcdf compression is used when installed. Small-data/test
+    installations can use scipy (no compression); this fallback is announced.
+    A failed write leaves any previously valid destination untouched.
+    """
+    import importlib.util
+    import os
+    import tempfile
+    import warnings
+    if not compute:
+        from dask import delayed
+        return delayed(_was_write_netcdf)(obj, path, encoding=encoding, compute=True, **kwargs)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    enc = {k: dict(v) for k, v in (encoding or {}).items()}
+    if "engine" not in kwargs:
+        if importlib.util.find_spec("netCDF4") is not None:
+            kwargs["engine"] = "netcdf4"
+        elif importlib.util.find_spec("h5netcdf") is not None:
+            kwargs["engine"] = "h5netcdf"
+        else:
+            kwargs["engine"] = "scipy"
+            dropped = {"zlib", "complevel", "shuffle", "fletcher32", "chunksizes", "contiguous", "compression", "compression_opts"}
+            if any(dropped.intersection(v) for v in enc.values()):
+                warnings.warn("netCDF4/h5netcdf unavailable: writing uncompressed NetCDF with scipy.", RuntimeWarning)
+            enc = {k: {a: b for a, b in v.items() if a not in dropped} for k, v in enc.items()}
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".part", dir=path.parent)
+    os.close(fd)
+    try:
+        obj.to_netcdf(tmp, encoding=enc, **kwargs)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
 
 class WAS_Download:
     def __init__(self):
@@ -817,8 +1429,11 @@ class WAS_Download:
         year_forecast=None,
         ensemble_mean=None,
         force_download=False,
-        nmme_source="cpt",  # Options: "netcdf" or "cpt"
-        year_init_nmmeNC=2025
+        nmme_source="cpt",  # Options: "ccsr", "netcdf", or "cpt"
+        year_init_nmmeNC=2025,
+        ccsr_base_url="https://forecast.ccsr.columbia.edu/data/NMME",
+        ccsr_cfsv2_sample="pentad_samples",
+        ccsr_engine="netcdf4",
     ):
         """
         Download seasonal forecast model data for specified center-variable combinations, initialization month, lead times, and years.
@@ -827,14 +1442,113 @@ class WAS_Download:
             dir_to_save (str): Directory to save the downloaded files.
             center_variable (list): List of center-variable identifiers (e.g., ["ECMWF_51.PRCP", "UKMO_602.TEMP"]).
             month_of_initialization (int): Initialization month as an integer (1-12).
-            lead_time (list): List of lead times in months.
+            lead_time (list): Zero-based monthly offsets from initialization.
+                For April initialization, [3, 4, 5] selects July–September.
             year_start_hindcast (int): Start year for hindcast data.
             year_end_hindcast (int): End year for hindcast data.
             area (list): Bounding box as [North, West, South, East] for clipping.
             year_forecast (int, optional): Forecast year if downloading forecast data. Defaults to None.
-            ensemble mean (str,optional): it's can be median, mean or None. Defaults to None. 
+            ensemble_mean (str, optional): "mean", "median", or None. None retains
+                actual ensemble members. Text "None" is accepted for CLI callers.
+                Member files live in ensemble_members/, median files in
+                ensemble_median/; mean filenames retain the legacy layout.
+            nmme_source (str): "ccsr", "cpt" (legacy default), or "netcdf".
+                CCSR downloads monthly members over OPeNDAP, aggregates each
+                member over the requested season, then optionally reduces M.
+                Its outputs use T (initialization date), M, Y, X, or T, Y, X.
+                The two legacy CPC branches supply ensemble MEANS only.
+            ccsr_base_url (str): Root of the CCSR NMME OPeNDAP catalogue.
+            ccsr_cfsv2_sample (str): "pentad_samples" (default) or
+                "early_month_samples". The same sampling must be used for
+                hindcast and forecast. Missing archives are not substituted
+                with another sampling scheme.
+            ccsr_engine (str): "netcdf4" (default) or "pydap". The latter
+                requires the optional pydap package. Cached data are independent
+                of the transport engine.
             force_download (bool): If True, forces download even if file exists.
         """
+        import warnings
+
+        if isinstance(ensemble_mean, str):
+            ensemble_mean = ensemble_mean.strip().lower()
+            if ensemble_mean == "none":
+                ensemble_mean = None
+        if ensemble_mean not in (None, "mean", "median"):
+            raise ValueError("ensemble_mean must be None, 'mean', or 'median'.")
+        nmme_source = str(nmme_source).strip().lower()
+        if nmme_source not in ("ccsr", "cpt", "netcdf"):
+            raise ValueError("nmme_source must be 'ccsr', 'cpt', or 'netcdf'.")
+
+        member_names = ("number", "member", "members", "M", "realization", "ensemble", "ensmem")
+        requested_statistic = "members" if ensemble_mean is None else ensemble_mean
+        legacy_directory = Path(dir_to_save)
+        if ensemble_mean is None:
+            dir_to_save = legacy_directory / "ensemble_members"
+        elif ensemble_mean == "median":
+            dir_to_save = legacy_directory / "ensemble_median"
+
+        def member_dimension(data):
+            # A coordinate by itself is not evidence of member-resolved data.
+            dims = {dim for variable in data.data_vars.values() for dim in variable.dims}
+            found = [name for name in member_names if name in dims]
+            if len(found) > 1:
+                raise ValueError(f"Ambiguous ensemble member dimensions: {found}")
+            return found[0] if found else None
+
+        def cache_available(path, c3s=False):
+            if force_download or not Path(path).is_file():
+                return False
+            with xr.open_dataset(path) as cached:
+                member = member_dimension(cached)
+                statistic = cached.attrs.get("wass2s_ensemble_statistic")
+                if not c3s and cached.attrs.get("wass2s_nmme_source") == "ccsr" and nmme_source != "ccsr":
+                    warnings.warn(f"Ignoring CCSR cache {path} for legacy source {nmme_source!r}.", RuntimeWarning)
+                    return False
+            compatible = (member is not None) if ensemble_mean is None else (member is None)
+            if statistic is not None and statistic != requested_statistic:
+                compatible = False
+            if not compatible:
+                warnings.warn(f"Ignoring incompatible ensemble cache {path}: "
+                              f"requested {requested_statistic}.", RuntimeWarning)
+                return False
+            if c3s:
+                _require_c3s_processing_version(path)
+            return True
+
+        def reuse_member_archive(output_path, c3s=False):
+            # Promote genuine legacy member files, or derive a requested mean /
+            # median from a retained member archive. Never fabricate members.
+            output_path = Path(output_path)
+            raw_target = legacy_directory / "ensemble_members" / output_path.name
+            candidates = [raw_target, legacy_directory / output_path.name]
+            if force_download:
+                return
+            for source in dict.fromkeys(candidates):
+                if not source.is_file():
+                    continue
+                with xr.open_dataset(source) as opened:
+                    if not c3s and opened.attrs.get("wass2s_nmme_source") == "ccsr" and nmme_source != "ccsr":
+                        continue
+                    dimension = member_dimension(opened)
+                    statistic = opened.attrs.get("wass2s_ensemble_statistic")
+                    if dimension is None or statistic in ("mean", "median"):
+                        continue
+                    if c3s:
+                        _require_c3s_processing_version(source)
+                    members = opened.load()
+                members.attrs["wass2s_ensemble_statistic"] = "members"
+                if source != raw_target:
+                    _save_netcdf_atomic(members, raw_target)
+                if ensemble_mean is not None and not c3s:
+                    # Preserve the existing C3S order of monthly aggregation /
+                    # reduction. Median and incomplete member-month coverage do
+                    # not commute with seasonal aggregation; a separate C3S
+                    # request prevents results depending on cache call order.
+                    reduced = getattr(members, ensemble_mean)(dim=dimension, keep_attrs=True)
+                    reduced.attrs["wass2s_ensemble_statistic"] = ensemble_mean
+                    _save_netcdf_atomic(reduced, output_path)
+                return
+
         years = (
             [str(year) for year in range(year_start_hindcast, year_end_hindcast + 1)]
             if year_forecast is None
@@ -973,6 +1687,64 @@ class WAS_Download:
         store_file_path = {}
         for cent, syst, k in zip(selected_centre, selected_system, selected_var):
             file_prefix = "forecast" if year_forecast else "hindcast"
+            file_path = f"{dir_to_save}/{file_prefix}_{cent.replace('_', '')}{syst}_{k}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
+            if cent in nmme and nmme_source == "ccsr":
+                if ccsr_engine not in ("netcdf4", "pydap"):
+                    raise ValueError("ccsr_engine must be 'netcdf4' or 'pydap'.")
+                model_id = f"{cent.upper()}_{syst}"
+                request_key = _ccsr_request_key(
+                    model_id, k, years, month_of_initialization, lead_time,
+                    area, ccsr_base_url, ccsr_cfsv2_sample,
+                )
+                if not force_download and _ccsr_cache_matches(
+                    file_path, request_key, requested_statistic
+                ):
+                    print(f"{file_path} already exists with matching CCSR provenance. Skipping download.")
+                    store_file_path[f"{cent}_{syst}"] = file_path
+                    continue
+                raw_target = legacy_directory / "ensemble_members" / Path(file_path).name
+                raw = None
+                if not force_download and _ccsr_cache_matches(raw_target, request_key, "members"):
+                    with xr.open_dataset(raw_target) as opened:
+                        raw = opened.load()
+                if raw is None:
+                    try:
+                        raw = _ccsr_download_season(
+                            model_id, k, years, month_of_initialization,
+                            lead_time, area, None, base_url=ccsr_base_url,
+                            cfsv2_sample=ccsr_cfsv2_sample,
+                            engine=ccsr_engine,
+                        )
+                    except _CCSRUnavailableError as exc:
+                        warnings.warn(f"CCSR {model_id}.{k} unavailable: {exc}", RuntimeWarning)
+                        continue
+                    raw.attrs["wass2s_ccsr_request"] = request_key
+                    raw.attrs["wass2s_processing_version"] = "ccsr-members-calendar-20260916"
+                    raw.attrs["wass2s_ensemble_statistic"] = "members"
+                    _save_netcdf_atomic(raw, raw_target)
+                if ensemble_mean is not None:
+                    result = getattr(raw, ensemble_mean)(dim="M", skipna=True, keep_attrs=True)
+                    result.attrs["wass2s_ensemble_statistic"] = ensemble_mean
+                    _save_netcdf_atomic(result, file_path)
+                store_file_path[f"{cent}_{syst}"] = file_path
+                print(f"Saved CCSR {model_id}.{k} ({requested_statistic}): {file_path}")
+                continue
+            if not cache_available(file_path, c3s=cent not in nmme):
+                reuse_member_archive(file_path, c3s=cent not in nmme)
+
+            if cent in nmme and ensemble_mean != "mean":
+                if cache_available(file_path):
+                    store_file_path[f"{cent}_{syst}"] = file_path
+                else:
+                    warnings.warn(
+                        f"NMME {cent}/{syst}/{k} unavailable for ensemble_mean={ensemble_mean!r}: "
+                        f"nmme_source={nmme_source!r} supplies ensemble means only. "
+                        "Provide a genuine member-resolved seasonal archive in "
+                        f"{legacy_directory / 'ensemble_members' / Path(file_path).name}; "
+                        "spread and quantiles cannot be recovered from ENSMEAN/CPT means.",
+                        RuntimeWarning,
+                    )
+                continue
 
             if cent in nmme:
 
@@ -986,7 +1758,7 @@ class WAS_Download:
                     ftp_model = nmme_netcdf_model_map[f"{cent.upper()}_{syst}"]
                     file_path = f"{dir_to_save}/{file_prefix}_{cent.replace('_', '')}{syst}_{k}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
                     
-                    if not force_download and os.path.exists(file_path):
+                    if cache_available(file_path):
                         print(f"{file_path} already exists. Skipping download.")
                         store_file_path[f"{cent}_{syst}"] = file_path                   
                     else:
@@ -1049,6 +1821,7 @@ class WAS_Download:
     
                             if list_ds_years:
                                 ds_final = xr.concat(list_ds_years, dim="T").sortby("T").transpose('T', 'Y', 'X')
+                                ds_final.attrs["wass2s_ensemble_statistic"] = "mean"
                                 ds_final.to_netcdf(file_path)
                                 store_file_path[f"{cent}_{syst}"] = file_path
                                 print(f"Saved: {file_path}")
@@ -1063,7 +1836,7 @@ class WAS_Download:
                     k = "precip" if k=="PRCP" else k
                     k = "tmp2m" if k=="TEMP" else k
                     k = "sst" if k=="SST" else k
-                    if not force_download and os.path.exists(file_path):
+                    if cache_available(file_path):
                         print(f"{file_path} already exists. Skipping download.")
                         store_file_path[f"{cent}_{syst}"] = file_path                   
                     else:
@@ -1144,6 +1917,7 @@ class WAS_Download:
                                 ds = ds.sortby("X")
                                 ds = ds.sel(X=slice(area[1],area[3]),Y=slice(area[2], area[0])).transpose('T', 'Y', 'X') 
     
+                                ds.attrs["wass2s_ensemble_statistic"] = "mean"
                                 ds.to_netcdf(file_path)
                                 print(f"Download finished for {cent} {syst} {k} to {file_path}")
                                 ds.close()
@@ -1194,6 +1968,7 @@ class WAS_Download:
                                 ds = ds.assign_coords(X=((ds.X + 180) % 360 - 180))
                                 ds = ds.sortby("X")
                                 ds = ds.sel(X=slice(area[1],area[3]),Y=slice(area[2], area[0])).transpose('T', 'Y', 'X') 
+                                ds.attrs["wass2s_ensemble_statistic"] = "mean"
                                 ds.to_netcdf(file_path)
                                 print(f"Download finished for {cent} {syst} {k} to {file_path}")
                                 ds.close()
@@ -1202,11 +1977,13 @@ class WAS_Download:
                             pass
             else:
                 file_path = f"{dir_to_save}/{file_prefix}_{cent.replace('_', '')}{syst}_{k}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
-                if not force_download and os.path.exists(file_path):
+                if cache_available(file_path, c3s=True):
                     print(f"{file_path} already exists. Skipping download.")
                     store_file_path[f"{cent}_{syst}"] = file_path
                 else:                
                     try:
+                        from wass2s.was_scientific_utils import c3s_leads_from_offsets
+                        cds_leads = c3s_leads_from_offsets(lead_time)
                         if k in variables_2:
                             press_level = k.split("_")[1]
                             dataset = "seasonal-monthly-pressure-levels"
@@ -1218,7 +1995,7 @@ class WAS_Download:
                                 "product_type": ["monthly_mean"],
                                 "year": years,
                                 "month": month_of_initialization,
-                                "leadtime_month": [i.lstrip('0') for i in lead_time],
+                                "leadtime_month": cds_leads,
                                 "data_format": "netcdf",
                                 "area": area,
                             }
@@ -1231,59 +2008,57 @@ class WAS_Download:
                                 "product_type": ["monthly_mean"],
                                 "year": years,
                                 "month": month_of_initialization,
-                                "leadtime_month": [i.lstrip('0') for i in lead_time],
+                                "leadtime_month": cds_leads,
                                 "data_format": "netcdf",
                                 "area": area,
                             }
         
                         client = cdsapi.Client()
-                        client.retrieve(dataset, request).download(file_path)
+                        import tempfile
+                        fd, raw_path = tempfile.mkstemp(prefix="c3s_", suffix=".raw.nc", dir=dir_to_save)
+                        os.close(fd)
+                        client.retrieve(dataset, request).download(raw_path)
                         print(f"Downloaded: {file_path}")
     
         
                         # Load the NetCDF file and apply area selection if specified
-                        ds = xr.open_dataset(file_path)
+                        with xr.open_dataset(raw_path) as opened:
+                            ds = opened.load()
+                        os.unlink(raw_path)
             
                         if k in ["TMIN","TEMP","TMAX","SST"]:
                             ds = ds - 273.15
                             ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds 
-                            ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            ds = _c3s_monthly_mean(ds).isel(latitude=slice(None, None, -1))
                             if "indexing_time" in ds.coords: 
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
                             else:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
                         if k =="PRCP":
-                            ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
-                            ds = (1000*30*24*60*60*ds).sum(dim="forecastMonth").isel(latitude=slice(None, None, -1))
-                            ds = ds.where(lambda x: x >= 0, other=0)
+                            from wass2s.was_scientific_utils import c3s_monthly_precipitation_total
+                            ds = c3s_monthly_precipitation_total(ds)
+                            ds = getattr(ds,ensemble_mean)(dim="number", keep_attrs=True) if ensemble_mean is not None else ds
+                            ds = ds.isel(latitude=slice(None, None, -1))
+                            ds = ds.clip(min=0)  # Keep missing seasonal totals missing.
                             if "indexing_time" in ds.coords: 
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
                             else:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
 
-                        if k =="RUNOFF":
-                            ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
-                            ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
-                            ds = ds.where(lambda x: x >= 0, other=0)
-                            if "indexing_time" in ds.coords: 
-                                ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
-                            else:
-                                ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
-                            lat = ds.lat
-                            lon = ds.lon
-                            dlon = np.deg2rad(0.1)
-                            dlat = np.deg2rad(0.1)
-                            r = 6371000 # Earth radius in meters
-                            # Area for each grid cell
-                            area_ = (r ** 2) * dlon * np.cos(np.deg2rad(lat)) * dlat
-                            # Perform the conversion to m^3/s
-                            ds = (ds * area_) 
-                        
+                        if k == "RUNOFF":
+                            from wass2s.was_scientific_utils import c3s_monthly_precipitation_total
+                            ds = c3s_monthly_precipitation_total(ds)
+                            if ensemble_mean is not None:
+                                ds = getattr(ds, ensemble_mean)(dim="number", keep_attrs=True)
+                            ds = ds.isel(latitude=slice(None, None, -1)).clip(min=0)
+                            time_name = "indexing_time" if "indexing_time" in ds.coords else "forecast_reference_time"
+                            ds = ds.rename({"latitude":"lat", "longitude":"lon", time_name:"time"})
+                            ds.attrs["quantity"] = "seasonal local runoff depth; not routed river discharge"
 
                         if k == "SLP":
                             ds = ds/100
                             ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds 
-                            ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            ds = _c3s_monthly_mean(ds).isel(latitude=slice(None, None, -1))
                             if "indexing_time" in ds.coords: 
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
                             else:
@@ -1291,7 +2066,7 @@ class WAS_Download:
 
                         if k in ["UGRD10","VGRD10"]:
                             ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
-                            ds = ds.mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            ds = _c3s_monthly_mean(ds).isel(latitude=slice(None, None, -1))
                             if "indexing_time" in ds.coords: 
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
                             else:
@@ -1299,33 +2074,43 @@ class WAS_Download:
 
                         if k in ["DSWR","DLWR", "NOLR"]:
                             ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
-                            ds = ds.sum(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            ds = _c3s_monthly_mean(ds).isel(latitude=slice(None, None, -1))
                             if "indexing_time" in ds.coords: 
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
                             else:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
 
-                        if k not in ["TMIN","TEMP","TMAX","SST","UGRD10","VGRD10", "PRCP","SLP","DSWR","DLWR","NOLR"]:
+                        if k not in ["TMIN","TEMP","TMAX","SST","UGRD10","VGRD10", "PRCP","RUNOFF","SLP","DSWR","DLWR","NOLR"]:
                             ds = getattr(ds,ensemble_mean)(dim="number") if ensemble_mean != None else ds
-                            ds = ds.drop_vars("pressure_level").squeeze().mean(dim="forecastMonth").isel(latitude=slice(None, None, -1))
+                            ds = _c3s_monthly_mean(ds)
+                            if "pressure_level" in ds.dims:
+                                ds = ds.squeeze("pressure_level", drop=True)
+                            ds = ds.isel(latitude=slice(None, None, -1))
                             if "indexing_time" in ds.coords: 
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","indexing_time":"time"})
                             else:
                                 ds = ds.rename({"latitude":"lat","longitude":"lon","forecast_reference_time":"time"})
             
-                        os.remove(file_path)
-                        print(f"Deleted not process file: {file_path}")
+
                             
                         ds = ds.rename({"lon":"X","lat":"Y","time":"T"})    
                         output_path = f"{dir_to_save}/{file_prefix}_{cent.replace('_', '')}{syst}_{k}_{abb_mont_ini}Ic_{season}_{lead_time[0]}.nc"
                         
                         # Save the combined dataset for the center-variable combination
-                        ds.to_netcdf(output_path)
+                        if ensemble_mean is None and member_dimension(ds) is None:
+                            raise ValueError("C3S returned no member dimension for a full-ensemble request.")
+                        ds.attrs["wass2s_processing_version"] = "calendar-rates-20260911"
+                        ds.attrs["wass2s_ensemble_statistic"] = requested_statistic
+                        _save_netcdf_atomic(ds, output_path)
                         print(f"Download finished, combined dataset for {cent} {syst} {k} to {output_path}")
                         ds.close()
                         store_file_path[f"{cent}_{syst}"] = file_path
+                    # except Exception as e:
+                    #     if "raw_path" in locals() and os.path.exists(raw_path):
+                    #         os.unlink(raw_path)
+                    #     raise RuntimeError(f"C3S processing failed for {cent}/{syst}/{k}") from e
                     except Exception as e:
-                        print(f"Failed to download data for {k}: {e}")
+                        print(f"C3S processing failed for {cent}/{syst}/{k}")
         return store_file_path
 
 
@@ -3781,25 +4566,36 @@ class WAS_Download:
             ds = _normalize_coords(ds)
             ds = _subset_area(ds)
             ds = ds.rename({"sst": "SST"})
-            ds = ds.drop_vars("lev", errors="ignore").squeeze()
-    
-            seasonal = []
-            for season_year in range(year_start, year_end + 1):
-                monthly = []
-                for _, cal_year, month in _season_calendar_months(season_year):
-                    t0 = np.datetime64(f"{cal_year}-{month:02d}-01")
-                    month_ds = ds.sel(time=t0, method="nearest").load()
-                    days = calendar.monthrange(cal_year, month)[1]
-                    month_ds["SST"].attrs["monthly_days"] = int(days)
-                    month_ds.attrs["monthly_days"] = int(days)
-                    monthly.append(month_ds)
-    
-                out = _aggregate_months(monthly, "SST")
-                out = out.expand_dims(time=[_representative_time(season_year)])
-                seasonal.append(out)
-    
-            ds.close()
+            ds = ds.drop_vars("lev", errors="ignore")
+            if "lev" in ds.dims:
+                ds = ds.squeeze("lev", drop=True)
+
+            seasonal, incomplete = [], []
+            try:
+                for season_year in range(year_start, year_end + 1):
+                    required_months = _season_calendar_months(season_year)
+                    indices = _noaa_exact_month_indices(
+                        ds["time"].values, [(y, m) for _, y, m in required_months])
+                    if indices is None:
+                        incomplete.append(season_year)
+                        print(f"NOAA SST: incomplete season {season_year}; skipped (missing calendar month).")
+                        continue
+                    monthly = []
+                    for index, (_, cal_year, month) in zip(indices, required_months):
+                        month_ds = ds.isel(time=int(index), drop=True).load()
+                        days = calendar.monthrange(cal_year, month)[1]
+                        month_ds["SST"].attrs["monthly_days"] = int(days)
+                        month_ds.attrs["monthly_days"] = int(days)
+                        monthly.append(month_ds)
+                    out = _aggregate_months(monthly, "SST")
+                    out = out.expand_dims(time=[_representative_time(season_year)])
+                    seasonal.append(out)
+            finally:
+                ds.close()
+            if not seasonal:
+                raise ValueError("NOAA SST: no complete requested season; missing months are never substituted.")
             out = xr.concat(seasonal, dim="time")
+            out.attrs["incomplete_seasons_skipped"] = ",".join(map(str, incomplete))
             out = out.rename({"time": "T"})
             out = _finalize_output(out, "NOAA", v)
             out.to_netcdf(out_file)
@@ -6685,112 +7481,434 @@ class WAS_Download:
         max_retries=3,
         retry_delay=10,
         keep_temporary=False,
+        upstream_area_url=None,
+        attach_upstream_area_to_q=True,
+        ewds_url="https://ewds.climate.copernicus.eu/api",
+        ewds_key=None,
+        ewds_rc_file=None,
+        allow_incomplete=False,
+        end_date=None,
+        refresh_incomplete=True,
+        *,
+        attach_static_maps_to_q=True,
+        network_area=None,
+        static_map_urls=None,
+        static_map_files=None,
+        force_static_download=None,
+        return_paths=False,
     ):
-        """
-        Download historical daily GloFAS hydrological data from the Copernicus
-        Emergency Management Service (CEMS) Early Warning Data Store and save it
-        in WASS2S-compatible xarray format (dimensions T=time, Y=lat, X=lon).
-    
-        Parameters
-        ----------
-        dir_to_save : str or Path
-            Output directory for the final NetCDF files.
-        variables : list of str
-            GloFAS variables to download. Supported: "GLOFAS.Q"
-            (river discharge in the last 24 hours, m3 s-1).
-        year_start, year_end : int
-            Inclusive year range.
-        area : list of float
-            Bounding box [North, West, South, East]. Benin/Oueme e.g. [11, 1, 6, 4].
-        system_version : str, optional
-            e.g. "version_5_0" (default), "version_4_0".
-        product_type : str, optional
-            "consolidated" (ERA5, default) or "intermediate" (ERA5T).
-        force_download : bool, optional
-            Overwrite existing outputs. Default False.
-        max_retries, retry_delay : int, optional
-            Per-month retry attempts and delay in seconds.
-        keep_temporary : bool, optional
-            Keep monthly/yearly temp files. Default False.
-    
-        Returns
-        -------
-        None
-            Writes one NetCDF per variable, e.g. Daily_Q_1990_2025.nc, with
-            Q of shape (T, Y, X).
-    
+
+        """Download daily GloFAS and optional static maps through ONE interface.
+
+        Backward-compatible inputs / outputs
+        -----------------------------------
+        Existing Q/UPAREA calls, Q filenames, incomplete-year policy, monthly
+        checkpoints and EWDS authentication are retained. A Q request returns
+        its Path, as in the user's original module. A static-only request returns
+        None unless return_paths=True. No files are downloaded at import.
+
+        variables : sequence of str
+            "GLOFAS.Q", "GLOFAS.UPAREA" (or "GLOFAS.DRAINAGE_AREA"),
+            "GLOFAS.LDD", "GLOFAS.CHAN", "GLOFAS.CELLAREA".
+            Q is m3 s-1. UPAREA is m2, UPAREA_KM2 is km2, CELLAREA is m2.
+            LDD retains PCRaster codes; CHAN is a 0/1 mask. Static fields are Y,X,
+            never broadcast over time. Zero Q and zero CHAN remain valid.
+
+        attach_static_maps_to_q : bool, default True
+            Attach requested LDD/CHAN/CELLAREA to Q on its native grid. UPAREA
+            remains controlled by attach_upstream_area_to_q. Existing complete
+            Q files can be enriched without a new EWDS discharge request.
+        network_area : [North, West, South, East] or None
+            Optional larger domain for the combined static file. None uses area.
+            Q retains the requested area. Attached fields are a native subset.
+            A crop is NOT proof that the complete upstream domain is included.
+        static_map_urls : mapping or None
+            Explicit version-compatible HTTPS URLs, keyed by LDD, UPAREA, CHAN,
+            CELLAREA (GLOFAS. prefixes also accepted). There is no cross-version
+            fallback. upstream_area_url remains supported; conflicting entries
+            are refused. v4 CHAN/CELLAREA require compatible explicit sources.
+        static_map_files : mapping or None
+            Optional existing NetCDF sources for these maps, for offline use.
+            Source version conflicts and invalid direction codes are rejected.
+            A source without version metadata is recorded as user-asserted.
+        force_static_download : bool or None
+            None follows force_download. True refreshes ONLY auxiliary data when
+            force_download=False, without forcing a Q re-download.
+        return_paths : bool, default False
+            True returns {"discharge": Path or None, "static": Path or None,
+            "uparea": Path or None, "system_version": str, "area": tuple,
+            "network_area": tuple, "requested_variables": tuple}.
+            This manifest is also stored in self.last_glofas_download.
+
+        allow_incomplete : bool, default False
+            False requires all requested days. True saves available days and
+            permits an incomplete year. Missing Q is never filled/interpolated.
+            Monthly checkpoints and a .coverage.json report permit later refresh.
+        end_date : date-like or None
+            Inclusive final request date within year_start..year_end. Requests
+            stop at yesterday UTC. Provider valid time T is NEVER shifted;
+            REQUEST_DATE is retained when different. An explicit end adds a
+            _toYYYYMMDD filename suffix. Static-only requests do not use dates.
+        refresh_incomplete : bool, default True
+            Refresh incomplete periods only; complete monthly caches are reused.
+
         Notes
         -----
-        Requires a valid EWDS config in ~/.cdsapirc. Downloads run month by month
-        for robustness; monthly data are combined into yearly temp files, then the
-        final multi-year file. Longitudes are wrapped to [-180, 180), coordinates
-        sorted ascending, duplicate timestamps dropped, discharge stored as
-        compressed float32.
+        Static global NetCDF sources are cached in .glofas_static before native
+        cropping. Static_GLOFAS_<version>.nc groups the requested fields;
+        Static_UPAREA_<version>.nc remains available for older workflows.
+        Native labels may be reconciled for tiny coordinate-rounding noise only;
+        no interpolation, flow repair, or snapping to a neighbouring river cell.
+        Keep source datasets closed before enriching files on Windows.
         """
-    
+
         import calendar
         import time as _time
         from pathlib import Path
-    
+        from urllib.request import Request, urlopen
+
         import numpy as np
         import xarray as xr
-        import cdsapi
-    
+
+
+        import pandas as pd
+        _glofas_patch_revision = "GLOFAS_UNIFIED_AUXILIARIES_HYDRO_V52"
+
+        # Private helpers belong INSIDE this method so copying this complete
+        # definition into WAS_Download does not need other WASS2S module globals.
+        def _was_validate_area(area):
+            """Validate [north, west, south, east]; None means no spatial subset."""
+            if area is None:
+                return None
+            if len(area) != 4:
+                raise ValueError("area must be [North, West, South, East].")
+            vals = tuple(float(v) for v in area)
+            if not np.isfinite(vals).all():
+                raise ValueError("area must contain finite coordinates.")
+            n, w, s, e = vals
+            if not (-90 <= s < n <= 90 and -180 <= w <= 180 and -180 <= e <= 180 and w != e):
+                raise ValueError("Invalid area: require -90 <= South < North <= 90 and longitudes in [-180, 180].")
+            return vals
+
+        def _was_cache_key(**identity):
+            """Deterministic configuration key; never pass tokens/passwords here."""
+            import hashlib
+            import json
+            return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+        def _was_write_netcdf(obj, path, *, encoding=None, compute=True, before_replace=None, **kwargs):
+            """Atomic replacement; never leave a half-written final NetCDF file.
+
+            netCDF4/h5netcdf compression is used when installed. Small-data/test
+            installations can use scipy (no compression); this fallback is announced.
+            A failed write leaves any previously valid destination untouched.
+            """
+            import importlib.util
+            import os
+            import tempfile
+            import warnings
+            if not compute:
+                from dask import delayed
+                return delayed(_was_write_netcdf)(obj, path, encoding=encoding, compute=True, before_replace=before_replace, **kwargs)
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            enc = {k: dict(v) for k, v in (encoding or {}).items()}
+            if "engine" not in kwargs:
+                if importlib.util.find_spec("netCDF4") is not None:
+                    kwargs["engine"] = "netcdf4"
+                elif importlib.util.find_spec("h5netcdf") is not None:
+                    kwargs["engine"] = "h5netcdf"
+                else:
+                    kwargs["engine"] = "scipy"
+                    dropped = {"zlib", "complevel", "shuffle", "fletcher32", "chunksizes", "contiguous", "compression", "compression_opts"}
+                    if any(dropped.intersection(v) for v in enc.values()):
+                        warnings.warn("netCDF4/h5netcdf unavailable: writing uncompressed NetCDF with scipy.", RuntimeWarning)
+                    enc = {k: {a: b for a, b in v.items() if a not in dropped} for k, v in enc.items()}
+            fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".part", dir=path.parent)
+            os.close(fd)
+            try:
+                obj.to_netcdf(tmp, encoding=enc, **kwargs)
+                # Windows refuses replacing a file still open in the reading Dataset.
+                # The callback runs only AFTER the temporary file was fully written.
+                if before_replace is not None:
+                    before_replace()
+                os.replace(tmp, path)
+            finally:
+                Path(tmp).unlink(missing_ok=True)
+
+        def _was_concat_files(files, time_dim="T", max_eager_bytes=512 * 1024**2):
+            """Lazy concatenation with Dask; explicit bounded-memory fallback otherwise.
+
+            The caller must close the returned Dataset. No spatial outer join and no
+            silent duplicate timestamp removal are allowed.
+            """
+            import importlib.util
+            files = list(files)
+            if not files:
+                raise ValueError("No files available for concatenation.")
+            if importlib.util.find_spec("dask") is not None:
+                out = xr.open_mfdataset(files, combine="nested", concat_dim=time_dim,
+                                       chunks={time_dim: 31}, parallel=False,
+                                       join="exact", data_vars="minimal", coords="minimal", compat="equals")
+                close = out.close
+                try:
+                    out = out.sortby(time_dim)
+                    if not out.get_index(time_dim).is_unique:
+                        raise ValueError("Duplicate timestamps across cache files; inspect overlapping source periods.")
+                    out.set_close(close)
+                    return out
+                except Exception:
+                    close()
+                    raise
+            total = 0
+            for path in files:
+                with xr.open_dataset(path) as item:
+                    total += item.nbytes
+            # Concatenation needs additional copies, hence a conservative small ceiling.
+            if total > max_eager_bytes:
+                raise ImportError(f"Dask is needed to assemble {total / 1024**2:.1f} MiB of data safely. Install dask[array].")
+            arrays = []
+            for path in files:
+                with xr.open_dataset(path) as item:
+                    arrays.append(item.load())
+            out = xr.concat(arrays, dim=time_dim, join="exact", data_vars="minimal", coords="minimal", compat="equals").sortby(time_dim)
+            if not out.get_index(time_dim).is_unique:
+                raise ValueError("Duplicate timestamps across cache files; inspect overlapping source periods.")
+            return out
+
+        def _was_ewds_client(url="https://ewds.climate.copernicus.eu/api", key=None, rc_file=None):
+            """Resolve a token without modifying CDS configuration or printing secrets."""
+            import os
+            import yaml
+            import cdsapi
+            from urllib.parse import urlsplit
+            parsed = urlsplit(str(url))
+            if parsed.scheme != "https" or parsed.hostname != "ewds.climate.copernicus.eu" or parsed.path.rstrip("/") != "/api":
+                raise ValueError("GloFAS must use https://ewds.climate.copernicus.eu/api, not the CDS endpoint.")
+            resolved = key or os.getenv("EWDS_API_KEY")
+            if not resolved and rc_file is not None:
+                config = Path(rc_file).expanduser()
+                if not config.is_file():
+                    raise FileNotFoundError(f"EWDS configuration not found: {config}")
+                with config.open() as stream:
+                    resolved = (yaml.safe_load(stream) or {}).get("key")
+                if not resolved:
+                    raise ValueError("The explicit EWDS configuration contains no key.")
+            if not resolved:
+                resolved = os.getenv("CDSAPI_KEY")
+            candidates = [Path.home() / ".ewdsapirc"]
+            if os.getenv("CDSAPI_RC"):
+                candidates.append(Path(os.environ["CDSAPI_RC"]).expanduser())
+            candidates.append(Path.home() / ".cdsapirc")
+            for config in candidates:
+                if resolved:
+                    break
+                if config.is_file():
+                    with config.open() as stream:
+                        resolved = (yaml.safe_load(stream) or {}).get("key")
+            if not resolved:
+                raise ValueError("No EWDS token. Set EWDS_API_KEY, ewds_key, or a key in ~/.ewdsapirc / ~/.cdsapirc.")
+            print(f"[GloFAS] EWDS endpoint: {str(url).rstrip('/')}")
+            return cdsapi.Client(url=str(url).rstrip("/"), key=str(resolved).strip())
+
+        def _was_permanent_http_error(exc):
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status is None:
+                status = getattr(exc, "code", None)  # urllib HTTPError
+            return status in {400, 401, 403, 404, 405, 410, 422}
+
         DATASET = "cems-glofas-historical"
         REQUIRED_DIMS = {"T", "Y", "X"}
-    
+
         COORD_ALIASES = {
-            "longitude": "X", "lon": "X",
-            "latitude": "Y", "lat": "Y",
-            "time": "T", "valid_time": "T", "date": "T",
+            "longitude": "X",
+            "lon": "X",
+            "latitude": "Y",
+            "lat": "Y",
+            "time": "T",
+            "valid_time": "T",
+            "date": "T",
         }
-    
+
+        UPAREA_ALIASES = {"GLOFAS.UPAREA", "GLOFAS.DRAINAGE_AREA"}
+        AUXILIARY_ALIASES = {
+            "GLOFAS.UPAREA": "UPAREA", "GLOFAS.DRAINAGE_AREA": "UPAREA",
+            "GLOFAS.LDD": "LDD", "GLOFAS.CHAN": "CHAN",
+            "GLOFAS.CELLAREA": "CELLAREA",
+        }
+
         VARIABLE_MAPPING = {
             "GLOFAS.Q": {
-                "cds_variable": "river_discharge_in_the_last_24_hours",
+                # Current EWDS schema (introduced with the GloFAS v5 rollout).
+                # This schema is also used when requesting v4 from the
+                # restructured cems-glofas-historical catalogue.
+                "cds_variable": "average_river_discharge_in_the_last_24_hours",
+                "timespan": "time_mean",
                 "output_name": "Q",
-                "long_name": "GloFAS daily river discharge",
+                "long_name": "GloFAS average daily river discharge",
                 "units": "m3 s-1",
             },
         }
-    
+
+        area = _was_validate_area(area)
+        if area is None:
+            raise ValueError("GloFAS requires a bounding box.")
+        year_start, year_end = int(year_start), int(year_end)
+        if year_start > year_end:
+            raise ValueError("year_start must be <= year_end.")
+        variables = [variables] if isinstance(variables, str) else list(dict.fromkeys(variables))
+        if not variables:
+            raise ValueError("At least one GloFAS variable is required.")
+        want_uparea = any(v in UPAREA_ALIASES for v in variables)
+        auxiliary_variables = tuple(dict.fromkeys(
+            AUXILIARY_ALIASES[v] for v in variables if v in AUXILIARY_ALIASES))
+        dynamic_variables = [v for v in variables if v not in AUXILIARY_ALIASES]
+
+        unknown = [
+            v for v in dynamic_variables
+            if v not in VARIABLE_MAPPING
+        ]
+        if unknown:
+            raise ValueError(
+                f"Unknown GloFAS variable(s): {unknown}. Supported: "
+                f"{list(VARIABLE_MAPPING) + list(AUXILIARY_ALIASES)}"
+            )
+
         dir_to_save = Path(dir_to_save)
         dir_to_save.mkdir(parents=True, exist_ok=True)
-    
-        tmp_root = dir_to_save / ".glofas_tmp"
+
+        tmp_root = dir_to_save / ".glofas_tmp" / _was_cache_key(version=system_version, product=product_type, area=area)
         tmp_root.mkdir(parents=True, exist_ok=True)
-    
-        # ------------------------------------------------------------------
-        # Standardize a raw GloFAS dataset to the WASS2S T/Y/X convention
-        # ------------------------------------------------------------------
-        def _standardize(ds, output_name):
-            ds = ds.drop_vars(
-                [v for v in ("crs", "spatial_ref", "surface") if v in ds.variables],
-                errors="ignore",
-            )
-    
-            data_vars = list(ds.data_vars)
-            if not data_vars:
-                raise ValueError("No data variable found in downloaded GloFAS file.")
-    
-            # Pick the discharge variable: prefer known names, else the largest 2D+ field
-            preferred = ["dis24", "q", "Q", "river_discharge_in_the_last_24_hours"]
-            source = next((v for v in preferred if v in data_vars), None)
-            if source is None:
-                candidates = [v for v in data_vars if ds[v].ndim >= 2] or data_vars
-                source = max(candidates, key=lambda v: ds[v].size)
-    
-            da = ds[source]
-    
-            # Rename coordinates -> T/Y/X
+
+        # ================================================================
+        # Generic coordinate helpers
+        # ================================================================
+        def _wrap_sort_xy(da):
+            """Standardize horizontal coordinates to ascending WASS2S X/Y."""
             rename = {
-                old: new for old, new in COORD_ALIASES.items()
+                old: new
+                for old, new in COORD_ALIASES.items()
                 if old in da.dims or old in da.coords
             }
             if rename:
                 da = da.rename(rename)
-    
-            # Drop singleton extra dims; anything else is unexpected
+
+            if "X" not in da.coords or "Y" not in da.coords:
+                raise ValueError(
+                    f"Could not identify GloFAS X/Y coordinates. Found dims={da.dims}, "
+                    f"coords={list(da.coords)}"
+                )
+
+            if float(da["X"].max()) > 180.0:
+                da = da.assign_coords(
+                    X=((da["X"] + 180.0) % 360.0) - 180.0
+                )
+
+            return da.sortby("X").sortby("Y")
+
+        def _subset_area_xy(da):
+            """Subset an already standardized X/Y DataArray to [N,W,S,E]."""
+            north, west, south, east = map(float, area)
+
+            if south > north:
+                raise ValueError(
+                    f"Invalid area={area}: South ({south}) > North ({north})."
+                )
+
+            da = da.sel(Y=slice(south, north))
+
+            # Standard non-dateline-crossing case (West Africa, etc.)
+            if west <= east:
+                da = da.sel(X=slice(west, east))
+            else:
+                # Dateline crossing, e.g. [N, 170, S, -170]
+                left = da.sel(X=slice(west, 180.0))
+                right = da.sel(X=slice(-180.0, east))
+                da = xr.concat([left, right], dim="X").sortby("X")
+
+            if da.sizes.get("X", 0) == 0 or da.sizes.get("Y", 0) == 0:
+                raise ValueError(
+                    f"Area {area} produced an empty subset. "
+                    f"Available X=[{float(da.X.min()) if da.sizes.get('X',0) else 'NA'}, "
+                    f"{float(da.X.max()) if da.sizes.get('X',0) else 'NA'}], "
+                    f"Y=[{float(da.Y.min()) if da.sizes.get('Y',0) else 'NA'}, "
+                    f"{float(da.Y.max()) if da.sizes.get('Y',0) else 'NA'}]."
+                )
+
+            return da
+
+        # ================================================================
+        # Dynamic T/Y/X standardization
+        # ================================================================
+        def _standardize_dynamic(ds, output_name):
+            ds = ds.drop_vars(
+                [
+                    v
+                    for v in ("crs", "spatial_ref", "surface")
+                    if v in ds.variables
+                ],
+                errors="ignore",
+            )
+
+            data_vars = list(ds.data_vars)
+            if not data_vars:
+                raise ValueError(
+                    "No data variable found in downloaded GloFAS file."
+                )
+
+            preferred = [
+                "dis24",
+                "q",
+                "Q",
+                "river_discharge_in_the_last_24_hours",
+                "average_river_discharge_in_the_last_24_hours",
+            ]
+            source = next((v for v in preferred if v in data_vars), None)
+
+            if source is None:
+                candidates = [v for v in data_vars if ds[v].ndim >= 2] or data_vars
+                source = max(candidates, key=lambda v: ds[v].size)
+
+            da = ds[source]
+            # Keep the provider reference date before dropping alternative time
+            # coordinates. GloFAS may expose time + step = valid_time.
+            if "REQUEST_DATE" not in da.coords:
+                valid = next((n for n in ("valid_time", "time", "date")
+                              if n in da.coords and da[n].ndim == 1), None)
+                if valid:
+                    ref = next((n for n in ("time", "forecast_reference_time", "date")
+                                if n in da.coords and da[n].dims == da[valid].dims
+                                and n != valid), None)
+                    if ref is not None:
+                        da = da.assign_coords(REQUEST_DATE=(da[valid].dims,
+                            pd.DatetimeIndex(da[ref].values).normalize().values))
+                    elif valid in ("time", "date"):
+                        da = da.assign_coords(REQUEST_DATE=(da[valid].dims,
+                            pd.DatetimeIndex(da[valid].values).normalize().values))
+
+
+            if "T" not in da.dims:
+                time_name = next((n for n in ("valid_time", "time", "date")
+                                  if n in da.coords and da[n].ndim == 1), None)
+                if time_name is None:
+                    raise ValueError("No one-dimensional valid-time coordinate found in GloFAS discharge.")
+                dim = da[time_name].dims[0]
+                if dim != time_name:
+                    da = da.swap_dims({dim: time_name}).drop_vars(dim, errors="ignore")
+                # Other time aliases can refer to initialization time, not valid time.
+                da = da.drop_vars([n for n in ("time", "date", "valid_time")
+                                   if n != time_name and n in da.coords], errors="ignore")
+                da = da.rename({time_name: "T"})
+            rename = {}
+            for target, aliases in (("X", ("longitude", "lon")), ("Y", ("latitude", "lat"))):
+                if target not in da.dims:
+                    old = next((n for n in aliases if n in da.dims), None)
+                    if old:
+                        rename[old] = target
+            if rename:
+                da = da.rename(rename)
+
+            # Drop singleton extra dimensions only.
             for dim in [d for d in da.dims if d not in REQUIRED_DIMS]:
                 if da.sizes[dim] == 1:
                     da = da.isel({dim: 0}, drop=True)
@@ -6799,253 +7917,3367 @@ class WAS_Download:
                         f"Unexpected non-singleton dimension '{dim}' "
                         f"with size {da.sizes[dim]}"
                     )
-    
+
             missing = REQUIRED_DIMS - set(da.dims)
             if missing:
                 raise ValueError(
-                    f"Could not identify all required GloFAS dimensions T/Y/X. "
+                    "Could not identify all required GloFAS dimensions T/Y/X. "
                     f"Missing: {missing}. Found: {da.dims}"
                 )
-    
-            # 0..360 -> -180..180 if needed
+
             if float(da["X"].max()) > 180.0:
-                da = da.assign_coords(X=((da["X"] + 180.0) % 360.0) - 180.0)
-    
+                da = da.assign_coords(
+                    X=((da["X"] + 180.0) % 360.0) - 180.0
+                )
+
             return (
-                da.sortby("X").sortby("Y").sortby("T")
-                  .transpose("T", "Y", "X")
-                  .rename(output_name)
+                da.sortby("X")
+                .sortby("Y")
+                .sortby("T")
+                .transpose("T", "Y", "X")
+                .rename(output_name)
             )
-    
+
         def _dedup_time(da):
             _, idx = np.unique(da["T"].values, return_index=True)
             return da.isel(T=np.sort(idx))
-    
-        def _encoding(name):
-            return {name: {"dtype": "float32", "zlib": True,
-                           "complevel": 4, "_FillValue": -9999.0}}
-    
-        client = cdsapi.Client()
-    
-        # ==================================================================
-        # Per-variable loop
-        # ==================================================================
-        for var in variables:
-            if var not in VARIABLE_MAPPING:
-                print(f"Unknown GloFAS variable: {var}. "
-                      f"Supported: {list(VARIABLE_MAPPING)}")
-                continue
-    
+
+        def _encoding_dynamic(name):
+            return {
+                name: {
+                    "dtype": "float32",
+                    "zlib": True,
+                    "complevel": 4,
+                    "_FillValue": -9999.0,
+                }
+            }
+
+        def _encoding_static(dataset):
+            encoding = {}
+            for name in dataset.data_vars:
+                dtype, fill = (("int16", -9999) if name == "LDD" else
+                               ("int8", -1) if name == "CHAN" else
+                               ("float32", -9999.0))
+                encoding[name] = dict(dtype=dtype, zlib=True, complevel=4,
+                                      _FillValue=fill)
+            return encoding
+
+        def _align_static_to_dynamic_grid(ds_up, dynamic_da):
+            """
+            Align requested static maps to the exact Q Y/X grid without regridding the
+            hydrological values. Only coordinate-rounding differences are allowed;
+            a shift to another river pixel is rejected.
+            """
+            x = dynamic_da["X"].values
+            y = dynamic_da["Y"].values
+
+            dx = (
+                float(np.nanmedian(np.abs(np.diff(x))))
+                if x.size > 1
+                else 0.05
+            )
+            dy = (
+                float(np.nanmedian(np.abs(np.diff(y))))
+                if y.size > 1
+                else 0.05
+            )
+            # Correct coordinate-rounding noise only, never move to an adjacent river pixel.
+            tolerance = min(dx, dy) * 1e-3 + 1e-10
+            for dim in ("X", "Y"):
+                idx = ds_up.get_index(dim).get_indexer(dynamic_da[dim].values, method="nearest", tolerance=tolerance)
+                if (idx < 0).any() or len(np.unique(idx)) != len(idx):
+                    raise ValueError(f"Auxiliary and Q grids do not match along {dim}; refusing hydrological nearest-neighbour remapping.")
+
+            aligned = ds_up.reindex(
+                X=dynamic_da["X"],
+                Y=dynamic_da["Y"],
+                method="nearest",
+                tolerance=tolerance,
+            )
+
+            return aligned
+
+        for name, value in (("attach_static_maps_to_q", attach_static_maps_to_q),
+                            ("attach_upstream_area_to_q", attach_upstream_area_to_q),
+                            ("return_paths", return_paths)):
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError(f"{name} must be True or False")
+        if force_static_download is not None and not isinstance(force_static_download, (bool, np.bool_)):
+            raise TypeError("force_static_download must be True, False or None")
+        auxiliary_area = area if network_area is None else _was_validate_area(network_area)
+        paths = dict(discharge=None, static=None, uparea=None,
+                     system_version=system_version, area=area,
+                     network_area=auxiliary_area,
+                     requested_variables=tuple(variables))
+        self.last_glofas_download = dict(paths)
+        ds_aux = None
+        if auxiliary_variables:
+            if __package__:
+                from .glofas_static_download import prepare_glofas_auxiliaries
+            else:
+                from glofas_static_download import prepare_glofas_auxiliaries
+            urls = {str(k).removeprefix("GLOFAS.").upper(): v
+                    for k, v in (static_map_urls or {}).items()}
+            if upstream_area_url is not None:
+                if "UPAREA" in urls and urls["UPAREA"] != upstream_area_url:
+                    raise ValueError("Conflicting upstream_area_url and static_map_urls['UPAREA']")
+                urls["UPAREA"] = upstream_area_url
+            ds_aux, auxiliary_paths = prepare_glofas_auxiliaries(
+                dir_to_save, variables=auxiliary_variables, version=system_version,
+                area=auxiliary_area,
+                force=force_download if force_static_download is None else force_static_download,
+                url_overrides=urls, local_files=static_map_files,
+                max_retries=max_retries, retry_delay=retry_delay,
+            )
+            paths.update(auxiliary_paths)
+            self.last_glofas_download = dict(paths)
+
+        def _attach_auxiliaries(dataset, q):
+            """Attach only requested fields, never expand the dynamic spatial grid."""
+            if ds_aux is None:
+                return dataset, {}
+            names = []
+            if want_uparea and attach_upstream_area_to_q:
+                names += ["UPAREA", "UPAREA_KM2"]
+            if attach_static_maps_to_q:
+                names += [name for name in auxiliary_variables if name != "UPAREA"]
+            if not names:
+                return dataset, {}
+            aligned = _align_static_to_dynamic_grid(ds_aux[names], q)
+            # Explicit encoding below must not conflict with inherited source packing.
+            aligned = aligned.drop_encoding()
+            for name in aligned:
+                aligned[name].attrs = {k: v for k, v in aligned[name].attrs.items()
+                                       if k not in ("_FillValue", "missing_value", "scale_factor", "add_offset")}
+            out = dataset.assign({name: aligned[name] for name in names})
+            out.attrs = dict(dataset.attrs)
+            out.attrs.update(glofas_static_file=str(paths["static"]),
+                             glofas_static_network_area_NWSE=str(list(auxiliary_area)),
+                             attached_static_variables=",".join(names))
+            if "UPAREA" in names:
+                out.attrs["upstream_area_static_file"] = str(paths["uparea"])
+            return out, _encoding_static(aligned)
+
+        if not dynamic_variables:
+            if not keep_temporary and tmp_root.exists() and not any(tmp_root.iterdir()):
+                tmp_root.rmdir()
+            return dict(paths) if return_paths else None
+
+        # ================================================================
+        # Temporal policy: calendar completeness is distinct from file validity.
+        # ================================================================
+        import json
+        import os
+        import tempfile
+        from datetime import datetime, timezone
+
+        if not isinstance(allow_incomplete, (bool, np.bool_)):
+            raise TypeError("allow_incomplete must be True or False.")
+        if not isinstance(refresh_incomplete, (bool, np.bool_)):
+            raise TypeError("refresh_incomplete must be True or False.")
+        if int(max_retries) != max_retries or max_retries < 1 or retry_delay < 0:
+            raise ValueError("Require max_retries >= 1 and retry_delay >= 0.")
+        max_retries = int(max_retries)
+        requested_start = pd.Timestamp(year_start, 1, 1)
+        calendar_end = pd.Timestamp(year_end, 12, 31)
+        requested_end = calendar_end if end_date is None else pd.Timestamp(end_date)
+        if pd.isna(requested_end):
+            raise ValueError("end_date must be a valid date.")
+        if requested_end.tzinfo is not None:
+            requested_end = requested_end.tz_convert("UTC").tz_localize(None)
+        requested_end = requested_end.normalize()
+        if not requested_start <= requested_end <= calendar_end:
+            raise ValueError("end_date must lie within year_start..year_end.")
+        today_utc = pd.Timestamp(datetime.now(timezone.utc).date())
+        last_request_day = today_utc - pd.Timedelta(days=1)
+        effective_end = min(requested_end, last_request_day)
+        if dynamic_variables:
+            if effective_end < requested_start:
+                raise ValueError("The requested period is entirely in the future; no request was sent.")
+            if requested_end > last_request_day and not allow_incomplete:
+                raise ValueError(
+                    "The requested calendar year/period is not finished. "
+                    "Use allow_incomplete=True or provide an end_date before today UTC."
+                )
+            if effective_end < requested_end:
+                print(f"[GloFAS] Partial-year mode: API requests stop at {effective_end:%Y-%m-%d}. "
+                      "This is a calendar limit, not a guarantee of provider availability.")
+
+        _day_ns = int(pd.Timedelta(days=1).value)
+        _known_time_offset = None
+
+        def _dates_for(start, end):
+            return pd.date_range(start, end, freq="D")
+
+        def _time_info(da, start, end, *, infer_full_window=False):
+            """Validate real daily samples, allowing missing dates but NOT bad dates.
+
+            REQUEST_DATE distinguishes the API date from the unchanged valid time T.
+            Old full-month/year checkpoints can infer a 0..24h offset from their
+            exact complete time axis. Partial raw responses use source metadata or
+            the offset established from earlier complete checkpoints.
+            """
+            nonlocal _known_time_offset
+            if "T" not in da.dims or not np.issubdtype(da["T"].dtype, np.datetime64):
+                raise ValueError("Invalid GloFAS time axis: decoded datetime T is required.")
+            times = pd.DatetimeIndex(da["T"].values)
+            if times.hasnans or not times.is_unique:
+                raise ValueError("Invalid GloFAS time axis: NaT or duplicate valid times.")
+            if not times.is_monotonic_increasing:
+                raise ValueError("Invalid GloFAS time axis: times are not increasing.")
+            if len(times) > 1:
+                jumps = np.diff(times.values.astype("datetime64[ns]").astype("int64"))
+                if np.any(jumps <= 0) or np.any(jumps % _day_ns):
+                    raise ValueError("Invalid GloFAS time axis: subdaily or irregular intraday samples.")
+            if len(times) == 0:
+                return da, pd.DatetimeIndex([])
+            basis = da.attrs.get("request_date_basis", "")
+            if "REQUEST_DATE" in da.coords:
+                days = pd.DatetimeIndex(da["REQUEST_DATE"].values)
+                basis = basis or "provider_reference_date"
+            else:
+                offset = da.attrs.get("request_date_offset_ns")
+                if offset is not None:
+                    offset = int(offset)
+                    basis = "checkpoint_offset"
+                elif "step" in da.coords and da["step"].ndim == 0 and np.issubdtype(da["step"].dtype, np.timedelta64):
+                    offset = int(pd.Timedelta(da["step"].values).value)
+                    basis = "provider_step"
+                elif infer_full_window and len(times) == len(_dates_for(start, end)):
+                    candidate = int((times[0] - pd.Timestamp(start)).value)
+                    offset = candidate if 0 <= candidate <= _day_ns else None
+                    basis = "complete_checkpoint_time_axis"
+                else:
+                    offset = _known_time_offset
+                    basis = "previous_complete_month_offset"
+                if offset is None:
+                    # A file exposing only valid_time, without time/step metadata:
+                    # retain its calendar labels, rather than inventing a shift.
+                    offset = int((times[0] - times[0].normalize()).value)
+                    basis = "valid_time_calendar_labels_no_reference"
+                days = (times - pd.Timedelta(offset, unit="ns")).normalize()
+                da = da.assign_coords(REQUEST_DATE=("T", days.values))
+            if (days.hasnans or not days.is_unique or not days.is_monotonic_increasing
+                    or not days.equals(days.normalize()) or len(days) != len(times)):
+                raise ValueError("Invalid REQUEST_DATE: require one distinct, ordered calendar date per sample.")
+            offsets = times.values.astype("datetime64[ns]").astype("int64") - days.values.astype("datetime64[ns]").astype("int64")
+            if len(np.unique(offsets)) != 1 or not 0 <= int(offsets[0]) <= _day_ns:
+                raise ValueError("Inconsistent provider valid_time/reference date offset; inspect the raw file.")
+            offset = int(offsets[0])
+            if _known_time_offset is not None and offset != _known_time_offset:
+                raise ValueError("Provider time convention changed across files; refusing a silent date shift.")
+            _known_time_offset = offset
+            if days.min() < start or days.max() > end:
+                raise ValueError(f"Unexpected dates outside {start:%Y-%m-%d}..{end:%Y-%m-%d} in a GloFAS source/cache.")
+            da.attrs.update(request_date_offset_ns=str(offset), request_date_basis=basis)
+            da["REQUEST_DATE"].attrs.update(
+                long_name="Date requested from EWDS; T retains the provider valid time",
+                description="Coverage accounting coordinate; no shift or interpolation of discharge values",
+            )
+            return da, days
+
+        def _check_identity(ds, *, require=False):
+            """Old hash-namespaced checkpoints can lack metadata, but never conflict."""
+            import ast as _ast
+            attrs = ds.attrs
+            field = ds["Q"].attrs if "Q" in ds else {}
+            for name, expected in (("system_version", system_version), ("product_type", product_type)):
+                actual = attrs.get(name, field.get(name))
+                if actual is None and require:
+                    raise ValueError(f"Existing Q has unknown {name}; use a separate directory.")
+                if actual is not None and actual != expected:
+                    raise ValueError(f"Existing Q has another {name}; use a separate directory.")
+            old_area = attrs.get("spatial_subset_NWSE")
+            if old_area is not None:
+                vals = _ast.literal_eval(old_area) if isinstance(old_area, str) else old_area
+                if tuple(map(float, vals)) != tuple(area):
+                    raise ValueError("Existing Q has another area; use a separate directory.")
+
+        def _merge_samples(old, new):
+            """New samples replace same-day samples; absent old days are retained.
+
+            Do not combine_first Q: a newly reported NaN must not become an old
+            value. Never remap hydrological grids while refreshing a month.
+            """
+            if old is None or old.sizes.get("T", 0) == 0:
+                return new
+            if new is None or new.sizes.get("T", 0) == 0:
+                return old
+            old_days = pd.DatetimeIndex(old["REQUEST_DATE"].values)
+            new_days = pd.DatetimeIndex(new["REQUEST_DATE"].values)
+            common = old_days.intersection(new_days)
+            if len(common):
+                if not np.array_equal(old["T"].values[old_days.get_indexer(common)],
+                                      new["T"].values[new_days.get_indexer(common)]):
+                    raise ValueError("Changed timestamps for the same API dates; refusing ambiguous refresh.")
+            keep = ~old_days.isin(new_days)
+            return xr.concat([old.isel(T=keep), new], dim="T", join="exact",
+                             coords="minimal", compat="equals").sortby("T")
+
+        def _common_attrs():
+            return dict(system_version=system_version, product_type=product_type,
+                        spatial_subset_NWSE=str(list(area)), ewds_endpoint=ewds_url,
+                        glofas_downloader_revision=_glofas_patch_revision)
+
+        def _write_checkpoint(da, path, start, end):
+            da.attrs.update(long_name="GloFAS average daily river discharge", units="m3 s-1",
+                            system_version=system_version, product_type=product_type)
+            ds = da.to_dataset(name="Q")
+            ds.attrs.update(_common_attrs())
+            days = pd.DatetimeIndex(da["REQUEST_DATE"].values)
+            ds.attrs.update(expected_start=str(start.date()), expected_end=str(end.date()),
+                            n_available_days=len(days), n_expected_days=len(_dates_for(start, end)),
+                            is_complete=int(days.equals(_dates_for(start, end))))
+            _was_write_netcdf(ds, path, encoding=_encoding_dynamic("Q"))
+
+        def _write_json_atomic(content, path):
+            fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".part", dir=path.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(content, handle, ensure_ascii=False, indent=2)
+                    handle.write("\n")
+                os.replace(tmp, path)
+            finally:
+                Path(tmp).unlink(missing_ok=True)
+
+        client = None  # No credentials needed until a real Q request is necessary.
+        for var in dynamic_variables:
             mapping = VARIABLE_MAPPING[var]
-            cds_variable = mapping["cds_variable"]
             output_name = mapping["output_name"]
             short_name = var.split(".")[-1]
-    
-            output_path = dir_to_save / f"Daily_{short_name}_{year_start}_{year_end}.nc"
-            if output_path.exists():
-                if not force_download:
-                    print(f"{output_path} already exists. Skipping download.")
-                    continue
-                output_path.unlink()
-    
+            date_tag = "" if end_date is None else f"_to{requested_end:%Y%m%d}"
+            output_path = dir_to_save / f"Daily_{short_name}_{year_start}_{year_end}{date_tag}.nc"
+            report_path = output_path.with_suffix(".coverage.json")
+            paths["discharge"] = output_path
             var_tmp = tmp_root / short_name
             var_tmp.mkdir(parents=True, exist_ok=True)
-    
+            final_seed = None
+
+            # A partial final file is a useful seed, NOT proof of a finished archive.
+            if output_path.exists() and not force_download:
+                with xr.open_dataset(output_path) as cached_q:
+                    _check_identity(cached_q, require=True)
+                    candidate, days = _time_info(cached_q[output_name], requested_start,
+                                                 calendar_end, infer_full_window=True)
+                    needed = _dates_for(requested_start, requested_end)
+                    covers_request = len(needed.difference(days)) == 0
+                    if covers_request:
+                        enriched, auxiliary_encoding = _attach_auxiliaries(cached_q, candidate)
+                        if auxiliary_encoding:
+                            _was_write_netcdf(enriched, output_path,
+                                encoding={**_encoding_dynamic(output_name), **auxiliary_encoding},
+                                before_replace=cached_q.close)
+                        self.last_glofas_download = dict(paths)
+                        print(f"{output_path} reused; requested period is complete, no discharge redownload.")
+                        continue
+                final_seed = output_path
+                print(f"[GloFAS] Existing output is incomplete: checking monthly checkpoints ({output_path.name}).")
+
+            month_reports = []
             year_files = []
-            all_years_ok = True
-    
-            # --------------------------------------------------------------
-            # Year loop
-            # --------------------------------------------------------------
-            for year in range(year_start, year_end + 1):
+
+            def _read_seed(path, scope_start, scope_end, first, last):
+                if path is None or not path.exists() or force_download:
+                    return None
+                with xr.open_dataset(path) as cached:
+                    _check_identity(cached)
+                    # _time_info touches coordinates, not the full gridded archive.
+                    da, _ = _time_info(cached[output_name], scope_start, scope_end,
+                                        infer_full_window=True)
+                    rd = pd.DatetimeIndex(da["REQUEST_DATE"].values)
+                    selected = da.isel(T=(rd >= first) & (rd <= last))
+                    return selected.load() if selected.sizes["T"] else None
+
+            for year in range(year_start, min(year_end, effective_end.year) + 1):
                 print(f"\n{'=' * 70}\nGloFAS {output_name}: processing year {year}\n{'=' * 70}")
-    
+                year_start_date = pd.Timestamp(year, 1, 1)
+                year_end_date = pd.Timestamp(year, 12, 31)
                 year_file = var_tmp / f"{short_name}_{year}.nc"
-                if year_file.exists() and not force_download:
-                    print(f"Using existing temporary yearly file: {year_file}")
-                    year_files.append(year_file)
-                    continue
-    
-                monthly_arrays = []
-                year_complete = True
-    
-                # ----------------------------------------------------------
-                # Month loop
-                # ----------------------------------------------------------
-                for month in range(1, 13):
-                    n_days = calendar.monthrange(year, month)[1]
-                    days = [f"{d:02d}" for d in range(1, n_days + 1)]
-    
+                month_paths = []
+                month_end_number = effective_end.month if year == effective_end.year else 12
+
+                for month in range(1, month_end_number + 1):
+                    first = pd.Timestamp(year, month, 1)
+                    full_last = pd.Timestamp(year, month, calendar.monthrange(year, month)[1])
+                    last = min(full_last, effective_end)
+                    wanted = _dates_for(first, last)
+                    month_file = var_tmp / f"processed_{short_name}_{year}{month:02d}.nc"
                     raw_file = var_tmp / f"raw_{short_name}_{year}{month:02d}.nc"
-    
-                    request = {
-                        "system_version": [system_version],
-                        "hydrological_model": ["lisflood"],
-                        "product_type": [product_type],
-                        "variable": [cds_variable],
-                        "hyear": [f"{year:04d}"],
-                        "hmonth": [f"{month:02d}"],
-                        "hday": days,
-                        "data_format": "netcdf",
-                        "download_format": "unarchived",
-                        "area": area,
-                    }
-    
-                    success = False
-                    for attempt in range(1, max_retries + 1):
-                        try:
-                            reuse = (raw_file.exists()
-                                     and raw_file.stat().st_size > 0
-                                     and not force_download)
-                            if reuse:
-                                print(f"Using existing {raw_file.name}")
-                            else:
-                                raw_file.unlink(missing_ok=True)
-                                print(f"Attempt {attempt}/{max_retries}: downloading "
-                                      f"{cds_variable} {year}-{month:02d}")
-                                client.retrieve(DATASET, request, str(raw_file))
-                                print(f"Downloaded: {raw_file}")
-    
-                            with xr.open_dataset(raw_file) as ds_raw:
-                                # load so the temp file can be removed afterwards
-                                monthly_arrays.append(
-                                    _standardize(ds_raw, output_name).load()
-                                )
-                            success = True
-                            break
-    
-                        except Exception as e:
-                            print(f"Attempt {attempt}/{max_retries} failed for "
-                                  f"{year}-{month:02d}: {e}")
-                            if raw_file.exists():
+                    old = None
+                    normalized_month_checkpoint = False
+                    if month_file.exists() and not force_download:
+                        with xr.open_dataset(month_file) as cached:
+                            _check_identity(cached)
+                            normalized_month_checkpoint = "REQUEST_DATE" in cached.coords
+                            old, _ = _time_info(cached[output_name], first, full_last, infer_full_window=True)
+                            old = old.load()
+                    # Preserve work even if a prior cleanup removed monthly caches.
+                    if old is None and not force_download:
+                        old = _read_seed(year_file, year_start_date, year_end_date, first, full_last)
+                    if old is None and final_seed is not None:
+                        old = _read_seed(final_seed, requested_start, calendar_end, first, full_last)
+                    old_days = pd.DatetimeIndex(old["REQUEST_DATE"].values) if old is not None else pd.DatetimeIndex([])
+                    cached_complete = len(wanted.difference(old_days)) == 0
+                    # A month completed before today is stable for cache purposes.
+                    # The open current month may still change, even if it reaches yesterday.
+                    current_month = first.year == today_utc.year and first.month == today_utc.month
+                    refresh = (force_download or old is None or
+                               (refresh_incomplete and (not cached_complete or current_month)))
+                    source = "cache"
+                    failure = None
+                    new = None
+
+                    if refresh:
+                        request = {
+                            "system_version": [system_version],
+                            "hydrological_model": ["lisflood"],
+                            "product_type": [product_type],
+                            "variable": [mapping["cds_variable"]],
+                            "timespan": [mapping.get("timespan", "time_mean")],
+                            "year": [f"{year:04d}"],
+                            "month": [f"{month:02d}"],
+                            "day": [f"{d.day:02d}" for d in wanted],
+                            "data_format": "netcdf",
+                            "download_format": "unarchived",
+                            "area": list(area),
+                        }
+                        # Raw files from the old failing run can be salvaged once.
+                        # Never reuse an old raw response to freeze a partial cache.
+                        use_raw = raw_file.exists() and raw_file.stat().st_size > 0 and old is None and not force_download
+                        response_available = use_raw
+                        source = "raw_cache" if use_raw else "download"
+                        if not use_raw:
+                            # Configuration/import errors must never become 'missing dates'.
+                            if client is None:
+                                client = _was_ewds_client(ewds_url, ewds_key, ewds_rc_file)
+                            for attempt in range(1, max_retries + 1):
+                                raw_part = raw_file.with_name(raw_file.name + ".part")
                                 try:
-                                    raw_file.unlink()
-                                    print(f"Deleted incomplete file: {raw_file}")
-                                except Exception:
-                                    pass
-                            if attempt < max_retries:
-                                print(f"Retrying after {retry_delay} seconds...")
-                                _time.sleep(retry_delay)
-    
-                    if not success:
-                        print(f"FAILED: GloFAS {year}-{month:02d}")
-                        year_complete = False
-                        break
-    
-                    if not keep_temporary and raw_file.exists():
-                        try:
+                                    raw_part.unlink(missing_ok=True)
+                                    print(f"Attempt {attempt}/{max_retries}: downloading {mapping['cds_variable']} "
+                                          f"{year}-{month:02d}, days 01..{last.day:02d}")
+                                    client.retrieve(DATASET, request, str(raw_part))
+                                    if not raw_part.exists() or raw_part.stat().st_size == 0:
+                                        raise OSError("The download returned no nonempty file.")
+                                    os.replace(raw_part, raw_file)
+                                    response_available = True
+                                    print(f"Downloaded: {raw_file}")
+                                    break
+                                except (NameError, ImportError, TypeError, AttributeError):
+                                    raise
+                                except Exception as exc:
+                                    status = getattr(getattr(exc, "response", None), "status_code", getattr(exc, "code", None))
+                                    text = str(exc)
+                                    # Explicit no-data messages only. 401/403/404 and
+                                    # malformed requests are never converted to absence.
+                                    no_data = (status in (None, 200, 400) and any(
+                                        token in text.lower() for token in (
+                                            "no data found", "no data available", "no data is available"))
+                                        and not any(token in text.lower() for token in (
+                                            "invalid", "not found for url", "process not found", "unauthorized", "forbidden")))
+                                    if no_data:
+                                        failure = {"kind": "provider_no_data", "message": text[:600]}
+                                        break
+                                    if _was_permanent_http_error(exc):
+                                        raise RuntimeError(f"Permanent EWDS request error for {year}-{month:02d}; "
+                                                           "check endpoint, request and licence.") from exc
+                                    # Unknown/programming exceptions are not evidence
+                                    # of a missing period. Retry only transport failures.
+                                    mro_names = {base.__name__ for base in type(exc).__mro__}
+                                    transport_error = (
+                                        isinstance(exc, OSError)
+                                        or bool(mro_names.intersection({"RequestException", "TransportError", "URLError"}))
+                                        or status in (408, 425, 429)
+                                        or (isinstance(status, int) and 500 <= status < 600)
+                                    )
+                                    if not transport_error:
+                                        raise
+                                    failure = {"kind": "download_failed", "message": text[:600]}
+                                    print(f"[GloFAS] Download failed for {year}-{month:02d}: {exc}")
+                                    if attempt < max_retries:
+                                        _time.sleep(retry_delay)
+                                finally:
+                                    raw_part.unlink(missing_ok=True)
+                        else:
+                            print(f"[GloFAS] Reading existing raw response: {raw_file.name}")
+
+                        if response_available:
+                            # Decoding, time, shape and filesystem errors remain fatal:
+                            # allow_incomplete is NOT an ignore-all-errors switch.
+                            with xr.open_dataset(raw_file) as ds_raw:
+                                new = _standardize_dynamic(ds_raw, output_name)
+                                if new.sizes.get("T", 0):
+                                    new = new.load()
+                            new, new_days = _time_info(new, first, full_last, infer_full_window=True)
+                            if len(new_days):
+                                new = new.isel(T=(new_days <= last))
+                                new_days = new_days[new_days <= last]
+                            if len(new_days) == 0:
+                                failure = {"kind": "provider_no_data", "message": "Decoded response contains no requested day."}
+                                new = None
+                                # Do not keep reusing an empty raw response on future
+                                # runs: the provider may publish this month later.
+                                if raw_file.exists():
+                                    if keep_temporary:
+                                        os.replace(raw_file, raw_file.with_name(raw_file.stem + "_empty.nc"))
+                                    else:
+                                        raw_file.unlink()
+                            else:
+                                failure = None
+
+                    da_month = _merge_samples(old, new)
+                    if da_month is not None and da_month.sizes["T"]:
+                        # Validate merged chronology; retain all cached days in the
+                        # monthly checkpoint, but clip assembly to requested dates.
+                        da_month, month_days = _time_info(da_month, first, full_last, infer_full_window=True)
+                        if new is not None or not normalized_month_checkpoint:
+                            _write_checkpoint(da_month, month_file, first, full_last)
+                        received = month_days.intersection(wanted)
+                        complete = len(wanted.difference(received)) == 0
+                        month_paths.append(month_file)
+                        if not complete:
+                            print(f"[GloFAS] {year}-{month:02d}: {len(received)}/{len(wanted)} requested days retained; "
+                                  "partial data are saved in the monthly checkpoint.")
+                        elif source == "cache":
+                            print(f"[GloFAS] Reusing complete month: {month_file.name}")
+                        if not keep_temporary and raw_file.exists():
                             raw_file.unlink()
-                        except Exception:
-                            pass
-    
-                # ----------------------------------------------------------
-                # Assemble yearly file
-                # ----------------------------------------------------------
-                if year_complete and monthly_arrays:
-                    try:
-                        da_year = _dedup_time(
-                            xr.concat(monthly_arrays, dim="T").sortby("T")
-                        ).transpose("T", "Y", "X")
-    
-                        da_year.attrs.update({
-                            "long_name": mapping["long_name"],
-                            "units": mapping["units"],
-                            "source": "Copernicus CEMS GloFAS",
-                            "system_version": system_version,
-                            "product_type": product_type,
-                        })
-    
-                        da_year.to_dataset(name=output_name).to_netcdf(
-                            year_file, encoding=_encoding(output_name)
-                        )
-                        print(f"Yearly GloFAS file saved: {year_file}")
-                        year_files.append(year_file)
-                        del da_year, monthly_arrays
-    
-                    except Exception as e:
-                        print(f"Failed to create yearly GloFAS file for {year}: {e}")
-                        year_complete = False
-    
-                if not year_complete:
-                    all_years_ok = False
-                    print(f"Year {year} incomplete. Stopping final assembly.")
-                    break
-    
-            # --------------------------------------------------------------
-            # Final multi-year assembly
-            # --------------------------------------------------------------
-            expected = year_end - year_start + 1
-            if not (all_years_ok and len(year_files) == expected):
-                print(f"Skipping final save for {var} because one or more "
-                      "years/months were not downloaded successfully.")
-                continue
-    
-            print(f"\n{'=' * 70}\nCombining GloFAS {output_name}: "
-                  f"{year_start}-{year_end}\n{'=' * 70}")
-    
-            combined_ds = None
-            try:
-                # Preferred: Dask-backed multi-file dataset; fall back to sequential concat
-                try:
-                    combined_ds = xr.open_mfdataset(
-                        year_files, combine="by_coords",
-                        chunks={"T": 365}, parallel=False,
+                    else:
+                        received = pd.DatetimeIndex([])
+                        complete = False
+                        print(f"[GloFAS] {year}-{month:02d}: no usable day; earlier checkpoints are retained.")
+
+                    report = dict(
+                        month=f"{year}-{month:02d}", source=source,
+                        requested_start=str(first.date()), requested_end=str(last.date()),
+                        n_requested_days=len(wanted), n_available_days=len(received),
+                        complete_request=bool(complete),
+                        complete_calendar_month=bool(complete and last == full_last),
+                        missing_request_dates=[str(x.date()) for x in wanted.difference(received)],
+                        failure=failure,
                     )
-                    da_final = combined_ds[output_name]
-                except Exception as dask_error:
-                    print("open_mfdataset unavailable; falling back to sequential "
-                          f"xarray concatenation.\nReason: {dask_error}")
-                    arrays = []
-                    for yf in year_files:
-                        with xr.open_dataset(yf) as ds_year:
-                            arrays.append(ds_year[output_name].load())
-                    da_final = xr.concat(arrays, dim="T")
-    
-                da_final = _dedup_time(
-                    da_final.sortby("T").sortby("Y").sortby("X")
-                ).transpose("T", "Y", "X")
-    
-                da_final.attrs.update({
-                    "long_name": mapping["long_name"],
-                    "units": mapping["units"],
-                    "source": "Copernicus Emergency Management Service - GloFAS",
-                    "dataset": DATASET,
-                    "system_version": system_version,
-                    "hydrological_model": "LISFLOOD",
-                    "product_type": product_type,
-                    "frequency": "daily",
-                    "WASS2S_dimensions": "T,Y,X",
-                })
-    
-                da_final.to_dataset(name=output_name).to_netcdf(
-                    output_path, encoding=_encoding(output_name)
-                )
-    
-                print(f"\nSaved final GloFAS dataset:\n  {output_path}")
-                print(f"\nFinal structure:\n{da_final}")
-    
-            except Exception as e:
-                print(f"Failed to create final GloFAS dataset for {var}: {e}")
-                continue
-    
-            finally:
-                if combined_ds is not None:
-                    combined_ds.close()
-    
-            # --------------------------------------------------------------
-            # Cleanup
-            # --------------------------------------------------------------
-            if not keep_temporary:
-                for yf in year_files:
-                    try:
-                        yf.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    month_reports.append(report)
+                    if (not complete or failure is not None) and not allow_incomplete:
+                        _write_json_atomic(dict(status="strict_incomplete_no_final_write", months=month_reports), report_path)
+                        raise RuntimeError(
+                            f"Incomplete GloFAS month {year}-{month:02d}: {len(received)}/{len(wanted)} days. "
+                            "Valid monthly checkpoints were kept. Set allow_incomplete=True to save available days."
+                        )
+
+                if not month_paths:
+                    continue
+                combined = _was_concat_files(month_paths)
                 try:
-                    if var_tmp.exists() and not any(var_tmp.iterdir()):
-                        var_tmp.rmdir()
+                    rd = pd.DatetimeIndex(combined["REQUEST_DATE"].values)
+                    da_year = combined[output_name].isel(T=(rd >= year_start_date) & (rd <= effective_end))
+                    if da_year.sizes["T"]:
+                        _write_checkpoint(da_year, year_file, year_start_date, year_end_date)
+                        year_files.append(year_file)
+                        print(f"[GloFAS] Year checkpoint saved: {year_file.name} ({da_year.sizes['T']} days).")
+                finally:
+                    combined.close()
+
+            if not year_files:
+                raise RuntimeError("No GloFAS day is available. No empty final NetCDF was written; caches retained.")
+
+            combined_ds = _was_concat_files(year_files)
+            try:
+                da_final = combined_ds[output_name].sortby("T").transpose("T", "Y", "X")
+                da_final, received = _time_info(da_final, requested_start, calendar_end, infer_full_window=True)
+                selection = (received >= requested_start) & (received <= effective_end)
+                da_final = da_final.isel(T=selection)
+                received = received[selection]
+                needed = _dates_for(requested_start, requested_end)
+                full_calendar = _dates_for(requested_start, calendar_end)
+                missing = needed.difference(received)
+                request_complete = len(missing) == 0
+                calendar_complete = len(full_calendar.difference(received)) == 0
+                failures = [r for r in month_reports if r["failure"] is not None]
+                if (not request_complete or failures) and not allow_incomplete:
+                    raise RuntimeError("Incomplete requested period: final NetCDF was not replaced; checkpoints retained.")
+                da_final.attrs.update(
+                    long_name=mapping["long_name"], units=mapping["units"],
+                    source="Copernicus Emergency Management Service - GloFAS", dataset=DATASET,
+                    system_version=system_version, product_type=product_type,
+                    hydrological_model="LISFLOOD", frequency="daily", WASS2S_dimensions="T,Y,X",
+                )
+                ds_out = da_final.to_dataset(name=output_name)
+                incomplete_years = []
+                for y in range(year_start, year_end + 1):
+                    expected_y = _dates_for(pd.Timestamp(y, 1, 1), pd.Timestamp(y, 12, 31))
+                    if len(expected_y.difference(received)):
+                        incomplete_years.append(y)
+                ds_out.attrs.update(_common_attrs())
+                ds_out.attrs.update(
+                    allow_incomplete=int(bool(allow_incomplete)),
+                    is_complete=int(calendar_complete),
+                    is_complete_request=int(request_complete),
+                    requested_time_start=str(requested_start.date()),
+                    requested_time_end=str(requested_end.date()),
+                    effective_request_end=str(effective_end.date()),
+                    actual_time_start=str(pd.Timestamp(da_final["T"].values[0])),
+                    actual_time_end=str(pd.Timestamp(da_final["T"].values[-1])),
+                    actual_request_start=str(received[0].date()),
+                    actual_request_end=str(received[-1].date()),
+                    n_available_days=len(received), n_expected_days=len(needed),
+                    n_missing_days=len(missing),
+                    incomplete_years=",".join(map(str, incomplete_years)),
+                    incomplete_months=",".join(r["month"] for r in month_reports if not r["complete_calendar_month"]),
+                    missing_days_policy="No interpolation; absent dates are omitted from T, details in coverage report",
+                    coverage_scope="Temporal record coverage, not pixelwise nonmissing-data coverage",
+                    temporal_coverage_report=report_path.name,
+                    n_failed_requests=len(failures),
+                )
+                final_encoding = _encoding_dynamic(output_name)
+                ds_out, auxiliary_encoding = _attach_auxiliaries(ds_out, da_final)
+                final_encoding.update(auxiliary_encoding)
+                _was_write_netcdf(ds_out, output_path, encoding=final_encoding)
+                report = dict(
+                    status="complete" if calendar_complete else "partial",
+                    output_file=str(output_path), system_version=system_version,
+                    product_type=product_type, area=list(area),
+                    requested_start=str(requested_start.date()), requested_end=str(requested_end.date()),
+                    effective_request_end=str(effective_end.date()),
+                    actual_time_start=ds_out.attrs["actual_time_start"], actual_time_end=ds_out.attrs["actual_time_end"],
+                    actual_request_start=str(received[0].date()), actual_request_end=str(received[-1].date()),
+                    n_expected_days=len(needed), n_available_days=len(received), n_missing_days=len(missing),
+                    is_complete_calendar_years=bool(calendar_complete), is_complete_request=bool(request_complete),
+                    missing_request_dates=[str(x.date()) for x in missing],
+                    not_yet_requested_dates=[str(x.date()) for x in needed if x > effective_end],
+                    incomplete_years=incomplete_years, months=month_reports,
+                    generated_at_utc=datetime.now(timezone.utc).isoformat(),
+                    coverage_scope="Temporal records only; NaN values within an available day are preserved.",
+                )
+                _write_json_atomic(report, report_path)
+                print(f"\nSaved {'complete' if calendar_complete else 'PARTIAL'} GloFAS dataset: {output_path}\n"
+                      f"Available days: {len(received)}/{len(needed)}; actual T: "
+                      f"{ds_out.attrs['actual_time_start']} -> {ds_out.attrs['actual_time_end']}\n"
+                      f"Coverage report: {report_path}")
+            finally:
+                combined_ds.close()
+
+            # Never remove resume state while a calendar year is incomplete.
+            if not keep_temporary and calendar_complete and not failures:
+                for cleanup_year in range(year_start, year_end + 1):
+                    for cleanup_month in range(1, 13):
+                        (var_tmp / f"processed_{short_name}_{cleanup_year}{cleanup_month:02d}.nc").unlink(missing_ok=True)
+                for yf in year_files:
+                    yf.unlink(missing_ok=True)
+                if var_tmp.exists() and not any(var_tmp.iterdir()):
+                    var_tmp.rmdir()
+            elif not calendar_complete:
+                print("[GloFAS] Monthly/yearly checkpoints retained for partial-year refresh.")
+
+        if not keep_temporary and tmp_root.exists() and not any(tmp_root.iterdir()):
+            tmp_root.rmdir()
+        
+        self.last_glofas_download = dict(paths)
+        return dict(paths) if return_paths else output_path
+
+
+    # Complementary downloaders from WAS_Download_REVIEWED.py
+
+    def _WAS_http_download(
+        self,
+        url,
+        target,
+        max_retries=3,
+        retry_delay=5,
+        timeout=180,
+        auth=None,
+        headers=None,
+    ):
+        """Internal atomic HTTP(S) downloader used by the extra sources."""
+        from pathlib import Path
+        import os
+        import time as _time
+        import requests
+
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        part = target.with_name(target.name + ".part")
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"[DL] {attempt}/{max_retries}: {url}")
+                with requests.get(
+                    url,
+                    stream=True,
+                    timeout=timeout,
+                    auth=auth,
+                    headers=headers,
+                ) as r:
+                    r.raise_for_status()
+                    with open(part, "wb") as fh:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                fh.write(chunk)
+                os.replace(part, target)
+                return target
+            except Exception as exc:
+                if _was_permanent_http_error(exc):
+                    part.unlink(missing_ok=True)
+                    raise RuntimeError(f"Permanent HTTP error; request was not retried: {url}") from exc
+                print(f"[WARN] download failed: {exc}")
+                try:
+                    part.unlink(missing_ok=True)
                 except Exception:
                     pass
+                if attempt < max_retries:
+                    _time.sleep(retry_delay)
+        raise RuntimeError(f"Failed to download after {max_retries} attempts: {url}")
+
+
+    def _WAS_standardize_grid_dataset(self, ds, area=None, time_name="T"):
+        """Internal helper: standardize a gridded Dataset to WASS2S T/Y/X."""
+        import numpy as np
+
+        rename = {}
+        for old in ("longitude", "lon", "LONGITUDE", "x"):
+            if old in ds.dims or old in ds.coords:
+                rename[old] = "X"
+                break
+        for old in ("latitude", "lat", "LATITUDE", "y"):
+            if old in ds.dims or old in ds.coords:
+                rename[old] = "Y"
+                break
+        for old in ("time", "date", "valid_time", "TIME", "DATE"):
+            if old in ds.dims or old in ds.coords:
+                rename[old] = time_name
+                break
+        if rename:
+            ds = ds.rename(rename)
+
+        if "X" in ds.coords and ds["X"].size:
+            try:
+                if float(ds["X"].max()) > 180.0:
+                    ds = ds.assign_coords(X=(((ds["X"] + 180.0) % 360.0) - 180.0))
+            except Exception:
+                pass
+            ds = ds.sortby("X")
+
+        if "Y" in ds.coords:
+            ds = ds.sortby("Y")
+        if time_name in ds.coords:
+            ds = ds.sortby(time_name)
+
+        if area is not None and "X" in ds.coords and "Y" in ds.coords:
+            north, west, south, east = [float(v) for v in area]
+            if west <= east:
+                ds = ds.sel(X=slice(west, east), Y=slice(south, north))
+            else:
+                # Dateline-crossing domain.
+                left = ds.sel(X=slice(west, 180.0), Y=slice(south, north))
+                right = ds.sel(X=slice(-180.0, east), Y=slice(south, north))
+                ds = __import__("xarray").concat([left, right], dim="X")
+
+        if any(ds.sizes.get(d, 1) == 0 for d in ("X", "Y")):
+            raise ValueError("The requested area contains no source grid-cell centres.")
+        ds = ds.drop_vars(
+            [v for v in ("crs", "spatial_ref") if v in ds.variables],
+            errors="ignore",
+        )
+        return ds
+
+
+    def _WAS_concat_grid_files(self, files, time_dim="T"):
+        """Lazy, grid-strict concatenation; caller closes the returned Dataset."""
+        return _was_concat_files(files, time_dim)
+
+
+    def WAS_Download_NASA_POWER_Daily(
+        self,
+        dir_to_save,
+        variables,
+        year_start,
+        year_end,
+        area,
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+        time_standard="UTC",
+        community="AG",
+        keep_yearly_cache=True,
+    ):
+        """
+        Download NASA POWER daily regional data and save WASS2S T/Y/X files.
+
+        Parameters
+        ----------
+        variables : sequence of str
+            WASS2S aliases such as POWER.PRCP, POWER.TEMP, POWER.TMAX,
+            POWER.TMIN, POWER.TDEW, POWER.RH2M, POWER.WS10M, POWER.DSWR,
+            or a native POWER parameter prefixed with POWER.
+        area : [North, West, South, East]
+        time_standard : {"UTC", "LST"}
+            UTC is recommended for comparison with other daily products.
+
+        Returns
+        -------
+        dict
+            Mapping requested variable -> final NetCDF Path.
+        """
+        from pathlib import Path
+        from urllib.parse import urlencode
+        import os
+        import xarray as xr
+
+        if isinstance(variables, str):
+            variables = [variables]
+        variables = list(variables)
+        time_standard = str(time_standard).upper()
+        if time_standard not in {"UTC", "LST"}:
+            raise ValueError("time_standard must be 'UTC' or 'LST'.")
+
+        mapping = {
+            "POWER.PRCP": ("PRECTOTCORR", "PRCP"),
+            "POWER.TEMP": ("T2M", "TEMP"),
+            "POWER.TMAX": ("T2M_MAX", "TMAX"),
+            "POWER.TMIN": ("T2M_MIN", "TMIN"),
+            "POWER.TDEW": ("T2MDEW", "TDEW"),
+            "POWER.RH2M": ("RH2M", "RH2M"),
+            "POWER.WS10M": ("WS10M", "WS10M"),
+            "POWER.DSWR": ("ALLSKY_SFC_SW_DWN", "DSWR"),
+            "POWER.PS": ("PS", "PS"),
+        }
+
+        base = "https://power.larc.nasa.gov/api/temporal/daily/regional"
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / ".power_daily_cache" / _was_cache_key(area=area, time_standard=time_standard, community=community)
+        cache.mkdir(parents=True, exist_ok=True)
+        north, west, south, east = [float(v) for v in area]
+        result = {}
+
+        for requested in variables:
+            key = str(requested).upper()
+            if key in mapping:
+                native, code = mapping[key]
+            else:
+                if not key.startswith("POWER."):
+                    raise ValueError(f"Unknown NASA POWER variable: {requested}")
+                native = key.split(".", 1)[1]
+                code = native
+
+            final = out_dir / f"Daily_POWER_{code}_{year_start}_{year_end}.nc"
+            if final.exists() and not force_download:
+                print(f"{final} already exists. Skipping.")
+                result[requested] = final
+                continue
+
+            var_cache = cache / code
+            var_cache.mkdir(parents=True, exist_ok=True)
+            yearly = []
+
+            for year in range(int(year_start), int(year_end) + 1):
+                regional = var_cache / f"POWER_{code}_{year}.nc"
+                if regional.exists() and not force_download:
+                    yearly.append(regional)
+                    continue
+
+                params = {
+                    "parameters": native,
+                    "community": community,
+                    "longitude-min": west,
+                    "longitude-max": east,
+                    "latitude-min": south,
+                    "latitude-max": north,
+                    "start": f"{year}0101",
+                    "end": f"{year}1231",
+                    "format": "NETCDF",
+                    "time-standard": time_standard,
+                }
+                url = base + "?" + urlencode(params)
+                raw = var_cache / f"raw_POWER_{native}_{year}.nc"
+                self._WAS_http_download(
+                    url, raw, max_retries=max_retries, retry_delay=retry_delay
+                )
+
+                try:
+                    with xr.open_dataset(raw) as ds:
+                        ds = self._WAS_standardize_grid_dataset(ds, area=area).load()
+                    if native in ds.data_vars:
+                        source = native
+                    elif native.lower() in ds.data_vars:
+                        source = native.lower()
+                    else:
+                        candidates = [v for v in ds.data_vars if ds[v].ndim >= 2]
+                        if not candidates:
+                            raise ValueError(
+                                f"NASA POWER response has no usable data variable: {list(ds.data_vars)}"
+                            )
+                        source = candidates[0]
+                    if source != code:
+                        ds = ds.rename({source: code})
+                    ds = ds[[code]]
+                    ds.attrs.update({
+                        "source": "NASA POWER Daily API",
+                        "native_parameter": native,
+                        "time_standard": time_standard,
+                        "WASS2S_dimensions": "T,Y,X",
+                    })
+                    ds[code].attrs.setdefault("source_parameter", native)
+                    encoding = {code: {"zlib": True, "complevel": 4, "dtype": "float32"}}
+                    _was_write_netcdf(ds, regional, encoding=encoding)
+                    yearly.append(regional)
+                finally:
+                    raw.unlink(missing_ok=True)
+
+            ds_out = self._WAS_concat_grid_files(yearly, "T")
+            if "T" in ds_out.coords:
+                ds_out = ds_out.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+            ds_out[code] = ds_out[code].astype("float32")
+            _was_write_netcdf(ds_out, final, encoding={code: {'zlib': True, 'complevel': 4, 'dtype': 'float32'}})
+            ds_out.close()
+            result[requested] = final
+            print(f"Saved NASA POWER: {final}")
+
+            if not keep_yearly_cache:
+                for p in yearly:
+                    p.unlink(missing_ok=True)
+
+        return result
+
+
+    def WAS_Download_ARC2_Daily(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+        keep_yearly_cache=True,
+        allow_incomplete=True,
+    ):
+        """Download NOAA/CPC ARC2 daily rainfall (0.1°, Africa) as PRCP(T,Y,X)."""
+        from pathlib import Path
+        import gzip
+        import io
+        import time as _time
+        import numpy as np
+        import pandas as pd
+        import requests
+        import xarray as xr
+
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / ".arc2_daily_cache" / _was_cache_key(area=area)
+        cache.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"Daily_ARC2_PRCP_{year_start}_{year_end}.nc"
+        if final.exists() and not force_download:
+            print(f"{final} already exists. Skipping.")
+            return final
+
+        # Native ARC2 grid: lon -20..55 (751), lat -40..40 (801), 0.1 degree.
+        X = np.round(-20.0 + np.arange(751) * 0.1, 10)
+        Y = np.round(-40.0 + np.arange(801) * 0.1, 10)
+        north, west, south, east = [float(v) for v in area]
+        ix = np.where((X >= west - 1e-8) & (X <= east + 1e-8))[0]
+        iy = np.where((Y >= south - 1e-8) & (Y <= north + 1e-8))[0]
+        if not len(ix) or not len(iy):
+            raise ValueError("Requested area does not intersect the ARC2 Africa domain.")
+        Xs, Ys = X[ix], Y[iy]
+        base = "https://ftp.cpc.ncep.noaa.gov/fews/fewsdata/africa/arc2/bin"
+        today = pd.Timestamp.utcnow().tz_localize(None).normalize()
+        yearly_files = []
+
+        for year in range(int(year_start), int(year_end) + 1):
+            yf = cache / f"ARC2_Daily_{year}.nc"
+            if yf.exists() and not force_download:
+                yearly_files.append(yf)
+                continue
+
+            dates = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
+            dates = dates[dates <= today]
+            values = np.full((len(dates), len(iy), len(ix)), np.nan, dtype="float32")
+            failed = []
+
+            for i, date in enumerate(dates):
+                ymd = date.strftime("%Y%m%d")
+                url = f"{base}/daily_clim.bin.{ymd}.gz"
+                data = None
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        r = requests.get(url, timeout=60)
+                        if r.status_code == 404:
+                            break
+                        r.raise_for_status()
+                        raw = gzip.decompress(r.content)
+                        arr = np.frombuffer(raw, dtype=">f4")
+                        if arr.size != 801 * 751:
+                            raise ValueError(f"Unexpected ARC2 grid size: {arr.size}")
+                        arr = arr.reshape(801, 751)
+                        arr = arr[np.ix_(iy, ix)].astype("float32")
+                        arr[arr <= -998.0] = np.nan
+                        values[i] = arr
+                        data = True
+                        break
+                    except Exception as exc:
+                        if attempt == max_retries:
+                            print(f"[ARC2] {ymd} failed: {exc}")
+                        else:
+                            _time.sleep(retry_delay)
+                if data is None:
+                    failed.append(ymd)
+
+            if failed:
+                print(f"[ARC2] {year}: {len(failed)} missing/unavailable day(s).")
+                if not allow_incomplete and year < today.year:
+                    raise RuntimeError(f"ARC2 year {year} incomplete: {failed[:10]}")
+
+            da = xr.DataArray(
+                values,
+                dims=("T", "Y", "X"),
+                coords={"T": dates.values, "Y": Ys, "X": Xs},
+                name="PRCP",
+                attrs={
+                    "long_name": "ARC2 24-hour rainfall",
+                    "units": "mm/day",
+                    "accumulation_window": "06 UTC to 06 UTC next day",
+                    "source": "NOAA CPC Africa Rainfall Climatology version 2",
+                    "resolution": "0.1 degree",
+                },
+            )
+            ds = da.to_dataset()
+            ds.attrs["missing_source_days"] = ",".join(failed)
+            ds.attrs["WASS2S_dimensions"] = "T,Y,X"
+            _was_write_netcdf(ds, yf, encoding={'PRCP': {'zlib': True, 'complevel': 4, 'dtype': 'float32', '_FillValue': -9999.0}})
+            yearly_files.append(yf)
+            print(f"Saved ARC2 yearly cache: {yf}")
+
+        ds_out = self._WAS_concat_grid_files(yearly_files, "T")
+        ds_out = ds_out.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+        # Continuous calendar; genuine missing days remain NaN.
+        if ds_out.sizes.get("T", 0):
+            full_t = pd.date_range(ds_out["T"].values[0], ds_out["T"].values[-1], freq="D")
+            ds_out = ds_out.reindex(T=full_t)
+        _was_write_netcdf(ds_out, final, encoding={'PRCP': {'zlib': True, 'complevel': 4, 'dtype': 'float32', '_FillValue': -9999.0}})
+        ds_out.close()
+        if not keep_yearly_cache:
+            for p in yearly_files:
+                p.unlink(missing_ok=True)
+        print(f"Saved ARC2 daily: {final}")
+        return final
+
+
+    def WAS_Download_ARC2_Monthly(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        force_download=False,
+        force_daily_download=False,
+        min_daily_coverage=1.0,
+        complete_months_only=True,
+        max_retries=3,
+        retry_delay=5,
+        daily_file=None,
+    ):
+        """Build ARC2 monthly totals from the official daily ARC2 archive."""
+        from pathlib import Path
+        import calendar
+        import pandas as pd
+        import xarray as xr
+
+        if not 0 < float(min_daily_coverage) <= 1:
+            raise ValueError("min_daily_coverage must be in (0, 1].")
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"Monthly_ARC2_PRCP_{year_start}_{year_end}.nc"
+        if final.exists() and not force_download:
+            print(f"{final} already exists. Skipping.")
+            return final
+
+        daily = Path(daily_file) if daily_file is not None else out_dir / f"Daily_ARC2_PRCP_{year_start}_{year_end}.nc"
+        if daily_file is not None and not daily.is_file():
+            raise FileNotFoundError(f"daily_file does not exist: {daily}")
+        if daily_file is not None and force_daily_download:
+            raise ValueError("force_daily_download cannot replace an explicitly supplied daily_file.")
+        if force_daily_download or not daily.exists():
+            daily = self.WAS_Download_ARC2_Daily(
+                out_dir, year_start, year_end, area,
+                force_download=force_daily_download,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                keep_yearly_cache=True,
+                allow_incomplete=True,
+            )
+
+        with xr.open_dataset(daily) as src:
+            subset = self._WAS_standardize_grid_dataset(src, area=area)
+            subset = subset.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+            out = _was_monthly_rainfall(subset, min_daily_coverage, complete_months_only)
+            out = _was_complete_monthly_axis(out, year_start, year_end, complete_months_only)
+            out.attrs["source"] = "ARC2 daily aggregated by WASS2S"
+            out.attrs["daily_source_file"] = str(daily.resolve())
+            _was_write_netcdf(out, final, encoding={v:{"zlib":True,"complevel":4} for v in out.data_vars})
+            out.close()
+        print(f"Saved ARC2 monthly: {final}")
+        return final
+
+
+    def WAS_Download_GPCC_Monthly(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        resolution="0.25",
+        include_infill=True,
+        include_diagnostics=False,
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+        keep_compressed=True,
+        allow_incomplete=True,
+    ):
+        """Download GPCC Precipitation Analysis Monthly v2025 on its native grid."""
+        from pathlib import Path
+        from urllib.parse import urljoin
+        import gzip
+        import re
+        import requests
+        import xarray as xr
+
+        res = str(resolution)
+        dirmap = {"0.25": ("025_degree", "025"), "0.5": ("050_degree", "050"),
+                  "1.0": ("100_degree", "100"), "2.5": ("250_degree", "250")}
+        if res not in dirmap:
+            raise ValueError("resolution must be one of '0.25', '0.5', '1.0', '2.5'.")
+        resdir, tag = dirmap[res]
+        base = (
+            "https://opendata.dwd.de/climate_environment/GPCC/"
+            f"GPCC_Precipitation_Analysis_Monthly/Version_2025/{resdir}/"
+        )
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / ".gpcc_monthly_cache" / f"v2025_{tag}"
+        source_cache = cache / "source"
+        regional_cache = cache / "regional" / _was_cache_key(area=area, start=year_start, end=year_end, infill=include_infill, diagnostics=include_diagnostics)
+        source_cache.mkdir(parents=True, exist_ok=True)
+        regional_cache.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"Monthly_GPCC_PRCP_{year_start}_{year_end}_{tag}.nc"
+        if final.exists() and not force_download:
+            print(f"{final} already exists. Skipping.")
+            return final
+
+        html = requests.get(base, timeout=60)
+        html.raise_for_status()
+        hrefs = sorted(set(re.findall(r'href=["\']([^"\']+\.nc\.gz)["\']', html.text, flags=re.I)))
+        if not hrefs:
+            raise RuntimeError(f"No GPCC monthly NetCDF archives found at {base}")
+
+        def interval(name):
+            m = re.search(r"monthly_(\d{4})_(\d{4})_v2025", name)
+            if m:
+                return (int(m.group(1)), 1, int(m.group(2)), 12)
+            m = re.search(r"monthly_(\d{4})_(\d{2})_v2025", name)
+            if m:
+                y, mo = int(m.group(1)), int(m.group(2))
+                return (y, mo, y, mo)
+            return None
+
+        selected = []
+        for name in hrefs:
+            span = interval(name)
+            if span is None:
+                continue
+            y0, _, y1, _ = span
+            if y1 >= int(year_start) and y0 <= int(year_end):
+                selected.append(name)
+        if not selected:
+            raise RuntimeError("No GPCC monthly files overlap the requested years.")
+
+        var_map = {"precip": "PRCP"}
+        if include_infill:
+            var_map["precip_infill"] = "PRCP_INFILL"
+        if include_diagnostics:
+            var_map.update({
+                "gauge": "GAUGE",
+                "gauge_int": "GAUGE_INT",
+                "dist_int": "DIST_INT",
+                "err": "INTERP_ERROR",
+                "sys_err": "SYS_ERROR_FACTOR",
+                "liquid": "LIQUID_FRACTION",
+                "solid": "SOLID_FRACTION",
+            })
+
+        regional_files = []
+        for name in selected:
+            reg = regional_cache / name.replace(".nc.gz", "_regional.nc")
+            if reg.exists() and not force_download:
+                regional_files.append(reg)
+                continue
+            gz_path = source_cache / name
+            if not gz_path.exists() or force_download:
+                self._WAS_http_download(
+                    urljoin(base, name), gz_path,
+                    max_retries=max_retries, retry_delay=retry_delay,
+                    timeout=600,
+                )
+            tmp_nc = source_cache / name[:-3]
+            try:
+                with gzip.open(gz_path, "rb") as src, open(tmp_nc, "wb") as dst:
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                with xr.open_dataset(tmp_nc) as ds:
+                    ds = self._WAS_standardize_grid_dataset(ds, area=area).load()
+                keep = [v for v in var_map if v in ds.data_vars]
+                if "precip" not in keep:
+                    raise ValueError(f"GPCC file {name} has no 'precip' variable. Found {list(ds.data_vars)}")
+                ds = ds[keep].rename({v: var_map[v] for v in keep})
+                if "T" in ds.coords:
+                    ds = ds.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+                if ds.sizes.get("T", 1) == 0:
+                    continue
+                ds.attrs.update({
+                    "source": "DWD GPCC Precipitation Analysis Monthly Version 2025",
+                    "resolution": res,
+                    "WASS2S_dimensions": "T,Y,X",
+                })
+                ds["PRCP"].attrs.setdefault("units", "mm/month")
+                _was_write_netcdf(ds, reg)
+                regional_files.append(reg)
+            finally:
+                tmp_nc.unlink(missing_ok=True)
+                if not keep_compressed:
+                    gz_path.unlink(missing_ok=True)
+
+        if not regional_files:
+            raise RuntimeError("No GPCC monthly regional data could be created.")
+        ds_out = self._WAS_concat_grid_files(regional_files, "T")
+        if "T" in ds_out.coords:
+            ds_out = ds_out.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+        actual_years = set(ds_out["T"].dt.year.values.tolist()) if "T" in ds_out.coords else set()
+        missing_years = [y for y in range(int(year_start), int(year_end)+1) if y not in actual_years]
+        if missing_years and not allow_incomplete:
+            raise RuntimeError(f"GPCC monthly missing requested years: {missing_years}")
+        ds_out.attrs["requested_year_start"] = int(year_start)
+        ds_out.attrs["requested_year_end"] = int(year_end)
+        _was_write_netcdf(ds_out, final, encoding={v: {'zlib': True, 'complevel': 4} for v in ds_out.data_vars})
+        ds_out.close()
+        print(f"Saved GPCC monthly: {final}")
+        return final
+
+
+    def WAS_Download_GPCC_Daily(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        resolution="0.5",
+        include_diagnostics=False,
+        keep_compressed=False,
+        keep_yearly_cache=True,
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+    ):
+        """Download GPCC Precipitation Analysis Daily v2025 (0.5° or 1.0°)."""
+        from pathlib import Path
+        from urllib.parse import urljoin
+        import gzip
+        import re
+        import requests
+        import xarray as xr
+
+        res = str(resolution)
+        dirmap = {"0.5": ("050_degree", "050"), "1.0": ("100_degree", "100")}
+        if res not in dirmap:
+            raise ValueError("GPCC Daily v2025 resolution must be '0.5' or '1.0'.")
+        resdir, tag = dirmap[res]
+        base = (
+            "https://opendata.dwd.de/climate_environment/GPCC/"
+            f"GPCC_Precipitation_Analysis_Daily/Version_2025/{resdir}/"
+        )
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / ".gpcc_daily_cache" / f"v2025_{tag}"
+        source_cache = cache / "source"
+        regional_cache = cache / "regional_yearly" / _was_cache_key(area=area, diagnostics=include_diagnostics)
+        source_cache.mkdir(parents=True, exist_ok=True)
+        regional_cache.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"Daily_GPCC_PRCP_{year_start}_{year_end}_{tag}.nc"
+        if final.exists() and not force_download:
+            print(f"{final} already exists. Skipping.")
+            return final
+
+        html = requests.get(base, timeout=60)
+        html.raise_for_status()
+        hrefs = sorted(set(re.findall(r'href=["\']([^"\']+\.nc\.gz)["\']', html.text, flags=re.I)))
+        if not hrefs:
+            raise RuntimeError(f"No GPCC Daily archives found at {base}")
+
+        def year_from_name(name):
+            patterns = [
+                r"daily_(\d{4})_v2025",
+                r"_(\d{4})_v2025_",
+                r"v2025_[^_]*_(\d{4})\.nc",
+                r"_(19\d{2}|20\d{2})\.nc",
+            ]
+            for pat in patterns:
+                m = re.search(pat, name)
+                if m:
+                    return int(m.group(1))
+            # Last resort: select a plausible year other than the version token.
+            years = [int(x) for x in re.findall(r"(?:19|20)\d{2}", name)]
+            for y in years:
+                if y != 2025 or years.count(2025) > 1:
+                    return y
+            return None
+
+        by_year = {}
+        for name in hrefs:
+            y = year_from_name(name)
+            if y is not None:
+                by_year[y] = name
+
+        requested_years = range(int(year_start), int(year_end)+1)
+        regional_files = []
+        missing = []
+        for year in requested_years:
+            name = by_year.get(year)
+            if name is None:
+                missing.append(year)
+                continue
+            reg = regional_cache / f"GPCC_Daily_{year}_{tag}.nc"
+            if reg.exists() and not force_download:
+                regional_files.append(reg)
+                continue
+            gz_path = source_cache / name
+            if not gz_path.exists() or force_download:
+                self._WAS_http_download(
+                    urljoin(base, name), gz_path,
+                    max_retries=max_retries, retry_delay=retry_delay,
+                    timeout=600,
+                )
+            tmp_nc = source_cache / name[:-3]
+            try:
+                with gzip.open(gz_path, "rb") as src, open(tmp_nc, "wb") as dst:
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                with xr.open_dataset(tmp_nc) as ds:
+                    ds = self._WAS_standardize_grid_dataset(ds, area=area).load()
+                if "precip" not in ds.data_vars:
+                    candidates = [v for v in ds.data_vars if "precip" in v.lower()]
+                    if not candidates:
+                        raise ValueError(f"No precipitation variable in {name}: {list(ds.data_vars)}")
+                    ds = ds.rename({candidates[0]: "precip"})
+                keep = ["precip"]
+                if include_diagnostics:
+                    keep += [v for v in ("gauge", "gauge_int", "dist_int", "err", "sys_err") if v in ds.data_vars]
+                ds = ds[keep]
+                ren = {"precip": "PRCP", "gauge": "GAUGE", "gauge_int": "GAUGE_INT",
+                       "dist_int": "DIST_INT", "err": "INTERP_ERROR", "sys_err": "SYS_ERROR_FACTOR"}
+                ds = ds.rename({k: v for k, v in ren.items() if k in ds.data_vars})
+                if "T" in ds.coords:
+                    ds = ds.sel(T=slice(f"{year}-01-01", f"{year}-12-31"))
+                ds["PRCP"].attrs.setdefault("units", "mm/day")
+                ds.attrs.update({
+                    "source": "DWD GPCC Precipitation Analysis Daily Version 2025",
+                    "resolution": res,
+                    "WASS2S_dimensions": "T,Y,X",
+                })
+                _was_write_netcdf(ds, reg)
+                regional_files.append(reg)
+            finally:
+                tmp_nc.unlink(missing_ok=True)
+                if not keep_compressed:
+                    gz_path.unlink(missing_ok=True)
+
+        if missing:
+            print(f"[GPCC Daily] unavailable years in the current v2025 archive: {missing}")
+        if not regional_files:
+            raise RuntimeError("No GPCC Daily files available for the requested period.")
+        ds_out = self._WAS_concat_grid_files(regional_files, "T")
+        if "T" in ds_out.coords:
+            ds_out = ds_out.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+        _was_write_netcdf(ds_out, final, encoding={v: {'zlib': True, 'complevel': 4} for v in ds_out.data_vars})
+        ds_out.close()
+        if not keep_yearly_cache:
+            for p in regional_files:
+                p.unlink(missing_ok=True)
+        print(f"Saved GPCC daily: {final}")
+        return final
+
+
+    def WAS_Download_CRU_Monthly(
+        self,
+        dir_to_save,
+        variables,
+        year_start,
+        year_end,
+        area,
+        version="4.10",
+        force_download=False,
+        keep_compressed=True,
+        max_retries=3,
+        retry_delay=5,
+        base_url=None,
+    ):
+        """Download CRU TS monthly data (default v4.10, 0.5°) in WASS2S format."""
+        from pathlib import Path
+        from urllib.parse import urljoin
+        import gzip
+        import re
+        import requests
+        import xarray as xr
+
+        if str(version) != "4.10" and base_url is None:
+            raise ValueError("For CRU versions other than 4.10, provide base_url explicitly.")
+        if int(year_end) > 2025 and str(version) == "4.10":
+            raise ValueError("CRU TS v4.10 covers through 2025.")
+        if isinstance(variables, str):
+            variables = [variables]
+        mapping = {
+            "CRU.PRCP": ("pre", "PRCP"), "CRU.PRE": ("pre", "PRCP"),
+            "CRU.TEMP": ("tmp", "TEMP"), "CRU.TMP": ("tmp", "TEMP"),
+            "CRU.TMAX": ("tmx", "TMAX"), "CRU.TMX": ("tmx", "TMAX"),
+            "CRU.TMIN": ("tmn", "TMIN"), "CRU.TMN": ("tmn", "TMIN"),
+            "CRU.DTR": ("dtr", "DTR"), "CRU.VAP": ("vap", "VAP"),
+            "CRU.CLD": ("cld", "CLD"), "CRU.WET": ("wet", "WET"),
+            "CRU.FRS": ("frs", "FRS"), "CRU.PET": ("pet", "PET"),
+        }
+        root = base_url or "https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.10/cruts.2604091129.v4.10"
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / ".cru_ts_cache" / f"v{version}"
+        cache.mkdir(parents=True, exist_ok=True)
+        results = {}
+
+        for requested in variables:
+            key = str(requested).upper()
+            if key not in mapping:
+                raise ValueError(f"Unsupported CRU variable: {requested}")
+            native, code = mapping[key]
+            var_url = f"{root.rstrip('/')}/{native}/"
+            final = out_dir / f"Monthly_CRU_{code}_{year_start}_{year_end}_v{version}.nc"
+            if final.exists() and not force_download:
+                results[requested] = final
+                print(f"{final} already exists. Skipping.")
+                continue
+
+            r = requests.get(var_url, timeout=60)
+            r.raise_for_status()
+            hrefs = sorted(set(re.findall(r'href=["\']([^"\']+\.dat\.nc\.gz)["\']', r.text, flags=re.I)))
+            if not hrefs:
+                raise RuntimeError(f"No CRU NetCDF archives found at {var_url}")
+
+            def span(name):
+                m = re.search(r"cru_ts[\d.]+\.(\d{4})\.(\d{4})\.", name)
+                return (int(m.group(1)), int(m.group(2))) if m else None
+
+            selected = []
+            for name in hrefs:
+                s = span(name)
+                if s and s[1] >= int(year_start) and s[0] <= int(year_end):
+                    # Prefer decade/short packages over the single 1901-2025 monolith.
+                    selected.append((s[1]-s[0], name))
+            # Eliminate overlapping monolithic files when shorter packages cover the period.
+            selected = [name for _, name in sorted(selected)]
+            if not selected:
+                raise RuntimeError(f"No CRU files overlap {year_start}-{year_end} for {native}")
+
+            # Greedy coverage by shortest ranges first.
+            needed = set(range(int(year_start), int(year_end)+1))
+            chosen = []
+            for name in selected:
+                y0, y1 = span(name)
+                cover = needed.intersection(range(y0, y1+1))
+                if cover:
+                    chosen.append(name)
+                    needed -= cover
+                if not needed:
+                    break
+            if needed:
+                raise RuntimeError(f"CRU archive selection failed to cover years: {sorted(needed)}")
+
+            regional = []
+            var_cache = cache / native
+            var_cache.mkdir(parents=True, exist_ok=True)
+            for name in chosen:
+                reg = var_cache / _was_cache_key(area=area, start=year_start, end=year_end) / name.replace(".dat.nc.gz", "_regional.nc")
+                if reg.exists() and not force_download:
+                    regional.append(reg)
+                    continue
+                gz_path = var_cache / name
+                if not gz_path.exists() or force_download:
+                    self._WAS_http_download(urljoin(var_url, name), gz_path,
+                                            max_retries=max_retries, retry_delay=retry_delay, timeout=600)
+                tmp = var_cache / name[:-3]
+                try:
+                    with gzip.open(gz_path, "rb") as src, open(tmp, "wb") as dst:
+                        while True:
+                            chunk = src.read(1024*1024)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                    with xr.open_dataset(tmp) as ds:
+                        ds = self._WAS_standardize_grid_dataset(ds, area=area).load()
+                    source = native if native in ds.data_vars else next(
+                        (v for v in ds.data_vars if v.lower() == native), None
+                    )
+                    if source is None:
+                        raise ValueError(f"CRU variable {native} not found in {name}: {list(ds.data_vars)}")
+                    ds = ds[[source]].rename({source: code})
+                    ds = ds.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+                    if ds.sizes.get("T", 0) == 0:
+                        continue
+                    ds.attrs.update({"source": f"CRU TS v{version}", "resolution": "0.5 degree", "WASS2S_dimensions": "T,Y,X"})
+                    _was_write_netcdf(ds, reg)
+                    regional.append(reg)
+                finally:
+                    tmp.unlink(missing_ok=True)
+                    if not keep_compressed:
+                        gz_path.unlink(missing_ok=True)
+
+            ds_out = self._WAS_concat_grid_files(regional, "T")
+            ds_out = ds_out.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+            _was_write_netcdf(ds_out, final, encoding={code: {'zlib': True, 'complevel': 4, 'dtype': 'float32'}})
+            ds_out.close()
+            results[requested] = final
+            print(f"Saved CRU: {final}")
+
+        return results
+
+
+    def WAS_Download_GSMaP_Daily(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        product="gauge_standard",
+        version="v8",
+        algorithm_version="v8.0000",
+        time_window="00Z-23Z",
+        gportal_user=None,
+        gportal_password=None,
+        sftp_host="ftp.gportal.jaxa.jp",
+        sftp_port=2051,
+        remote_root="/standard/v8",
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+        keep_yearly_cache=True,
+        known_hosts=None,
+    ):
+        """
+        Download GSMaP v8 daily 0.1° rainfall using JAXA G-Portal SFTP.
+
+        Current default is the gauge-calibrated Standard product. G-Portal account
+        credentials may be passed explicitly or through JAXA_GPORTAL_USER and
+        JAXA_GPORTAL_PASSWORD.  The host/port/root are parameters because JAXA has
+        announced a G-Portal infrastructure migration for October 2026.
+        """
+        from pathlib import Path
+        import calendar
+        import gzip
+        import os
+        import time as _time
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        try:
+            import paramiko
+        except ImportError as exc:
+            raise ImportError(
+                "WAS_Download_GSMaP_Daily requires 'paramiko' for SFTP. "
+                "Install it in the WASS2S environment with: pip install paramiko"
+            ) from exc
+
+        product = str(product).lower()
+        if product not in {"gauge_standard", "standard"}:
+            raise ValueError("product must be 'gauge_standard' or 'standard'.")
+        if time_window not in {"00Z-23Z", "12Z-11Z"}:
+            raise ValueError("time_window must be '00Z-23Z' or '12Z-11Z'.")
+        user = gportal_user or os.getenv("JAXA_GPORTAL_USER")
+        password = gportal_password or os.getenv("JAXA_GPORTAL_PASSWORD")
+        if not user or not password:
+            raise ValueError(
+                "GSMaP download needs G-Portal credentials. Set JAXA_GPORTAL_USER "
+                "and JAXA_GPORTAL_PASSWORD or pass gportal_user/gportal_password."
+            )
+
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / ".gsmap_daily_cache" / f"{product}_{version}" / _was_cache_key(area=area, window=time_window, algorithm=algorithm_version, root=remote_root)
+        cache.mkdir(parents=True, exist_ok=True)
+        tag_window = "00Z23Z" if time_window == "00Z-23Z" else "12Z11Z"
+        ptag = "Gauge" if product == "gauge_standard" else "Standard"
+        final = out_dir / f"Daily_GSMaP_{ptag}_PRCP_{year_start}_{year_end}_{tag_window}.nc"
+        if final.exists() and not force_download:
+            print(f"{final} already exists. Skipping.")
+            return final
+
+        # Native v8 daily binary: 3600 lon x 1200 lat, 0.1°, 60N..60S,
+        # first cell center 0.05E, 59.95N, little-endian float32, mm/hr.
+        X0 = np.round(0.05 + np.arange(3600) * 0.1, 10)
+        Xwrap = ((X0 + 180.0) % 360.0) - 180.0
+        Ydesc = np.round(59.95 - np.arange(1200) * 0.1, 10)
+        north, west, south, east = [float(v) for v in area]
+        # Read on native ordering, subset after wrapping/sorting.
+
+        ssh = paramiko.SSHClient()
+        ssh.load_system_host_keys()
+        if known_hosts is not None:
+            ssh.load_host_keys(str(Path(known_hosts).expanduser()))
+        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+        try:
+            ssh.connect(sftp_host, port=int(sftp_port), username=user, password=password,
+                        timeout=60, auth_timeout=60, look_for_keys=False, allow_agent=False)
+            sftp = ssh.open_sftp()
+        except Exception:
+            ssh.close()
+            raise
+        yearly_files = []
+        try:
+            for year in range(int(year_start), int(year_end)+1):
+                yf = cache / f"GSMaP_{product}_{year}_{tag_window}.nc"
+                if yf.exists() and not force_download:
+                    yearly_files.append(yf)
+                    continue
+                dates = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
+                now = pd.Timestamp.utcnow().tz_localize(None).normalize()
+                dates = dates[dates <= now]
+                pieces = []
+                missing = []
+                for date in dates:
+                    ymd = date.strftime("%Y%m%d")
+                    ym = date.strftime("%Y%m")
+                    subdir = "00Z-23Z" if time_window == "00Z-23Z" else "p12Z-11Z"
+                    if product == "gauge_standard":
+                        folder = f"{remote_root.rstrip('/')}/daily_G/{subdir}/{ym}"
+                        win = "00Z-23Z" if time_window == "00Z-23Z" else "p12Z-11Z"
+                        stem = f"gsmap_gauge.{ymd}.0.1d.daily.{win}.{algorithm_version}.dat.gz"
+                        fallback = f"gsmap_gauge.{ymd}.0.1d.daily.{win}.dat.gz"
+                    else:
+                        folder = f"{remote_root.rstrip('/')}/daily/{subdir}/{ym}"
+                        win = "00Z-23Z" if time_window == "00Z-23Z" else "p12Z-11Z"
+                        stem = f"gsmap.{ymd}.0.1d.daily.{win}.{algorithm_version}.dat.gz"
+                        fallback = f"gsmap.{ymd}.0.1d.daily.{win}.dat.gz"
+
+                    local = cache / f"raw_{ymd}.dat.gz"
+                    ok = False
+                    for candidate in (stem, fallback):
+                        remote = f"{folder}/{candidate}"
+                        for attempt in range(1, max_retries+1):
+                            try:
+                                if local.exists() and not force_download:
+                                    ok = True
+                                else:
+                                    part = local.with_name(local.name + ".part")
+                                    try:
+                                        sftp.get(remote, str(part))
+                                        with gzip.open(part, "rb") as check:
+                                            payload_check = check.read()
+                                        if len(payload_check) != 1200 * 3600 * 4:
+                                            raise ValueError("Invalid GSMaP binary length; refusing to cache partial download.")
+                                        os.replace(part, local)
+                                    finally:
+                                        part.unlink(missing_ok=True)
+                                    ok = True
+                                break
+                            except Exception as exc:
+                                if attempt < max_retries:
+                                    _time.sleep(retry_delay)
+                                else:
+                                    last_exc = exc
+                        if ok:
+                            break
+                    if not ok:
+                        missing.append(ymd)
+                        continue
+                    try:
+                        with gzip.open(local, "rb") as fh:
+                            arr = np.frombuffer(fh.read(), dtype="<f4").astype("float32", copy=True)
+                        if arr.size != 1200 * 3600:
+                            raise ValueError(f"Unexpected GSMaP binary size {arr.size} for {ymd}")
+                        arr = arr.reshape(1200, 3600)
+                        arr[arr <= -999.0] = np.nan
+                        da = xr.DataArray(
+                            arr, dims=("Y", "X"),
+                            coords={"Y": Ydesc, "X": Xwrap}, name="PRCP"
+                        ).sortby("X").sortby("Y")
+                        da = da.sel(X=slice(west, east), Y=slice(south, north))
+                        # Daily file is a 24-h mean rate [mm/hr]. Convert to total [mm/day].
+                        da = (da * 24.0).astype("float32")
+                        da = da.expand_dims(T=[date.to_datetime64()])
+                        pieces.append(da)
+                    finally:
+                        local.unlink(missing_ok=True)
+
+                if pieces:
+                    da_year = xr.concat(pieces, dim="T").sortby("T")
+                else:
+                    print(f"[GSMaP] No source day available for {year}; skipping yearly cache.")
+                    continue
+                da_year.attrs.update({
+                    "units": "mm/day",
+                    "native_units": "mm/hr (24-hour mean rate)",
+                    "source": f"JAXA GSMaP {product} {version}",
+                    "time_window": time_window,
+                    "resolution": "0.1 degree",
+                })
+                ds = da_year.to_dataset()
+                ds.attrs["missing_source_days"] = ",".join(missing)
+                ds.attrs["WASS2S_dimensions"] = "T,Y,X"
+                _was_write_netcdf(ds, yf, encoding={'PRCP': {'zlib': True, 'complevel': 4, 'dtype': 'float32', '_FillValue': -9999.0}})
+                yearly_files.append(yf)
+        finally:
+            sftp.close()
+            ssh.close()
+
+        ds_out = self._WAS_concat_grid_files(yearly_files, "T")
+        ds_out = ds_out.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+        if ds_out.sizes.get("T", 0):
+            full_t = pd.date_range(f"{int(year_start)}-01-01", min(pd.Timestamp(int(year_end),12,31), pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()), freq="D")
+            ds_out = ds_out.reindex(T=full_t)
+        _was_write_netcdf(ds_out, final, encoding={'PRCP': {'zlib': True, 'complevel': 4, 'dtype': 'float32', '_FillValue': -9999.0}})
+        ds_out.close()
+        if not keep_yearly_cache:
+            for p in yearly_files:
+                p.unlink(missing_ok=True)
+        print(f"Saved GSMaP daily: {final}")
+        return final
+
+
+    def WAS_Download_CPCUnified_Daily(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        force_download=False,
+        keep_source_cache=False,
+        keep_yearly_cache=True,
+        max_retries=3,
+        retry_delay=5,
+    ):
+        """Download CPC Global Unified Gauge-Based Daily Precipitation (0.5°)."""
+        from pathlib import Path
+        import pandas as pd
+        import xarray as xr
+
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / ".cpc_unified_daily_cache"
+        source_cache = cache / "source"
+        regional_cache = cache / "regional_yearly" / _was_cache_key(area=area)
+        source_cache.mkdir(parents=True, exist_ok=True)
+        regional_cache.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"Daily_CPCUnified_PRCP_{year_start}_{year_end}.nc"
+        if final.exists() and not force_download:
+            print(f"{final} already exists. Skipping.")
+            return final
+
+        base = "https://psl.noaa.gov/thredds/fileServer/Datasets/cpc_global_precip"
+        regional_files = []
+        for year in range(int(year_start), int(year_end)+1):
+            reg = regional_cache / f"CPCUnified_Daily_{year}.nc"
+            if reg.exists() and not force_download:
+                regional_files.append(reg)
+                continue
+            src = source_cache / f"precip.{year}.nc"
+            if not src.exists() or force_download:
+                self._WAS_http_download(
+                    f"{base}/precip.{year}.nc", src,
+                    max_retries=max_retries, retry_delay=retry_delay, timeout=600,
+                )
+            try:
+                with xr.open_dataset(src) as ds:
+                    ds = self._WAS_standardize_grid_dataset(ds, area=area).load()
+                if "precip" not in ds.data_vars:
+                    raise ValueError(f"CPC Unified file lacks precip: {list(ds.data_vars)}")
+                ds = ds[["precip"]].rename({"precip": "PRCP"})
+                ds["PRCP"] = ds["PRCP"].where(ds["PRCP"] > -1e20).astype("float32")
+                ds["PRCP"].attrs.update({"units": "mm/day", "long_name": "CPC Global Unified daily precipitation"})
+                ds.attrs.update({"source": "NOAA PSL / CPC Global Unified Gauge-Based Analysis", "resolution": "0.5 degree", "WASS2S_dimensions": "T,Y,X"})
+                _was_write_netcdf(ds, reg, encoding={'PRCP': {'zlib': True, 'complevel': 4, 'dtype': 'float32', '_FillValue': -9999.0}})
+                regional_files.append(reg)
+            finally:
+                if not keep_source_cache:
+                    src.unlink(missing_ok=True)
+
+        ds_out = self._WAS_concat_grid_files(regional_files, "T")
+        ds_out = ds_out.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+        if ds_out.sizes.get("T", 0):
+            full_t = pd.date_range(ds_out["T"].values[0], ds_out["T"].values[-1], freq="D")
+            ds_out = ds_out.reindex(T=full_t)
+        _was_write_netcdf(ds_out, final, encoding={'PRCP': {'zlib': True, 'complevel': 4, 'dtype': 'float32', '_FillValue': -9999.0}})
+        ds_out.close()
+        if not keep_yearly_cache:
+            for p in regional_files:
+                p.unlink(missing_ok=True)
+        print(f"Saved CPC Unified daily: {final}")
+        return final
+
+
+    def WAS_Download_CPCUnified_Monthly(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        force_download=False,
+        force_daily_download=False,
+        min_daily_coverage=1.0,
+        complete_months_only=True,
+        keep_source_cache=False,
+        keep_yearly_cache=True,
+        max_retries=3,
+        retry_delay=5,
+        daily_file=None,
+    ):
+        """Aggregate CPC Global Unified daily precipitation to monthly totals."""
+        from pathlib import Path
+        import calendar
+        import pandas as pd
+        import xarray as xr
+
+        if not 0 < float(min_daily_coverage) <= 1:
+            raise ValueError("min_daily_coverage must be in (0, 1].")
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"Monthly_CPCUnified_PRCP_{year_start}_{year_end}.nc"
+        if final.exists() and not force_download:
+            print(f"{final} already exists. Skipping.")
+            return final
+        daily = Path(daily_file) if daily_file is not None else out_dir / f"Daily_CPCUnified_PRCP_{year_start}_{year_end}.nc"
+        if daily_file is not None and not daily.is_file():
+            raise FileNotFoundError(f"daily_file does not exist: {daily}")
+        if daily_file is not None and force_daily_download:
+            raise ValueError("force_daily_download cannot replace an explicitly supplied daily_file.")
+        if force_daily_download or not daily.exists():
+            daily = self.WAS_Download_CPCUnified_Daily(
+                out_dir, year_start, year_end, area,
+                force_download=force_daily_download,
+                keep_source_cache=keep_source_cache,
+                keep_yearly_cache=keep_yearly_cache,
+                max_retries=max_retries, retry_delay=retry_delay,
+            )
+        with xr.open_dataset(daily) as src:
+            subset = self._WAS_standardize_grid_dataset(src, area=area)
+            subset = subset.sel(T=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+            out = _was_monthly_rainfall(subset, min_daily_coverage, complete_months_only)
+            out = _was_complete_monthly_axis(out, year_start, year_end, complete_months_only)
+            out.attrs["source"] = "CPCUnified daily aggregated by WASS2S"
+            out.attrs["daily_source_file"] = str(daily.resolve())
+            _was_write_netcdf(out, final, encoding={v:{"zlib":True,"complevel":4} for v in out.data_vars})
+            out.close()
+        print(f"Saved CPC Unified monthly: {final}")
+        return final
+
+
+    def _WAS_Download_NCEI_Station_API(
+        self,
+        dataset_id,
+        output_prefix,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        variables,
+        variable_mapping,
+        frequency="daily",
+        include_qc=False,
+        include_provenance=False,
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+    ):
+        """Internal NCEI Access Data Service downloader for station products."""
+        from pathlib import Path
+        import io
+        import time as _time
+        import numpy as np
+        import pandas as pd
+        import requests
+        import xarray as xr
+
+        if isinstance(variables, str):
+            variables = [variables]
+        requested = [str(v).upper() for v in variables]
+        unknown = [v for v in requested if v not in variable_mapping]
+        if unknown:
+            raise ValueError(f"Unsupported {output_prefix} variable(s): {unknown}")
+        native_types = [variable_mapping[v] for v in requested]
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / f".{output_prefix.lower()}_api_cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"{'Hourly' if frequency == 'hourly' else 'Daily'}_{output_prefix}_{year_start}_{year_end}.nc"
+        stations_csv = out_dir / f"Stations_{output_prefix}_{year_start}_{year_end}.csv"
+        if final.exists() and not force_download:
+            print(f"{final} already exists. Skipping.")
+            return final
+
+        endpoint = "https://www.ncei.noaa.gov/access/services/data/v1"
+        north, west, south, east = [float(v) for v in area]
+        # NCEI boundingBox order is N,W,S,E.
+        bounding = f"{north},{west},{south},{east}"
+        frames = []
+
+        # Daily summaries: one request/year. Hourly: one request/month to avoid
+        # service-size limits and to make interruption/restart practical.
+        chunks = []
+        if frequency == "hourly":
+            for year in range(int(year_start), int(year_end)+1):
+                for month in range(1, 13):
+                    start = pd.Timestamp(year, month, 1)
+                    end = start + pd.offsets.MonthEnd(1)
+                    chunks.append((start, end, f"{year}{month:02d}"))
+        else:
+            for year in range(int(year_start), int(year_end)+1):
+                chunks.append((pd.Timestamp(year,1,1), pd.Timestamp(year,12,31), str(year)))
+
+        for start, end, label in chunks:
+            cache_csv = cache / f"{output_prefix}_{label}.csv"
+            if cache_csv.exists() and not force_download:
+                try:
+                    df = pd.read_csv(cache_csv, low_memory=False)
+                    if not df.empty:
+                        frames.append(df)
+                    continue
+                except Exception:
+                    cache_csv.unlink(missing_ok=True)
+
+            params = {
+                "dataset": dataset_id,
+                "dataTypes": ",".join(native_types),
+                "startDate": start.strftime("%Y-%m-%d"),
+                "endDate": end.strftime("%Y-%m-%d"),
+                "boundingBox": bounding,
+                "format": "csv",
+                "units": "metric",
+                "includeStationName": "true",
+                "includeStationLocation": "true",
+                "includeAttributes": "true" if (include_qc or include_provenance) else "false",
+            }
+            ok = False
+            for attempt in range(1, max_retries+1):
+                try:
+                    r = requests.get(endpoint, params=params, timeout=180)
+                    if r.status_code == 204 or not r.text.strip():
+                        ok = True
+                        break
+                    r.raise_for_status()
+                    # NCEI may return JSON error even when content-type is not ideal.
+                    if r.text.lstrip().startswith("{") and "error" in r.text[:300].lower():
+                        raise RuntimeError(r.text[:1000])
+                    cache_csv.write_text(r.text, encoding="utf-8")
+                    df = pd.read_csv(io.StringIO(r.text), low_memory=False)
+                    if not df.empty:
+                        frames.append(df)
+                    ok = True
+                    break
+                except Exception as exc:
+                    print(f"[{output_prefix}] {label} attempt {attempt}/{max_retries} failed: {exc}")
+                    if attempt < max_retries:
+                        _time.sleep(retry_delay)
+            if not ok:
+                print(f"[{output_prefix}] skipped failed chunk {label}")
+
+        if not frames:
+            raise RuntimeError(f"No {output_prefix} station data returned for area={area} and period {year_start}-{year_end}.")
+        df = pd.concat(frames, ignore_index=True, sort=False)
+
+        def find_col(candidates):
+            lookup = {str(c).upper(): c for c in df.columns}
+            for cand in candidates:
+                if cand.upper() in lookup:
+                    return lookup[cand.upper()]
+            return None
+
+        time_col = find_col(["DATE", "DATE_TIME", "TIME", "timestamp"])
+        station_col = find_col(["STATION", "STATION_ID", "station"])
+        lat_col = find_col(["LATITUDE", "LAT"])
+        lon_col = find_col(["LONGITUDE", "LON"])
+        elev_col = find_col(["ELEVATION", "ELEV"])
+        name_col = find_col(["NAME", "STATION_NAME"])
+        if time_col is None or station_col is None:
+            raise ValueError(f"Cannot identify DATE/STATION in NCEI columns: {list(df.columns)}")
+
+        df["_T"] = pd.to_datetime(df[time_col], errors="coerce", utc=True).dt.tz_convert(None)
+        df["_STATION"] = df[station_col].astype(str)
+        df = df.dropna(subset=["_T", "_STATION"])
+        if df.empty:
+            raise RuntimeError("NCEI response contained no valid station/time records.")
+
+        # Normalize requested data variables to numeric columns.
+        renamed = {}
+        col_lookup = {str(c).upper(): c for c in df.columns}
+        for alias, native in variable_mapping.items():
+            if alias not in requested:
+                continue
+            source = col_lookup.get(str(native).upper())
+            if source is not None:
+                renamed[source] = alias
+        df = df.rename(columns=renamed)
+        for alias in requested:
+            if alias in df.columns:
+                # Attribute-bearing fields can look like "12.3,flags"; keep leading value.
+                if df[alias].dtype == object:
+                    df[alias] = df[alias].astype(str).str.split(",", n=1).str[0]
+                df[alias] = pd.to_numeric(df[alias], errors="coerce")
+
+        # Station metadata table.
+        meta_cols = [c for c in (station_col, lat_col, lon_col, elev_col, name_col) if c is not None]
+        meta = df[meta_cols].drop_duplicates(subset=[station_col]).copy()
+        meta = meta.rename(columns={station_col: "station"})
+        if lat_col: meta = meta.rename(columns={lat_col: "LAT"})
+        if lon_col: meta = meta.rename(columns={lon_col: "LON"})
+        if elev_col: meta = meta.rename(columns={elev_col: "ELEV"})
+        if name_col: meta = meta.rename(columns={name_col: "NAME"})
+        meta.to_csv(stations_csv, index=False)
+
+        stations = np.array(sorted(df["_STATION"].unique()), dtype=str)
+        times = np.array(sorted(df["_T"].unique()), dtype="datetime64[ns]")
+        out = xr.Dataset(coords={"T": times, "station": stations})
+
+        # Keep one value per exact station/timestamp. Raw API CSV cache remains the
+        # audit trail when multiple source reports exist.
+        for alias in requested:
+            if alias not in df.columns:
+                continue
+            tab = df[["_T", "_STATION", alias]].dropna(subset=[alias])
+            tab = tab.drop_duplicates(subset=["_T", "_STATION"], keep="first")
+            pivot = tab.pivot(index="_T", columns="_STATION", values=alias)
+            pivot = pivot.reindex(index=pd.DatetimeIndex(times), columns=stations)
+            out[alias] = (("T", "station"), pivot.to_numpy(dtype="float32"))
+
+        # Station metadata as coordinates.
+        meta_idx = meta.set_index("station").reindex(stations)
+        for name in ("LAT", "LON", "ELEV"):
+            if name in meta_idx.columns:
+                out = out.assign_coords({name: ("station", pd.to_numeric(meta_idx[name], errors="coerce").to_numpy())})
+        if "NAME" in meta_idx.columns:
+            out = out.assign_coords(NAME=("station", meta_idx["NAME"].fillna("").astype(str).to_numpy()))
+
+        # Preserve selected textual QC/provenance columns when they are explicitly
+        # requested and when NCEI returns them as separate fields.
+        if include_qc or include_provenance:
+            keys = []
+            for c in df.columns:
+                uc = str(c).upper()
+                if include_qc and any(k in uc for k in ("QUALITY", "_QC", "QC_", "MEASUREMENT_CODE", "MEAS_CODE")):
+                    keys.append(c)
+                if include_provenance and any(k in uc for k in ("REPORT_TYPE", "SOURCE_CODE", "SOURCE_STATION")):
+                    keys.append(c)
+            for c in sorted(set(keys))[:40]:
+                tab = df[["_T", "_STATION", c]].dropna(subset=[c]).drop_duplicates(["_T", "_STATION"], keep="first")
+                if tab.empty:
+                    continue
+                pivot = tab.pivot(index="_T", columns="_STATION", values=c)
+                pivot = pivot.reindex(index=pd.DatetimeIndex(times), columns=stations).fillna("")
+                safe_name = str(c).upper().replace(" ", "_").replace("-", "_")[:63]
+                out[safe_name] = (("T", "station"), pivot.astype(str).to_numpy(dtype=str))
+
+        out.attrs.update({
+            "source": f"NOAA NCEI {dataset_id}",
+            "api": "NCEI Access Data Service",
+            "units_request": "metric",
+            "station_metadata_csv": str(stations_csv),
+            "raw_cache_directory": str(cache),
+            "WASS2S_dimensions": "T,station",
+        })
+        enc = {v: {"zlib": True, "complevel": 4} for v in out.data_vars if out[v].dtype.kind not in "OUS"}
+        _was_write_netcdf(out, final, encoding=enc)
+        out.close()
+        print(f"Saved {output_prefix}: {final}")
+        return final
+
+
+    def _WAS_HTTP_download_cached(
+        self,
+        url,
+        target,
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+        timeout=120,
+        quiet_404=True,
+    ):
+        """Download a remote file atomically, reusing a non-empty cache file."""
+        from pathlib import Path
+        import os
+        import time as _time
+        import requests
+
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.stat().st_size > 0 and not force_download:
+            return True
+
+        part = target.with_name(target.name + '.part')
+        for attempt in range(1, max_retries + 1):
+            try:
+                with requests.get(url, stream=True, timeout=timeout) as response:
+                    if response.status_code == 404 and quiet_404:
+                        part.unlink(missing_ok=True)
+                        return False
+                    response.raise_for_status()
+                    with open(part, 'wb') as handle:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                handle.write(chunk)
+                if part.stat().st_size == 0:
+                    raise IOError(f'Empty download: {url}')
+                os.replace(part, target)
+                return True
+            except Exception as exc:
+                part.unlink(missing_ok=True)
+                if _was_permanent_http_error(exc):
+                    raise RuntimeError(f"Permanent HTTP error; request was not retried: {url}") from exc
+                if attempt >= max_retries:
+                    print(f'[HTTP] {attempt}/{max_retries} failed: {url}\n       {exc}')
+                    return False
+                print(f'[HTTP] {attempt}/{max_retries} failed: {url}\n       {exc}')
+                _time.sleep(retry_delay)
+        return False
+
+
+    def _WAS_GHCNh_station_list(
+        self,
+        cache_file,
+        area=None,
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+    ):
+        """Load the official GHCNh station list and optionally subset a bbox."""
+        from pathlib import Path
+        import pandas as pd
+        import numpy as np
+
+        cache_file = Path(cache_file)
+        url = (
+            'https://www.ncei.noaa.gov/oa/global-historical-climatology-network/'
+            'hourly/doc/ghcnh-station-list.csv'
+        )
+        ok = self._WAS_HTTP_download_cached(
+            url, cache_file, force_download=force_download,
+            max_retries=max_retries, retry_delay=retry_delay,
+        )
+        if not ok:
+            raise RuntimeError(f'Could not download GHCNh station list: {url}')
+
+        def _normalize(s):
+            return ''.join(ch for ch in str(s).strip().upper() if ch.isalnum())
+
+        # NCEI has published this file both as a conventional CSV and in forms
+        # consumed as headerless station metadata. Support both layouts.
+        df = pd.read_csv(cache_file, dtype=str)
+        norm = {_normalize(c): c for c in df.columns}
+        has_named = any(k in norm for k in ('GHCNID', 'STATION', 'STATIONID')) and 'LATITUDE' in norm and 'LONGITUDE' in norm
+        if not has_named:
+            raw = pd.read_csv(cache_file, header=None, dtype=str)
+            names = ['GHCN_ID', 'LATITUDE', 'LONGITUDE', 'ELEVATION', 'STATE', 'NAME', 'GSN', 'HCN_CRN', 'WMO_ID', 'ICAO']
+            raw.columns = names[:raw.shape[1]] + [f'EXTRA_{i}' for i in range(raw.shape[1] - len(names))]
+            df = raw
+
+        norm = {_normalize(c): c for c in df.columns}
+        aliases = {
+            'station': ('GHCNID', 'STATIONID', 'STATION'),
+            'LAT': ('LATITUDE', 'LAT'),
+            'LON': ('LONGITUDE', 'LON'),
+            'ELEV': ('ELEVATION', 'ELEV', 'ELEVATIONM'),
+            'NAME': ('NAME', 'STATIONNAME'),
+            'WMO_ID': ('WMOID',),
+            'ICAO': ('ICAO',),
+        }
+        out = pd.DataFrame(index=df.index)
+        for dst, cands in aliases.items():
+            src_col = next((norm[c] for c in cands if c in norm), None)
+            if src_col is not None:
+                out[dst] = df[src_col]
+
+        required = {'station', 'LAT', 'LON'}
+        if not required.issubset(out.columns):
+            raise ValueError(
+                f'Unexpected GHCNh station-list structure. Need {sorted(required)}, '
+                f'found columns={list(df.columns)}'
+            )
+
+        out['station'] = out['station'].astype(str).str.strip()
+        out['LAT'] = pd.to_numeric(out['LAT'], errors='coerce')
+        out['LON'] = pd.to_numeric(out['LON'], errors='coerce')
+        if 'ELEV' in out:
+            out['ELEV'] = pd.to_numeric(out['ELEV'], errors='coerce')
+        else:
+            out['ELEV'] = np.nan
+        if 'NAME' not in out:
+            out['NAME'] = ''
+        out['NAME'] = out['NAME'].fillna('').astype(str).str.strip()
+        out = out.dropna(subset=['LAT', 'LON']).drop_duplicates('station')
+
+        if area is not None:
+            north, west, south, east = [float(v) for v in area]
+            lat_ok = out['LAT'].between(south, north, inclusive='both')
+            if west <= east:
+                lon_ok = out['LON'].between(west, east, inclusive='both')
+            else:  # dateline-crossing bbox
+                lon_ok = (out['LON'] >= west) | (out['LON'] <= east)
+            out = out.loc[lat_ok & lon_ok].copy()
+
+        return out.sort_values('station').reset_index(drop=True)
+
+
+    @staticmethod
+    def _WAS_find_column(columns, *candidates):
+        """Case/punctuation-insensitive dataframe column lookup."""
+        def norm(x):
+            return ''.join(ch for ch in str(x).strip().lower() if ch.isalnum())
+        lookup = {norm(c): c for c in columns}
+        for candidate in candidates:
+            hit = lookup.get(norm(candidate))
+            if hit is not None:
+                return hit
+        return None
+
+
+    @staticmethod
+    def _WAS_station_dataset_from_long(
+        df,
+        meta,
+        variables,
+        native_map,
+        start,
+        end,
+        frequency='daily',
+        attrs=None,
+        full_calendar=False,
+    ):
+        """Convert long station observations to a numeric T x station Dataset."""
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        if df.empty:
+            raise RuntimeError('No station observations remain after filtering.')
+
+        station_col = WAS_Download._WAS_find_column(df.columns, 'STATION', 'Station_ID', 'GHCN_ID')
+        date_col = WAS_Download._WAS_find_column(df.columns, 'DATE', 'datetime', 'timestamp')
+        if station_col is None or date_col is None:
+            raise ValueError(f'Cannot identify station/date columns in {list(df.columns)}')
+
+        work = df.dropna(subset=[station_col]).copy()
+        work['_STATION'] = work[station_col].astype(str).str.strip()
+        work = work[work['_STATION'].ne('')]
+        work['_T'] = pd.to_datetime(work[date_col], errors='coerce', utc=True).dt.tz_convert(None)
+        # Convert timezone-aware timestamps, if any, to naive UTC-like timestamps.
+        try:
+            if getattr(work['_T'].dt, 'tz', None) is not None:
+                work['_T'] = work['_T'].dt.tz_convert('UTC').dt.tz_localize(None)
+        except Exception:
+            pass
+        work = work.dropna(subset=['_T', '_STATION'])
+        work = work[(work['_T'] >= pd.Timestamp(start)) & (work['_T'] <= pd.Timestamp(end))]
+
+        stations = meta['station'].astype(str).tolist()
+        work = work[work['_STATION'].isin(stations)]
+        if work.empty:
+            raise RuntimeError('No observations found for selected stations and time period.')
+
+        if full_calendar and frequency == 'daily':
+            times = pd.date_range(pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize(), freq='D')
+        else:
+            times = pd.DatetimeIndex(sorted(work['_T'].dropna().unique()))
+
+        ds = xr.Dataset(coords={'T': times, 'station': np.asarray(stations, dtype=str)})
+
+        for alias in variables:
+            candidates = native_map.get(alias, ())
+            if isinstance(candidates, str):
+                candidates = (candidates,)
+            native = WAS_Download._WAS_find_column(work.columns, *candidates)
+            if native is None:
+                print(f'[STATION] variable {alias} not present in downloaded files; filling NaN.')
+                ds[alias] = (('T', 'station'), np.full((len(times), len(stations)), np.nan, dtype='float32'))
+                continue
+            tab = work[['_T', '_STATION', native]].copy()
+            tab[native] = pd.to_numeric(
+                tab[native].astype(str).str.extract(r'([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)', expand=False),
+                errors='coerce',
+            )
+            # GHCNh/SSOD should be harmonized to one record per station-time, but
+            # groupby(first non-null) makes the output deterministic if duplicates occur.
+            tab = tab.dropna(subset=[native]).groupby(['_T', '_STATION'], as_index=False)[native].first()
+            if tab.empty:
+                data = np.full((len(times), len(stations)), np.nan, dtype='float32')
+            else:
+                pivot = tab.pivot(index='_T', columns='_STATION', values=native)
+                pivot = pivot.reindex(index=times, columns=stations)
+                data = pivot.to_numpy(dtype='float32')
+            ds[alias] = (('T', 'station'), data)
+
+        meta_idx = meta.set_index('station').reindex(stations)
+        for c in ('LAT', 'LON', 'ELEV'):
+            if c in meta_idx:
+                ds = ds.assign_coords({c: ('station', pd.to_numeric(meta_idx[c], errors='coerce').to_numpy(dtype=float))})
+        if 'NAME' in meta_idx:
+            ds = ds.assign_coords(NAME=('station', meta_idx['NAME'].fillna('').astype(str).to_numpy()))
+        if attrs:
+            ds.attrs.update(attrs)
+        return ds
+
+
+    def WAS_Download_SSOD_Daily(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        variables=('PRCP', 'TEMP', 'TMAX', 'TMIN', 'TDEW', 'SLP', 'SP', 'WIND', 'GUST'),
+        include_flags=True,
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+    ):
+        """
+        Download NOAA/NCEI Synoptic Summary of the Day Version 2 (SSODv2).
+
+        Access strategy
+        ---------------
+        1. Select GHCNh candidate stations from the official station list.
+        2. Try the official SSODv2 station/year file first:
+               .../access/by-year/YYYY/ssod_<GHCN_ID>_YYYY.csv
+           and the documented upper-case ``SSOD_`` variant.
+        3. If the station/year file is absent, fall back to the official
+           period-of-record station file:
+               .../access/by-station/SSOD_<GHCN_ID>.csv
+           then extract only the requested year locally.
+
+        The fallback is important for the current/incomplete year because the
+        SSODv2 product is updated daily but the population of the ``by-year``
+        tree can lag or can differ from the complete GHCNh candidate list.
+
+        Notes
+        -----
+        The GHCNh station list is a *candidate* list. Not every GHCNh station
+        necessarily has an SSODv2 daily-summary file for every requested year.
+
+        Output
+        ------
+        Daily_SSOD_<start>_<end>.nc
+            WASS2S NetCDF with dimensions ``T, station`` and coordinates
+            LAT/LON/ELEV/NAME.
+
+        Stations_SSOD_candidates_<start>_<end>.csv
+            All GHCNh stations geographically inside ``area``.
+
+        Stations_SSOD_<start>_<end>.csv
+            Only stations for which at least one SSODv2 record was actually
+            obtained in the requested period.
+
+        Native SSODv2 units are preserved:
+            temperature degC, precipitation mm, pressure hPa, wind m s-1,
+            visibility km, snow depth cm.
+        """
+        from pathlib import Path
+        import pandas as pd
+        import numpy as np
+
+        variables = [variables] if isinstance(variables, str) else list(variables)
+
+        native_map = {
+            'PRCP': ('total_precipitation',),
+            'TEMP': ('mean_temperature',),
+            'TMAX': ('max_temperature',),
+            'TMIN': ('min_temperature',),
+            'TDEW': ('mean_dew_point_temperature',),
+            'SLP': ('mean_sea_level_pressure',),
+            'SP': ('mean_station_level_pressure',),
+            'WIND': ('mean_wind_speed',),
+            'WINDMAX': ('max_wind_speed',),
+            'GUST': ('max_wind_gust',),
+            'VISIB': ('mean_visibility',),
+            'SNOW': ('Snow Depth', 'snow_depth', 'mean_snow_depth'),
+        }
+
+        unknown = [v for v in variables if v not in native_map]
+        if unknown:
+            raise ValueError(
+                f'Unsupported SSOD variable(s): {unknown}. '
+                f'Supported: {sorted(native_map)}'
+            )
+
+        year_start = int(year_start)
+        year_end = int(year_end)
+        if year_end < year_start:
+            raise ValueError('year_end must be >= year_start.')
+
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        cache = out_dir / '.ssod_v2_cache'
+        cache.mkdir(parents=True, exist_ok=True)
+
+        by_year_cache = cache / 'by_year'
+        by_station_cache = cache / 'by_station'
+        by_year_cache.mkdir(parents=True, exist_ok=True)
+        by_station_cache.mkdir(parents=True, exist_ok=True)
+
+        final = out_dir / f'Daily_SSOD_{year_start}_{year_end}.nc'
+        stations_candidates_csv = (
+            out_dir / f'Stations_SSOD_candidates_{year_start}_{year_end}.csv'
+        )
+        stations_csv = out_dir / f'Stations_SSOD_{year_start}_{year_end}.csv'
+        flags_csv = out_dir / f'SSOD_Flags_{year_start}_{year_end}.csv.gz'
+
+        if final.exists() and not force_download:
+            print(f'{final} already exists. Skipping.')
+            return final
+
+        # ------------------------------------------------------------------
+        # GHCNh candidate station inventory.
+        # ------------------------------------------------------------------
+        meta_candidates = self._WAS_GHCNh_station_list(
+            cache / 'ghcnh-station-list.csv',
+            area=area,
+            force_download=False,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+        )
+
+        if meta_candidates.empty:
+            raise RuntimeError(
+                f'No GHCNh station candidates found inside area={area}'
+            )
+
+        meta_candidates.to_csv(stations_candidates_csv, index=False)
+
+        print(
+            f'[SSOD] selected {len(meta_candidates)} GHCNh candidate station(s) '
+            f'inside area.'
+        )
+        print(
+            '[SSOD] note: GHCNh candidates are not guaranteed to have an '
+            'SSODv2 file for every year.'
+        )
+
+        base_year = (
+            'https://www.ncei.noaa.gov/oa/'
+            'synoptic-summary-of-the-day/v2/access/by-year'
+        )
+        base_station = (
+            'https://www.ncei.noaa.gov/oa/'
+            'synoptic-summary-of-the-day/v2/access/by-station'
+        )
+
+        frames = []
+        flag_frames = []
+        successful_stations = set()
+
+        # Small status registry for a useful final error message.
+        status_rows = []
+
+        def _read_csv(path):
+            try:
+                df = pd.read_csv(path, dtype=str, low_memory=False)
+            except Exception as exc:
+                print(f'[SSOD] cannot parse {Path(path).name}: {exc}')
+                return None
+            if df.empty:
+                return None
+            return df
+
+        def _filter_one_year(df, station, year):
+            """
+            Keep only records in ``year`` and make the station identifier
+            explicit if NCEI omitted the STATION column.
+            """
+            date_col = self._WAS_find_column(
+                df.columns,
+                'DATE',
+                'date',
+            )
+            if date_col is None:
+                return None
+
+            dt = pd.to_datetime(df[date_col], errors='coerce')
+            keep = dt.dt.year.eq(int(year))
+
+            out = df.loc[keep].copy()
+            if out.empty:
+                return None
+
+            station_col = self._WAS_find_column(
+                out.columns,
+                'STATION',
+                'Station_ID',
+                'station',
+            )
+            if station_col is None:
+                out['STATION'] = str(station)
+            else:
+                # Keep the file's GHCN identifier when present, but fill any
+                # missing values deterministically.
+                out[station_col] = (
+                    out[station_col]
+                    .fillna(str(station))
+                    .astype(str)
+                    .str.strip()
+                )
+
+            return out
+
+        def _collect_flags(df):
+            if not include_flags or df is None or df.empty:
+                return
+
+            wanted = []
+            for c in df.columns:
+                cl = str(c).lower()
+                if (
+                    'measurement_code' in cl
+                    or cl.endswith('_attributes')
+                    or 'quality' in cl
+                    or cl.startswith('qc_')
+                    or cl.endswith('_qc')
+                ):
+                    wanted.append(c)
+
+            date_col = self._WAS_find_column(
+                df.columns,
+                'DATE',
+                'date',
+            )
+            station_col = self._WAS_find_column(
+                df.columns,
+                'STATION',
+                'Station_ID',
+                'station',
+            )
+
+            base_cols = [
+                c for c in (station_col, date_col)
+                if c is not None
+            ]
+
+            selected = base_cols + [
+                c for c in wanted
+                if c not in base_cols
+            ]
+
+            if selected and date_col is not None:
+                flag_frames.append(df[selected].copy())
+
+        for year in range(year_start, year_end + 1):
+            year_cache = by_year_cache / str(year)
+            year_cache.mkdir(parents=True, exist_ok=True)
+
+            got = 0
+            hit_by_year = 0
+            hit_by_station = 0
+
+            for station in meta_candidates['station'].astype(str):
+                station = station.strip()
+                if not station:
+                    continue
+
+                target = year_cache / f'ssod_{station}_{year}.csv'
+
+                # ----------------------------------------------------------
+                # 1) Reuse extracted year cache when available.
+                # ----------------------------------------------------------
+                df_year = None
+                source_kind = None
+
+                if (
+                    target.exists()
+                    and target.stat().st_size > 0
+                    and not force_download
+                ):
+                    cached = _read_csv(target)
+                    if cached is not None:
+                        df_year = _filter_one_year(
+                            cached,
+                            station,
+                            year,
+                        )
+                        if df_year is not None:
+                            source_kind = 'year-cache'
+
+                # ----------------------------------------------------------
+                # 2) Official station/year archive.
+                # ----------------------------------------------------------
+                if df_year is None:
+                    year_urls = [
+                        f'{base_year}/{year}/ssod_{station}_{year}.csv',
+                        f'{base_year}/{year}/SSOD_{station}_{year}.csv',
+                    ]
+
+                    ok = False
+                    for url in year_urls:
+                        ok = self._WAS_HTTP_download_cached(
+                            url,
+                            target,
+                            force_download=force_download,
+                            max_retries=max_retries,
+                            retry_delay=retry_delay,
+                            quiet_404=True,
+                        )
+                        if ok:
+                            break
+
+                    if ok:
+                        downloaded = _read_csv(target)
+                        if downloaded is not None:
+                            df_year = _filter_one_year(
+                                downloaded,
+                                station,
+                                year,
+                            )
+                            if df_year is not None:
+                                source_kind = 'by-year'
+                                hit_by_year += 1
+
+                # ----------------------------------------------------------
+                # 3) Official period-of-record station fallback.
+                # ----------------------------------------------------------
+                if df_year is None:
+                    por_target = by_station_cache / f'SSOD_{station}.csv'
+
+                    por_urls = [
+                        f'{base_station}/SSOD_{station}.csv',
+                        f'{base_station}/ssod_{station}.csv',
+                    ]
+
+                    por_ok = (
+                        por_target.exists()
+                        and por_target.stat().st_size > 0
+                        and not force_download
+                    )
+
+                    if not por_ok:
+                        for url in por_urls:
+                            por_ok = self._WAS_HTTP_download_cached(
+                                url,
+                                por_target,
+                                force_download=force_download,
+                                max_retries=max_retries,
+                                retry_delay=retry_delay,
+                                quiet_404=True,
+                            )
+                            if por_ok:
+                                break
+
+                    if por_ok:
+                        por = _read_csv(por_target)
+                        if por is not None:
+                            df_year = _filter_one_year(
+                                por,
+                                station,
+                                year,
+                            )
+
+                        if df_year is not None:
+                            source_kind = 'by-station'
+                            hit_by_station += 1
+
+                            # Materialize a small year-specific cache so the
+                            # next run does not have to re-read a potentially
+                            # long period-of-record station CSV.
+                            try:
+                                df_year.to_csv(target, index=False)
+                            except Exception as exc:
+                                print(
+                                    f'[SSOD] warning: could not write '
+                                    f'{target.name}: {exc}'
+                                )
+
+                if df_year is None:
+                    status_rows.append({
+                        'station': station,
+                        'year': int(year),
+                        'status': 'no_ssod_file_or_no_records',
+                    })
+                    continue
+
+                frames.append(df_year)
+                successful_stations.add(station)
+                got += 1
+
+                status_rows.append({
+                    'station': station,
+                    'year': int(year),
+                    'status': source_kind or 'available',
+                })
+
+                _collect_flags(df_year)
+
+            print(
+                f'[SSOD] {year}: {got}/{len(meta_candidates)} candidate '
+                f'station files/records available '
+                f'(by-year={hit_by_year}, by-station fallback={hit_by_station}).'
+            )
+
+        # ------------------------------------------------------------------
+        # Fail with diagnostics rather than a generic "0/58" message.
+        # ------------------------------------------------------------------
+        status_csv = (
+            out_dir / f'SSOD_Access_Status_{year_start}_{year_end}.csv'
+        )
+        if status_rows:
+            pd.DataFrame(status_rows).to_csv(status_csv, index=False)
+
+        if not frames:
+            raise RuntimeError(
+                'No SSODv2 records could be obtained for the requested '
+                f'area/period. {len(meta_candidates)} GHCNh candidate station(s) '
+                'were tested using both official NCEI access modes: '
+                'station/year files and period-of-record by-station files. '
+                f'Access diagnostics were saved to {status_csv}. '
+                'A GHCNh station being inside the bounding box does not imply '
+                'that SSODv2 has a daily-summary record for that station/year.'
+            )
+
+        # ------------------------------------------------------------------
+        # Restrict metadata to stations that actually supplied SSOD data.
+        # ------------------------------------------------------------------
+        meta = meta_candidates.loc[
+            meta_candidates['station'].astype(str).isin(
+                sorted(successful_stations)
+            )
+        ].copy()
+
+        meta = meta.sort_values('station').reset_index(drop=True)
+        meta.to_csv(stations_csv, index=False)
+
+        print(
+            f'[SSOD] actual SSODv2 stations retained: '
+            f'{len(meta)}/{len(meta_candidates)}.'
+        )
+
+        long = pd.concat(
+            frames,
+            ignore_index=True,
+            sort=False,
+        )
+
+        # De-duplicate deterministic station/day records if a file was seen
+        # through both a cache and a fallback across interrupted runs.
+        station_col = self._WAS_find_column(
+            long.columns,
+            'STATION',
+            'Station_ID',
+            'station',
+        )
+        date_col = self._WAS_find_column(
+            long.columns,
+            'DATE',
+            'date',
+        )
+        if station_col is not None and date_col is not None:
+            long['_SSOD_DATE_SORT'] = pd.to_datetime(
+                long[date_col],
+                errors='coerce',
+            )
+            long = (
+                long.sort_values(
+                    [station_col, '_SSOD_DATE_SORT']
+                )
+                .drop_duplicates(
+                    [station_col, '_SSOD_DATE_SORT'],
+                    keep='last',
+                )
+                .drop(columns=['_SSOD_DATE_SORT'])
+            )
+
+        _now = pd.Timestamp.utcnow()
+        if _now.tzinfo is not None:
+            _now = _now.tz_convert(None)
+
+        effective_end = min(
+            pd.Timestamp(
+                year_end,
+                12,
+                31,
+                23,
+                59,
+                59,
+            ),
+            _now,
+        )
+
+        ds = self._WAS_station_dataset_from_long(
+            long,
+            meta,
+            variables,
+            native_map,
+            start=f'{year_start}-01-01',
+            end=effective_end,
+            frequency='daily',
+            full_calendar=True,
+            attrs={
+                'source': (
+                    'NOAA NCEI Synoptic Summary of the Day Version 2'
+                ),
+                'access': (
+                    'official NCEI direct WAF: by-year station CSV with '
+                    'by-station period-of-record fallback'
+                ),
+                'summary_day': '00-23 UTC',
+                'station_metadata_csv': str(stations_csv),
+                'candidate_station_metadata_csv': str(
+                    stations_candidates_csv
+                ),
+                'access_status_csv': str(status_csv),
+                'n_candidate_stations': int(len(meta_candidates)),
+                'n_available_stations': int(len(meta)),
+                'WASS2S_dimensions': 'T,station',
+            },
+        )
+
+        units = {
+            'PRCP': 'mm/day',
+            'TEMP': 'degC',
+            'TMAX': 'degC',
+            'TMIN': 'degC',
+            'TDEW': 'degC',
+            'SLP': 'hPa',
+            'SP': 'hPa',
+            'WIND': 'm s-1',
+            'WINDMAX': 'm s-1',
+            'GUST': 'm s-1',
+            'VISIB': 'km',
+            'SNOW': 'cm',
+        }
+
+        for v in variables:
+            ds[v].attrs['units'] = units[v]
+
+        enc = {
+            v: {
+                'zlib': True,
+                'complevel': 4,
+                'dtype': 'float32',
+                '_FillValue': -9999.0,
+            }
+            for v in variables
+        }
+
+        _was_write_netcdf(ds, final, encoding=enc)
+        ds.close()
+
+        if include_flags and flag_frames:
+            (
+                pd.concat(
+                    flag_frames,
+                    ignore_index=True,
+                    sort=False,
+                )
+                .to_csv(
+                    flags_csv,
+                    index=False,
+                    compression='gzip',
+                )
+            )
+            print(f'[SSOD] flags saved: {flags_csv}')
+
+        print(f'[SSOD] access diagnostics: {status_csv}')
+        print(f'[SSOD] saved: {final}')
+        return final
+
+
+    def WAS_Download_GHCNh_Hourly(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        variables=('PRCP', 'TEMP', 'TDEW', 'RH', 'SLP', 'SP', 'WIND', 'WDIR', 'GUST'),
+        include_qc=True,
+        include_provenance=True,
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+    ):
+        """
+        Download NOAA Global Historical Climatology Network hourly (GHCNh).
+
+        Uses official station/year PSV files from the NCEI direct archive.
+        Timestamps are kept at their actual reported minute; no unsafe hourly
+        resampling or precipitation summation is performed.
+        """
+        from pathlib import Path
+        import pandas as pd
+        import numpy as np
+
+        variables = [variables] if isinstance(variables, str) else list(variables)
+        native_map = {
+            'PRCP': ('precipitation', 'Precipitation'),
+            'TEMP': ('temperature', 'Temperature'),
+            'TDEW': ('dew_point_temperature', 'Dew Point Temperature'),
+            'RH': ('relative_humidity', 'Relative Humidity'),
+            'SLP': ('sea_level_pressure', 'Sea Level Pressure'),
+            'SP': ('station_level_pressure', 'Station Level Pressure'),
+            'WIND': ('wind_speed', 'Wind Speed'),
+            'WDIR': ('wind_direction', 'Wind Direction'),
+            'GUST': ('wind_gust', 'Wind Gust'),
+            'VISIB': ('visibility', 'Visibility'),
+            'ALTIMETER': ('altimeter', 'Altimeter'),
+            'SNOW': ('snow_depth', 'Snow Depth'),
+        }
+        unknown = [v for v in variables if v not in native_map]
+        if unknown:
+            raise ValueError(f'Unsupported GHCNh variable(s): {unknown}. Supported: {sorted(native_map)}')
+
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / '.ghcnh_cache'
+        cache.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f'Hourly_GHCNh_{year_start}_{year_end}.nc'
+        stations_csv = out_dir / f'Stations_GHCNh_{year_start}_{year_end}.csv'
+        provenance_csv = out_dir / f'GHCNh_QC_Provenance_{year_start}_{year_end}.csv.gz'
+        if final.exists() and not force_download:
+            print(f'{final} already exists. Skipping.')
+            return final
+
+        meta = self._WAS_GHCNh_station_list(
+            cache / 'ghcnh-station-list.csv', area=area,
+            force_download=False, max_retries=max_retries, retry_delay=retry_delay,
+        )
+        if meta.empty:
+            raise RuntimeError(f'No GHCNh stations found inside area={area}')
+        meta.to_csv(stations_csv, index=False)
+        print(f'[GHCNh] selected {len(meta)} stations inside area.')
+
+        base = 'https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/access/by-year'
+        frames = []
+        provenance = []
+        for year in range(int(year_start), int(year_end) + 1):
+            year_cache = cache / 'by_year' / str(year)
+            year_cache.mkdir(parents=True, exist_ok=True)
+            got = 0
+            for station in meta['station'].astype(str):
+                target = year_cache / f'GHCNh_{station}_{year}.psv'
+                url = f'{base}/{year}/psv/GHCNh_{station}_{year}.psv'
+                ok = self._WAS_HTTP_download_cached(
+                    url, target, force_download=force_download,
+                    max_retries=max_retries, retry_delay=retry_delay,
+                    quiet_404=True,
+                )
+                if not ok:
+                    continue
+                try:
+                    df = pd.read_csv(target, sep='|', dtype=str, low_memory=False)
+                except Exception as exc:
+                    print(f'[GHCNh] cannot parse {target.name}: {exc}')
+                    continue
+                if df.empty:
+                    continue
+
+                # GHCNh PSV uses separate Y/M/D/H/M columns. Build DATE explicitly
+                # when a ready timestamp column is absent.
+                date_col = self._WAS_find_column(df.columns, 'DATE', 'datetime', 'timestamp')
+                if date_col is None:
+                    ycol = self._WAS_find_column(df.columns, 'Year')
+                    mcol = self._WAS_find_column(df.columns, 'Month')
+                    dcol = self._WAS_find_column(df.columns, 'Day')
+                    hcol = self._WAS_find_column(df.columns, 'Hour')
+                    mincol = self._WAS_find_column(df.columns, 'Minute')
+                    if all(c is not None for c in (ycol, mcol, dcol)):
+                        stamp = pd.DataFrame({
+                            'year': pd.to_numeric(df[ycol], errors='coerce'),
+                            'month': pd.to_numeric(df[mcol], errors='coerce'),
+                            'day': pd.to_numeric(df[dcol], errors='coerce'),
+                            'hour': pd.to_numeric(df[hcol], errors='coerce').fillna(0) if hcol else 0,
+                            'minute': pd.to_numeric(df[mincol], errors='coerce').fillna(0) if mincol else 0,
+                        })
+                        df['DATE'] = pd.to_datetime(stamp, errors='coerce')
+                    else:
+                        print(f'[GHCNh] no timestamp columns in {target.name}; skipped.')
+                        continue
+
+                stcol = self._WAS_find_column(df.columns, 'STATION', 'Station_ID', 'GHCN_ID')
+                if stcol is None:
+                    df['STATION'] = station
+                frames.append(df)
+                got += 1
+
+                if include_qc or include_provenance:
+                    keep = []
+                    for c in df.columns:
+                        cl = str(c).lower()
+                        if include_qc and ('quality_code' in cl or 'measurement_code' in cl):
+                            keep.append(c)
+                        if include_provenance and any(x in cl for x in ('report_type', 'source_code', 'source_station_id')):
+                            keep.append(c)
+                    date_col2 = self._WAS_find_column(df.columns, 'DATE')
+                    stcol2 = self._WAS_find_column(df.columns, 'STATION', 'Station_ID', 'GHCN_ID')
+                    if keep and date_col2 is not None:
+                        cols = [c for c in (stcol2, date_col2) if c is not None] + sorted(set(keep))
+                        provenance.append(df[cols].copy())
+            print(f'[GHCNh] {year}: {got}/{len(meta)} station files available.')
+
+        if not frames:
+            raise RuntimeError('No GHCNh station files could be downloaded for the requested area/period.')
+        long = pd.concat(frames, ignore_index=True, sort=False)
+        _now = pd.Timestamp.utcnow()
+        if _now.tzinfo is not None:
+            _now = _now.tz_convert(None)
+        effective_end = min(pd.Timestamp(int(year_end), 12, 31, 23, 59, 59), _now)
+        ds = self._WAS_station_dataset_from_long(
+            long, meta, variables, native_map,
+            start=f'{year_start}-01-01', end=effective_end,
+            frequency='hourly', full_calendar=False,
+            attrs={
+                'source': 'NOAA NCEI Global Historical Climatology Network hourly (GHCNh)',
+                'access': 'direct NCEI WAF station/year PSV',
+                'time_axis': 'actual report timestamps; not resampled',
+                'precipitation_note': 'GHCNh precipitation may represent different accumulation periods; inspect Measurement_Code before temporal aggregation.',
+                'station_metadata_csv': str(stations_csv),
+                'WASS2S_dimensions': 'T,station',
+            },
+        )
+        units = {
+            'PRCP': 'mm', 'TEMP': 'degC', 'TDEW': 'degC', 'RH': '%',
+            'SLP': 'hPa', 'SP': 'hPa', 'WIND': 'm s-1', 'WDIR': 'degree',
+            'GUST': 'm s-1', 'VISIB': 'km', 'ALTIMETER': 'hPa', 'SNOW': 'cm',
+        }
+        for v in variables:
+            ds[v].attrs['units'] = units[v]
+        enc = {v: {'zlib': True, 'complevel': 4, 'dtype': 'float32', '_FillValue': -9999.0} for v in variables}
+        _was_write_netcdf(ds, final, encoding=enc)
+        ds.close()
+        if provenance:
+            pd.concat(provenance, ignore_index=True, sort=False).to_csv(
+                provenance_csv, index=False, compression='gzip'
+            )
+            print(f'[GHCNh] QC/provenance saved: {provenance_csv}')
+        print(f'[GHCNh] saved: {final}')
+        return final
+
+
+    def WAS_Download_ISD_Hourly(self, *args, **kwargs):
+        """Compatibility alias: new WASS2S workflows use NOAA GHCNh."""
+        print('[INFO] WAS_Download_ISD_Hourly uses the current GHCNh backend.')
+        return self.WAS_Download_GHCNh_Hourly(*args, **kwargs)
+
+
+    def WAS_Download_GSOD_Daily(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        variables=('PRCP', 'TEMP', 'TMAX', 'TMIN', 'TDEW', 'SLP', 'SP', 'WIND', 'GUST'),
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+    ):
+        """
+        Download legacy NOAA Global Summary of the Day (GSOD) from its native
+        annual station-file archive. Direct GSOD files use legacy imperial units;
+        this method converts them to SI/metric WASS2S variables.
+        """
+        from pathlib import Path
+        import pandas as pd
+        import numpy as np
+
+        variables = [variables] if isinstance(variables, str) else list(variables)
+        native_map = {
+            'TEMP': ('TEMP',), 'TDEW': ('DEWP',), 'SLP': ('SLP',), 'SP': ('STP',),
+            'VISIB': ('VISIB',), 'WIND': ('WDSP',), 'WINDMAX': ('MXSPD',),
+            'GUST': ('GUST',), 'TMAX': ('MAX',), 'TMIN': ('MIN',), 'PRCP': ('PRCP',),
+            'SNOW': ('SNDP',),
+        }
+        unknown = [v for v in variables if v not in native_map]
+        if unknown:
+            raise ValueError(f'Unsupported GSOD variable(s): {unknown}. Supported: {sorted(native_map)}')
+
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / '.gsod_cache'
+        cache.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f'Daily_GSOD_{year_start}_{year_end}.nc'
+        stations_csv = out_dir / f'Stations_GSOD_{year_start}_{year_end}.csv'
+        if final.exists() and not force_download:
+            print(f'{final} already exists. Skipping.')
+            return final
+
+        history_file = cache / 'isd-history.csv'
+        history_url = 'https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv'
+        if not self._WAS_HTTP_download_cached(
+            history_url, history_file, force_download=False,
+            max_retries=max_retries, retry_delay=retry_delay,
+        ):
+            raise RuntimeError(f'Could not download station history: {history_url}')
+        hist = pd.read_csv(history_file, dtype=str, low_memory=False)
+        col = {str(c).strip().upper(): c for c in hist.columns}
+        usaf = col.get('USAF'); wban = col.get('WBAN')
+        latc = col.get('LAT'); lonc = col.get('LON'); elevc = col.get('ELEV(M)') or col.get('ELEV')
+        namec = col.get('STATION NAME') or col.get('STATION_NAME')
+        beginc = col.get('BEGIN'); endc = col.get('END')
+        if None in (usaf, wban, latc, lonc):
+            raise ValueError(f'Unexpected isd-history.csv columns: {list(hist.columns)}')
+
+        hist['LAT'] = pd.to_numeric(hist[latc], errors='coerce')
+        hist['LON'] = pd.to_numeric(hist[lonc], errors='coerce')
+        north, west, south, east = [float(v) for v in area]
+        lat_ok = hist['LAT'].between(south, north, inclusive='both')
+        lon_ok = hist['LON'].between(west, east, inclusive='both') if west <= east else ((hist['LON'] >= west) | (hist['LON'] <= east))
+        hist = hist.loc[lat_ok & lon_ok].copy()
+        if beginc and endc:
+            hist['_BEGIN'] = pd.to_datetime(hist[beginc], format='%Y%m%d', errors='coerce')
+            hist['_END'] = pd.to_datetime(hist[endc], format='%Y%m%d', errors='coerce')
+            hist = hist[(hist['_END'].isna() | (hist['_END'] >= pd.Timestamp(year_start,1,1))) &
+                        (hist['_BEGIN'].isna() | (hist['_BEGIN'] <= pd.Timestamp(year_end,12,31)))]
+
+        hist['USAF6'] = hist[usaf].fillna('').astype(str).str.replace(r'\.0$', '', regex=True).str.zfill(6)
+        hist['WBAN5'] = hist[wban].fillna('').astype(str).str.replace(r'\.0$', '', regex=True).str.zfill(5)
+        hist['station'] = hist['USAF6'] + hist['WBAN5']
+        hist['ELEV'] = pd.to_numeric(hist[elevc], errors='coerce') if elevc else np.nan
+        hist['NAME'] = hist[namec].fillna('').astype(str) if namec else ''
+        meta = hist[['station','LAT','LON','ELEV','NAME']].drop_duplicates('station').sort_values('station')
+        if meta.empty:
+            raise RuntimeError(f'No GSOD/ISD stations found inside area={area}')
+        meta.to_csv(stations_csv, index=False)
+        print(f'[GSOD] selected {len(meta)} stations inside area.')
+
+        base = 'https://www.ncei.noaa.gov/data/global-summary-of-the-day/access'
+        frames = []
+        for year in range(int(year_start), int(year_end) + 1):
+            year_cache = cache / str(year)
+            year_cache.mkdir(parents=True, exist_ok=True)
+            got = 0
+            for station in meta['station'].astype(str):
+                target = year_cache / f'{station}.csv'
+                url = f'{base}/{year}/{station}.csv'
+                ok = self._WAS_HTTP_download_cached(
+                    url, target, force_download=force_download,
+                    max_retries=max_retries, retry_delay=retry_delay,
+                    quiet_404=True,
+                )
+                if not ok:
+                    continue
+                try:
+                    df = pd.read_csv(target, dtype=str, low_memory=False)
+                except Exception as exc:
+                    print(f'[GSOD] cannot parse {target.name}: {exc}')
+                    continue
+                if df.empty:
+                    continue
+                frames.append(df)
+                got += 1
+            print(f'[GSOD] {year}: {got}/{len(meta)} station files available.')
+
+        if not frames:
+            raise RuntimeError('No GSOD station files could be downloaded for the requested area/period.')
+        long = pd.concat(frames, ignore_index=True, sort=False)
+
+        # Clean/convert the legacy direct-file units BEFORE matrix construction.
+        def numeric_column(name):
+            c = self._WAS_find_column(long.columns, name)
+            if c is None:
+                return None
+            vals = pd.to_numeric(
+                long[c].astype(str).str.extract(r'([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)', expand=False),
+                errors='coerce',
+            )
+            return c, vals
+
+        # Missing sentinels and conversions: F -> C, inches -> mm, miles -> km, knots -> m/s.
+        for name in ('TEMP','DEWP','MAX','MIN'):
+            hit = numeric_column(name)
+            if hit:
+                c, v = hit; v = v.where(v < 9999.0); long[c] = (v - 32.0) * (5.0/9.0)
+        for name in ('SLP','STP'):
+            hit = numeric_column(name)
+            if hit:
+                c, v = hit; long[c] = v.where(v < 9999.0)
+        hit = numeric_column('VISIB')
+        if hit:
+            c, v = hit; long[c] = v.where(v < 999.0) * 1.609344
+        for name in ('WDSP','MXSPD','GUST'):
+            hit = numeric_column(name)
+            if hit:
+                c, v = hit; long[c] = v.where(v < 999.0) * 0.514444444
+        hit = numeric_column('PRCP')
+        if hit:
+            c, v = hit; long[c] = v.where(v < 99.0) * 25.4
+        hit = numeric_column('SNDP')
+        if hit:
+            c, v = hit; long[c] = v.where(v < 999.0) * 25.4
+
+        ds = self._WAS_station_dataset_from_long(
+            long, meta, variables, native_map,
+            start=f'{year_start}-01-01', end=f'{year_end}-12-31 23:59:59',
+            frequency='daily', full_calendar=True,
+            attrs={
+                'source': 'NOAA NCEI Global Summary of the Day (GSOD) legacy',
+                'access': 'direct NCEI GSOD annual station CSV archive',
+                'units_conversion': 'legacy direct-file imperial units converted to SI/metric',
+                'station_metadata_csv': str(stations_csv),
+                'WASS2S_dimensions': 'T,station',
+            },
+        )
+        units = {
+            'PRCP':'mm/day','TEMP':'degC','TMAX':'degC','TMIN':'degC','TDEW':'degC',
+            'SLP':'hPa','SP':'hPa','WIND':'m s-1','WINDMAX':'m s-1','GUST':'m s-1',
+            'VISIB':'km','SNOW':'mm',
+        }
+        for v in variables:
+            ds[v].attrs['units'] = units[v]
+        enc = {v: {'zlib': True, 'complevel': 4, 'dtype': 'float32', '_FillValue': -9999.0} for v in variables}
+        _was_write_netcdf(ds, final, encoding=enc)
+        ds.close()
+        print(f'[GSOD] saved: {final}')
+        return final
+
+
+    def WAS_Download_CAMSOPI_Monthly(
+        self,
+        dir_to_save,
+        year_start,
+        year_end,
+        area,
+        force_download=False,
+        max_retries=3,
+        retry_delay=5,
+        include_components=True,
+        convert_to_monthly_total=True,
+    ):
+        """Download CPC CAMS-OPI monthly fields (2.5°) and save WASS2S T/Y/X."""
+        from pathlib import Path
+        import calendar
+        import gzip
+        import time as _time
+        import numpy as np
+        import pandas as pd
+        import requests
+        import xarray as xr
+
+        out_dir = Path(dir_to_save)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache = out_dir / ".camsopi_cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"Monthly_CAMSOPI_PRCP_{year_start}_{year_end}.nc"
+        if final.exists() and not force_download:
+            print(f"{final} already exists. Skipping.")
+            return final
+
+        base = "https://ftp.cpc.ncep.noaa.gov/precip/data-req/cams_opi_v0208"
+        X = 1.25 + np.arange(144) * 2.5
+        X = ((X + 180.0) % 360.0) - 180.0
+        Y = -88.75 + np.arange(72) * 2.5
+        north, west, south, east = [float(v) for v in area]
+        months = pd.period_range(f"{year_start}-01", f"{year_end}-12", freq="M")
+        records = []
+        times = []
+        missing = []
+
+        for per in months:
+            ym = per.strftime("%Y%m")
+            local = cache / f"cams_opi_merged.{ym}"
+            payload = None
+            # Older files are gzip-compressed; recent files may be uncompressed.
+            candidates = [f"{base}/cams_opi_merged.{ym}.gz", f"{base}/cams_opi_merged.{ym}"]
+            if local.exists() and not force_download:
+                cached = local.read_bytes()
+                if len(cached) == 7 * 72 * 144 * 4:
+                    payload = cached
+            if payload is None:
+                for url in candidates:
+                    for attempt in range(1, max_retries+1):
+                        try:
+                            r = requests.get(url, timeout=90)
+                            if r.status_code == 404:
+                                break
+                            r.raise_for_status()
+                            payload = gzip.decompress(r.content) if url.endswith(".gz") else r.content
+                            break
+                        except Exception as exc:
+                            if attempt < max_retries:
+                                _time.sleep(retry_delay)
+                            else:
+                                last_exc = exc
+                    if payload is not None:
+                        break
+            if payload is None:
+                missing.append(ym)
+                continue
+            arr = np.frombuffer(payload, dtype=">f4").astype("float32", copy=True)
+            expected = 7 * 72 * 144
+            if arr.size != expected:
+                raise ValueError(f"Unexpected CAMS-OPI file size for {ym}: {arr.size}, expected {expected}")
+            part = local.with_name(local.name + ".part")
+            part.write_bytes(payload)
+            part.replace(local)
+            arr = arr.reshape(7, 72, 144)
+            arr[arr <= -998.0] = np.nan
+            # Record order from camsopi.ctl: cams, camsn, opi, comb, xxxx, comba, gam.
+            ds = xr.Dataset(
+                {
+                    "PRCP_GAUGE_RATE": (("Y", "X"), arr[0]),
+                    "N_GAUGES": (("Y", "X"), arr[1]),
+                    "PRCP_OPI_RATE": (("Y", "X"), arr[2]),
+                    "PRCP_RATE": (("Y", "X"), arr[3]),
+                    "PRCP_ANOM_OLD_RATE": (("Y", "X"), arr[4]),
+                    "PRCP_ANOM_RATE": (("Y", "X"), arr[5]),
+                    "GAMMA_PERCENT": (("Y", "X"), arr[6]),
+                },
+                coords={"Y": Y, "X": X},
+            ).sortby("X").sortby("Y")
+            ds = ds.sel(X=slice(west, east), Y=slice(south, north))
+            days = calendar.monthrange(per.year, per.month)[1]
+            if convert_to_monthly_total:
+                ds["PRCP"] = (ds["PRCP_RATE"] * days).astype("float32")
+                ds["PRCP"].attrs["units"] = "mm/month"
+                if include_components:
+                    ds["PRCP_GAUGE"] = (ds["PRCP_GAUGE_RATE"] * days).astype("float32")
+                    ds["PRCP_OPI"] = (ds["PRCP_OPI_RATE"] * days).astype("float32")
+                    ds["PRCP_ANOM"] = (ds["PRCP_ANOM_RATE"] * days).astype("float32")
+                    ds["PRCP_GAUGE"].attrs["units"] = "mm/month"
+                    ds["PRCP_OPI"].attrs["units"] = "mm/month"
+                    ds["PRCP_ANOM"].attrs["units"] = "mm/month"
+            else:
+                ds = ds.rename({"PRCP_RATE": "PRCP"})
+                ds["PRCP"].attrs["units"] = "mm/day"
+                if include_components:
+                    for source, target in (("PRCP_GAUGE_RATE", "PRCP_GAUGE"), ("PRCP_OPI_RATE", "PRCP_OPI"), ("PRCP_ANOM_RATE", "PRCP_ANOM")):
+                        ds[target] = ds[source]
+                        ds[target].attrs["units"] = "mm/day"
+            keep = ["PRCP", "N_GAUGES", "GAMMA_PERCENT"]
+            if include_components:
+                keep += ["PRCP_GAUGE", "PRCP_OPI", "PRCP_ANOM"]
+            ds = ds[[v for v in keep if v in ds.data_vars]]
+            ds = ds.expand_dims(T=[pd.Timestamp(per.year, per.month, 1)])
+            records.append(ds)
+            times.append(per)
+
+        if not records:
+            raise RuntimeError("No CAMS-OPI monthly data could be downloaded.")
+        out = xr.concat(records, dim="T", join="exact").sortby("T")
+        requested_times = months.to_timestamp()
+        available_times = out["T"].values
+        out = out.reindex(T=requested_times)
+        out["SOURCE_AVAILABLE"] = ("T", np.isin(requested_times.values, available_times).astype("int8"))
+        out.attrs.update({
+            "source": "NOAA CPC CAMS-OPI",
+            "native_resolution": "2.5 degree",
+            "native_precipitation_units": "mm/day",
+            "missing_source_months": ",".join(missing),
+            "WASS2S_dimensions": "T,Y,X",
+        })
+        _was_write_netcdf(out, final, encoding={v: {'zlib': True, 'complevel': 4} for v in out.data_vars})
+        out.close()
+        print(f"Saved CAMS-OPI monthly: {final}")
+        return final
+
 
 #####
 
@@ -7077,3 +11309,15 @@ def plot_map(extent, title="Map"): # [west, east, south, north]
     plt.show()
 
 
+def _noaa_exact_month_indices(times, required_months):
+    """Find exact calendar months in monthly NOAA SST; never reuse a neighbour."""
+    months = np.asarray(times).astype("datetime64[M]")
+    indices = []
+    for year, month in required_months:
+        match = np.flatnonzero(months == np.datetime64(f"{year:04d}-{month:02d}", "M"))
+        if match.size == 0:
+            return None
+        if match.size != 1:
+            raise ValueError(f"NOAA SST: duplicate monthly records for {year}-{month:02d}")
+        indices.append(int(match[0]))
+    return indices

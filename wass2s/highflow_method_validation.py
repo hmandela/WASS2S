@@ -18,7 +18,7 @@ from typing import Any, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-try:
+if __package__:
     from .highwater_season_predictands_modeaware import (
         HighWaterConfig,
         _segment_sse_cost_matrix,
@@ -29,7 +29,7 @@ try:
         _monthday_to_doy,
         fit_station_highwater_regime,
     )
-except ImportError:  # pragma: no cover - flat layout
+else:  # pragma: no cover - flat layout
     from highwater_season_predictands_modeaware import (
         HighWaterConfig,
         _segment_sse_cost_matrix,

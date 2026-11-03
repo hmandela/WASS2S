@@ -72,7 +72,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-try:
+if __package__:
     from .highwater_season_predictands_modeaware import (
         HighWaterConfig,
         fit_station_highwater_regime,
@@ -93,7 +93,7 @@ try:
         fit_point_variogram,
         topkriging_predict,
     )
-except ImportError:  # pragma: no cover - flat layout
+else:  # pragma: no cover - flat layout
     from highwater_season_predictands_modeaware import (
         HighWaterConfig,
         fit_station_highwater_regime,
@@ -115,10 +115,10 @@ except ImportError:  # pragma: no cover - flat layout
         topkriging_predict,
     )
 
-try:
+if __package__:
     from .highflow_utils import (area_to_km2, align_spatial_grid, wrap_doy,
         circular_bias_mean, unwrap_biases, match_windows, window_day_set)
-except ImportError:
+else:
     from highflow_utils import (area_to_km2, align_spatial_grid, wrap_doy,
         circular_bias_mean, unwrap_biases, match_windows, window_day_set)
 

@@ -31,6 +31,7 @@ WAS_TransformData
         Cartopy map of the winning distribution per grid cell.
 """
 import xarray as xr
+from wass2s.was_scientific_utils import climate_cluster_map
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +41,7 @@ import xarray as xr
 # inputs along Y and runs the kernel across worker THREADS (numpy/scipy release
 # the GIL), returning an eager result identical to the original — chunking
 # changes execution, never values. Disable with WAS_GRID_PARALLEL=0; small
-# grids and any error fall back to plain xr.apply_ufunc.
+# grids use plain xr.apply_ufunc. Kernel errors propagate without rerunning.
 # ---------------------------------------------------------------------------
 def _grid_workers():
     import os
@@ -60,26 +61,24 @@ def _pufunc(func, *args, **kwargs):
     n = _grid_workers()
     if n <= 1:
         return xr.apply_ufunc(func, *args, **kwargs)
-    try:
-        new_args, chunked = [], False
-        for a in args:
-            if hasattr(a, "dims") and "Y" in getattr(a, "dims", ()):
-                ny = int(a.sizes.get("Y", 1))
-                if ny >= 2 * n:
-                    a = a.chunk({"Y": max(1, ny // n)})
-                    chunked = True
-            new_args.append(a)
-        if not chunked:
-            return xr.apply_ufunc(func, *args, **kwargs)
-        res = xr.apply_ufunc(func, *new_args, **kwargs)
-        return res.compute(scheduler="threads", num_workers=n)
-    except Exception:
-        return xr.apply_ufunc(func, *args, **kwargs)
+    new_args, chunked = [], False
+    for a in args:
+        if hasattr(a, "dims") and "Y" in a.dims:
+            ny = int(a.sizes.get("Y", 1))
+            if ny >= 2 * n:
+                a = a.chunk({"Y": max(1, ny // n)})
+                chunked = True
+        new_args.append(a)
+    res = xr.apply_ufunc(func, *new_args, **kwargs)
+    if chunked:
+        from dask import compute
+        return compute(*res, scheduler="threads", num_workers=n) if isinstance(res, tuple) else res.compute(scheduler="threads", num_workers=n)
+    return res
+
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from sklearn.cluster import KMeans
 from scipy.stats import (
@@ -89,8 +88,7 @@ from scipy.stats import (
 )
 import warnings
 
-# Suppress warnings that occur during fitting (convergence warnings)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
+# Do not change the application's global warning filters at import time.
 
 def inv_boxcox(y, lmbda):
     """Inverse Box-Cox transformation."""
@@ -102,6 +100,7 @@ def inv_yeojohnson(y, lmbda):
     """
     Inverse Yeo-Johnson transformation.
     """
+    y = np.asarray(y, dtype=float)
     out = np.zeros_like(y)
     pos = y >= 0
     neg = ~pos
@@ -243,6 +242,10 @@ class WAS_TransformData:
         else:
             method_da = method
 
+        allowed = {'none', 'log', 'square_root', 'box_cox', 'yeo_johnson',
+                   'reflect_log', 'reflect_yeo_johnson', 'clipping'}
+        if any(str(v) not in allowed for v in np.unique(method_da.values)):
+            raise ValueError("Unknown transformation method.")
         self.transform_methods = method_da
 
         # 2. Define the Core Transformation Logic (1D)
@@ -250,34 +253,34 @@ class WAS_TransformData:
             # Returns: (transformed_array, parameter)
             # parameter is lambda for boxcox/yeo, or NaN for others
             
-            out = arr.copy()
+            out = np.asarray(arr, dtype=float).copy()
             param = np.nan
             
-            mask = ~np.isnan(arr)
+            mask = np.isfinite(arr)
             vals = arr[mask]
             
             if len(vals) < 2 or method_str == 'none':
-                return out, param
+                return out, param, 'none'
 
             try:
                 if method_str == 'log':
-                    if np.all(vals > 0): out[mask] = np.log(vals)
+                    if not np.all(vals > 0): return out, param, 'none'
+                    out[mask] = np.log(vals)
                 
                 elif method_str == 'square_root':
-                    if np.all(vals >= 0): out[mask] = np.sqrt(vals)
+                    if not np.all(vals >= 0): return out, param, 'none'
+                    out[mask] = np.sqrt(vals)
                 
                 elif method_str == 'box_cox':
-                    if np.all(vals > 0):
-                        out[mask], param = boxcox(vals)
+                    if not np.all(vals > 0): return out, param, 'none'
+                    out[mask], param = boxcox(vals)
                 
                 elif method_str == 'yeo_johnson':
                     out[mask], param = yeojohnson(vals)
                 
                 elif method_str == 'reflect_log':
-                    # Reflect: new = log(max(vals) + 1 - vals) or simple reflection -vals
-                    # Assuming simple reflection based on previous code context:
-                    ref = -vals
-                    if np.all(ref > 0): out[mask] = np.log(ref)
+                    param = float(np.max(vals) + max(1.0, abs(np.max(vals))*1e-6))
+                    out[mask] = np.log(param - vals)
 
                 elif method_str == 'reflect_yeo_johnson':
                     out[mask], param = yeojohnson(-vals)
@@ -288,25 +291,51 @@ class WAS_TransformData:
                     out[mask] = np.clip(vals, lower, upper)
             
             except Exception:
-                pass # Return original if fail
+                return np.asarray(arr, dtype=float).copy(), np.nan, 'none'
             
-            return out, param
+            return out, param, method_str
 
         # 3. Apply using xarray wrapper
-        transformed, params = _pufunc(
+        transformed, params, effective_methods = _pufunc(
             _transform_core,
             self.data,
             self.transform_methods,
             input_core_dims=[['T'], []],
-            output_core_dims=[['T'], []],
+            output_core_dims=[['T'], [], []],
             vectorize=True,
             dask='parallelized',
-            output_dtypes=[float, float] 
+            output_dtypes=[float, float, object]
         )
 
-        self.transformed_data = transformed
+        self.transform_methods = effective_methods
+        self.transformed_data = transformed.transpose(*self.data.dims)
         self.transform_params = params # Now a DataArray of floats (lambdas)
         return self.transformed_data
+
+    def transform(self, data):
+        """Apply stored training transformations without refitting on new times.
+
+        Construct this object on each training fold and call
+        ``apply_transformation`` once, then ``transform`` on validation/forecast.
+        """
+        if self.transform_params is None:
+            raise ValueError("Run apply_transformation on the training data first.")
+        if bool((self.transform_methods == 'clipping').any()):
+            raise ValueError("Clipping is irreversible and has no fitted transform API.")
+        def apply(vec, method, param):
+            vec = np.asarray(vec, dtype=float)
+            if method == 'none': return vec
+            if method == 'log': return np.log(np.where(vec > 0, vec, np.nan))
+            if method == 'square_root': return np.sqrt(np.where(vec >= 0, vec, np.nan))
+            if method == 'reflect_log': return np.log(np.where(param > vec, param-vec, np.nan))
+            if method == 'box_cox': return boxcox(np.where(vec > 0, vec, np.nan), lmbda=float(param))
+            if method == 'yeo_johnson': return yeojohnson(vec, lmbda=float(param))
+            if method == 'reflect_yeo_johnson': return yeojohnson(-vec, lmbda=float(param))
+            raise ValueError(f"Unknown transformation {method!r}.")
+        out = _pufunc(apply, data, self.transform_methods, self.transform_params,
+                      input_core_dims=[['T'], [], []], output_core_dims=[['T']],
+                      vectorize=True, dask='parallelized', output_dtypes=[float])
+        return out.transpose(*data.dims)
 
     # ----------------------------------------------------------------------
     # 4. Inverse Transform 
@@ -336,6 +365,8 @@ class WAS_TransformData:
 
         if self.transform_params is None:
              raise ValueError("Transform parameters missing. Run apply_transformation() first.")
+        if bool((self.transform_methods == 'clipping').any()):
+            raise ValueError("Clipping cannot be inverted: tail information was discarded.")
 
         # 2. Define Inverse Logic
         def _inv_core(vec, method, param):
@@ -356,7 +387,9 @@ class WAS_TransformData:
                     return inv_yeojohnson(vec, param)
                 
                 if method == 'reflect_log':
-                    return -np.exp(vec)
+                    if not np.isfinite(param):
+                        return np.full_like(vec, np.nan, dtype=float)
+                    return param - np.exp(vec)
                 
                 if method == 'reflect_yeo_johnson':
                     if np.isnan(param): return -vec
@@ -370,7 +403,7 @@ class WAS_TransformData:
         # Note: We use xarray broadcasting. 
         # transform_params has (Y, X). target_data has (T_new, Y, X).
         # xarray automatically aligns them by Y and X.
-        return _pufunc(
+        restored = _pufunc(
             _inv_core,
             target_data,
             self.transform_methods,
@@ -381,6 +414,7 @@ class WAS_TransformData:
             dask='parallelized',
             output_dtypes=[float]
         )
+        return restored.transpose(*target_data.dims)
 
     # ----------------------------------------------------------------------
     # 5. Unified Distribution Fitting (Grid + Cluster modes)
@@ -427,11 +461,19 @@ class WAS_TransformData:
                 # 1. Select correct subset based on support
                 if is_discrete:
                     # Enforce integer inputs for discrete distributions
-                    current_sample = np.round(vals_pos)
-                    # Filter out any lingering non-integers or zeros if strict
-                    current_sample = current_sample[current_sample >= 0]
+                    # A discrete pmf cannot compete with a continuous density
+                    # in the same AIC ranking. Count-only maps remain supported.
+                    if any(n not in ('poisson','nbinom') for n in dist_candidates):
+                        continue
+                    if np.any(vals < 0) or np.any(vals != np.floor(vals)):
+                        continue
+                    current_sample = vals
                 elif name in ("lognorm", "gamma", "weibull_min", "expon"):
-                    current_sample = vals_pos
+                    # Every candidate must explain the SAME observations.
+                    # A positive-only fit silently dropping zeros is invalid.
+                    if np.any(vals <= 0):
+                        continue
+                    current_sample = vals
                 else:
                     current_sample = vals
 
@@ -446,7 +488,18 @@ class WAS_TransformData:
                         params = (mu, 0)
                         k = 1
                     elif name == "nbinom":
-                        params = dist_obj.fit(current_sample, floc=0)
+                        from scipy.optimize import minimize
+                        mu = float(current_sample.mean())
+                        if mu <= 0: continue
+                        variance = float(current_sample.var())
+                        n0 = max(1e-3, mu*mu/max(variance-mu, 1e-6))
+                        def nll(theta):
+                            n, mean = np.exp(theta)
+                            return -np.sum(nbinom.logpmf(current_sample,n,n/(n+mean)))
+                        fitted = minimize(nll,np.log([min(n0,1e6),mu]),method='L-BFGS-B',bounds=[(-14,20),(-14,20)])
+                        if not fitted.success: continue
+                        n, mean = np.exp(fitted.x)
+                        params = (n, n/(n+mean), 0)
                         k = 2 # n, p (loc fixed)
                     elif name in ("lognorm", "gamma", "weibull_min", "expon"):
                         params = dist_obj.fit(current_sample, floc=0)
@@ -488,6 +541,12 @@ class WAS_TransformData:
             return best_res
 
         # --- MODE: Grid (Pixel by Pixel) ---
+        if mode == "grid" and os.environ.get("WAS_BESTFIT_FAST", "1") != "0":
+            from .was_bestfit_fast import fast_supported, fit_best_distribution_fast
+            if fast_supported(self.distribution_map):
+                # closed-form / 1-D MLE, all cells at once (same selection rules)
+                res = fit_best_distribution_fast(data, self.distribution_map)
+                return res[0], res[1], res[2], res[3], xr.full_like(res[0], np.nan)
         if mode == "grid":
             res = _pufunc(
                 _fit_1d_core, data,
@@ -500,19 +559,7 @@ class WAS_TransformData:
 
         # --- MODE: Cluster (Regional Frequency Analysis) ---
         elif mode == "cluster":
-            # 1. KMeans on Mean/Std
-            df = data.to_dataframe().reset_index().dropna().drop(columns=['T'])
-            if df.empty or len(df) < self.n_clusters:
-                print("Not enough data for clustering.")
-                nan_da = xr.full_like(data.isel(T=0), np.nan)
-                return nan_da, nan_da, nan_da, nan_da, nan_da
-
-            var_col = df.columns[-1] # Assuming data column is last
-            kmeans = KMeans(n_clusters=self.n_clusters, n_init=10, random_state=42)
-            df['cluster'] = kmeans.fit_predict(df[[var_col]])
-
-            # Map clusters back to grid
-            cluster_da = df.set_index(['Y', 'X'])['cluster'].to_xarray().reindex_like(data.isel(T=0))
+            cluster_da = climate_cluster_map(data, self.n_clusters, random_state=42)
 
             # 2. Loop over clusters (fast, N=1000 not N=1Million)
             best_code = xr.full_like(cluster_da, np.nan, dtype=float)
@@ -520,7 +567,7 @@ class WAS_TransformData:
             best_loc = xr.full_like(cluster_da, np.nan, dtype=float)
             best_scale = xr.full_like(cluster_da, np.nan, dtype=float)
 
-            unique_clusters = np.unique(df['cluster'].values)
+            unique_clusters = np.unique(cluster_da.values[np.isfinite(cluster_da.values)])
             
             for cl in unique_clusters:
                 # Mask: All time steps for all pixels in this cluster
@@ -542,8 +589,10 @@ class WAS_TransformData:
 
         else:
             raise ValueError("mode must be 'grid' or 'cluster'")
-    def plot_best_fit_map(self, data_array, map_dict, output_file='map.png', 
+    def plot_best_fit_map(self, data_array, map_dict, output_file='map.png',
                               title='Map', colors=None, show_plot=True):
+            import cartopy.crs as ccrs
+            import cartopy.feature as cfeature
             if colors is None:
                 colors = ['#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', 
                           '#fb9a99', '#e31a1c', '#fdbf6f', '#ff7f00']

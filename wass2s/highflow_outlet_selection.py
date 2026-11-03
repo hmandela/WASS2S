@@ -55,7 +55,7 @@ def _canonical_columns(frame):
 
 
 def prepare_prediction_outlets(outlets, basins, uparea, *, config, match_config,
-                                level=None) -> PreparedOutlets:
+                                level=None, matcher=None) -> PreparedOutlets:
     """Clean and select physical outlets once, before any temporal calculation.
 
     ``duplicate_outlet_policy='best_glofas'`` interprets distinct points of a
@@ -162,7 +162,9 @@ def prepare_prediction_outlets(outlets, basins, uparea, *, config, match_config,
     targets = tab.assign(target_lon=tab.X, target_lat=tab.Y,
         HYBAS_UP_AREA_KM2=tab.get('UP_AREA',np.nan),
         target_coordinate_source='hybas_outlet', station_hybas_status=tab.outlet_match_status)
-    matches, alternatives = match_hybas_outlets_to_glofas(targets, uparea, config=match_config)
+    # v5.2: defer representative selection until ALL matching evidence is scored.
+    match_fn = matcher or match_hybas_outlets_to_glofas
+    matches, alternatives = match_fn(targets, uparea, config=match_config)
     matches['outlet_id'] = tab.outlet_id.values
     if len(alternatives):
         alternatives['outlet_id'] = alternatives.target_row.map(dict(enumerate(tab.outlet_id)))

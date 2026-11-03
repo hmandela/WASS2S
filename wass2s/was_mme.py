@@ -1,8 +1,7 @@
 """Multi-Model Ensemble (MME) methods for seasonal forecasting.
 
 Provides weighted averaging, probabilistic MME schemes, ELM/MLP-based
-ensembles, logistic and Gaussian-process based post-processing, and
-wrappers for the xcast ELM/ELR framework.
+ensembles, and logistic and Gaussian-process post-processing.
 
 Key functions
 -------------
@@ -14,22 +13,19 @@ myfill
 
 Key classes
 -----------
-WAS_mme_Weighted
-    Simple or skill-weighted ensemble averaging with parametric or
-    non-parametric tercile probabilities.
-WAS_ProbWeighted
-    Probabilistic skill-weighted ensemble (tercile-class based).
+WAS_mme_Weighted / WAS_mme_WeightedContinuous
+    Historical threshold weighting plus a continuous shrinkage-stabilised variant.
+WAS_ProbWeighted / WAS_ProbWeightedContinuous / WAS_ProbWeightedRPS
+    Historical stepwise weighting plus continuous and proper-score RPS variants.
 WAS_Min2009_ProbWeighted
     Probabilistic MME following Min (2009) chi-squared weighting.
-WAS_mme_MLP / WAS_mme_MLP_
+WAS_mme_MLP
     MLP-based MME post-processing.
-WAS_mme_hpELM / WAS_mme_hpELM_
+WAS_mme_hpELM
     Extreme Learning Machine MME post-processing.
-WAS_mme_Stacking / WAS_mme_Stacking_
-    Stacking ensemble MME.
-WAS_mme_XGBoosting / WAS_mme_XGBoosting_
+WAS_mme_XGBoosting
     XGBoost-based MME post-processing.
-WAS_mme_RF / WAS_mme_RF_
+WAS_mme_RF
     Random Forest MME post-processing.
 WAS_mme_logistic
     Logistic-regression MME producing direct tercile probabilities.
@@ -37,8 +33,6 @@ WAS_mme_gaussian_process
     Gaussian Process MME.
 WAS_mme_FastBMA / WAS_mme_FullBMA
     Bayesian Model Averaging (fast and full variants).
-WAS_mme_xcELM / WAS_mme_xcELR
-    xcast-based ELM and ELR wrappers.
 """
 from __future__ import annotations
 
@@ -47,19 +41,26 @@ from __future__ import annotations
 # ---------------------------------------------------------
 import datetime
 import gc
+import os
 import operator
 import random
 import warnings
 from dataclasses import dataclass
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 # ---------------------------------------------------------
 # 2. Third-Party Core Data Libraries
 # ---------------------------------------------------------
+from collections import OrderedDict
+from .was_cca_engine import ExactCCA, LazyXeofsCCA, exact_cca_supported
 import numpy as np
 import pandas as pd
 import xarray as xr
+from .was_probability_reference import climatological_terciles
+from .was_mme_schema import (validate_mme_predictor_schema,
+                             standardize_mme_predictors, require_physical_ensemble)
 
 
 # ---------------------------------------------------------------------------
@@ -71,39 +72,198 @@ import xarray as xr
 # changes execution, never values. Disable with WAS_GRID_PARALLEL=0; small
 # grids and any error fall back to plain xr.apply_ufunc.
 # ---------------------------------------------------------------------------
-def _grid_workers():
-    import os
+# ---------------------------------------------------------------------------
+# Cluster stacking
+#
+# The ML classes below fit one model per climate cluster. The original idiom
+#
+#     X.where(mask_3d).stack(sample=("T", "Y", "X")).transpose("sample", "M").values
+#
+# re-materialises the FULL (T, M, Y, X) array once per cluster, then throws
+# away roughly (1 - 1/n_clusters) of the rows. Measured on a 350x171 grid,
+# 24 years, 10 members, 5 clusters: 1.8 s per call site per fold against 0.2 s
+# when the array is stacked once and the rows are indexed -- an 8.8x saving,
+# and 115 MB allocated once instead of five times.
+#
+# _stack_masked returns exactly what the old expression returned (full sample
+# length, masked rows set to NaN), so every call site keeps its semantics:
+# downstream code relies on len(stacked) to rebuild the (T, Y, X) cube.
+#
+# The memo keys on the identity, shape and dims of the DataArray and keeps a
+# strong reference, so an id() cannot be recycled while the entry is alive.
+# ---------------------------------------------------------------------------
+class _StackMemo:
+    """Small LRU of stacked arrays, keyed by the DataArray that produced them."""
+
+    def __init__(self, maxsize=8):
+        self._store = OrderedDict()
+        self._maxsize = maxsize
+
+    def _get(self, da, core):
+        key = (id(da), tuple(da.shape), tuple(da.dims), core)
+        hit = self._store.get(key)
+        if hit is not None:
+            self._store.move_to_end(key)
+            return hit[1]
+        stacked = da.stack(sample=("T", "Y", "X"))
+        if core is not None and core in stacked.dims:
+            stacked = stacked.transpose("sample", core)
+        values = np.asarray(stacked.values)
+        # Keep a strong reference to `da` so its id() cannot be recycled.
+        self._store[key] = (da, values)
+        self._store.move_to_end(key)
+        while len(self._store) > self._maxsize:
+            self._store.popitem(last=False)
+        return values
+
+    def full(self, da, core="M"):
+        return self._get(da, core)
+
+    def rows(self, mask_3d):
+        return np.asarray(self._get(mask_3d, None)).ravel().astype(bool)
+
+
+_STACK_MEMO = _StackMemo()
+
+
+def _stack_masked(da, mask_3d, core="M"):
+    """``da.where(mask_3d).stack(...).transpose(...).values``, computed once.
+
+    Kept for call sites that need the FULL sample length with masked rows set
+    to NaN. Note that the NaN fill costs about as much as the saving, so this
+    form is only ~1.2x faster than the original expression; prefer
+    :func:`_stack_rows` where the call site can work on compact rows.
+    """
     try:
-        n = int(os.environ.get("WAS_NCORES", "0"))
-        if n <= 0:
-            n = os.cpu_count() or 1
-        return max(1, n)
+        full = _STACK_MEMO.full(da, core)
+        rows = _STACK_MEMO.rows(mask_3d)
     except Exception:
-        return 1
+        out = da.where(mask_3d).stack(sample=("T", "Y", "X"))
+        if core is not None and core in out.dims:
+            out = out.transpose("sample", core)
+        return np.asarray(out.values)
+    out = np.array(full, dtype=float, copy=True)
+    if out.ndim == 1:
+        out[~rows] = np.nan
+    else:
+        out[~rows, ...] = np.nan
+    return out
+
+
+def _cluster_row_index(cluster_da, n_time):
+    """Row positions of each cluster in a ``('T', 'Y', 'X')`` stacked array."""
+    labels = np.asarray(cluster_da.values)
+    return np.broadcast_to(labels[None, :, :], (int(n_time),) + labels.shape).ravel()
+
+
+def _stack_rows(da, row_mask, core="M"):
+    """Compact rows of the stacked array: no NaN fill, no full-size copy.
+
+    This is the fast path. Measured on a 350x171 grid, 24 years, 10 members,
+    5 clusters, with 3% missing values:
+
+        where + stack, once per cluster   2.91 s
+        stack once + row indexing         0.20 s    ->  14.4x
+
+    and the 115 MB stacked array is allocated once per fold instead of once
+    per cluster. Returns ``(rows, positions)`` where ``positions`` are the row
+    numbers in the full stacked array, so the caller can scatter predictions
+    back into the (T, Y, X) cube.
+    """
+    full = _STACK_MEMO.full(da, core)
+    positions = np.flatnonzero(row_mask)
+    return full[positions], positions
+
+
+def _grid_workers():
+    """Available CPU budget, bounded by scheduler allocation and affinity."""
+    limits = []
+    for key in ("WAS_NCORES", "SLURM_CPUS_PER_TASK", "PBS_NP", "NSLOTS"):
+        value = os.environ.get(key)
+        if value:
+            try:
+                if int(value) > 0:
+                    limits.append(int(value))
+            except ValueError:
+                pass
+    try:
+        limits.append(len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        limits.append(os.cpu_count() or 1)
+    return max(1, min(limits))
+def _report_best_params(tag, best_params_dict, verbose=True, score=None):
+    """Print the tuned hyperparameters of every cluster.
+
+    Only WAS_mme_RF and WAS_mme_hpELM reported theirs; XGBoost, MLP, the
+    Gaussian process and ELR returned silently, so a run gave no way to tell
+    whether a search had converged on a near-linear configuration or on a
+    flexible one -- which is exactly the diagnostic worth having on a 24-year
+    sample. One line per cluster, gated on the caller's verbose flag.
+    """
+    if not verbose:
+        return
+    if isinstance(best_params_dict, dict) and best_params_dict and all(
+        isinstance(k, (int, float, np.integer, np.floating)) for k in best_params_dict
+    ):
+        for cluster_id in sorted(best_params_dict):
+            # Cluster ids arrive as numpy floats from np.unique(cluster_da);
+            # print them as plain integers so the log stays readable.
+            print(f"[{tag}] cluster {int(cluster_id)}: "
+                  f"params={best_params_dict[cluster_id]}", flush=True)
+    else:
+        suffix = "" if score is None else f" score={score:.4f}"
+        print(f"[{tag}] params={best_params_dict}{suffix}", flush=True)
+
+
+def _cluster_plan(n_clusters, n_jobs, cluster_n_jobs=None, model_is_threaded=False):
+    """Split the CPU budget between cluster-level and model-level parallelism.
+
+    Clusters are independent, so that is the axis that pays. Measured on 10
+    predictor features, ``n_jobs=-1`` inside a single RandomForest fit gives no
+    speedup (36.7 s against 35.7 s): the trees are too small for sklearn's
+    per-tree threading to help. XGBoost and BLAS-backed learners DO use threads
+    productively, so for those the remaining budget is handed to the model
+    instead of being wasted.
+
+    Returns ``(workers, threads_per_model)``.
+    """
+    budget = n_jobs if (n_jobs and n_jobs > 0) else _grid_workers()
+    budget = max(1, int(budget))
+    if cluster_n_jobs:
+        workers = max(1, min(int(cluster_n_jobs), int(n_clusters), budget))
+    else:
+        workers = max(1, min(int(n_clusters), budget))
+    if model_is_threaded:
+        threads = max(1, budget // workers)
+    else:
+        threads = 1 if workers > 1 else budget
+    return workers, threads
+
 
 
 def _pufunc(func, *args, **kwargs):
-    import os
-    if os.environ.get("WAS_GRID_PARALLEL", "1") == "0":
-        return xr.apply_ufunc(func, *args, **kwargs)
+    """Evaluate once; never retry a failing scientific kernel silently."""
     n = _grid_workers()
-    if n <= 1:
+    if os.environ.get("WAS_GRID_PARALLEL", "1") == "0" or n <= 1:
         return xr.apply_ufunc(func, *args, **kwargs)
     try:
-        new_args, chunked = [], False
-        for a in args:
-            if hasattr(a, "dims") and "Y" in getattr(a, "dims", ()):
-                ny = int(a.sizes.get("Y", 1))
-                if ny >= 2 * n:
-                    a = a.chunk({"Y": max(1, ny // n)})
-                    chunked = True
-            new_args.append(a)
-        if not chunked:
-            return xr.apply_ufunc(func, *args, **kwargs)
-        res = xr.apply_ufunc(func, *new_args, **kwargs)
-        return res.compute(scheduler="threads", num_workers=n)
-    except Exception:
+        import dask
+    except ImportError:
         return xr.apply_ufunc(func, *args, **kwargs)
+    new_args, chunked = [], False
+    for a in args:
+        if isinstance(a, xr.DataArray) and "Y" in a.dims:
+            ny = a.sizes["Y"]
+            if ny >= 2 * n:
+                a = a.chunk({"Y": max(1, ny // n)})
+                chunked = True
+        new_args.append(a)
+    result = xr.apply_ufunc(func, *new_args, **kwargs)
+    if not chunked:
+        return result
+    if isinstance(result, tuple):
+        return dask.compute(*result, scheduler="threads", num_workers=n)
+    return result.compute(scheduler="threads", num_workers=n)
 
 # ---------------------------------------------------------
 # 3. Third-Party Math & ML Libraries (Hard Dependencies)
@@ -118,7 +278,7 @@ from xgboost import XGBRegressor
 # SciPy
 from scipy import stats
 from scipy.optimize import brentq, fsolve, minimize, minimize_scalar, root_scalar
-from scipy.special import betaln, expit, gammainc, gammaincinv, softmax
+from scipy.special import betaln, expit, gammainc, gammaincinv, softmax, logsumexp
 from scipy.special import gamma as gamma_function
 from scipy.stats import (
     boxcox_normmax, expon, genextreme, laplace, linregress, logistic,
@@ -134,12 +294,14 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.cluster import KMeans
 from sklearn.ensemble import (
     AdaBoostRegressor, GradientBoostingRegressor,
-    RandomForestRegressor, StackingRegressor
+    RandomForestRegressor, StackingRegressor, ExtraTreesRegressor,
+    HistGradientBoostingRegressor
 )
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessClassifier, GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel as C, Matern, RBF, WhiteKernel
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge, ElasticNet
+from sklearn.cross_decomposition import PLSRegression
 from sklearn.metrics import log_loss, make_scorer, mean_squared_error
 from sklearn.model_selection import (
     GridSearchCV, GroupKFold, KFold, LeaveOneGroupOut,
@@ -171,14 +333,17 @@ try:
 except ImportError:
     OPTUNA_AVAILABLE = False
     HAS_OPTUNA = False
+    optuna = None
     warnings.warn("Optuna not installed. Bayesian optimization will not be available.")
 
-try:
-    from hpelm import HPELM
-except ImportError:
-    HPELM = None
+# ELM: numpy implementation by Gram matrices (was_elm). The hpelm package is
+# no longer used; the name is kept for scripts that test for its presence.
+from .was_elm import (ELMRegressor, ELMGramBank, effective_norm as _elm_effective_norm,
+                      random_layer as _elm_random_layer)
+HPELM = None
 
 try:
+    import matplotlib.style.core
     import pymc as pm
     import arviz as az
     HAS_PYMC = True
@@ -194,20 +359,47 @@ try:
 except ImportError:
     _HAS_SCIPY = False
 
+# Optional acceleration. Numba is deliberately optional: every scientific
+# result is identical when it is unavailable; only low-level loops change.
+try:
+    from numba import njit
+    NUMBA_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    NUMBA_AVAILABLE = False
+    def njit(*args, **kwargs):
+        def _decorator(func):
+            return func
+        return _decorator
+
 # ---------------------------------------------------------
 # 5. Project-Specific Imports
 # ---------------------------------------------------------
-try:
-    import xcast as xc
-except ImportError:
-    xc = None
-
 try:
     import xeofs as xe
 except ImportError:
     xe = None
 
 from wass2s.utils import *
+from wass2s.was_scientific_utils import align_predictor_target, apply_physical_support
+from wass2s.was_machine_learning import MARS as _MARSCore
+
+# U-Net MME post-processor. Kept in its own module because it pulls in an
+# OPTIONAL torch dependency: importing it here (rather than inlining 1400+
+# lines) means `import wass2s` still works when torch is absent — the class is
+# simply unavailable, and WAS_mme_UNet itself raises a clear ImportError when
+# instantiated without torch.
+try:
+    from wass2s.was_mme_unet import WAS_mme_UNet  # noqa: F401
+    HAS_UNET = True
+except ImportError:  # pragma: no cover - torch (or the module) not installed
+    WAS_mme_UNet = None
+    HAS_UNET = False
+try:
+    from wass2s.was_mme_rescnn import WAS_mme_ResCNN  # noqa: F401
+    HAS_RESCNN = True
+except ImportError:  # pragma: no cover - optional module unavailable
+    WAS_mme_ResCNN = None
+    HAS_RESCNN = False
 from wass2s.was_eof import *
 from wass2s.was_verification import *
 
@@ -217,6 +409,296 @@ from wass2s.was_verification import *
 # shadowed by a project module.
 gamma = gamma_dist
 t = tdist
+
+
+# ---------------------------------------------------------------------------
+# Scientific safeguards shared by all MME learners
+# ---------------------------------------------------------------------------
+def _calendar_year_groups(T):
+    """Return one group label per T value, preserving whole-year CV blocks."""
+    vals = np.asarray(T.values if hasattr(T, "values") else T)
+    if np.issubdtype(vals.dtype, np.datetime64):
+        return vals.astype("datetime64[Y]").astype(np.int64) + 1970
+    return vals
+
+
+def _recommended_min_years(n_free_parameters: int, floor: int = 8, ratio: float = 2.0) -> int:
+    """Conservative lower bound for gridwise fits on short seasonal hindcasts.
+
+    This is a guardrail, not an inferential theorem.  It prevents fitting a
+    parameter-rich distribution to 3--5 years simply because an optimizer can
+    technically return a solution.
+    """
+    return max(int(floor), int(np.ceil(float(ratio) * max(1, n_free_parameters))))
+
+
+def _year_grouped_splitter(groups, n_splits=5, leave_one_year_out=False):
+    """Leakage-safe CV splitter for pooled (T,Y,X) climate samples."""
+    groups = np.asarray(groups)
+    n_group = len(np.unique(groups))
+    if n_group < 2:
+        raise ValueError("At least two independent years are required for CV.")
+    if leave_one_year_out or n_group <= int(n_splits):
+        return LeaveOneGroupOut()
+    return GroupKFold(n_splits=min(int(n_splits), n_group))
+
+
+@njit(cache=True)
+def _nonparam_tercile_numba(best_guess, errors, t1, t2, positive_support=False):
+    """Fast residual-dressing kernel; exact empirical probabilities."""
+    nt = best_guess.size
+    out = np.empty((3, nt), dtype=np.float64)
+    out[:] = np.nan
+    if not np.isfinite(t1) or not np.isfinite(t2) or t2 < t1:
+        return out
+    for i in range(nt):
+        bg = best_guess[i]
+        if not np.isfinite(bg):
+            continue
+        n = 0
+        nb = 0
+        nn = 0
+        for j in range(errors.size):
+            e = errors[j]
+            if not np.isfinite(e):
+                continue
+            d = bg + e
+            if positive_support and d < 0.0:
+                d = 0.0
+            n += 1
+            if d <= t1:
+                nb += 1
+            elif d <= t2:
+                nn += 1
+        if n > 0:
+            pb = nb / n
+            pn = nn / n
+            out[0, i] = pb
+            out[1, i] = pn
+            out[2, i] = 1.0 - pb - pn
+    return out
+
+
+
+def empirical_tercile_probabilities_from_training(
+    forecast_det, residual_samples, training_obs, clim_year_start=None, clim_year_end=None,
+    *, positive_support=None, tercile_thresholds=None, climatology_obs=None
+):
+    """Dress a held-out deterministic forecast with TRAINING-ONLY residuals.
+
+    ``residual_samples`` must have been generated without using the target/outer-test
+    observation (typically by an inner blocked CV over the outer-training years).
+    Pass ``tercile_thresholds`` computed once on the climatological reference,
+    or the full ``climatology_obs`` reference sample, to use fixed categories.
+    Without either argument this low-level helper retains training-only
+    categories for compatibility with research callers.
+    """
+    obs=training_obs
+    if "M" in obs.dims:
+        obs=obs.isel(M=0,drop=True)
+    obs=obs.transpose("T","Y","X")
+    fc=forecast_det.transpose("T","Y","X")
+    err=residual_samples
+    if "T" in err.dims:
+        err=err.rename({"T":"S"})
+    if "S" not in err.dims:
+        raise ValueError("residual_samples must contain T or S sample dimension.")
+    if positive_support is None:
+        positive_support = bool(apply_physical_support(xr.DataArray(-1.0), obs).item() == 0.0)
+    if positive_support:
+        fc=fc.clip(min=0.0)
+    if tercile_thresholds is not None or climatology_obs is not None:
+        clim = obs
+    elif clim_year_start is not None and clim_year_end is not None:
+        clim=obs.sel(T=slice(str(clim_year_start),str(clim_year_end)))
+        if clim.sizes.get("T",0)<3:
+            raise ValueError("At least three training years are required inside the requested climatology.")
+    else:
+        clim=obs
+    if clim.sizes.get("T",0)<3:
+        raise ValueError("At least three outer-training years are required for terciles.")
+    if tercile_thresholds is not None:
+        q = tercile_thresholds
+    elif climatology_obs is not None:
+        q = climatological_terciles(climatology_obs, clim_year_start, clim_year_end)[0]
+    else:
+        q = climatological_terciles(clim)[0]
+    t1=q.isel(quantile=0,drop=True); t2=q.isel(quantile=1,drop=True)
+    prob=_pufunc(
+        _nonparam_tercile_numba, fc, err, t1, t2,
+        input_core_dims=[("T",),("S",),(),()],
+        output_core_dims=[("probability","T")],
+        vectorize=True,dask="parallelized",output_dtypes=[float],
+        kwargs={"positive_support": bool(positive_support)},
+        dask_gufunc_kwargs={"output_sizes":{"probability":3},"allow_rechunk":True},
+    ).assign_coords(probability=("probability",["PB","PN","PA"]))
+    prob=prob.transpose("probability","T","Y","X").clip(min=0,max=1)
+    total=prob.sum("probability",skipna=False)
+    prob=xr.where(total>0,prob/total,np.nan)
+    mask=xr.where(np.isfinite(obs).sum("T")>=3,1.0,np.nan)
+    return (prob*mask).transpose("probability","T","Y","X")
+
+
+def compute_oos_tercile_probabilities(
+    Predictant, hindcast_det, splits, clim_year_start=None, clim_year_end=None,
+    *, positive_support=None, tercile_reference="climatology", climatology_obs=None
+):
+    """First-order OOS residual dressing from a completed deterministic hindcast.
+
+    Categories use the fixed climatological reference by default. The target fold
+    is excluded from the selected residual rows, but historical residual
+    predictions may themselves have been fitted with that
+    target year in their own training folds.  Therefore this helper is convenient
+    for diagnostics but is NOT the publication-grade nested probability path. Use
+    :func:`empirical_tercile_probabilities_from_training` with residuals generated
+    inside each outer-training fold for strict verification.
+    """
+    if "M" in Predictant.dims:
+        Predictant=Predictant.isel(M=0,drop=True)
+    obs=Predictant.transpose("T","Y","X")
+    det=hindcast_det.transpose("T","Y","X")
+    det = align_predictor_target(det, obs, mode="season_year")
+    if positive_support is None:
+        positive_support = bool(apply_physical_support(xr.DataArray(-1.0), obs).item() == 0.0)
+    if tercile_reference not in {"climatology", "training"}:
+        raise ValueError("tercile_reference must be 'climatology' or 'training'.")
+    fixed_q = None
+    if tercile_reference == "climatology":
+        fixed_q = climatological_terciles(
+            obs if climatology_obs is None else climatology_obs,
+            clim_year_start, clim_year_end,
+        )[0]
+    probs=[]
+    for tr,te in [(np.asarray(a),np.asarray(b)) for a,b in splits]:
+        otr=obs.isel(T=tr); htr=det.isel(T=tr); fte=det.isel(T=te)
+        if positive_support:
+            fte=fte.clip(min=0.0)
+        if fixed_q is not None:
+            q = fixed_q
+        elif clim_year_start is not None and clim_year_end is not None:
+            clim=otr.sel(T=slice(str(clim_year_start),str(clim_year_end)))
+            if clim.sizes.get("T",0)<3:
+                raise ValueError("Too few training years in the requested climatology.")
+        else:
+            clim=otr
+        if fixed_q is None:
+            if clim.sizes.get("T",0)<3:
+                continue
+            q = climatological_terciles(clim)[0]
+        t1=q.isel(quantile=0,drop=True); t2=q.isel(quantile=1,drop=True)
+        err=(otr-htr).rename({"T":"S"})
+        prob=_pufunc(
+            _nonparam_tercile_numba,
+            fte,err,t1,t2,
+            input_core_dims=[("T",),("S",),(),()],
+            output_core_dims=[("probability","T")],
+            vectorize=True,dask="parallelized",output_dtypes=[float],
+        kwargs={"positive_support": bool(positive_support)},
+            dask_gufunc_kwargs={"output_sizes":{"probability":3},"allow_rechunk":True},
+        ).assign_coords(probability=("probability",["PB","PN","PA"]))
+        prob=prob.transpose("probability","T","Y","X").clip(min=0,max=1)
+        s=prob.sum("probability",skipna=False)
+        prob=xr.where(s>0,prob/s,np.nan)
+        probs.append(prob)
+    if not probs:
+        raise ValueError("No valid fold available for strict OOS probability dressing.")
+    out=xr.concat(probs,dim="T").sortby("T").reindex(T=obs["T"])
+    mask=xr.where(np.isfinite(obs).sum("T")>=3,1.0,np.nan)
+    return (out*mask).transpose("probability","T","Y","X")
+
+def _tercile_logloss_scorer(estimator, X, y):
+    raw = estimator.predict_proba(X)
+    probability = np.zeros((len(y), 3), dtype=float)
+    for index, category in enumerate(estimator.classes_):
+        category = int(category)
+        if category not in (0, 1, 2):
+            raise ValueError("Classifier targets must be tercile labels 0, 1, 2.")
+        probability[:, category] = raw[:, index]
+    return -log_loss(y, probability, labels=[0, 1, 2])
+
+
+def _effective_sample_warning(n_years, n_features, learner):
+    """Warn when flexible ML is being asked to learn from very few years."""
+    if int(n_years) < max(12, 2 * int(n_features)):
+        warnings.warn(
+            f"{learner}: only {n_years} independent years for {n_features} predictors. "
+            "Treat skill as provisional and require nested/outer year-wise validation.",
+            RuntimeWarning, stacklevel=2,
+        )
+
+
+def _training_year_signature(da):
+    """Stable signature used to detect cluster maps fitted outside a CV fold."""
+    if not isinstance(da, xr.DataArray) or "T" not in da.coords:
+        return ""
+    y = _calendar_year_groups(da["T"])
+    return ",".join(str(int(v)) if np.issubdtype(np.asarray(y).dtype, np.integer) else str(v)
+                    for v in np.unique(y))
+
+
+def _stored_training_signature(da):
+    """Training-year signature stored on a cluster/covariate map.
+
+    ``was_mme`` writes ``training_years``; ``was_scientific_utils.climate_cluster_map``
+    (used by was_crossfit, was_linear_models, was_machine_learning) writes
+    ``training_times``.  Both are accepted so a map produced by either helper is
+    recognised instead of silently triggering a full re-tuning.
+    """
+    attrs = getattr(da, "attrs", {}) or {}
+    stored = str(attrs.get("training_years", "") or "")
+    if stored:
+        return stored
+    times = str(attrs.get("training_times", "") or "")
+    if not times:
+        return ""
+    try:
+        years = np.asarray(times.split(","), dtype="datetime64[ns]").astype("datetime64[Y]").astype(int) + 1970
+        return ",".join(str(int(v)) for v in np.unique(years))
+    except (ValueError, TypeError):
+        return ""
+
+
+def _cluster_matches_training(cluster_da, y_train):
+    if cluster_da is None:
+        return False
+    stored = _stored_training_signature(cluster_da)
+    return bool(stored) and stored == _training_year_signature(y_train)
+
+
+def _looks_standardized(da, tol=0.05):
+    """Heuristic: per-pixel anomalies with mean≈0 and std≈1 on most cells."""
+    if not isinstance(da, xr.DataArray) or "T" not in da.dims:
+        return False
+    if "M" in da.dims:
+        da = da.isel(M=0, drop=True)
+    mean = np.asarray(da.mean("T", skipna=True).values, dtype=float).ravel()
+    std = np.asarray(da.std("T", skipna=True).values, dtype=float).ravel()
+    good = np.isfinite(mean) & np.isfinite(std) & (std > 0)
+    if good.sum() < 4:
+        return False
+    return bool(np.nanmedian(np.abs(mean[good])) < tol and
+                np.nanmedian(np.abs(std[good] - 1.0)) < tol)
+
+
+def _resolve_regional_params(model, X_train, y_train, clim_year_start, clim_year_end,
+                             best_params, cluster_da):
+    """Reuse supplied (best_params, cluster_da) or re-tune, never silently.
+
+    The pair is accepted when the cluster map carries a training signature that
+    matches ``y_train`` (``training_years`` or ``training_times``).  When a pair
+    was supplied but rejected, a warning says why instead of the old silent
+    re-tuning, which also hid the cost of an unexpected HPO inside forecasts.
+    """
+    if best_params is not None and cluster_da is not None and _cluster_matches_training(cluster_da, y_train):
+        return best_params, cluster_da
+    if best_params is not None or cluster_da is not None:
+        stored = _stored_training_signature(cluster_da) if cluster_da is not None else ""
+        warnings.warn(
+            f"{type(model).__name__}: supplied best_params/cluster_da were discarded "
+            f"(cluster map training years {stored or 'missing'!r} != y_train "
+            f"{_training_year_signature(y_train)!r}); hyperparameters are re-tuned.",
+            RuntimeWarning, stacklevel=3)
+    return model.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end)
 
 
 def _build_climate_feature_clusters(Predictand, n_clusters, random_state=42):
@@ -236,6 +718,14 @@ def _build_climate_feature_clusters(Predictand, n_clusters, random_state=42):
     if missing:
         raise ValueError(f"Predictand is missing dimensions {sorted(missing)}.")
     Predictand = Predictand.transpose("T", "Y", "X")
+    if _looks_standardized(Predictand):
+        # (mean, std, q33, q67) of standardized anomalies are ~(0, 1, -.43, .43)
+        # on every cell: KMeans would then partition pure sampling noise.
+        warnings.warn(
+            "Climate zones are being built from a predictand that looks already "
+            "standardized (mean~0, std~1 per pixel); pass the RAW predictand to "
+            "compute_hyperparameters/compute_model so the zones are meaningful.",
+            RuntimeWarning, stacklevel=2)
 
     q33 = Predictand.quantile(1.0 / 3.0, dim="T", skipna=True).drop_vars(
         "quantile", errors="ignore"
@@ -287,8 +777,815 @@ def _build_climate_feature_clusters(Predictand, n_clusters, random_state=42):
         "requested_clusters": requested,
         "effective_clusters": effective,
         "features": "mean,std,q33,q67",
+        "training_years": _training_year_signature(Predictand),
     })
     return result
+
+
+# =============================================================================
+# Spatial variability of the pooled ML MMEs (RF / XGB / hpELM / MLP / sklearn)
+#
+#   spatial_mode = "zones"  one model per KMeans climate zone (historical).
+#                  "soft"   ONE model on the whole domain; the zones are replaced
+#                           by continuous, fold-local spatial covariates appended
+#                           to the GCM channels (Dabernig et al. 2017 "SAMOS";
+#                           the static channels of WAS_mme_UNet). No seams, no
+#                           unstable zone boundaries, same computational cost.
+#                  "both"   per-zone models AND the covariates.
+#
+# Covariates are built from the RAW training predictand only (climatology of the
+# fold), z-scored across pixels, so they are constant in time and leak nothing.
+# =============================================================================
+SPATIAL_MODES = ("zones", "soft", "both")
+DEFAULT_COVARIATES = ("clim_mean", "clim_logstd", "clim_asym", "dry_frac")
+STATIC_CHANNEL_LABEL = "static"
+
+
+def _init_spatial_options(model, spatial_mode="zones", covariate_names=None,
+                          static_fields=None, coord_step=None, zones_as_features=False,
+                          predictor_smoothing=0, one_se_rule=False,
+                          amplitude_calibration=True, amplitude_calibration_inner_folds=3):
+    """Attach the spatial/selection options shared by every pooled ML MME.
+
+    ``amplitude_calibration`` (on by default) rescales the prediction with a
+    single domain-wide slope fitted on the training fold; see
+    ``_calibrate_amplitude``. Pass False to restore the raw, uncalibrated
+    output of releases before 2026-09-20.
+    """
+    mode = str(spatial_mode or "zones").lower()
+    if mode not in SPATIAL_MODES:
+        raise ValueError(f"spatial_mode must be one of {SPATIAL_MODES}, got {spatial_mode!r}.")
+    model.spatial_mode = mode
+    model.covariate_names = tuple(covariate_names) if covariate_names else DEFAULT_COVARIATES
+    if static_fields is not None and not isinstance(static_fields, dict):
+        raise TypeError("static_fields must be a dict {name: DataArray(Y, X)}.")
+    model.static_fields = static_fields
+    model.coord_step = None if coord_step in (None, 0) else float(coord_step)
+    model.zones_as_features = bool(zones_as_features)
+    model.predictor_smoothing = max(0, int(predictor_smoothing or 0))
+    model.one_se_rule = bool(one_se_rule)
+    # True/'global' : une pente par pli ; 'spread' : une pente par annee,
+    # pilotee par le rapport signal/dispersion de l'ensemble ; False : brut.
+    mode = _normalise_amplitude_mode(amplitude_calibration)
+    model.amplitude_calibration = mode is not None
+    model.amplitude_calibration_mode = mode or "global"
+    # >= 2 : pente estimee sur des predictions HORS echantillon des annees
+    # d'entrainement (validation croisee interne par blocs, cout x(1+k)) ;
+    # 0 : pente en echantillon, biaisee vers 1 pour tout apprenant qui ajuste
+    # ses donnees (mesure : MSSS -0.017 contre +0.011 pour le MLP).
+    model.amplitude_calibration_inner_folds = max(0, int(amplitude_calibration_inner_folds or 0))
+    model.amplitude_calibration_ = None
+    model.covariates_ = None
+
+
+def _single_zone_map(Predictand):
+    """One label (0) on every cell observed at least once; NaN elsewhere."""
+    if "M" in Predictand.dims:
+        Predictand = Predictand.isel(M=0, drop=True)
+    valid = Predictand.transpose("T", "Y", "X").notnull().any("T")
+    result = xr.where(valid, 0.0, np.nan).rename("cluster")
+    result.attrs.update({
+        "requested_clusters": 1, "effective_clusters": 1, "features": "none",
+        "training_years": _training_year_signature(Predictand), "spatial_mode": "soft",
+    })
+    return result
+
+
+def _regionalisation(model, Predictand):
+    """Zone map of the model's spatial mode, built from the RAW predictand."""
+    mode = getattr(model, "spatial_mode", "zones")
+    if mode == "soft":
+        return _single_zone_map(Predictand)
+    clusters = _build_climate_feature_clusters(
+        Predictand, model.n_clusters, getattr(model, "random_state", 42))
+    clusters.attrs["spatial_mode"] = mode
+    return clusters
+
+
+def _spatial_covariates(y_train, clim_start=None, clim_end=None, names=DEFAULT_COVARIATES,
+                        static=None, cluster_da=None, coord_step=None):
+    """(M, Y, X) spatial covariates: fold climatology + static fields.
+
+    * ``clim_mean``, ``clim_logstd``: location/scale of the raw predictand,
+    * ``clim_asym``: (q67 - mean) - (mean - q33), in local standard deviations,
+    * ``dry_frac``: fraction of seasons at or below 5 % of the local mean
+      (dropped automatically when constant, e.g. for temperature),
+    * ``lat``/``lon`` coarsened to ``coord_step`` degrees (off by default:
+      raw coordinates let trees carve latitude bands, Meyer et al. 2019),
+    * ``static_<name>``: user fields (elevation, distance to coast, ...),
+    * ``zone_<k>``: optional one-hot membership of the KMeans zones.
+
+    Each channel is z-scored ACROSS PIXELS (they are constant in time) and
+    missing cells are set to 0 (a neutral value; those cells carry no target).
+    The result carries the ``training_years`` signature of ``y_train``.
+    """
+    if "M" in y_train.dims:
+        y_train = y_train.isel(M=0, drop=True)
+    y_train = y_train.transpose("T", "Y", "X")
+    if _looks_standardized(y_train):
+        warnings.warn(
+            "Spatial covariates are being built from a predictand that looks already "
+            "standardized; they must come from the RAW training predictand.",
+            RuntimeWarning, stacklevel=2)
+    ref = y_train
+    if clim_start is not None and clim_end is not None:
+        window = y_train.sel(T=slice(str(clim_start), str(clim_end)))
+        if window.sizes.get("T", 0) >= 3:
+            ref = window
+    names = tuple(names or ())
+    mu = ref.mean("T", skipna=True)
+    sd = ref.std("T", skipna=True)
+    sd = sd.where(np.isfinite(sd) & (sd > 0))
+    feats = {}
+    if "clim_mean" in names:
+        feats["clim_mean"] = mu
+    if "clim_logstd" in names:
+        feats["clim_logstd"] = np.log(sd)
+    if "clim_asym" in names:
+        q = ref.quantile([1.0 / 3.0, 2.0 / 3.0], dim="T", skipna=True)
+        q1 = q.isel(quantile=0, drop=True).drop_vars("quantile", errors="ignore")
+        q2 = q.isel(quantile=1, drop=True).drop_vars("quantile", errors="ignore")
+        feats["clim_asym"] = ((q2 - mu) - (mu - q1)) / sd
+    if "dry_frac" in names:
+        feats["dry_frac"] = (ref <= 0.05 * mu.clip(min=0.0)).where(np.isfinite(ref)).mean("T", skipna=True)
+    if coord_step:
+        step = float(coord_step)
+        feats["lat"] = (np.floor(mu["Y"] / step) * step).broadcast_like(mu)
+        feats["lon"] = (np.floor(mu["X"] / step) * step).broadcast_like(mu)
+    if static:
+        for key, field in static.items():
+            if not isinstance(field, xr.DataArray) or set(field.dims) != {"Y", "X"}:
+                raise ValueError(f"static field {key!r} must be a DataArray with dims (Y, X).")
+            field = field.transpose("Y", "X")
+            if not (field["Y"].equals(mu["Y"]) and field["X"].equals(mu["X"])):
+                field = field.interp_like(mu, method="nearest")
+            feats[f"static_{key}"] = field
+    if cluster_da is not None:
+        labels = np.asarray(cluster_da.values, dtype=float)
+        for c in np.unique(labels[np.isfinite(labels)]):
+            feats[f"zone_{int(c)}"] = (cluster_da == c).astype(float)
+    if not feats:
+        return None
+    cov = xr.concat([f.astype(float) for f in feats.values()],
+                    dim=pd.Index(list(feats), name="M"))
+    cov = cov.where(np.isfinite(mu))
+    centre = cov.mean(("Y", "X"), skipna=True)
+    scale = cov.std(("Y", "X"), skipna=True)
+    finite_scale = np.isfinite(scale.values) & (scale.values > 1e-12)
+    cov = cov.isel(M=np.flatnonzero(finite_scale))            # drop constant channels
+    centre = centre.isel(M=np.flatnonzero(finite_scale))
+    scale = scale.isel(M=np.flatnonzero(finite_scale))
+    if cov.sizes["M"] == 0:
+        return None
+    z = ((cov - centre) / scale).fillna(0.0).transpose("M", "Y", "X")
+    z.name = "spatial_covariates"
+    z.attrs.update({
+        "training_years": _training_year_signature(y_train),
+        "covariates": ",".join(str(v) for v in z["M"].values),
+        "standardization": "z-score across pixels; NaN -> 0",
+    })
+    return z
+
+
+def _smoothed_predictor_channels(X, window):
+    """Regional means (window x window cells) of every GCM channel.
+
+    The seasonal predictable signal is large scale while the grid-point GCM
+    value is noisy: smoothed copies give the learner the regional context.
+    """
+    window = int(window)
+    if window <= 1:
+        return None
+    sm = X.transpose("T", "M", "Y", "X").rolling(Y=window, X=window, center=True,
+                                                 min_periods=1).mean()
+    sm = sm.assign_coords(M=[f"{m}__smooth{window}" for m in X["M"].values])
+    return sm
+
+
+def _augment_predictors(X, cov=None, smoothing=0):
+    """Concatenate covariates (constant in T) and smoothed GCM channels along M."""
+    X = X.transpose("T", "M", "Y", "X")
+    parts = [X]
+    smoothed = _smoothed_predictor_channels(X, smoothing) if smoothing else None
+    if smoothed is not None:
+        parts.append(smoothed)
+    if cov is not None:
+        extra = cov.transpose("M", "Y", "X").expand_dims(T=X.sizes["T"]).assign_coords(T=X["T"])
+        extra = extra.transpose("T", "M", "Y", "X")
+        for name in X.coords:
+            if name != "M" and X.coords[name].dims == ("M",):
+                extra = extra.assign_coords({name: ("M", [STATIC_CHANNEL_LABEL] * extra.sizes["M"])})
+        parts.append(extra)
+    if len(parts) == 1:
+        return X
+    # Channel labels of mixed dtype (ints/str/pandas string) cannot be
+    # concatenated by xarray: use one plain object index for every part.
+    parts = [p.assign_coords(M=np.asarray(p["M"].values, dtype=object)) for p in parts]
+    out = xr.concat(parts, dim="M", coords="minimal", compat="override")
+    out.attrs = dict(X.attrs)
+    if cov is not None:
+        out.attrs["spatial_covariates"] = cov.attrs.get("covariates", "")
+    if smoothed is not None:
+        out.attrs["predictor_smoothing"] = int(smoothing)
+    return out
+
+
+def _model_covariates(model, y_raw, clim_start=None, clim_end=None):
+    """Covariates requested by the model's spatial mode, from the RAW predictand."""
+    mode = getattr(model, "spatial_mode", "zones")
+    if mode == "zones":
+        return None
+    zones = None
+    if mode == "soft" and getattr(model, "zones_as_features", False):
+        zones = _build_climate_feature_clusters(y_raw, model.n_clusters, getattr(model, "random_state", 42))
+    return _spatial_covariates(
+        y_raw, clim_start, clim_end, names=getattr(model, "covariate_names", DEFAULT_COVARIATES),
+        static=getattr(model, "static_fields", None), cluster_da=zones,
+        coord_step=getattr(model, "coord_step", None))
+
+
+def _prepare_channels(model, X_train, X_test, y_train, covariates=None,
+                      clim_start=None, clim_end=None):
+    """Predictor channels actually seen by the learner (GCM + spatial extras).
+
+    ``covariates`` come from the caller (WAS_Cross_Validator passes fold-local
+    ones built from the raw training predictand); otherwise the map stored by
+    ``compute_hyperparameters`` is reused when it was fitted on the same years.
+    """
+    mode = getattr(model, "spatial_mode", "zones")
+    smoothing = getattr(model, "predictor_smoothing", 0)
+    cov = None
+    if mode != "zones":
+        cov = covariates
+        if cov is None:
+            stored = getattr(model, "covariates_", None)
+            if stored is not None and _cluster_matches_training(stored, y_train):
+                cov = stored
+        if cov is None:
+            if _looks_standardized(y_train):
+                raise ValueError(
+                    f"{type(model).__name__}: spatial_mode={mode!r} needs covariates built from the "
+                    "RAW predictand; pass covariates=... (WAS_Cross_Validator does it) or call "
+                    "compute_hyperparameters on raw data before compute_model.")
+            cov = _model_covariates(model, y_train, clim_start, clim_end)
+    if cov is None and not smoothing:
+        return X_train, X_test
+    return (_augment_predictors(X_train, cov, smoothing),
+            _augment_predictors(X_test, cov, smoothing))
+
+
+def _regional_params_from(model, best_params, Predictand):
+    """Reuse tuned hyperparameters on a NEW training sample.
+
+    The zone map is refitted on ``Predictand`` (RAW training predictand of the
+    new sample) while the hyperparameters are kept: this is what
+    ``probability_inner_retune=False`` means for the calibration folds. In
+    strict regional tuning every zone shares one candidate; a legacy
+    per-zone dict falls back to its first entry for zones it does not list.
+    """
+    clusters = _regionalisation(model, Predictand)
+    if isinstance(best_params, dict) and best_params and all(
+            isinstance(v, dict) for v in best_params.values()):
+        per, shared = best_params, next(iter(best_params.values()))
+    else:
+        per, shared = {}, dict(best_params or {})
+    labels = np.unique(clusters.values[np.isfinite(clusters.values)])
+    params = {int(c): dict(per.get(int(c), shared)) for c in labels}
+    clusters.attrs['hyperparameter_scope'] = 'reused_from_outer_training_fold'
+    return dict(best_params=params, cluster_da=clusters)
+
+
+def _thin_training_rows(train_sel, n_time, n_lat, n_lon, stride):
+    """Keep one training cell out of ``stride`` in BOTH Y and X (rows stay (T,Y,X)).
+
+    The previous ``[::stride]`` on the flattened index thinned along X only
+    (reduction 1/stride instead of 1/stride^2, and never the tuning sample).
+    """
+    stride = int(stride or 1)
+    if stride <= 1:
+        return train_sel
+    keep = np.zeros((int(n_lat), int(n_lon)), dtype=bool)
+    keep[::stride, ::stride] = True
+    return train_sel & np.broadcast_to(keep[None], (int(n_time), int(n_lat), int(n_lon))).ravel()
+
+
+# ---------------------------------------------------------------------------
+# Global amplitude calibration of pooled ML predictions
+# ---------------------------------------------------------------------------
+# Validated on 17 GCM hindcasts (1993-2016, MJJ, West Africa, 0.1 deg) with
+# 8 blocked 3-year folds. Raw "zones" predictions carry far more anomaly
+# amplitude than their correlation justifies, which is catastrophic for the
+# mean squared error: the MLP scored r = 0.198 but MSSS = -0.522. Rescaling
+# with a single domain-wide slope fitted on the training fold kept r = 0.187
+# and lifted MSSS to +0.011 -- the only positive MSSS obtained on that case.
+#
+# The slope MUST be global. A per-pixel slope estimated on ~20 years has a
+# standard error near 0.22 while the true correlation is around 0.1, so it is
+# mostly noise and wrong-signed on roughly half the grid: applied out of
+# sample it destroyed the signal (XGBoost r fell 0.131 -> 0.035, losing
+# significance). A single number pooled over all pixels and years is stable,
+# and amplitude is a level defect rather than a geographical one.
+
+# Nombre minimal de cellules de validation conservees apres amincissement du
+# reglage regional : en deca, on repasse sur la grille pleine plutot que de
+# noter un candidat sur un echantillon vide.
+_MIN_TUNING_VALID_CELLS = 30
+
+AMPLITUDE_SLOPE_BOUNDS = (0.0, 2.0)
+DEGENERATE_INSAMPLE_R = 0.05
+DEGENERATE_AMPLITUDE = 0.5
+
+
+def _pooled_grid_prediction(models, X, cluster_da):
+    """Predict a full ``(T, Y, X)`` grid with one fitted estimator per cluster.
+
+    Mirrors the scatter used by the pooled learners' ``compute_model`` so the
+    in-sample prediction is produced by exactly the same path as the test one.
+    """
+    n_time = int(X.sizes["T"])
+    n_lat = int(X.sizes["Y"])
+    n_lon = int(X.sizes["X"])
+    flat = np.full((n_time * n_lat * n_lon,), np.nan)
+    rows = _cluster_row_index(cluster_da, n_time)
+    for label, estimator in (models or {}).items():
+        if estimator is None:
+            continue
+        block, positions = _stack_rows(X, rows == label, core="M")
+        if positions.size == 0:
+            continue
+        keep = np.all(np.isfinite(block), axis=1)
+        if not keep.any():
+            continue
+        flat[positions[keep]] = np.asarray(estimator.predict(block[keep])).ravel()
+    return xr.DataArray(flat.reshape(n_time, n_lat, n_lon), dims=("T", "Y", "X"),
+                        coords={"T": X["T"], "Y": X["Y"], "X": X["X"]})
+
+
+def _amplitude_slope(prediction, target, bounds=AMPLITUDE_SLOPE_BOUNDS):
+    """Domain-wide regression slope of observed on predicted anomalies.
+
+    Anomalies are taken about each field's own training mean, so the slope is
+    invariant to a constant bias and to the scale the caller works in.
+    Returns ``(slope, in-sample correlation, predicted/observed amplitude)``;
+    the two diagnostics feed the degeneracy guard.
+    """
+    pa = prediction - prediction.mean("T")
+    oa = target - target.mean("T")
+    finite = np.isfinite(pa) & np.isfinite(oa)
+    pa = pa.where(finite)
+    oa = oa.where(finite)
+
+    cov = float((pa * oa).sum(skipna=True))
+    var = float((pa ** 2).sum(skipna=True))
+    var_obs = float((oa ** 2).sum(skipna=True))
+    if not np.isfinite(cov) or not np.isfinite(var) or var <= 1e-12:
+        # a prediction with no temporal variance carries no information:
+        # fall back to the training climatology
+        return 0.0, 0.0, 0.0
+    slope = float(np.clip(cov / var, bounds[0], bounds[1]))
+    correlation = cov / np.sqrt(var * var_obs) if var_obs > 1e-12 else 0.0
+    amplitude = np.sqrt(var / var_obs) if var_obs > 1e-12 else 0.0
+    return slope, float(correlation), float(amplitude)
+
+
+# ---------------------------------------------------------------------------
+# Spread-conditioned amplitude: the year's ensemble agreement modulates the slope
+# ---------------------------------------------------------------------------
+# A forecaster trusts a seasonal signal more when the ensemble agrees on it.
+# The global slope above applies the same shrinkage to every year; here the
+# slope becomes a function of the year's signal-to-spread ratio z:
+#
+#     b(t) = b0 + b1 * (z_t / median(z_train) - 1),     b1 >= 0
+#
+# fitted at the YEAR level (one optimal slope per training year, regressed on
+# z with n = number of training years), so that the standard error of b1 is
+# honest. b1 is then shrunk towards 0 by its own t statistic (positive-part
+# James-Stein): with no spread-skill relation the method degrades gracefully
+# to the global slope, never below it in expectation.
+#
+# Spread is read from the predictor cube in two ways:
+#   * WASS2S member-statistics mode (ensemble_mean=None): channels carry the
+#     coordinate ``ensemble_statistic``; signal = mean of the ``mean`` channels,
+#     spread^2 = mean of the ``std`` channels squared + variance of the model
+#     means (law of total variance of the grand ensemble);
+#   * legacy mode (one channel per model mean): signal = mean over M,
+#     spread = inter-model standard deviation, a proxy for member spread.
+
+AMPLITUDE_CALIBRATION_MODES = ("global", "spread")
+SPREAD_Z_BOUNDS = (0.0, 3.0)          # z_test / median(z_train), extrapolation guard
+_COVARIATE_LABELS = set(DEFAULT_COVARIATES) | {"lat", "lon"}
+
+
+def _normalise_amplitude_mode(value):
+    """True -> 'global'; False/None -> None; 'global'/'spread' pass through."""
+    if value is None or value is False:
+        return None
+    if value is True:
+        return "global"
+    mode = str(value).strip().lower()
+    if mode in ("", "off", "none", "false", "0"):
+        return None
+    if mode in ("on", "true", "1"):
+        return "global"
+    if mode not in AMPLITUDE_CALIBRATION_MODES:
+        raise ValueError(f"amplitude_calibration must be one of {AMPLITUDE_CALIBRATION_MODES}, "
+                         f"True/False, got {value!r}.")
+    return mode
+
+
+def _gcm_channels(X):
+    """Keep the GCM channels of a predictor cube, dropping covariates.
+
+    ``_augment_predictors`` appends spatial covariates (``clim_mean``,
+    ``static_<name>``, ``zone_<k>``, ``lat``/``lon``) and smoothed copies
+    (``<model>__smooth<w>``) along M. None of them carries ensemble spread.
+    """
+    if "M" not in X.dims:
+        return X
+    labels = [str(v) for v in np.asarray(X["M"].values)]
+    keep = [not (lab in _COVARIATE_LABELS or lab.startswith("static_")
+                 or lab.startswith("zone_") or "__smooth" in lab)
+            for lab in labels]
+    if all(keep):
+        return X
+    return X.isel(M=np.flatnonzero(keep))
+
+
+def _ensemble_signal_spread(X):
+    """``(signal, spread)`` as ``(T, Y, X)`` fields from a ``(T, M, Y, X)`` cube."""
+    X = _gcm_channels(X).transpose("T", "M", "Y", "X")
+    stats = X.coords.get("ensemble_statistic")
+    if stats is not None:
+        labels = np.asarray(stats.values).astype(str)
+        means = X.isel(M=np.flatnonzero(labels == "mean"))
+        stds = X.isel(M=np.flatnonzero(labels == "std"))
+        if means.sizes["M"] == 0:
+            raise ValueError("member-statistics cube without any 'mean' channel.")
+        signal = means.mean("M", skipna=True)
+        within = (stds ** 2).mean("M", skipna=True) if stds.sizes["M"] else 0.0
+        between = means.var("M", skipna=True) if means.sizes["M"] > 1 else 0.0
+        spread = np.sqrt(within + between)
+    else:
+        if X.sizes["M"] < 2:
+            raise ValueError("spread-conditioned calibration needs at least two channels.")
+        signal = X.mean("M", skipna=True)
+        spread = X.std("M", skipna=True)
+    return signal, spread
+
+
+def _signal_to_spread_ratio(X, signal_clim=None):
+    """Domain-wide ratio per year: RMS of the ensemble-mean anomaly over the
+    RMS of the ensemble spread. Returns ``(z (T,), signal climatology (Y,X))``.
+
+    One number per year keeps the modulation stable on 20-30 years; a
+    per-pixel ratio would inherit the per-pixel noise this module is built to
+    avoid.
+    """
+    signal, spread = _ensemble_signal_spread(X)
+    if signal_clim is None:
+        signal_clim = signal.mean("T")
+    anom = signal - signal_clim
+    finite = np.isfinite(anom) & np.isfinite(spread)
+    num = np.sqrt((anom.where(finite) ** 2).mean(("Y", "X"), skipna=True))
+    den = np.sqrt((spread.where(finite) ** 2).mean(("Y", "X"), skipna=True))
+    z = (num / den.where(den > 1e-12)).fillna(0.0)
+    return z, signal_clim
+
+
+def _yearly_slopes(pa, oa):
+    """Optimal global slope of each year and its weight sum(pa^2)."""
+    finite = np.isfinite(pa) & np.isfinite(oa)
+    cov = (pa.where(finite) * oa.where(finite)).sum(("Y", "X"), skipna=True)
+    var = (pa.where(finite) ** 2).sum(("Y", "X"), skipna=True)
+    slope = (cov / var.where(var > 1e-12))
+    return slope, var
+
+
+def _spread_conditioned_slope(pa_train, oa_train, z_train, z_test,
+                              bounds=AMPLITUDE_SLOPE_BOUNDS):
+    """Fit ``b(z)`` on the training years, return the slope of each test year.
+
+    Weighted least squares of the yearly slope on ``(z_norm - 1)`` with weights
+    sum(pa^2): years with more predicted signal pin the line down. ``b1`` is
+    forced non-negative (agreement never *reduces* confidence) and shrunk by
+    ``max(0, 1 - 1/t^2)``: a sensitivity that is not distinguishable from zero
+    on the training years is not used.
+    """
+    b_year, w_year = _yearly_slopes(pa_train, oa_train)
+    b = np.asarray(b_year.values, dtype=float)
+    w = np.asarray(w_year.values, dtype=float)
+    z = np.asarray(z_train.values, dtype=float)
+    ok = np.isfinite(b) & np.isfinite(w) & np.isfinite(z) & (w > 0)
+    scale = float(np.median(z[ok])) if ok.any() and np.median(z[ok]) > 1e-12 else 1.0
+    x = z / scale - 1.0
+
+    diag = dict(b0=np.nan, b1=np.nan, b1_raw=np.nan, b1_t=np.nan,
+                z_scale=scale, n_years=int(ok.sum()))
+    if ok.sum() < 5:
+        # too few years for a two-parameter line: fall back to the pooled slope
+        b0 = float(np.clip(np.sum(w[ok] * b[ok]) / np.sum(w[ok]), *bounds)) if ok.any() else 0.0
+        diag.update(b0=b0, b1=0.0, b1_raw=0.0, b1_t=0.0, fallback="too_few_years")
+        zt = np.clip(np.asarray(z_test.values, dtype=float) / scale, *SPREAD_Z_BOUNDS)
+        return np.full(zt.shape, b0), diag
+
+    bw, ww, xw = b[ok], w[ok], x[ok]
+    xbar = np.sum(ww * xw) / np.sum(ww)
+    bbar = np.sum(ww * bw) / np.sum(ww)
+    sxx = np.sum(ww * (xw - xbar) ** 2)
+    sxy = np.sum(ww * (xw - xbar) * (bw - bbar))
+    b1_raw = sxy / sxx if sxx > 1e-12 else 0.0
+    b0 = bbar - b1_raw * xbar
+
+    resid = bw - (b0 + b1_raw * xw)
+    dof = max(int(ok.sum()) - 2, 1)
+    s2 = np.sum(ww * resid ** 2) / dof
+    se = np.sqrt(s2 / sxx) if sxx > 1e-12 else np.inf
+    t = b1_raw / se if np.isfinite(se) and se > 0 else 0.0
+    shrink = max(0.0, 1.0 - 1.0 / (t * t)) if abs(t) > 1e-12 else 0.0
+    b1 = max(0.0, b1_raw) * shrink
+    # the intercept is re-centred so that the mean training slope is preserved
+    b0 = bbar - b1 * xbar
+
+    diag.update(b0=float(b0), b1=float(b1), b1_raw=float(b1_raw), b1_t=float(t))
+    zt = np.clip(np.asarray(z_test.values, dtype=float) / scale, *SPREAD_Z_BOUNDS)
+    slopes = np.clip(b0 + b1 * (zt - 1.0), *bounds)
+    return slopes, diag
+
+
+def _blocked_inner_predictions(model, models_by_cluster, raw_X_train, y_train,
+                               best_params, clim_year_start, clim_year_end, n_folds):
+    """Out-of-sample predictions of the training years by blocked inner CV.
+
+    The learner is refitted ``n_folds`` times on contiguous year blocks with
+    the OUTER hyperparameters (zone map refitted per block, hyperparameters
+    kept -- ``_regional_params_from``), calibration disabled, and each block
+    is predicted by the fit that did not see it.
+
+    Why this matters: a slope fitted on in-sample predictions is biased
+    towards 1 (or above) for any learner that fits its training data, so the
+    calibration under-shrinks. Measured on 17 GCM hindcasts (MJJ, 0.1 deg):
+    with in-sample slopes the MLP kept 36 % of the observed amplitude and
+    scored MSSS -0.017; XGBoost got a slope of 1.2 and MSSS -0.102. The
+    out-of-sample slope is the honest one.
+
+    Returns ``(pa, oa)``: predicted and observed ANOMALIES, each block being
+    centred on its own inner-training climatology -- the prediction on the
+    inner fit's own in-sample mean, the observation on the inner-training
+    observed mean. Re-centring the recombined blocks globally would inject
+    the fold-recombination artefact (a block trained without a wet year
+    predicts low while that year observes high), which drives the pooled
+    slope negative: the first implementation returned exactly 0.0 on every
+    fold because of it.
+    """
+    n = int(y_train.sizes["T"])
+    block = max(1, int(np.ceil(n / max(2, int(n_folds)))))
+    saved_models = dict(models_by_cluster)
+    saved_flag = model.amplitude_calibration
+    model.amplitude_calibration = False
+    pa_parts, oa_parts = [], []
+    try:
+        for start in range(0, n, block):
+            test = np.arange(start, min(start + block, n))
+            train = np.setdiff1d(np.arange(n), test)
+            if train.size < 5:
+                continue
+            y_in = y_train.isel(T=train)
+            params = _regional_params_from(model, best_params, y_in)
+            # one fit, one prediction of BOTH the inner-training years (for
+            # the fit's own climatology) and the held-out block
+            both = model.compute_model(
+                raw_X_train.isel(T=train), y_in, raw_X_train.isel(T=np.r_[train, test]),
+                clim_year_start=clim_year_start, clim_year_end=clim_year_end, **params)
+            both = both.transpose("T", "Y", "X")
+            level = both.isel(T=slice(0, train.size)).mean("T")
+            pa_parts.append(both.isel(T=slice(train.size, None)) - level)
+            oa_parts.append(y_train.isel(T=test) - y_in.mean("T"))
+    finally:
+        model.amplitude_calibration = saved_flag
+        # the inner refits overwrote the per-cluster estimators: restore the
+        # outer fit so that later diagnostics / forecast see the right models
+        models_by_cluster.clear()
+        models_by_cluster.update(saved_models)
+    if not pa_parts:
+        return None
+    pa = xr.concat(pa_parts, dim="T").sortby("T").transpose("T", "Y", "X")
+    oa = xr.concat(oa_parts, dim="T").sortby("T").transpose("T", "Y", "X")
+    return pa, oa
+
+
+def _anomaly_slope(pa, oa, bounds=AMPLITUDE_SLOPE_BOUNDS):
+    """Pooled slope of observed on predicted anomalies (already centred)."""
+    finite = np.isfinite(pa) & np.isfinite(oa)
+    cov = float((pa.where(finite) * oa.where(finite)).sum(skipna=True))
+    var = float((pa.where(finite) ** 2).sum(skipna=True))
+    if not np.isfinite(cov) or not np.isfinite(var) or var <= 1e-12:
+        return 0.0
+    return float(np.clip(cov / var, bounds[0], bounds[1]))
+
+
+def _calibrate_amplitude(model, models_by_cluster, X_train, y_train,
+                         prediction, cluster_da, X_test=None, raw_predictors=None,
+                         best_params=None, clim_year_start=None, clim_year_end=None):
+    """Rescale ``prediction`` by a slope fitted on the training fold only.
+
+    ``model.amplitude_calibration_mode`` selects the slope:
+
+    * ``"global"`` -- one slope for the whole fold (default);
+    * ``"spread"`` -- a slope per forecast year driven by the year's
+      ensemble signal-to-spread ratio (needs ``X_test``; falls back to
+      ``"global"`` without it and records the fallback).
+
+    ``model.amplitude_calibration_inner_folds`` (default 3) estimates the
+    slope on OUT-OF-SAMPLE predictions of the training years (blocked inner
+    CV, see ``_blocked_inner_predictions``); 0 uses the in-sample prediction,
+    which is cheaper but biased towards 1.
+
+    Also guards against a degenerate fit -- a learner that does not even
+    reproduce its own training data while emitting near-full observed
+    variance, i.e. broadcasting noise at full amplitude. hpELM showed exactly
+    this on the validation case (in-sample r = 0.003, amplitude 0.99,
+    MSSS = -6.82). The slope collapses to ~0 there, which is the intended
+    fallback to climatology; the warning makes the event visible.
+    """
+    insample = _pooled_grid_prediction(models_by_cluster, X_train, cluster_da)
+    _, correlation, amplitude = _amplitude_slope(insample, y_train)
+    mode = getattr(model, "amplitude_calibration_mode", "global") or "global"
+    inner_folds = int(getattr(model, "amplitude_calibration_inner_folds", 3) or 0)
+
+    # anomalies used to fit the slope: out-of-sample when possible, each
+    # inner block centred on its own training climatology
+    anomalies = None
+    basis = "in_sample"
+    if inner_folds >= 2 and best_params is not None and raw_predictors is not None:
+        anomalies = _blocked_inner_predictions(
+            model, models_by_cluster, raw_predictors[0], y_train, best_params,
+            clim_year_start, clim_year_end, inner_folds)
+        if anomalies is not None:
+            basis = f"blocked_inner_cv_{inner_folds}"
+    if anomalies is None:
+        anomalies = (insample - insample.mean("T"), y_train - y_train.mean("T"))
+    pa_ref, oa_ref = anomalies
+    slope = _anomaly_slope(pa_ref, oa_ref)
+
+    diagnostics = dict(mode=mode, slope=slope, slope_basis=basis,
+                       insample_correlation=correlation, insample_amplitude=amplitude)
+
+    if abs(correlation) < DEGENERATE_INSAMPLE_R and amplitude > DEGENERATE_AMPLITUDE:
+        warnings.warn(
+            f"{type(model).__name__}: in-sample correlation {correlation:.3f} with "
+            f"amplitude {amplitude:.2f} -- the fit does not reproduce its own training "
+            f"data yet emits near-full observed variance. Amplitude calibration shrinks "
+            f"it to {slope:.3f} (towards climatology).",
+            RuntimeWarning, stacklevel=2)
+
+    baseline = y_train.mean("T")
+    pa_test = prediction - insample.mean("T")
+
+    if mode == "spread" and X_test is not None and slope > 0:
+        try:
+            z_train, signal_clim = _signal_to_spread_ratio(X_train)
+            z_test, _ = _signal_to_spread_ratio(X_test, signal_clim)
+            # yearly slopes on the same (out-of-sample when available) basis
+            z_train = z_train.sel(T=pa_ref["T"])
+            slopes, fit = _spread_conditioned_slope(pa_ref, oa_ref, z_train, z_test)
+            per_year = xr.DataArray(slopes, dims=("T",), coords={"T": prediction["T"]})
+            diagnostics.update(fit, z_train=np.asarray(z_train.values, dtype=float).tolist(),
+                               z_test=np.asarray(z_test.values, dtype=float).tolist(),
+                               slopes_test=np.asarray(slopes, dtype=float).tolist())
+            calibrated = baseline + per_year * pa_test
+        except ValueError as exc:
+            # no usable spread in the cube: keep the global slope, say so
+            diagnostics.update(fallback=f"global ({exc})")
+            calibrated = baseline + slope * pa_test
+    else:
+        if mode == "spread":
+            diagnostics.update(fallback="global (no X_test or zero slope)")
+        calibrated = baseline + slope * pa_test
+
+    model.amplitude_calibration_ = diagnostics
+    # baseline est (Y, X) : sans transpose, la diffusion xarray renvoie
+    # (Y, X, T) et casse le contrat (T, Y, X) attendu en aval
+    return calibrated.transpose(*prediction.dims)
+
+
+def _maybe_calibrate_amplitude(model, models_by_cluster, X_train, y_train,
+                               prediction, cluster_da, X_test=None, raw_predictors=None,
+                               best_params=None, clim_year_start=None, clim_year_end=None):
+    """Apply the calibration when the learner has it enabled."""
+    if not getattr(model, "amplitude_calibration", False):
+        return prediction
+    return _calibrate_amplitude(model, models_by_cluster, X_train, y_train,
+                                prediction, cluster_da, X_test=X_test,
+                                raw_predictors=raw_predictors, best_params=best_params,
+                                clim_year_start=clim_year_start, clim_year_end=clim_year_end)
+
+
+def _effective_spatial_dof(field):
+    """Bretherton et al. (1999) effective spatial degrees of freedom.
+
+    N_eff = (sum lambda)^2 / sum lambda^2 of the spatial covariance, computed
+    from the T x T Gram matrix (same non-zero spectrum) on cells complete in
+    time. Standardized anomalies are expected.
+    """
+    if not isinstance(field, xr.DataArray) or "T" not in field.dims:
+        return np.nan
+    if "M" in field.dims:
+        field = field.isel(M=0, drop=True)
+    a = np.asarray(field.transpose("T", "Y", "X").values, dtype=float).reshape(field.sizes["T"], -1)
+    good = np.isfinite(a).all(axis=0)
+    a = a[:, good]
+    if a.shape[0] < 2 or a.shape[1] < 2:
+        return np.nan
+    a = a - a.mean(axis=0, keepdims=True)
+    lam = np.linalg.eigvalsh(a @ a.T / a.shape[1])
+    lam = lam[lam > 1e-12 * max(lam.max(), 1e-300)]
+    if lam.size == 0:
+        return np.nan
+    return float(lam.sum() ** 2 / np.sum(lam ** 2))
+
+
+def _sample_size_report(learner, n_rows, n_years, n_features, n_eff_spatial, verbose=True):
+    """One line on the true sample size of a pooled fit; warn when it is small."""
+    n_eff_total = n_years * n_eff_spatial if np.isfinite(n_eff_spatial) else np.nan
+    if verbose:
+        print(f"[{learner}] rows={int(n_rows)} years={int(n_years)} features={int(n_features)} "
+              f"N_eff_spatial={n_eff_spatial:.1f} N_eff_total~{n_eff_total:.0f} "
+              f"(rows/N_eff~{(n_rows / n_eff_total) if np.isfinite(n_eff_total) and n_eff_total > 0 else np.nan:.0f})",
+              flush=True)
+    if int(n_years) < 12:
+        warnings.warn(
+            f"{learner}: only {n_years} independent years (N_eff_total~{n_eff_total:.0f} for "
+            f"{n_rows} rows). Treat skill as provisional; keep the outer year-wise validation.",
+            RuntimeWarning, stacklevel=2)
+    return n_eff_total
+
+
+# Hyperparameters ordered by complexity for the one-standard-error rule:
+# +1 = larger value means a more flexible model, -1 = larger means more regularized.
+_COMPLEXITY_DIRECTION = {
+    'n_estimators': 1, 'max_depth': 1, 'min_samples_split': -1, 'min_samples_leaf': -1,
+    'max_features': 1, 'max_samples': 1, 'min_impurity_decrease': -1, 'ccp_alpha': -1,
+    'min_weight_fraction_leaf': -1, 'max_leaf_nodes': 1, 'learning_rate': 1,
+    'min_child_weight': -1, 'subsample': 1, 'colsample_bytree': 1, 'gamma': -1,
+    'reg_alpha': -1, 'reg_lambda': -1, 'neurons': 1, 'norm': -1, 'hidden_layer_sizes': 1,
+    'alpha': -1, 'learning_rate_init': 1, 'C': 1, 'epsilon': -1, 'n_components': 1,
+    'degree': 1, 'max_terms': 1, 'penalty': -1, 'max_bins': 1, 'l2_regularization': -1,
+    'max_iter_no_improve': 0, 'max_iter': 0, 'l1_ratio': 0,
+}
+_MAX_FEATURES_ALIASES = {'sqrt': 0.5, 'log2': 0.4, 'auto': 1.0, None: 1.0}
+
+
+def _complexity_value(name, value):
+    if value is None:
+        return np.inf if name in ('max_depth', 'max_leaf_nodes') else 1.0
+    if isinstance(value, (tuple, list)):
+        return float(sum(float(v) for v in value))
+    if isinstance(value, str):
+        return float(_MAX_FEATURES_ALIASES.get(value, np.nan))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _one_se_select(records, score_key='score', year_key='year_scores'):
+    """Most regularized candidate within one standard error of the best score.
+
+    ``records`` are dicts with ``params`` (dict), ``score`` (float, higher is
+    better) and ``year_scores`` (per validation year). Complexity is a rank
+    aggregate over the known hyperparameters (:data:`_COMPLEXITY_DIRECTION`);
+    ties keep the better score. Returns ``(chosen_record, info)``.
+    """
+    from scipy.stats import rankdata
+    best = max(records, key=lambda r: r[score_key])
+    years = np.asarray(best.get(year_key) or [], dtype=float)
+    years = years[np.isfinite(years)]
+    se = float(years.std(ddof=1) / np.sqrt(len(years))) if len(years) > 1 else 0.0
+    threshold = best[score_key] - se
+    eligible = [r for r in records if r[score_key] >= threshold]
+    info = {'rule': 'one_se', 'best_score': float(best[score_key]), 'standard_error': se,
+            'n_eligible': len(eligible), 'n_candidates': len(records)}
+    if len(eligible) <= 1:
+        return best, info
+    names = sorted({k for r in eligible for k in r['params']})
+    complexity = np.zeros(len(eligible))
+    for name in names:
+        direction = _COMPLEXITY_DIRECTION.get(name, 0)
+        if not direction:
+            continue
+        vals = np.asarray([_complexity_value(name, r['params'].get(name)) for r in eligible], dtype=float)
+        finite = np.isfinite(vals)
+        if finite.sum() < 2 or np.nanmin(vals[finite]) == np.nanmax(vals[finite]) and not np.isinf(vals).any():
+            continue
+        filled = vals.copy()
+        top = np.nanmax(vals[finite]) if finite.any() else 0.0
+        filled[np.isposinf(vals)] = top + 1.0
+        filled[~np.isfinite(filled)] = np.nanmedian(filled[np.isfinite(filled)])
+        complexity += direction * rankdata(filled, method='average') / len(eligible)
+    order = sorted(range(len(eligible)), key=lambda i: (complexity[i], -eligible[i][score_key]))
+    chosen = eligible[order[0]]
+    info['chosen_score'] = float(chosen[score_key])
+    return chosen, info
 
 
 def _assign_target_time(da, predictor_for_year, predictant):
@@ -317,8 +1614,17 @@ def _mean_if_member(da):
         da = da.mean("M", skipna=True)
     return da.transpose("T", "Y", "X")
 
-# Suppress specific warnings for cleaner output
-warnings.filterwarnings('ignore', category=RuntimeWarning)
+# Suppress the numerical noise of numpy/xarray reductions (all-NaN slices,
+# 0/0 on empty pixels, ...) WITHOUT silencing the scientific RuntimeWarnings
+# raised explicitly by this module (_effective_sample_warning, empty HPELM
+# clusters, standardized-predictand clustering, ...). The previous blanket
+# ``filterwarnings('ignore', category=RuntimeWarning)`` muted every one of them
+# for the whole process.
+for _pattern in (r'invalid value encountered', r'divide by zero encountered',
+                 r'overflow encountered', r'Mean of empty slice',
+                 r'Degrees of freedom <= 0', r'All-NaN slice encountered',
+                 r'underflow encountered'):
+    warnings.filterwarnings('ignore', message=_pattern, category=RuntimeWarning)
 warnings.filterwarnings('ignore', category=ConvergenceWarning)
 
 
@@ -330,7 +1636,7 @@ def process_datasets_for_mme(
     agroparam=False,
     Prob=False,
     hydro=False,
-    ELM_ELR=False,
+    *,
     dir_to_save_model=None,
     best_models=None,
     scores=None,
@@ -342,6 +1648,10 @@ def process_datasets_for_mme(
     year_forecast=None,
     score_metric="GROC",
     var="PRCP",
+    ensemble_mean="mean",
+    ensemble_features=("mean", "std", "q10", "q50", "q90"),
+    ensemble_std_ddof=0,
+    ensemble_min_members=2,
 ):
     """Prepare deterministic or probabilistic fields for an MME.
 
@@ -349,14 +1659,40 @@ def process_datasets_for_mme(
 
     * deterministic fields: ``(T, M, Y, X)``;
     * probabilistic fields: ``(probability, T, M, Y, X)``;
-    * xcast ELM/ELR fields: ``(S, M, Y, X)``;
     * observations: ``(T, M, Y, X)`` with a singleton ``M`` dimension;
     * score fields: one strictly spatial ``(Y, X)`` array per model.
+
+    With ``ensemble_mean='mean'`` (default), M indexes GCM means and existing
+    deterministic inputs are accepted. The legacy ``'median'`` mode also remains
+    available as one channel per GCM. With ``ensemble_mean=None``, raw members
+    are summarized separately for each GCM, time and native-grid cell, BEFORE
+    interpolation. M then indexes ``GCM__statistic`` predictor channels. The
+    default features are mean, population std (ddof=0), q10, q50 and q90. At
+    least two finite members are required by default; missing values remain
+    masked. Configure the ordered feature list, ddof and minimum count with
+    ``ensemble_features``, ``ensemble_std_ddof``, ``ensemble_min_members``.
+    Already averaged inputs are rejected in statistics mode. Hindcast and
+    forecast member counts may differ, but output channel schemas must match.
+
+    Statistical channels are regression INPUTS, not physical model forecasts:
+    they must not be averaged as a weighted/probabilistic MME. ``Prob=True``
+    is therefore incompatible with statistics mode. Score dictionaries remain
+    keyed by original GCM names, never duplicated as feature-channel weights.
 
     In particular, a score carrying an ``M`` dimension is explicitly reduced
     to the requested model before it can be used. This prevents accidental
     xarray broadcasting from reintroducing ``M`` into a deterministic MME.
     """
+
+    from .was_ensemble_features import (
+        ensemble_summary_fields, normalise_ensemble_mean, normalise_ensemble_features,
+    )
+
+    ensemble_mean = normalise_ensemble_mean(ensemble_mean)
+    feature_names = normalise_ensemble_features(ensemble_features)
+    statistics_mode = ensemble_mean is None
+    if statistics_mode and Prob:
+        raise ValueError("ensemble_mean=None creates regression features; Prob=True cannot average distribution statistics as probabilities.")
 
     def _as_dataarray(obj, label):
         if isinstance(obj, xr.DataArray):
@@ -449,7 +1785,7 @@ def process_datasets_for_mme(
             )
 
         if not da.Y.identical(obs.Y) or not da.X.identical(obs.X):
-            method = "nearest" if probabilistic else "linear"
+            method = "nearest" if probabilistic or da.attrs.get("ensemble_statistic") == "count" else "linear"
             da = da.interp(
                 Y=obs.Y,
                 X=obs.X,
@@ -585,26 +1921,22 @@ def process_datasets_for_mme(
 
     for model_name in selected_models:
         if gcm:
-            hdcst = load_gridded_predictor(
-                dir_to_save_model,
-                model_name,
-                year_start,
-                year_end,
-                model=True,
-                month_of_initialization=month_of_initialization,
-                lead_time=lead_time,
-                year_forecast=None,
-            )
-            fcst = load_gridded_predictor(
-                dir_to_save_model,
-                model_name,
-                year_start,
-                year_end,
-                model=True,
-                month_of_initialization=month_of_initialization,
-                lead_time=lead_time,
-                year_forecast=year_forecast,
-            )
+            def _load_gcm(mapping, forecast_year, label):
+                # Explicit downloader mappings may point to a member-specific
+                # cache directory/filename. Do not reconstruct a mean filename.
+                if mapping:
+                    source = _find_path(mapping, model_name, label)
+                    if isinstance(source, (xr.DataArray, xr.Dataset)):
+                        return source
+                    return _open_dataarray(source, f"{label}[{model_name}]")
+                return load_gridded_predictor(
+                    dir_to_save_model, model_name, year_start, year_end,
+                    model=True, month_of_initialization=month_of_initialization,
+                    lead_time=lead_time, year_forecast=forecast_year,
+                    preserve_members=True,
+                )
+            hdcst = _load_gcm(hdcsted, None, "hindcast")
+            fcst = _load_gcm(fcsted, year_forecast, "forecast")
         elif agroparam:
             hdcst = _open_dataarray(
                 _find_path(hdcsted, model_name, "hindcast"),
@@ -625,28 +1957,61 @@ def process_datasets_for_mme(
             hdcst = hdcsted[model_name]
             fcst = fcsted[model_name]
 
-        hdcst = _prepare_field(
-            hdcst,
-            model_name,
-            "hindcast",
-            probabilistic=Prob,
-        )
-        fcst = _prepare_field(
-            fcst,
-            model_name,
-            "forecast",
-            probabilistic=Prob,
-        )
+        if Prob:
+            hdcst = _prepare_field(hdcst, model_name, "hindcast", probabilistic=True)
+            fcst = _prepare_field(fcst, model_name, "forecast", probabilistic=True)
+        else:
+            prepared = []
+            for value, label in ((hdcst, "hindcast"), (fcst, "forecast")):
+                value = _as_dataarray(value, label)
+                # Preserve the old per-model selection for deterministic cubes
+                # while member-statistics mode always requires raw member data.
+                if not statistics_mode and "M" in value.dims and "M" in value.coords and model_name in value.M.values.tolist():
+                    value = value.sel(M=model_name, drop=True)
+                summaries = ensemble_summary_fields(
+                    value, ensemble_mean=ensemble_mean, features=feature_names,
+                    std_ddof=ensemble_std_ddof, min_members=ensemble_min_members,
+                )
+                fields = [_prepare_field(field, model_name, label) for field in summaries.values()]
+                if statistics_mode:
+                    channels = [f"{model_name}__{stat}" for stat in summaries]
+                    result = xr.concat(fields, dim=xr.IndexVariable("M", channels),
+                                       join="exact", coords="minimal", compat="override")
+                    result = result.assign_coords(
+                        source_model=("M", [str(model_name)] * len(channels)),
+                        ensemble_statistic=("M", list(summaries)),
+                        feature_units=("M", [str(field.attrs.get("units", "")) for field in fields]),
+                    ).transpose("T", "M", "Y", "X")
+                else:
+                    result = fields[0]
+                prepared.append(result)
+            hdcst, fcst = prepared
+            if statistics_mode and not hdcst.M.identical(fcst.M):
+                raise ValueError(f"Hindcast/forecast ensemble feature channels differ for {model_name!r}.")
 
-        if not Prob and hdcst.sizes["T"] == obs.sizes["T"]:
-            # hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
-            hdcst = hdcst.assign_coords(T=obs["T"].astype("datetime64[ns]"))
+        # Seasonal stamps may differ within a year, but positional replacement
+        # must never pair different years or conceal a reordered archive.
+        if hdcst.sizes['T'] != obs.sizes['T'] or not np.array_equal(
+                hdcst['T'].dt.year.values, obs['T'].dt.year.values):
+            raise ValueError(f'Hindcast years/order differ from observations for {model_name!r}. Align explicitly before MME preparation.')
+        if len(np.unique(hdcst['T'].dt.year.values)) != hdcst.sizes['T']:
+            raise ValueError('MME preparation requires one seasonal target per year.')
+        hdcst = hdcst.assign_coords(T=obs['T'])
 
         all_model_hdcst[model_name] = hdcst
         all_model_fcst[model_name] = fcst
 
     # Keep only models successfully loaded in the same explicit order.
     predictor_names = list(all_model_hdcst)
+    if not predictor_names:
+        raise ValueError(
+            f"process_datasets_for_mme: {len(selected_models)} model(s) were "
+            "requested but NONE survived loading/_prepare_field — the M-stacked "
+            "cube would be empty. Requested: "
+            f"{selected_models[:10]}{'...' if len(selected_models) > 10 else ''}. "
+            "Check that each member's hindcast/forecast file exists and carries "
+            "T/Y/X dims."
+        )
     hdcst_list = [all_model_hdcst[name] for name in predictor_names]
     fcst_list = [all_model_fcst[name] for name in predictor_names]
 
@@ -654,61 +2019,80 @@ def process_datasets_for_mme(
         hdcst_stack = xr.concat(
             hdcst_list,
             dim=xr.IndexVariable("M", predictor_names),
-            join="inner",
+            join="exact",
             coords="minimal",
             compat="override",
         ).transpose("probability", "T", "M", "Y", "X")
         fcst_stack = xr.concat(
             fcst_list,
             dim=xr.IndexVariable("M", predictor_names),
-            join="inner",
+            join="exact",
             coords="minimal",
             compat="override",
         ).transpose("probability", "T", "M", "Y", "X")
 
         hdcst_stack = hdcst_stack.where(mask.notnull())
-        hdcst_clim = hdcst_stack.mean("T", skipna=True)
-        hdcst_stack = hdcst_stack.fillna(hdcst_clim)
-        fcst_stack = fcst_stack.where(mask.notnull()).fillna(hdcst_clim)
+        fcst_stack = fcst_stack.where(mask.notnull())
+    elif statistics_mode:
+        hdcst_stack = xr.concat(hdcst_list, dim="M", join="exact", coords="minimal", compat="override").transpose("T", "M", "Y", "X")
+        fcst_stack = xr.concat(fcst_list, dim="M", join="exact", coords="minimal", compat="override").transpose("T", "M", "Y", "X")
+        if len(set(hdcst_stack.M.values.tolist())) != hdcst_stack.sizes["M"]:
+            raise ValueError("Ensemble feature channel names are not unique; rename the source GCM identifiers.")
+        hdcst_stack = hdcst_stack.where(mask.notnull())
+        fcst_stack = fcst_stack.where(mask.notnull())
     else:
         hdcst_stack = xr.concat(
             hdcst_list,
             dim=xr.IndexVariable("M", predictor_names),
-            join="inner",
+            join="exact",
             coords="minimal",
             compat="override",
         ).transpose("T", "M", "Y", "X")
         fcst_stack = xr.concat(
             fcst_list,
             dim=xr.IndexVariable("M", predictor_names),
-            join="inner",
+            join="exact",
             coords="minimal",
             compat="override",
         ).transpose("T", "M", "Y", "X")
 
         hdcst_stack = hdcst_stack.where(mask.notnull())
-        hdcst_clim = hdcst_stack.mean("T", skipna=True)
-        hdcst_stack = hdcst_stack.fillna(hdcst_clim)
-        fcst_stack = fcst_stack.where(mask.notnull()).fillna(hdcst_clim)
+        fcst_stack = fcst_stack.where(mask.notnull())
+
+    if not Prob:
+        for cube in (hdcst_stack, fcst_stack):
+            cube.attrs = dict(cube.attrs)
+            cube.attrs.pop("ensemble_statistic", None)
+            cube.attrs.update(
+                wass2s_ensemble_mode="statistics" if statistics_mode else ensemble_mean,
+                ensemble_features=",".join(feature_names) if statistics_mode else ensemble_mean,
+                ensemble_std_ddof=int(ensemble_std_ddof),
+                ensemble_min_members=int(ensemble_min_members) if statistics_mode else 1,
+                ensemble_statistics_grid="native_before_interpolation",
+            )
+            # Preserve units from each GCM/statistic before concatenation:
+            # the first channel may be dimensionless count, and GCM source
+            # metadata may differ. Never infer all units from that first field.
+            if statistics_mode:
+                units = set(cube.feature_units.values.tolist())
+                if len(units) == 1 and next(iter(units)):
+                    cube.attrs["units"] = next(iter(units))
+                else:
+                    cube.attrs.pop("units", None)
 
     obs_m = (
         obs.where(mask.notnull())
         .expand_dims(M=[0])
         .transpose("T", "M", "Y", "X")
     )
-    obs_m = obs_m.fillna(obs_m.mean("T", skipna=True))
+    # Missing observations are never imputed for verification. Any estimator
+    # imputation must be fitted inside its training fold, not in this assembler.
 
     score_pool = _score_pool_from_input(scores)
     scores_organized = {
         name: _prepare_score(_match_score(name, score_pool), name, index)
         for index, name in enumerate(predictor_names)
     }
-
-    if ELM_ELR:
-        if Prob:
-            raise ValueError("ELM_ELR=True is incompatible with Prob=True.")
-        hdcst_stack = hdcst_stack.rename(T="S").transpose("S", "M", "Y", "X")
-        fcst_stack = fcst_stack.rename(T="S").transpose("S", "M", "Y", "X")
 
     return hdcst_stack, fcst_stack, obs_m, scores_organized
 
@@ -830,6 +2214,7 @@ class WAS_mme_Weighted:
 
     @classmethod
     def _as_ensemble(cls, da, name):
+        require_physical_ensemble(da)
         return cls._strict_dims(da, ("T", "M", "Y", "X"), name)
 
     @classmethod
@@ -842,10 +2227,10 @@ class WAS_mme_Weighted:
             return forecast
         try:
             forecast_year = int(
-                forecast.T.values[0].astype("datetime64[Y]").astype(int) + 1970
+                forecast["T"].values[0].astype("datetime64[Y]").astype(int) + 1970
             )
             obs_month = int(
-                observation.T.values[0].astype("datetime64[M]").astype(int) % 12 + 1
+                observation["T"].values[0].astype("datetime64[M]").astype(int) % 12 + 1
             )
             new_time = np.datetime64(f"{forecast_year:04d}-{obs_month:02d}-01", "ns")
             if forecast.sizes["T"] == 1:
@@ -937,7 +2322,7 @@ class WAS_mme_Weighted:
                 f"hdcst and observation must have the same T length; "
                 f"got {hdcst.sizes['T']} and {obs.sizes['T']}."
             )
-        hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        hdcst = align_predictor_target(hdcst, obs, mode="season_year")
         fcst = self._normalise_forecast_time(fcst, obs)
 
         hdcst = hdcst.interp(
@@ -1010,21 +2395,21 @@ class WAS_mme_Weighted:
         code = int(dist_code)
         try:
             if code == 1:
-                return norm.ppf(0.33, loc=loc, scale=scale), norm.ppf(0.67, loc=loc, scale=scale)
+                return norm.ppf(1.0 / 3.0, loc=loc, scale=scale), norm.ppf(2.0 / 3.0, loc=loc, scale=scale)
             if code == 2:
-                return lognorm.ppf(0.33, s=shape, loc=loc, scale=scale), lognorm.ppf(0.67, s=shape, loc=loc, scale=scale)
+                return lognorm.ppf(1.0 / 3.0, s=shape, loc=loc, scale=scale), lognorm.ppf(2.0 / 3.0, s=shape, loc=loc, scale=scale)
             if code == 3:
-                return expon.ppf(0.33, loc=loc, scale=scale), expon.ppf(0.67, loc=loc, scale=scale)
+                return expon.ppf(1.0 / 3.0, loc=loc, scale=scale), expon.ppf(2.0 / 3.0, loc=loc, scale=scale)
             if code == 4:
-                return gamma_dist.ppf(0.33, a=shape, loc=loc, scale=scale), gamma_dist.ppf(0.67, a=shape, loc=loc, scale=scale)
+                return gamma_dist.ppf(1.0 / 3.0, a=shape, loc=loc, scale=scale), gamma_dist.ppf(2.0 / 3.0, a=shape, loc=loc, scale=scale)
             if code == 5:
-                return weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale), weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale)
+                return weibull_min.ppf(1.0 / 3.0, c=shape, loc=loc, scale=scale), weibull_min.ppf(2.0 / 3.0, c=shape, loc=loc, scale=scale)
             if code == 6:
-                return tdist.ppf(0.33, df=shape, loc=loc, scale=scale), tdist.ppf(0.67, df=shape, loc=loc, scale=scale)
+                return tdist.ppf(1.0 / 3.0, df=shape, loc=loc, scale=scale), tdist.ppf(2.0 / 3.0, df=shape, loc=loc, scale=scale)
             if code == 7:
-                return poisson.ppf(0.33, mu=shape, loc=loc), poisson.ppf(0.67, mu=shape, loc=loc)
+                return poisson.ppf(1.0 / 3.0, mu=shape, loc=loc), poisson.ppf(2.0 / 3.0, mu=shape, loc=loc)
             if code == 8:
-                return nbinom.ppf(0.33, n=shape, p=scale, loc=loc), nbinom.ppf(0.67, n=shape, p=scale, loc=loc)
+                return nbinom.ppf(1.0 / 3.0, n=shape, p=scale, loc=loc), nbinom.ppf(2.0 / 3.0, n=shape, p=scale, loc=loc)
         except (ValueError, FloatingPointError, TypeError):
             pass
         return np.nan, np.nan
@@ -1136,25 +2521,11 @@ class WAS_mme_Weighted:
     def calculate_tercile_probabilities_nonparametric(
         best_guess, error_samples, first_tercile, second_tercile
     ):
-        best_guess = np.asarray(best_guess, dtype=float)
-        errors = np.asarray(error_samples, dtype=float)
-        errors = errors[np.isfinite(errors)]
-        out = np.full((3, best_guess.size), np.nan, dtype=float)
-        if errors.size == 0:
-            return out
-
-        for index, value in enumerate(best_guess):
-            if not np.isfinite(value):
-                continue
-            distribution = value + errors
-            pb = np.mean(distribution < first_tercile)
-            pn = np.mean((distribution >= first_tercile) & (distribution < second_tercile))
-            pa = 1.0 - pb - pn
-            probs = np.clip(np.array([pb, pn, pa]), 0.0, 1.0)
-            total = probs.sum()
-            if total > 0:
-                out[:, index] = probs / total
-        return out
+        return _nonparam_tercile_numba(
+            np.asarray(best_guess, dtype=np.float64),
+            np.asarray(error_samples, dtype=np.float64),
+            float(first_tercile), float(second_tercile),
+        )
 
     @staticmethod
     def _prepare_spatial_parameter(parameter, obs, name):
@@ -1188,7 +2559,7 @@ class WAS_mme_Weighted:
             probability=("probability", list(cls._PROBABILITY_LABELS))
         ).transpose("probability", "T", "Y", "X")
         probability = probability.clip(min=0.0, max=1.0)
-        total = probability.sum("probability", skipna=True)
+        total = probability.sum("probability", skipna=False)
         probability = probability / total.where(total > 0)
         return probability.where(mask.notnull())
 
@@ -1210,11 +2581,30 @@ class WAS_mme_Weighted:
                 "At least three observation years are required in the climatology period."
             )
 
-        terciles = climatology.quantile([0.33, 0.67], dim="T")
+        terciles = climatological_terciles(climatology)[0]
         t1_emp = terciles.isel(quantile=0, drop=True)
         t2_emp = terciles.isel(quantile=1, drop=True)
         errors = obs - hindcast_det
-        error_variance = errors.var("T", skipna=True)
+        # Residual dressing must not see the error of the year it dresses. When
+        # the target IS the hindcast (same T axis, as in compute_prob) the error
+        # of each target year is left out (leave-one-out); the residual variance
+        # is the unbiased sample variance (ddof=1) in every case.
+        leave_one_out = bool(
+            target_det.sizes.get("T", 0) == errors.sizes["T"]
+            and np.array_equal(target_det["T"].values, errors["T"].values)
+        )
+        error_variance = errors.var("T", skipna=True, ddof=1)
+        if leave_one_out:
+            # Exact ddof=1 variance of the sample without year j:
+            # [S - n/(n-1) (e_j - ebar)^2] / (n - 2), S = sum_k (e_k - ebar)^2.
+            # A year whose own error is missing keeps the full-sample variance.
+            n_errors = errors.count("T")
+            deviation2 = (errors - errors.mean("T", skipna=True)) ** 2
+            with np.errstate(divide="ignore", invalid="ignore"):
+                loo_variance = (deviation2.sum("T", skipna=True)
+                                - deviation2 * n_errors / (n_errors - 1)) / (n_errors - 2)
+            error_variance = xr.where(deviation2.notnull(), loo_variance,
+                                      error_variance).where(n_errors > 2)
         # The forecast target may have a different T coordinate/length from the
         # historical error sample. Give the error sample its own core dimension
         # so xarray does not try to align forecast T with hindcast T.
@@ -1233,26 +2623,47 @@ class WAS_mme_Weighted:
             loc = self._prepare_spatial_parameter(best_loc_da, obs, "best_loc_da")
             scale = self._prepare_spatial_parameter(best_scale_da, obs, "best_scale_da")
 
-            t1, t2 = _pufunc(
-                self._ppf_terciles_from_code,
-                code,
-                shape,
-                loc,
-                scale,
-                input_core_dims=[[], [], [], []],
-                output_core_dims=[[], []],
-                vectorize=True,
-                dask="parallelized",
-                output_dtypes=[float, float],
-            )
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                t1, t2 = _pufunc(
+                    self._ppf_terciles_from_code,
+                    code,
+                    shape,
+                    loc,
+                    scale,
+                    input_core_dims=[[], [], [], []],
+                    output_core_dims=[[], []],
+                    vectorize=True,
+                    dask="parallelized",
+                    output_dtypes=[float, float],
+                )
+            else:
+                t1, t2 = t1_emp, t2_emp
+            kernel = self.calculate_tercile_probabilities_bestfit
+            variance_dims = []
+            if leave_one_out:
+                variance_dims = ["T"]
+
+                def kernel(best_guess, variances, T1, T2, dist_code, dof,
+                           _kernel=self.calculate_tercile_probabilities_bestfit):
+                    # One leave-one-out residual variance per dressed year.
+                    best_guess = np.asarray(best_guess, dtype=float)
+                    variances = np.asarray(variances, dtype=float)
+                    out = np.full((3, best_guess.size), np.nan, dtype=float)
+                    for j in range(best_guess.size):
+                        out[:, j] = _kernel(best_guess[j:j + 1], variances[j],
+                                            T1, T2, dist_code, dof)[:, 0]
+                    return out
+
             probability = _pufunc(
-                self.calculate_tercile_probabilities_bestfit,
+                kernel,
                 target_det,
                 error_variance,
                 t1,
                 t2,
                 code,
-                input_core_dims=[["T"], [], [], [], []],
+                input_core_dims=[["T"], variance_dims, [], [], []],
                 output_core_dims=[["probability", "T"]],
                 vectorize=True,
                 dask="parallelized",
@@ -1264,8 +2675,26 @@ class WAS_mme_Weighted:
                 },
             )
         elif self.dist_method == "nonparam":
+            kernel = self.calculate_tercile_probabilities_nonparametric
+            if leave_one_out:
+
+                def kernel(best_guess, error_samples, first_tercile, second_tercile,
+                           _kernel=self.calculate_tercile_probabilities_nonparametric):
+                    # Year j is dressed with every error but its own: the error
+                    # sample keeps its own dimension and the j-th entry is set to
+                    # NaN, which _nonparam_tercile_numba ignores.
+                    best_guess = np.asarray(best_guess, dtype=np.float64)
+                    error_samples = np.asarray(error_samples, dtype=np.float64)
+                    out = np.full((3, best_guess.size), np.nan, dtype=float)
+                    for j in range(best_guess.size):
+                        sample = error_samples.copy()
+                        sample[j] = np.nan
+                        out[:, j] = _kernel(best_guess[j:j + 1], sample,
+                                            first_tercile, second_tercile)[:, 0]
+                    return out
+
             probability = _pufunc(
-                self.calculate_tercile_probabilities_nonparametric,
+                kernel,
                 target_det,
                 errors_for_ufunc,
                 t1_emp,
@@ -1306,7 +2735,7 @@ class WAS_mme_Weighted:
             raise ValueError(
                 "hindcast_det and Predictant must have the same number of T values."
             )
-        hindcast_det = hindcast_det.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        hindcast_det = align_predictor_target(hindcast_det, obs, mode="season_year")
         hindcast_det = hindcast_det.interp(
             Y=obs.Y, X=obs.X, method="nearest", kwargs={"fill_value": "extrapolate"}
         )
@@ -1343,7 +2772,7 @@ class WAS_mme_Weighted:
             raise ValueError(
                 "hindcast_det and Predictant must have the same number of T values."
             )
-        hindcast_det = hindcast_det.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        hindcast_det = align_predictor_target(hindcast_det, obs, mode="season_year")
         forecast_det = self._normalise_forecast_time(forecast_det, obs)
         hindcast_det = hindcast_det.interp(
             Y=obs.Y, X=obs.X, method="nearest", kwargs={"fill_value": "extrapolate"}
@@ -1365,6 +2794,59 @@ class WAS_mme_Weighted:
         )
         mask = xr.where(obs.notnull().any("T"), 1.0, np.nan)
         return forecast_det.where(mask.notnull()), forecast_prob
+
+class WAS_mme_WeightedContinuous(WAS_mme_Weighted):
+    """Continuous, shrinkage-stabilised skill-weighted deterministic MME.
+
+    ``WAS_mme_Weighted`` is intentionally preserved unchanged for backward
+    compatibility.  This companion avoids hard 0/1 jumps in skill and shrinks
+    learned weights toward equal weighting -- a useful safeguard for seasonal
+    hindcasts with only a few decades.
+
+    Higher-is-better scores are measured relative to a no-skill reference
+    (GROC/ROC: 0.5; RPSS/correlation/KGE/NSE: 0). Lower-is-better scores use a
+    smooth inverse loss transform. ``shrinkage``=1 is equal weighting and 0 is
+    pure data-derived weighting.
+    """
+    def __init__(self, dist_method="nonparam", metric="GROC", threshold=0.5,
+                 power=1.0, shrinkage=0.20, loss_scale=None, neutral_score=None):
+        super().__init__(equal_weighted=False, dist_method=dist_method,
+                         metric=metric, threshold=threshold)
+        if not (0.0 <= float(shrinkage) <= 1.0):
+            raise ValueError("shrinkage must be in [0,1].")
+        if float(power) <= 0:
+            raise ValueError("power must be > 0.")
+        self.power = float(power)
+        self.shrinkage = float(shrinkage)
+        self.loss_scale = loss_scale
+        self.neutral_score = neutral_score
+
+    def transform_score(self, score_array):
+        metric = self.metric.lower().replace("_", "").replace("-", "")
+        score = score_array.astype(float)
+        lower = {"mae", "rmse", "mse", "crps", "ignorance"}
+        if metric in lower:
+            scale = float(self.loss_scale if self.loss_scale is not None else self.threshold)
+            if not np.isfinite(scale) or scale <= 0:
+                finite = score.where(np.isfinite(score))
+                scale = float(finite.median(skipna=True)) if finite.count() else 1.0
+            skill = 1.0 / (1.0 + (score.clip(min=0.0) / max(scale, 1e-12)) ** self.power)
+        elif metric == "bias":
+            scale = float(self.loss_scale if self.loss_scale is not None else self.threshold)
+            skill = 1.0 / (1.0 + (np.abs(score) / max(scale, 1e-12)) ** self.power)
+        else:
+            if self.neutral_score is not None:
+                neutral = float(self.neutral_score)
+            elif metric in {"groc", "roc"}:
+                neutral = 0.5
+            else:
+                neutral = 0.0
+            denom = max(1.0 - neutral, 1e-12)
+            skill = ((score - neutral) / denom).clip(min=0.0) ** self.power
+        # Equal-weight shrinkage prevents unstable all-or-nothing maps.
+        weight = (1.0 - self.shrinkage) * skill + self.shrinkage
+        return weight.where(np.isfinite(weight), self.shrinkage).clip(min=0.0)
+
 
 class WAS_ProbWeighted(WAS_mme_Weighted):
     """Skill-weighted combination of multi-model tercile probabilities.
@@ -1658,7 +3140,7 @@ class WAS_ProbWeighted(WAS_mme_Weighted):
                 f"got {hdcst.sizes['T']} and {obs.sizes['T']}."
             )
 
-        hdcst = hdcst.assign_coords(T=obs.T.astype("datetime64[ns]"))
+        hdcst = align_predictor_target(hdcst, obs, mode="season_year")
         fcst = self._normalise_forecast_time(fcst, obs)
 
         # Forecast model and probability axes must match the hindcast exactly.
@@ -1768,6 +3250,197 @@ class WAS_ProbWeighted(WAS_mme_Weighted):
             "forecast_weighted",
         )
         return hindcast_weighted, forecast_weighted
+
+class WAS_ProbWeightedContinuous(WAS_ProbWeighted):
+    """Continuous/shrunk version of :class:`WAS_ProbWeighted`.
+
+    The historical stepwise class is kept intact. This variant avoids arbitrary
+    score bins and therefore changes smoothly when a model skill estimate moves
+    from, for example, GROC 0.79 to 0.81.
+    """
+    def __init__(self, metric="GROC", threshold=0.5, power=1.0,
+                 shrinkage=0.20, loss_scale=None, missing_score="zero",
+                 normalize_probabilities=True):
+        super().__init__(metric=metric, threshold=threshold,
+                         missing_score=missing_score,
+                         normalize_probabilities=normalize_probabilities)
+        self.power = float(power)
+        self.shrinkage = float(shrinkage)
+        self.loss_scale = loss_scale
+        if self.power <= 0 or not (0 <= self.shrinkage <= 1):
+            raise ValueError("power must be >0 and shrinkage must be in [0,1].")
+
+    def transform_score(self, score_array, threshold=None):
+        metric = self.metric.lower().replace("_", "").replace("-", "")
+        score = score_array.astype(float)
+        lower = {"mae", "rmse", "mse", "crps", "ignorance"}
+        thr = self.threshold if threshold is None else float(threshold)
+        if metric in lower or metric == "bias":
+            scale = float(self.loss_scale if self.loss_scale is not None else thr)
+            x = np.abs(score) if metric == "bias" else score.clip(min=0.0)
+            skill = 1.0 / (1.0 + (x / max(scale, 1e-12)) ** self.power)
+        else:
+            neutral = 0.5 if metric in {"groc", "roc"} else 0.0
+            skill = ((score - neutral) / max(1.0-neutral, 1e-12)).clip(min=0.0) ** self.power
+        return ((1-self.shrinkage)*skill + self.shrinkage).where(np.isfinite(score), 0.0)
+
+
+class WAS_ProbWeightedRPS:
+    """Proper-score optimized probability blend with LOYO shrinkage selection.
+
+    Weights lie on the simplex and minimize Ranked Probability Score.  L2
+    shrinkage toward equal weights is selected by leave-one-year-out CV.  This
+    is deliberately global by default because per-gridpoint weights are poorly
+    identified with ~20--30 seasonal hindcast years.
+    """
+    def __init__(self, shrinkage_grid=(0.0, 0.01, 0.03, 0.1, 0.3, 1.0),
+                 min_train_years=8, spatial_pooling="global"):
+        if spatial_pooling not in {"global", "gridpoint"}:
+            raise ValueError("spatial_pooling must be 'global' or 'gridpoint'.")
+        self.shrinkage_grid=tuple(float(v) for v in shrinkage_grid)
+        if not self.shrinkage_grid or not all(np.isfinite(v) and v >= 0 for v in self.shrinkage_grid):
+            raise ValueError("shrinkage_grid must contain finite nonnegative values.")
+        self.min_train_years=int(min_train_years)
+        self.spatial_pooling=spatial_pooling
+        self.weights_=None; self.lambda_=None; self.cv_rps_=None
+
+    @staticmethod
+    def _obs_class(obs, y0, y1):
+        return WAS_Verification().compute_class(obs, y0, y1).transpose("T","Y","X")
+
+    @staticmethod
+    def _rps(P, cls):
+        # P (...,3), cls (...)
+        c1=P[...,0]; c2=P[...,0]+P[...,1]
+        o1=(cls==0).astype(float); o2=(cls<=1).astype(float)
+        valid=np.isfinite(cls)&np.isfinite(c1)&np.isfinite(c2)
+        if not np.any(valid): return np.inf
+        return float(np.mean(((c1-o1)**2+(c2-o2)**2)[valid]))
+
+    @staticmethod
+    def _fit_w(P, cls, lam):
+        # P: (M,N,3)
+        M=P.shape[0]; prior=np.full(M,1/M)
+        def obj(w):
+            blend=np.tensordot(w,P,axes=(0,0))
+            return WAS_ProbWeightedRPS._rps(blend,cls)+float(lam)*np.sum((w-prior)**2)
+        cons={"type":"eq","fun":lambda w: np.sum(w)-1.0}
+        res=minimize(obj,prior,method="SLSQP",bounds=[(0,1)]*M,constraints=[cons],
+                     options={"maxiter":500,"ftol":1e-10})
+        return res.x if res.success else prior
+
+    def fit(self, rainfall, hindcast_prob, clim_year_start, clim_year_end, *, obs_class=None):
+        """Fit weights against observed categories for the forecast events.
+
+        ``obs_class`` optionally supplies aligned labels 0/1/2 (or NaN),
+        for example when upstream cross-validation probabilities refer to
+        different training-fold thresholds at each time. When omitted, the
+        historical climatological category calculation is retained. Supplying
+        classes preserves event definitions; it does not make precomputed
+        upstream forecasts an end-to-end nested validation dataset.
+        """
+        obs=WAS_mme_Weighted._as_observation(rainfall)
+        hp=WAS_ProbWeighted._as_probability_ensemble(hindcast_prob,"hindcast_prob")
+        hp=align_predictor_target(hp, obs, mode="season_year")
+        hp=WAS_ProbWeighted._normalise_probability_vectors(hp)
+        if obs_class is None:
+            cls=self._obs_class(obs,clim_year_start,clim_year_end)
+        else:
+            if not isinstance(obs_class, xr.DataArray):
+                raise TypeError("obs_class must be an xarray.DataArray with T,Y,X dimensions.")
+            if set(obs_class.dims) != {"T", "Y", "X"}:
+                raise ValueError("obs_class must have exactly T,Y,X dimensions.")
+            cls=obs_class.transpose("T","Y","X")
+            obs,cls=xr.align(obs,cls,join="exact")
+            invalid=np.isinf(cls) | (np.isfinite(cls) & ~cls.isin([0,1,2]))
+            if bool(invalid.any().compute()):
+                raise ValueError("obs_class values must be 0, 1, 2 or NaN.")
+            cls=cls.where(np.isfinite(obs))
+        arr=hp.transpose("M","T","Y","X","probability").values
+        hp, cls = xr.align(hp, cls, join="exact")
+        cv=cls.values; M,T,ny,nx,_=arr.shape
+        years = _calendar_year_groups(obs["T"])
+        if len(np.unique(years)) != T:
+            raise ValueError("RPS blend currently requires one seasonal target per calendar year.")
+        if T < self.min_train_years:
+            warnings.warn("Too few years for RPS weighting; equal weights used.",RuntimeWarning)
+            self.weights_=xr.DataArray(np.full(M,1/M),dims="M",coords={"M":hp.M})
+            self.lambda_=np.nan; return self
+        if self.spatial_pooling == "global":
+            best=(np.inf,self.shrinkage_grid[0])
+            for lam in self.shrinkage_grid:
+                vals=[]
+                for it in range(T):
+                    tr=np.arange(T)!=it
+                    P=arr[:,tr].reshape(M,-1,3); C=cv[tr].reshape(-1)
+                    good=np.isfinite(C)&np.all(np.isfinite(P),axis=(0,2))
+                    if good.sum()<self.min_train_years: continue
+                    w=self._fit_w(P[:,good],C[good],lam)
+                    Pt=arr[:,it].reshape(M,-1,3); Ct=cv[it].reshape(-1)
+                    vals.append(self._rps(np.tensordot(w,Pt,axes=(0,0)),Ct))
+                v=float(np.mean(vals)) if vals else np.inf
+                if v<best[0]: best=(v,lam)
+            self.cv_rps_,self.lambda_=best
+            P=arr.reshape(M,-1,3); C=cv.reshape(-1)
+            good=np.isfinite(C)&np.all(np.isfinite(P),axis=(0,2))
+            w=self._fit_w(P[:,good],C[good],self.lambda_) if good.any() else np.full(M,1/M)
+            self.weights_=xr.DataArray(w,dims="M",coords={"M":hp.M},name="RPS_weights")
+        else:
+            W=np.full((M,ny,nx),1.0/M); L=np.full((ny,nx),np.nan); R=np.full((ny,nx),np.nan)
+            for iy in range(ny):
+                for ix in range(nx):
+                    C=cv[:,iy,ix]; P=arr[:,:,iy,ix,:]
+                    valid_year=np.isfinite(C)&np.all(np.isfinite(P),axis=(0,2))
+                    if valid_year.sum()<self.min_train_years: continue
+                    best=(np.inf,self.shrinkage_grid[0])
+                    for lam in self.shrinkage_grid:
+                        vals=[]
+                        ids=np.where(valid_year)[0]
+                        for it in ids:
+                            tr=valid_year.copy(); tr[it]=False
+                            w=self._fit_w(P[:,tr],C[tr],lam)
+                            vals.append(self._rps(np.tensordot(w,P[:,it:it+1],axes=(0,0)),C[it:it+1]))
+                        v=float(np.mean(vals)) if vals else np.inf
+                        if v<best[0]: best=(v,lam)
+                    R[iy,ix],L[iy,ix]=best
+                    W[:,iy,ix]=self._fit_w(P[:,valid_year],C[valid_year],best[1])
+            self.weights_=xr.DataArray(W,dims=("M","Y","X"),coords={"M":hp.M,"Y":obs.Y,"X":obs.X},name="RPS_weights")
+            self.lambda_=xr.DataArray(L,dims=("Y","X"),coords={"Y":obs.Y,"X":obs.X})
+            self.cv_rps_=xr.DataArray(R,dims=("Y","X"),coords={"Y":obs.Y,"X":obs.X})
+        return self
+
+    def transform(self, prob):
+        if self.weights_ is None: raise RuntimeError("Call fit() first.")
+        p=WAS_ProbWeighted._as_probability_ensemble(prob,"prob")
+        p=WAS_ProbWeighted._normalise_probability_vectors(p)
+        w=self.weights_.sel(M=p.M)
+        valid=p.notnull().all("probability")
+        we=w.where(valid); den=we.sum("M")
+        out=(p*we).sum("M",skipna=True)/den
+        return WAS_ProbWeighted._normalise_probability_vectors(out).transpose("probability","T","Y","X")
+
+    def compute_model(self, X_train, y_train, X_test, y_test=None,
+                      clim_year_start=None, clim_year_end=None, **kwargs):
+        """Fit weights on training observations, apply to the held-out forecast.
+
+        Base probabilities must be generated within this outer-training fold;
+        a single collection of global OOF predictions does not ensure this.
+        """
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
+        if clim_year_start is None:
+            clim_year_start = int(y_train["T"].dt.year.min())
+        if clim_year_end is None:
+            clim_year_end = int(y_train["T"].dt.year.max())
+        self.fit(y_train, X_train, clim_year_start, clim_year_end)
+        return self.transform(X_test)
+
+    def compute(self, rainfall, hdcst, fcst, clim_year_start, clim_year_end):
+        """Operational weight fit; the returned fitted hindcast is in-sample."""
+        self.fit(rainfall,hdcst,clim_year_start,clim_year_end)
+        fitted = self.transform(hdcst)
+        fitted.attrs["weight_validation"] = "in_sample; use outer-fold compute_model for evaluation"
+        return fitted, self.transform(fcst)
+
 
 class WAS_Min2009_ProbWeighted:
     """
@@ -1933,38 +3606,25 @@ class WAS_Min2009_ProbWeighted:
 
         raise ValueError(f"Unknown cv_method={self.cv_method!r}")
 
-    def _align_stats(
-        self,
-        mu: xr.DataArray,
-        sigma: xr.DataArray,
-        target: xr.DataArray,
-        hindcasts: xr.DataArray,
-    ) -> Tuple[xr.DataArray, xr.DataArray]:
-        """
-        Broadcast mu/sigma to match target and replace degenerate sigma values
-        with the raw full-hindcast sigma (never NaN).
+    def _align_stats(self, mu, sigma, target, hindcasts):
+        """Use only the requested training climatology for each target date.
 
-        FIX: the original set degenerate sigma to NaN, propagating silence.
-        We fall back to the raw hindcast sigma instead.
+        Operational dates use the entire supplied hindcast training pool;
+        dates in that pool retain their leave-one-out/window statistics.
+        A degenerate training spread is floored without borrowing the excluded
+        observation or ensemble. Undefined training means remain missing.
         """
-        # raw full-hindcast sigma as safe fallback
-        sigma_raw = hindcasts.std(dim=("T", "M"))
-
-        # if cv stats have a T dim and the forecast T doesn't overlap
-        # (operational run outside the hindcast period) -> use full-pool stats
         if "T" in mu.dims and "T" in target.dims:
-            overlap = np.intersect1d(mu["T"].values, target["T"].values)
-            if overlap.size == 0:
-                mu       = hindcasts.mean(dim=("T", "M"))
-                sigma    = sigma_raw.copy()
-
-        # replace any floor-or-below sigma with the raw fallback (not NaN)
-        sigma = xr.where(sigma > self.sigma_floor, sigma, sigma_raw)
-
-        # broadcast to target shape
-        mu    = mu.broadcast_like(target)
-        sigma = sigma.broadcast_like(target)
-        return mu, sigma
+            overlap = np.isin(target["T"].values, mu["T"].values)
+            full_mu = hindcasts.mean(dim=("T", "M"))
+            full_sigma = hindcasts.std(dim=("T", "M"))
+            is_operational = xr.DataArray(~overlap, dims="T", coords={"T": target["T"]})
+            mu = mu.reindex(T=target["T"])
+            sigma = sigma.reindex(T=target["T"])
+            mu = xr.where(is_operational, full_mu, mu)
+            sigma = xr.where(is_operational, full_sigma, sigma)
+        sigma = sigma.where(~np.isfinite(sigma), sigma.clip(min=self.sigma_floor))
+        return mu.broadcast_like(target), sigma.broadcast_like(target)
 
     def _forecast_sigma(
         self, forecasts: xr.DataArray, sigma_hcst: xr.DataArray
@@ -1987,9 +3647,12 @@ class WAS_Min2009_ProbWeighted:
         self,
         forecasts: xr.DataArray,
         hindcasts: xr.DataArray,
+        clim_terciles=None,
     ) -> Tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
         """
-        Compute PB / PN / PA for a single model.
+        Compute PB / PN / PA for a single model. ``clim_terciles`` supplies
+        fixed observed lower/upper bounds in the forecast's physical units.
+        Omitting it preserves the historical model-climatology definition.
 
         Gaussian & lognormal
         --------------------
@@ -2024,6 +3687,8 @@ class WAS_Min2009_ProbWeighted:
             # category boundaries from hindcast climatology
             T_lower = mu + z_lo * sigma_hcst
             T_upper = mu + z_hi * sigma_hcst
+            if clim_terciles is not None:
+                T_lower, T_upper = clim_terciles
 
             # 1: use FORECAST ensemble spread, not hindcast sigma
             sigma_f = self._forecast_sigma(forecasts, sigma_hcst)
@@ -2048,6 +3713,11 @@ class WAS_Min2009_ProbWeighted:
             # category boundaries in log-space
             T_lower_l = mu_l + z_lo * sigma_hcst_l
             T_upper_l = mu_l + z_hi * sigma_hcst_l
+            if clim_terciles is not None:
+                low, high = clim_terciles
+                # A positive lognormal has zero mass at nonpositive bounds.
+                T_lower_l = np.log(xr.where(low > 0, low, np.nan)).where(low > 0, -np.inf).where(np.isfinite(low))
+                T_upper_l = np.log(xr.where(high > 0, high, np.nan)).where(high > 0, -np.inf).where(np.isfinite(high))
 
             # 1 (lognormal): use FORECAST log-space spread
             sigma_f_l = self._forecast_sigma(f_log, sigma_hcst_l)
@@ -2059,12 +3729,16 @@ class WAS_Min2009_ProbWeighted:
 
         # ---- Empirical -----------------------------------------------
         if self.distribution == "empirical":
-            q33 = hindcasts.quantile(1.0 / 3.0, dim=("T", "M")).drop_vars("quantile", errors="ignore")
-            q66 = hindcasts.quantile(2.0 / 3.0, dim=("T", "M")).drop_vars("quantile", errors="ignore")
+            if clim_terciles is None:
+                q33 = hindcasts.quantile(1.0 / 3.0, dim=("T", "M")).drop_vars("quantile", errors="ignore")
+                q66 = hindcasts.quantile(2.0 / 3.0, dim=("T", "M")).drop_vars("quantile", errors="ignore")
+            else:
+                q33, q66 = clim_terciles
 
             # 2: count ENSEMBLE MEMBERS, not just compare the mean
-            p_bn = (forecasts < q33).mean(dim="M").astype(float)
-            p_an = (forecasts > q66).mean(dim="M").astype(float)
+            valid = np.isfinite(forecasts) & np.isfinite(q33) & np.isfinite(q66)
+            p_bn = (forecasts <= q33).where(valid).mean(dim="M").astype(float)
+            p_an = (forecasts > q66).where(valid).mean(dim="M").astype(float)
             p_nn = 1.0 - p_bn - p_an
             return self._safe_clip_and_renorm(p_bn, p_nn, p_an)
 
@@ -2084,6 +3758,7 @@ class WAS_Min2009_ProbWeighted:
         climatology: Optional[xr.DataArray] = None,   # kept for pipeline compat
         ensemble_sizes: Optional[Dict[str, int]] = None,
         strict_models: bool = True,
+        clim_terciles=None,
     ) -> Dict[str, xr.DataArray]:
         """
         Compute PMME probabilities (PB / PN / PA) across models.
@@ -2096,6 +3771,8 @@ class WAS_Min2009_ProbWeighted:
         ensemble_sizes : {model_name: int}  defaults to forecasts[m].sizes['M']
         strict_models  : if True, require forecasts and hindcasts to have the
                          same keys.
+        clim_terciles   : optional (lower, upper) fixed observed climatological
+                         bounds, shared by all models; physical forecast units.
 
         Returns
         -------
@@ -2120,7 +3797,7 @@ class WAS_Min2009_ProbWeighted:
         per_model: Dict[str, Dict[str, xr.DataArray]] = {}
         for m in model_names:
             p_bn, p_nn, p_an = self._compute_tercile_probabilities_one_model(
-                forecasts[m], hindcasts[m]
+                forecasts[m], hindcasts[m], clim_terciles=clim_terciles
             )
             per_model[m] = {"PB": p_bn, "PN": p_nn, "PA": p_an}
 
@@ -2197,101 +3874,6 @@ class WAS_Min2009_ProbWeighted:
         return combined, chi_square
 
 
-class WAS_mme_xcELR:
-    """xcast MELR wrapper producing direct tercile probabilities.
-
-    ``apply_drymask`` should be True for precipitation and False for temperature.
-    Extra positional/keyword arguments are accepted so the class remains
-    compatible with the cross-validator's broader model contract.
-    """
-
-    def __init__(
-        self,
-        elm_kwargs=None,
-        apply_drymask=True,
-        dry_threshold=10.0,
-        quantile_threshold=0.2,
-    ):
-        if xc is None:
-            raise ImportError("WAS_mme_xcELR requires the optional 'xcast' package.")
-        self.elm_kwargs = {"preprocessing": "minmax"} if elm_kwargs is None else dict(elm_kwargs)
-        self.apply_drymask = bool(apply_drymask)
-        self.dry_threshold = float(dry_threshold)
-        self.quantile_threshold = float(quantile_threshold)
-        self.model_ = None
-
-    @staticmethod
-    def _target(y):
-        if "M" in y.dims:
-            y = y.isel(M=0, drop=True)
-        return y.transpose("T", "Y", "X")
-
-    def _mask(self, y):
-        if not self.apply_drymask:
-            return xr.where(y.notnull().any("T"), 1.0, np.nan)
-        return xc.drymask(
-            y,
-            dry_threshold=self.dry_threshold,
-            quantile_threshold=self.quantile_threshold,
-        )
-
-    @staticmethod
-    def _normalise_probability_output(result):
-        rename = {}
-        if "S" in result.dims and "T" not in result.dims:
-            rename["S"] = "T"
-        if "M" in result.dims and "probability" not in result.dims:
-            rename["M"] = "probability"
-        result = result.rename(rename)
-        for dim in list(result.dims):
-            if dim not in ("probability", "T", "Y", "X"):
-                if result.sizes[dim] == 1:
-                    result = result.isel({dim: 0}, drop=True)
-                else:
-                    raise ValueError(f"Unexpected MELR output dimension {dim!r}: {result.dims}")
-        required = {"probability", "T", "Y", "X"}
-        if not required.issubset(result.dims):
-            raise ValueError(f"MELR output must contain {sorted(required)}; got {result.dims}.")
-        if result.sizes["probability"] != 3:
-            raise ValueError("MELR must return exactly three tercile probabilities.")
-        result = result.transpose("probability", "T", "Y", "X")
-        result = result.assign_coords(probability=("probability", ["PB", "PN", "PA"]))
-        result = result.clip(min=0.0, max=1.0)
-        total = result.sum("probability", skipna=False)
-        return (result / total.where(total > 0)).transpose("probability", "T", "Y", "X")
-
-    def _fit_predict(self, X_train, y_train, X_test):
-        y_train = self._target(y_train)
-        X_train = xc.regrid(X_train, y_train.X, y_train.Y)
-        X_test = xc.regrid(X_test, y_train.X, y_train.Y)
-        mask = self._mask(y_train)
-        X_train = X_train * mask
-        X_test = X_test * mask
-        model = xc.MELR(**self.elm_kwargs)
-        model.fit(X_train, y_train)
-        self.model_ = model
-        result = self._normalise_probability_output(model.predict_proba(X_test))
-        return result * mask
-
-    def compute_model(self, X_train, y_train, X_test, *args, **kwargs):
-        return self._fit_predict(X_train, y_train, X_test)
-
-    def forecast(
-        self,
-        Predictant,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det,
-        Predictor_for_year,
-        *args,
-        **kwargs,
-    ):
-        target = self._target(Predictant)
-        prob = self._fit_predict(hindcast_det, target, Predictor_for_year)
-        prob = _assign_target_time(prob, Predictor_for_year, target)
-        return prob.load()
-
-
 class WAS_mme_logistic:
     """
     Multinomial Logistic Regression MME with spatial clustering and three
@@ -2301,7 +3883,7 @@ class WAS_mme_logistic:
     ---------------------------------------------
     1. Bayesian objective now scores by NEGATIVE LOG LOSS (a proper score for
        probability forecasts), consistent with the grid/random searches which
-       use scoring='neg_log_loss'. The old code used model.score (accuracy)
+       use scoring=_tercile_logloss_scorer. The old code used model.score (accuracy)
        despite the comment, so the three methods optimized different criteria.
     2. Random search no longer samples invalid penalty/solver pairs: l1 is only
        paired with 'saga' (like the grid). RandomizedSearchCV accepts a LIST of
@@ -2388,22 +3970,54 @@ class WAS_mme_logistic:
             dists.append({'penalty': ['l1'], 'solver': ['saga'], 'C': self.C_range})
         return dists
 
+    def _cv_splitter(self, groups=None):
+        """Folds that never split a year across train and validation.
+
+        The samples fed to the search are pooled over (T, Y, X), so
+        KFold(shuffle=True) puts cells from the SAME year on both sides of a
+        fold. Rainfall fields are strongly autocorrelated in space, so a
+        validation cell is then almost predictable from its own neighbours in
+        the training half. Measured on pooled samples with year-correlated
+        noise, 18 training years:
+
+            tuning score, KFold(shuffle=True)   -1.0510   (what the code saw)
+            tuning score, GroupKFold(year)      -1.1059   (honest)
+            true score, 6 held-out years        -1.1483
+
+        The shuffled estimate was optimistic by 0.055 in log loss and pointed
+        the C search towards weaker regularisation than the data supports.
+        Every other learner in this module already groups by year
+        (GroupKFold / LeaveOneGroupOut); the logistic MME was the exception.
+        """
+        if groups is None:
+            return KFold(n_splits=self.cv_folds, shuffle=False)
+        n_group = len(np.unique(groups))
+        if n_group <= self.cv_folds:
+            return LeaveOneGroupOut()
+        return GroupKFold(n_splits=min(self.cv_folds, n_group))
+
     # ----------------------------------------------------- search routines
-    def _grid_search_optimization(self, X, y):
+    def _grid_search_optimization(self, X, y, groups=None):
         model = LogisticRegression(random_state=self.random_state, max_iter=1000)
-        cv = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+        cv = self._cv_splitter(groups)
         gs = GridSearchCV(model, param_grid=self._create_parameter_grids(), cv=cv,
-                          scoring='neg_log_loss', error_score=np.nan, n_jobs=self.n_jobs)
-        gs.fit(X, y)
+                          scoring=_tercile_logloss_scorer, error_score=np.nan, n_jobs=self.n_jobs)
+        gs.fit(X, y, groups=groups)
+        if getattr(self, "verbose", 1):
+            print(f"[logistic/grid] score={gs.best_score_:.4f}, params={gs.best_params_}",
+                  flush=True)
         return gs.best_params_
 
-    def _random_search_optimization(self, X, y):
+    def _random_search_optimization(self, X, y, groups=None):
         model = LogisticRegression(random_state=self.random_state, max_iter=1000)
-        cv = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+        cv = self._cv_splitter(groups)
         rs = RandomizedSearchCV(model, param_distributions=self._create_parameter_distributions(),
-                                n_iter=self.n_iter_search, cv=cv, scoring='neg_log_loss',
+                                n_iter=self.n_iter_search, cv=cv, scoring=_tercile_logloss_scorer,
                                 random_state=self.random_state, error_score=np.nan, n_jobs=self.n_jobs)
-        rs.fit(X, y)
+        rs.fit(X, y, groups=groups)
+        if getattr(self, "verbose", 1):
+            print(f"[logistic/random] score={rs.best_score_:.4f}, params={rs.best_params_}",
+                  flush=True)
         return rs.best_params_
 
     def _bayesian_objective(self, trial, X, y):
@@ -2425,18 +4039,18 @@ class WAS_mme_logistic:
                                    random_state=self.random_state, max_iter=1000)
 
         labels = np.unique(y)
-        cv = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+        # Same reasoning as _cv_splitter: never split a year across folds.
+        cv = self._cv_splitter(getattr(self, "_current_groups", None))
         def score_fold(tr, va):
             try:
                 fold_model = LogisticRegression(
                     penalty=penalty, solver=solver, C=C,
                     random_state=self.random_state, max_iter=1000)
                 fold_model.fit(X[tr], y[tr])
-                proba = fold_model.predict_proba(X[va])
-                return -log_loss(y[va], proba, labels=labels)
+                return _tercile_logloss_scorer(fold_model, X[va], y[va])
             except Exception:
                 return np.nan
-        splits = list(cv.split(X, y))
+        splits = list(cv.split(X, y, groups=getattr(self, '_current_groups', None)))
         if JOBLIB_AVAILABLE and self.cv_n_jobs != 1:
             scores = Parallel(n_jobs=self.cv_n_jobs)(
                 delayed(score_fold)(tr, va) for tr, va in splits)
@@ -2461,13 +4075,19 @@ class WAS_mme_logistic:
         best_params = dict(study.best_params)
         if best_params.get('penalty') == 'l1':
             best_params['solver'] = 'saga'
+        if getattr(self, "verbose", 1):
+            print(f"[logistic] cluster {cluster_id}: "
+                  f"score={study.best_value:.4f}, params={best_params}", flush=True)
         return best_params
 
-    def _best_params_for(self, X_clean_c, y_clean_c, cluster_id=None):
+    def _best_params_for(self, X_clean_c, y_clean_c, cluster_id=None, groups=None):
+        # Stash the groups so the Optuna objective, which takes no extra
+        # argument, can build the same year-aware folds as the other searches.
+        self._current_groups = groups
         if self.optimization_method == 'grid':
-            return self._grid_search_optimization(X_clean_c, y_clean_c)
+            return self._grid_search_optimization(X_clean_c, y_clean_c, groups)
         if self.optimization_method == 'random':
-            return self._random_search_optimization(X_clean_c, y_clean_c)
+            return self._random_search_optimization(X_clean_c, y_clean_c, groups)
         if self.optimization_method == 'bayesian':
             return self._bayesian_optimization(X_clean_c, y_clean_c, cluster_id=cluster_id)
         if self.optimization_method == 'none':
@@ -2495,24 +4115,31 @@ class WAS_mme_logistic:
         return out
 
     # ----------------------------------------------------- hyperparameters
-    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
+    def compute_hyperparameters(self, Predictors, Predictand,
+                                clim_year_start=None, clim_year_end=None, *, target_is_class=False):
+        """Tune with fold-local standardization, target encoding and climate zones."""
+        return _strict_regional_hyperparameters(
+            self, Predictors, Predictand, clim_year_start, clim_year_end, target_is_class=target_is_class)
+
+    def compute_hyperparameters_legacy(self, Predictors, Predictand, clim_year_start, clim_year_end, *, target_is_class=False):
         """
         Compute best hyperparameters per spatial cluster.
 
         Predictors : (T, M, Y, X) RAW predictor cube.
         Predictand : (T, Y, X) RAW predictand (classes are computed here).
         """
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        Predictors = align_predictor_target(Predictors, Predictand, mode="season_year")
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
         Predictand.name = "varname"
 
-        X_train_std = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        X_train_std = Predictors if target_is_class else standardize_timeseries(Predictors, clim_year_start, clim_year_end)
 
         # KMeans directly on predictand values (original approach, kept by preference)
         Cluster = self._cluster_on_values(Predictand)
 
         verify = WAS_Verification()
-        y_train_std = verify.compute_class(Predictand, clim_year_start, clim_year_end)
+        y_train_std = Predictand if target_is_class else verify.compute_class(Predictand, clim_year_start, clim_year_end)
 
         # align cluster grid with the (classed) predictand grid
         xarray1, xarray2 = xr.align(y_train_std, Cluster, join="outer")
@@ -2526,20 +4153,32 @@ class WAS_mme_logistic:
         best_params_dict = {}
         for c in clusters:
             mask_3d = (cluster_da == c).expand_dims({'T': y_train_std['T']})
-            X_c = X_train_std.where(mask_3d).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            y_c = y_train_std.where(mask_3d).stack(sample=('T', 'Y', 'X')).values.ravel()
+            X_c = _stack_masked(X_train_std, mask_3d, core='M')
+            y_c = _stack_masked(y_train_std, mask_3d, core=None).ravel()
+
+            # Year label of every pooled (T, Y, X) sample, so the folds can be
+            # grouped by year instead of shuffled across it.
+            n_time = int(y_train_std.sizes["T"])
+            spatial = int(y_c.size // n_time)
+            years_all = np.repeat(
+                y_train_std["T"].dt.year.values.astype(int), spatial
+            )
 
             bad = np.any(~np.isfinite(X_c), axis=1) | ~np.isfinite(y_c)
             X_clean, y_clean = X_c[~bad], y_c[~bad]
+            groups_c = years_all[~bad] if years_all.size == y_c.size else None
 
             # 4: need samples and at least two classes
             if len(X_clean) == 0 or len(np.unique(y_clean)) < 2:
                 continue
 
-            best_params_dict[c] = self._best_params_for(X_clean, y_clean, cluster_id=c)
+            best_params_dict[c] = self._best_params_for(
+                X_clean, y_clean, cluster_id=c, groups=groups_c
+            )
 
         self.best_params_dict = best_params_dict
         self.cluster_da = cluster_da
+        _report_best_params("logistic", best_params_dict, getattr(self, "verbose", 1))
         return best_params_dict, cluster_da
 
     # ----------------------------------------------------- shared fit/predict
@@ -2613,12 +4252,13 @@ class WAS_mme_logistic:
                           a RAW predictand for compute_class, so prefer passing
                           precomputed values inside cross-validation.
         """
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
         X_train_std = X_train          # already standardized by the framework
         X_test_std = X_test
 
-        if best_params is None or cluster_da is None:
+        if best_params is None or cluster_da is None or not _cluster_matches_training(cluster_da, y_train):
             best_params, cluster_da = self.compute_hyperparameters(
-                X_train, y_train, clim_year_start, clim_year_end)
+                X_train, y_train, clim_year_start, clim_year_end, target_is_class=True)
 
         predictions, predictions_prob, time, lat, lon = self._fit_predict_clusters(
             X_train_std, y_train, X_test_std, best_params, cluster_da)
@@ -2629,15 +4269,15 @@ class WAS_mme_logistic:
     def forecast(self, Predictant, clim_year_start, clim_year_end,
                  Predictors_train, Predictor_for_year, best_params=None, cluster_da=None):
         """Operational forecast for a single target year (classes + tercile probabilities)."""
-        if "M" in Predictant.coords:
-            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictant.dims:
+            Predictant_no_m = Predictant.isel(M=0, drop=True)
         else:
             Predictant_no_m = Predictant
 
         verify = WAS_Verification()
         Predictant_class = verify.compute_class(Predictant_no_m, clim_year_start, clim_year_end)
 
-        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan)
+        mask = xr.where(np.isfinite(Predictant_no_m).sum(dim='T') >= 3, 1.0, np.nan)
 
         Predictors_train_st = standardize_timeseries(Predictors_train, clim_year_start, clim_year_end)
         clim_slice = slice(str(clim_year_start), str(clim_year_end))
@@ -2699,9 +4339,8 @@ class WAS_mme_ELR:
        containing the terciles); the tercile probabilities PB/PN/PA are then
        read off the same fitted equation.
     2. GUARANTEED MONOTONE CDF. Monotonicity of P(Y<=q) in q requires alpha>0.
-       Instead of the previous post-hoc min/max reordering of the two
-       cumulative probabilities, the Newton solver PROJECTS alpha onto
-       [alpha_min, inf) at every iteration, so pup >= plo holds by
+       The damped Newton solver constrains alpha to [alpha_min, inf),
+       with a line search and a checked constrained-solver fallback, so pup >= plo holds by
        construction and no crossing can occur at any threshold.
     3. THRESHOLD TRANSFORM g(q). Wilks found g(q) = sqrt(q) clearly superior
        to g(q) = q for (non-negative, raw) precipitation. 'sqrt' is offered
@@ -2710,7 +4349,7 @@ class WAS_mme_ELR:
        compute_hyperparameters, which also tunes the fitted-quantile set).
     4. PREDICTOR TRANSFORM. Wilks' best single predictor was the SQUARE ROOT
        of the ensemble-mean precipitation. `predictor_transform='sqrt'`
-       applies it to the raw predictor before standardization in
+       applies it to EACH raw ensemble member before aggregation/standardization in
        compute_hyperparameters / forecast. (The framework CV branch feeds
        already-standardized predictors to compute_model; for exact
        consistency, apply the same transform to the raw hindcast before the
@@ -2738,18 +4377,20 @@ class WAS_mme_ELR:
 
     Thresholds
     ----------
-    Output terciles are estimated fold-safe from the TRAINING predictand by
-    default; pass `clim_terciles=(t1, t2)` (DataArrays on Y, X, same units as
-    y_train) to pin them to the boundaries your verification uses
+    Output terciles use the declared climatology window; pass
+    `clim_terciles=(t1, t2)` (DataArrays on Y, X, same units as y_train) to pin
+    every fold to the complete reference boundaries your verification uses
     (WAS_Verification.compute_class). The EXTRA fitting quantiles are always
     taken fold-safe from the training predictand.
 
     Fitting
     -------
     One equation per cell, all cells fitted simultaneously with a vectorized,
-    ridge-stabilized projected-Newton/IRLS solver. Rows with missing
+    ridge-stabilized damped-Newton solver with a decreasing objective. Rows with missing
     predictor/predictand are zero-weighted; cells with fewer than `min_obs`
-    valid years fall back to climatology [1/3, 1/3, 1/3]. With K fitting
+    valid years (or no converged solution) fall back to training-only empirical
+    probabilities at the same fixed thresholds. Missing test predictors stay
+    missing. With K fitting
     quantiles the stacked-binary objective is a composite likelihood (the K
     indicator responses per year are correlated) -- exactly Wilks' fitting
     strategy. In dry cells several low quantiles may coincide (ties at 0);
@@ -2774,7 +4415,7 @@ class WAS_mme_ELR:
         Transform applied to the RAW predictor before standardization in
         compute_hyperparameters / forecast (Wilks: 'sqrt' for raw precip).
     n_iter, tol : Newton controls (default 50, 1e-7).
-    min_obs : minimum valid training years per cell (default 5).
+    min_obs : minimum valid training years per cell (default 8).
     """
 
     # named threshold transforms g(q); all NON-DECREASING so that the
@@ -2788,7 +4429,7 @@ class WAS_mme_ELR:
 
     def __init__(self, predictors="mean", threshold_transform="cbrt",
                  fit_quantiles=(0.10, 0.25, 1.0 / 3.0, 0.50, 2.0 / 3.0, 0.75, 0.90),
-                 l2=1e-3, alpha_min=1e-3, n_iter=50, tol=1e-7, min_obs=5,
+                 l2=1e-3, alpha_min=1e-3, n_iter=50, tol=1e-7, min_obs=8,
                  predictor_transform=None, random_state=42):
         if predictors not in ("mean", "mean_std", "models"):
             raise ValueError("predictors must be 'mean', 'mean_std' or 'models'.")
@@ -2800,6 +4441,14 @@ class WAS_mme_ELR:
         self.n_iter = int(n_iter)
         self.tol = float(tol)
         self.min_obs = int(min_obs)
+        if not np.isfinite(self.l2) or self.l2 < 0:
+            raise ValueError("l2 must be finite and non-negative.")
+        if not np.isfinite(self.alpha_min) or self.alpha_min <= 0:
+            raise ValueError("alpha_min must be finite and strictly positive.")
+        if self.n_iter < 1 or not np.isfinite(self.tol) or self.tol <= 0 or self.min_obs < 2:
+            raise ValueError("n_iter >= 1, tol > 0 and min_obs >= 2 are required.")
+        self._resolve_transform(threshold_transform)
+        self._resolve_transform(predictor_transform)
         self.predictor_transform = predictor_transform
         self.random_state = random_state
         # filled by compute_hyperparameters (joint l2 + g(q) + quantile tuning)
@@ -2813,9 +4462,8 @@ class WAS_mme_ELR:
     @staticmethod
     def _check_quantiles(qs):
         """Sorted unique fitting quantiles, terciles enforced, all in (0, 1)."""
-        qs = np.unique(np.round(np.asarray(list(qs) + [1.0 / 3.0, 2.0 / 3.0],
-                                           dtype=float), 6))
-        if np.any((qs <= 0.0) | (qs >= 1.0)):
+        qs = np.unique(np.asarray(list(qs) + [1.0 / 3.0, 2.0 / 3.0], dtype=float))
+        if np.any(~np.isfinite(qs) | (qs <= 0.0) | (qs >= 1.0)):
             raise ValueError("fit_quantiles must lie strictly inside (0, 1).")
         return qs
 
@@ -2828,7 +4476,9 @@ class WAS_mme_ELR:
             if transform not in cls._TRANSFORMS:
                 raise ValueError(f"unknown threshold_transform '{transform}'.")
             return cls._TRANSFORMS[transform]
-        return transform  # already a callable
+        if not callable(transform):
+            raise ValueError("A transform must be a supported name or callable.")
+        return transform
 
     @classmethod
     def _resolve_inverse(cls, transform):
@@ -2853,9 +4503,28 @@ class WAS_mme_ELR:
         if f is None:
             return X
         if self.predictor_transform == "sqrt":
-            X = X.where(X >= 0.0, 0.0) if isinstance(X, xr.DataArray) \
+            X = X.where((X >= 0.0) | X.isnull(), 0.0) if isinstance(X, xr.DataArray) \
                 else np.maximum(X, 0.0)
         return f(X)
+
+    def _standardize_predictors(self, train, test, clim_start=None, clim_end=None):
+        """Transform raw predictors, then estimate scaling on training dates only."""
+        train, test = self._tx_predictor(train), self._tx_predictor(test)
+        reference = train
+        if clim_start is not None and clim_end is not None:
+            window = train.sel(T=slice(str(clim_start), str(clim_end)))
+            if window.sizes.get("T", 0) >= 2:
+                reference = window
+        mean, std = reference.mean("T", skipna=True), reference.std("T", skipna=True)
+        std = xr.where(np.isfinite(std) & (std == 0), 1.0, std)
+        return (train - mean) / std, (test - mean) / std
+
+    @staticmethod
+    def _event_thresholds(y, clim_start=None, clim_end=None, explicit=None):
+        if explicit is not None:
+            return explicit
+        q, _ = climatological_terciles(y, clim_start, clim_end)
+        return tuple(q.isel(quantile=i, drop=True) for i in range(2))
 
     def _features(self, X):
         """Reduce a (T, Y, X[, M]) cube to a (T, Y, X, feat) predictor stack."""
@@ -2904,13 +4573,37 @@ class WAS_mme_ELR:
         K = thr.shape[0]
         gthr = self._apply_g(thr, tfm)                          # (K, n_cells)
 
+        if not np.isfinite(l2) or l2 < 0:
+            raise ValueError("l2 must be finite and non-negative.")
+        if tfm == "sqrt" and np.any(np.isfinite(ytr) & (ytr < 0)):
+            raise ValueError("The sqrt ELR threshold transform requires non-negative observations.")
+        finite_thr = np.isfinite(thr)
+        if np.any(finite_thr & ~np.isfinite(gthr)):
+            raise ValueError("The threshold transform must be finite on observed thresholds.")
+        order = np.argsort(thr, axis=0)
+        sorted_thr = np.take_along_axis(thr, order, axis=0)
+        sorted_g = np.take_along_axis(gthr, order, axis=0)
+        if np.any((np.diff(sorted_thr, axis=0) >= 0) & (np.diff(sorted_g, axis=0) < 0)):
+            raise ValueError("The ELR threshold transform must be non-decreasing.")
+        if np.any(np.isfinite(t1) & np.isfinite(t2) & (t1 > t2)):
+            raise ValueError("The lower climatological threshold must not exceed the upper one.")
+
+        # Centering eliminates artificial sensitivity to Celsius/Kelvin offsets.
+        # Scaling only changes coordinates: alpha's original-unit penalty and
+        # lower bound are transformed explicitly, so the objective is unchanged.
+        gc = np.nanmean(gthr, axis=0)
+        gs = np.nanstd(gthr, axis=0)
+        gs = np.where(np.isfinite(gs) & (gs > 0), gs, 1.0)
+        gc = np.where(np.isfinite(gc), gc, 0.0)
+        zthr = (gthr - gc) / gs
+
         # ---- extended design: K threshold blocks stacked along rows ---------
         valid_xy = np.isfinite(ytr) & np.isfinite(Ftr).all(axis=2)  # (n_train, n_cells)
-        col = np.broadcast_to(gthr[:, None, :], (K, n_train, n_cells))
+        col = np.broadcast_to(zthr[:, None, :], (K, n_train, n_cells))
         Fb = np.broadcast_to(Ftr[None], (K, n_train, n_cells, F))
         A = np.concatenate([Fb, col[..., None],
                             np.ones((K, n_train, n_cells, 1))], axis=3)
-        A = np.nan_to_num(A, nan=0.0).reshape(K * n_train, n_cells, F + 2)
+        A = np.where(np.isfinite(A), A, 0.0).reshape(K * n_train, n_cells, F + 2)
         Yb = (ytr[None, :, :] <= thr[:, None, :]).astype(float)
         Yb = Yb.reshape(K * n_train, n_cells)
         R = (valid_xy[None] & np.isfinite(thr)[:, None, :]
@@ -2922,39 +4615,109 @@ class WAS_mme_ELR:
         Yb = Yb.T                                               # (n_cells, Kn)
         R = R.T                                                 # (n_cells, Kn)
 
-        # ridge on every column except the intercept (last)
-        pen = np.full(n_feat, l2); pen[-1] = 0.0
-        eyepen = np.eye(n_feat)[None] * pen[None, None, :]
-        jitter = 1e-8 * np.eye(n_feat)[None]
-
+        pen = np.full((n_cells, n_feat), l2)
+        pen[:, F], pen[:, -1] = l2 / gs**2, 0.0
+        eye = np.eye(n_feat)
+        eyepen = eye[None] * pen[:, None, :]
+        lower = self.alpha_min * gs
         beta = np.zeros((n_cells, n_feat))
-        beta[:, F] = self.alpha_min          # start feasible (alpha > 0)
+        beta[:, F] = lower
+        nvalid = valid_xy.sum(axis=0)
+        fit_cells = ((nvalid >= self.min_obs) & np.isfinite(t1) & np.isfinite(t2)
+                     & (np.nanmax(gthr, axis=0) > np.nanmin(gthr, axis=0)))
+
+        def loss(coeff):
+            eta = np.einsum("crf,cf->cr", A, coeff)
+            return ((R * (np.logaddexp(0.0, eta) - Yb * eta)).sum(axis=1)
+                    + 0.5 * (pen * coeff**2).sum(axis=1))
+
+        def gradient(coeff):
+            p = expit(np.einsum("crf,cf->cr", A, coeff))
+            return np.einsum("crf,cr->cf", A, R * (p - Yb)) + pen * coeff
+
+        def projected_gradient(coeff, grad):
+            out = grad.copy()
+            bound = (coeff[:, F] <= lower + 1e-12) & (grad[:, F] > 0)
+            out[bound, F] = 0.0
+            return out
+
+        # Batched damped Newton, with an active-set constraint on alpha and an
+        # Armijo line search. No arbitrary coefficient/intercept clipping.
+        converged = ~fit_cells
+        iterations = np.zeros(n_cells, dtype=int)
         for _ in range(self.n_iter):
-            eta = np.clip(np.einsum("crf,cf->cr", A, beta), -35.0, 35.0)
-            p = expit(eta)
-            w = R * np.maximum(p * (1.0 - p), 1e-9)
-            grad = np.einsum("crf,cr->cf", A, R * (Yb - p)) - beta * pen[None, :]
-            H = np.einsum("crf,crg->cfg", A * w[:, :, None], A) + eyepen + jitter
-            try:
-                step = np.linalg.solve(H, grad[..., None])[..., 0]
-            except np.linalg.LinAlgError:
-                H = H + 1e-3 * np.eye(n_feat)[None]
-                step = np.linalg.solve(H, grad[..., None])[..., 0]
-            step = np.clip(step, -10.0, 10.0)
-            beta = np.clip(beta + step, -50.0, 50.0)
-            # Wilks monotonicity: project alpha onto [alpha_min, inf)
-            beta[:, F] = np.maximum(beta[:, F], self.alpha_min)
-            if np.nanmax(np.abs(step)) < self.tol:
+            grad = gradient(beta)
+            pg = projected_gradient(beta, grad)
+            converged |= np.max(np.abs(pg), axis=1) <= self.tol
+            active = fit_cells & ~converged
+            if not active.any():
                 break
+            p = expit(np.einsum("crf,cf->cr", A, beta))
+            w = R * p * (1.0 - p)
+            H = np.einsum("crf,crg->cfg", A * w[:, :, None], A) + eyepen
+            H += 1e-10 * eye[None]
+            bound = (beta[:, F] <= lower + 1e-12) & (grad[:, F] > 0)
+            H[bound, F, :] = 0.0
+            H[bound, :, F] = 0.0
+            H[bound, F, F] = 1.0
+            rhs = -pg
+            try:
+                direction = np.linalg.solve(H, rhs[..., None])[..., 0]
+            except np.linalg.LinAlgError:
+                direction = np.einsum("cij,cj->ci", np.linalg.pinv(H), rhs)
+            direction[~active] = 0.0
+            old = loss(beta)
+            length = np.ones(n_cells)
+            accepted = ~active
+            for _line in range(40):
+                candidate = beta + length[:, None] * direction
+                candidate[:, F] = np.maximum(candidate[:, F], lower)
+                delta = candidate - beta
+                improved = loss(candidate) <= old + 1e-4 * (grad * delta).sum(axis=1)
+                accepted |= improved & active
+                if accepted.all():
+                    break
+                length[~accepted] *= 0.5
+            beta[active & accepted] = candidate[active & accepted]
+            iterations[active] += 1
+
+        grad = projected_gradient(beta, gradient(beta))
+        converged = fit_cells & (np.max(np.abs(grad), axis=1) <= max(self.tol, 1e-6))
+        fallback_solver = fit_cells & ~converged
+        # Rare ill-conditioned cells receive an independent constrained solve.
+        # A failed solve is never reported as a calibrated probability forecast.
+        for cell in np.flatnonzero(fallback_solver):
+            ac, yc, rc, pc = A[cell], Yb[cell], R[cell], pen[cell]
+            def objective(coeff):
+                eta = ac @ coeff
+                return float(np.sum(rc * (np.logaddexp(0, eta) - yc * eta))
+                             + 0.5 * np.sum(pc * coeff**2))
+            def jacobian(coeff):
+                return ac.T @ (rc * (expit(ac @ coeff) - yc)) + pc * coeff
+            bounds = [(None, None)] * n_feat
+            bounds[F] = (float(lower[cell]), None)
+            result = minimize(objective, beta[cell], jac=jacobian, bounds=bounds,
+                              method="L-BFGS-B", options={"maxiter": 500,
+                              "ftol": 1e-14, "gtol": max(self.tol, 1e-8)})
+            candidate_gradient = jacobian(result.x)
+            if result.x[F] <= lower[cell] + 1e-10 and candidate_gradient[F] > 0:
+                candidate_gradient[F] = 0
+            ok = (np.all(np.isfinite(result.x)) and np.isfinite(result.fun)
+                  and np.max(np.abs(candidate_gradient)) <= max(10*self.tol, 1e-5))
+            if ok:
+                beta[cell], converged[cell] = result.x, True
+            iterations[cell] += int(result.nit)
 
         # ---- tercile probabilities from the single fitted equation ----------
-        bpred, alpha, b0 = beta[:, :F], beta[:, F], beta[:, F + 1]
+        bpred, alpha = beta[:, :F], np.maximum(beta[:, F] / gs, self.alpha_min)
+        b0 = beta[:, F + 1] - alpha * gc
         g1 = self._apply_g(t1, tfm)
         g2 = self._apply_g(t2, tfm)
-        Fc = np.transpose(np.nan_to_num(Fte, nan=0.0), (1, 0, 2))  # (n_cells, n_test, F)
+        test_valid = np.isfinite(Fte).all(axis=2).T
+        Fc = np.transpose(np.where(np.isfinite(Fte), Fte, 0.0), (1, 0, 2))
         lin = np.einsum("ctf,cf->ct", Fc, bpred) + b0[:, None]
-        plo = expit(np.clip(lin + alpha[:, None] * g1[:, None], -35.0, 35.0))
-        pup = expit(np.clip(lin + alpha[:, None] * g2[:, None], -35.0, 35.0))
+        plo = expit(lin + alpha[:, None] * g1[:, None])
+        pup = expit(lin + alpha[:, None] * g2[:, None])
 
         # alpha >= alpha_min > 0 and g non-decreasing => pup >= plo by
         # construction; keep the tracker as a numerical sanity check only.
@@ -2968,12 +4731,23 @@ class WAS_mme_ELR:
         tot = np.where(tot > 0, tot, np.nan)
         probs = np.stack([PB / tot, PN / tot, PA / tot], axis=0)   # (3, n_cells, n_test)
 
-        # robustness: climatology where too few valid years; NaN where no thresholds
-        nvalid = valid_xy.sum(axis=0)
-        clim_cells = (nvalid < self.min_obs) & np.isfinite(t1) & np.isfinite(t2)
-        probs[:, clim_cells, :] = 1.0 / 3.0
-        bad = ~(np.isfinite(t1) & np.isfinite(t2))
+        # Training-only empirical fallback at the SAME fixed events, preserving
+        # ties and genuinely dry cells (uniform thirds would be incorrect).
+        obs_valid = np.isfinite(ytr)
+        counts = obs_valid.sum(axis=0)
+        clim_cells = ~converged & np.isfinite(t1) & np.isfinite(t2) & (counts > 0)
+        denominator = np.maximum(counts, 1)
+        c1 = ((ytr <= t1) & obs_valid).sum(axis=0) / denominator
+        c2 = ((ytr <= t2) & obs_valid).sum(axis=0) / denominator
+        climatology = np.stack([c1, c2-c1, 1-c2])
+        probs[:, clim_cells, :] = climatology[:, clim_cells, None]
+        bad = ~(np.isfinite(t1) & np.isfinite(t2)) | (counts == 0)
         probs[:, bad, :] = np.nan
+        probs = np.where(test_valid[None], probs, np.nan)
+        lin = np.where(test_valid, lin, np.nan)
+        self.fit_diagnostics_ = {"converged": converged, "fallback": clim_cells,
+                                 "solver_fallback": fallback_solver, "iterations": iterations,
+                                 "objective": loss(beta), "valid_training_count": nvalid}
 
         # stash the fit for full-distribution queries (predictive_quantiles)
         self._last_fit_ = {"lin": lin, "alpha": alpha, "transform": tfm,
@@ -2991,8 +4765,8 @@ class WAS_mme_ELR:
 
         X_train / X_test : standardized predictor cubes (T, Y, X[, M]).
         y_train          : predictand (T, Y, X), kept RAW (un-standardized):
-                           the fit is invariant to predictand scaling and raw
-                           values let g(q) act in physical units (so g='sqrt'
+                           values let g(q) and its coefficient penalty act in
+                           physical units (so g='sqrt'
                            is valid for precipitation, per Wilks).
         clim_terciles    : optional (t1, t2) DataArrays (Y, X) of fixed
                            climatological boundaries in the SAME units as
@@ -3004,6 +4778,7 @@ class WAS_mme_ELR:
                            used (which compute_hyperparameters updates in
                            place).
         """
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
         if "M" in y_train.dims:
             y_train = y_train.isel(M=0, drop=True)
         y_train = y_train.transpose("T", "Y", "X")
@@ -3015,14 +4790,10 @@ class WAS_mme_ELR:
         Ftr_s = Ftr.stack(cell=("Y", "X")).transpose("T", "cell", "feat")
         Fte_s = Fte.stack(cell=("Y", "X")).transpose("T", "cell", "feat")
 
-        if clim_terciles is not None:
-            t1da, t2da = clim_terciles
-            t1 = t1da.stack(cell=("Y", "X")).transpose("cell").values.astype(float)
-            t2 = t2da.stack(cell=("Y", "X")).transpose("cell").values.astype(float)
-        else:
-            with np.errstate(all="ignore"):
-                qs = np.nanquantile(ytr_s.values, [1.0 / 3.0, 2.0 / 3.0], axis=0)
-            t1, t2 = qs[0], qs[1]
+        t1da, t2da = self._event_thresholds(
+            y_train, clim_year_start, clim_year_end, clim_terciles)
+        t1 = t1da.stack(cell=("Y", "X")).transpose("cell").values.astype(float)
+        t2 = t2da.stack(cell=("Y", "X")).transpose("cell").values.astype(float)
 
         l2_use = best_params.get("l2") if best_params else None
         g_use = best_params.get("g", "__self__") if best_params else "__self__"
@@ -3040,6 +4811,12 @@ class WAS_mme_ELR:
             coords={"probability": ["PB", "PN", "PA"],
                     "T": Fte_s["T"], "cell": ytr_s["cell"]},
         ).unstack("cell").transpose("probability", "T", "Y", "X")
+        out.attrs.update(
+            probability_method="extended_logistic_regression",
+            elr_converged_cells=int(self.fit_diagnostics_["converged"].sum()),
+            elr_empirical_fallback_cells=int(self.fit_diagnostics_["fallback"].sum()),
+            elr_fallback_reference="training observations at the fixed climatological thresholds",
+        )
         return out
 
     # ------------------------------------------------- full predictive dist.
@@ -3065,10 +4842,11 @@ class WAS_mme_ELR:
         fit = self._last_fit_
         inv = self._resolve_inverse(fit["transform"])
         p = np.asarray(p_levels, dtype=float)
-        if np.any((p <= 0.0) | (p >= 1.0)):
+        if np.any(~np.isfinite(p) | (p <= 0.0) | (p >= 1.0)):
             raise ValueError("p_levels must lie strictly inside (0, 1).")
 
-        z = (logit(p)[:, None, None] - fit["lin"][None]) / fit["alpha"][None, :, None]
+        logits = np.log(p) - np.log1p(-p)
+        z = (logits[:, None, None] - fit["lin"][None]) / fit["alpha"][None, :, None]
         q = z if inv is None else inv(z)                     # (P, n_cells, n_test)
         q[:, fit["clim_cells"] | fit["bad"], :] = np.nan
 
@@ -3088,19 +4866,25 @@ class WAS_mme_ELR:
             return T.dt.year.values
         return np.arange(T.sizes["T"])
 
-    def _year_splits(self, years, cv_folds, leave_one_year_out):
-        """Year-grouped train/val splits (leakage-free: whole years held out)."""
+    def _year_splits(self, years, cv_folds, leave_one_year_out, nb_omit=0):
+        """Whole-year splits with an optional symmetric calendar-year buffer."""
+        if int(nb_omit) != nb_omit or nb_omit < 0:
+            raise ValueError("nb_omit must be a non-negative integer.")
+        gap = int(np.ceil(nb_omit / 2))
+        years = np.asarray(years)
         uniq = np.unique(years)
         n = len(uniq)
         if leave_one_year_out or cv_folds >= n:
             folds = [np.array([u]) for u in uniq]
+        elif gap > 0:
+            folds = [block for block in np.array_split(uniq, cv_folds) if len(block)]
         else:
             rng = np.random.default_rng(self.random_state)
             folds = [uniq[b] for b in np.array_split(rng.permutation(n), cv_folds)]
         splits = []
         for val_years in folds:
             va = np.isin(years, val_years)
-            tr = ~va
+            tr = ~va & (np.abs(years[:, None] - val_years[None, :]) > gap).all(axis=1)
             if tr.sum() >= 2 and va.sum() >= 1:
                 splits.append((np.where(tr)[0], np.where(va)[0]))
         return splits
@@ -3135,7 +4919,7 @@ class WAS_mme_ELR:
                                 clim_year_start, clim_year_end,
                                 clim_terciles=None, l2_grid=None, g_grid=None,
                                 quantile_grid=None, score="rps", cv_folds=5,
-                                leave_one_year_out=False):
+                                leave_one_year_out=False, nb_omit=0):
         """
         Jointly tune the ridge penalty l2, the threshold transform g(q) AND the
         fitting-quantile set by year-grouped cross-validation. Winners are
@@ -3154,9 +4938,9 @@ class WAS_mme_ELR:
         the categorical target the RPSS verification uses. RPS by default, or
         multiclass log-loss.
 
-        Standardization: only the PREDICTOR is standardized over the clim
-        window (after predictor_transform, if set); the PREDICTAND stays RAW so
-        thresholds and g(q) act in physical units.
+        Standardization: only the PREDICTOR is standardized, within each inner
+        training split's climatology window (after predictor_transform, if set).
+        The PREDICTAND stays RAW so thresholds and g(q) act in physical units.
 
         Parameters
         ----------
@@ -3169,6 +4953,9 @@ class WAS_mme_ELR:
                   vs Wilks-style multi-threshold fit.
         score   : {'rps', 'log_loss'} -- proper score MINIMIZED over folds.
         cv_folds, leave_one_year_out : year-grouped CV controls.
+        nb_omit : symmetric exclusion buffer, ceil(nb_omit / 2) calendar
+                  years on each side of validation dates. Positive buffers
+                  use contiguous validation blocks, avoiding fragmented training.
         clim_terciles : optional (t1, t2) in PHYSICAL units -- same fixed
                   boundaries your CV branch passes to compute_model.
 
@@ -3180,45 +4967,32 @@ class WAS_mme_ELR:
             raise ValueError("score must be 'rps' or 'log_loss'.")
         l2_grid = [float(v) for v in (np.logspace(-4, 1, 6) if l2_grid is None
                                       else l2_grid)]
+        if not l2_grid or any(not np.isfinite(v) or v < 0 for v in l2_grid):
+            raise ValueError("l2_grid must contain finite non-negative penalties.")
+        if int(cv_folds) < 2:
+            raise ValueError("cv_folds must be at least 2.")
 
         if "M" in Predictand.dims:
             Predictand = Predictand.isel(M=0, drop=True)
         Predictand = Predictand.transpose("T", "Y", "X")
 
-        # ---- observed tercile CLASSES from the framework (0/1/2) -------------
-        verify = WAS_Verification()
-        obs_class = verify.compute_class(Predictand, clim_year_start,
-                                         clim_year_end).transpose("T", "Y", "X")
-
-        # ---- transform + standardize the PREDICTOR only; PREDICTAND RAW ------
-        Predictor = self._tx_predictor(Predictor)
-        clim = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        sX = clim.std("T"); sX = sX.where(sX > 0)
-        Predictor_st = (Predictor - clim.mean("T")) / sX
-        Predictor_st = Predictor_st.assign_coords(T=Predictand["T"])
-        obs_class = obs_class.assign_coords(T=Predictand["T"])
-
-        # ---- features + stacking (once) -------------------------------------
-        F = self._features(Predictor_st)
+        # Events are fixed before inner splits; preprocessing is fitted afresh
+        # inside each split. Explicit climatological thresholds take precedence.
+        Predictor = align_predictor_target(Predictor, Predictand, mode="season_year")
+        t1da, t2da = self._event_thresholds(
+            Predictand, clim_year_start, clim_year_end, clim_terciles)
+        obs_class = xr.where(Predictand <= t1da, 0, xr.where(Predictand <= t2da, 1, 2)).where(
+            np.isfinite(Predictand) & np.isfinite(t1da) & np.isfinite(t2da))
         y_s = Predictand.stack(cell=("Y", "X")).transpose("T", "cell")
-        F_s = F.stack(cell=("Y", "X")).transpose("T", "cell", "feat")
         o_s = obs_class.stack(cell=("Y", "X")).transpose("T", "cell")
-        Yv, Fv, Ov = y_s.values, F_s.values, o_s.values
-
-        if clim_terciles is not None:
-            t1da, t2da = clim_terciles
-            t1_fix = t1da.stack(cell=("Y", "X")).transpose("cell").values.astype(float)
-            t2_fix = t2da.stack(cell=("Y", "X")).transpose("cell").values.astype(float)
-        else:
-            t1_fix = t2_fix = None
+        Yv, Ov = y_s.values, o_s.values
+        t1_fix = t1da.stack(cell=("Y", "X")).transpose("cell").values.astype(float)
+        t2_fix = t2da.stack(cell=("Y", "X")).transpose("cell").values.astype(float)
 
         # ---- g(q) candidates: 'sqrt' needs non-negative thresholds ----------
-        if t1_fix is not None:
-            thr_min = np.nanmin([np.nanmin(t1_fix), np.nanmin(t2_fix)])
-        else:
-            with np.errstate(all="ignore"):
-                thr_min = float(np.nanmin(np.nanquantile(Yv, 1.0 / 3.0, axis=0)))
-        can_sqrt = np.isfinite(thr_min) and thr_min >= 0.0
+        observed = Yv[np.isfinite(Yv)]
+        can_sqrt = bool(observed.size and np.min(observed) >= 0.0
+                        and not np.any(t1_fix < 0.0) and not np.any(t2_fix < 0.0))
         if g_grid is None:
             g_grid = ["identity", "cbrt"] + (["sqrt"] if can_sqrt else [])
         else:
@@ -3231,11 +5005,21 @@ class WAS_mme_ELR:
         if quantile_grid is None:
             quantile_grid = [(1.0 / 3.0, 2.0 / 3.0), tuple(self.fit_quantiles)]
         quantile_grid = [self._check_quantiles(qc) for qc in quantile_grid]
+        if not quantile_grid:
+            raise ValueError("quantile_grid must contain at least one candidate.")
 
         years = self._year_groups(Predictand["T"])
-        splits = self._year_splits(years, cv_folds, leave_one_year_out)
+        splits = self._year_splits(years, cv_folds, leave_one_year_out, nb_omit)
         if not splits:
             raise ValueError("Not enough years to build a CV split for tuning.")
+        prepared = []
+        for tr_idx, va_idx in splits:
+            train, validation = self._standardize_predictors(
+                Predictor.isel(T=tr_idx), Predictor.isel(T=va_idx),
+                clim_year_start, clim_year_end)
+            ftrain = self._features(train).stack(cell=("Y", "X")).transpose("T", "cell", "feat")
+            fvalidation = self._features(validation).stack(cell=("Y", "X")).transpose("T", "cell", "feat")
+            prepared.append((tr_idx, va_idx, ftrain.values, fvalidation.values))
 
         scores = {}
         best_key, best_val = (l2_grid[0], g_grid[0], quantile_grid[0]), np.inf
@@ -3243,16 +5027,9 @@ class WAS_mme_ELR:
             for g in g_grid:
                 for l2 in l2_grid:
                     fold_vals = []
-                    for tr_idx, va_idx in splits:
-                        if t1_fix is not None:
-                            t1, t2 = t1_fix, t2_fix
-                        else:
-                            with np.errstate(all="ignore"):
-                                qs = np.nanquantile(Yv[tr_idx],
-                                                    [1.0 / 3.0, 2.0 / 3.0], axis=0)
-                            t1, t2 = qs[0], qs[1]
-                        probs = self._fit_predict(Fv[tr_idx], Yv[tr_idx],
-                                                  Fv[va_idx], t1, t2,
+                    for tr_idx, va_idx, ftrain, fvalidation in prepared:
+                        probs = self._fit_predict(ftrain, Yv[tr_idx],
+                                                  fvalidation, t1_fix, t2_fix,
                                                   l2=l2, transform=g,
                                                   quantiles=qc)
                         s = self._score_vs_class(probs, Ov[va_idx], score)
@@ -3265,14 +5042,19 @@ class WAS_mme_ELR:
                         best_val, best_key = val, (l2, g, qc)
 
         best_l2, best_g, best_qc = best_key
-        best_gname = best_g if isinstance(best_g, str) else getattr(best_g, "__name__", "callable")
+        if not np.isfinite(best_val):
+            raise ValueError("ELR tuning has no finite validation scores.")
         self.l2 = float(best_l2)
         self.threshold_transform = best_g
         self.fit_quantiles = best_qc
-        self.best_params = {"l2": float(best_l2), "g": best_gname,
+        self.best_params = {"l2": float(best_l2), "g": best_g,
                             "quantiles": tuple(best_qc)}
         self.cv_scores_ = {"score": score, "values": scores,
                            "best": dict(self.best_params)}
+        self._last_fit_ = None
+        self._last_coords_ = None
+        _report_best_params("elr", self.best_params, getattr(self, "verbose", 1),
+                            score=best_val)
         return self.best_params
 
     # ------------------------------------------------------------- operational
@@ -3293,28 +5075,18 @@ class WAS_mme_ELR:
         if "M" in Predictant.dims:
             Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
-        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where(np.isfinite(Predictant).sum(dim='T') >= 3, 1.0, np.nan)
 
-        Predictor = self._tx_predictor(Predictor)
-        Predictor_for_year = self._tx_predictor(Predictor_for_year)
-        clim = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end)))
-        mX = clim.mean("T")
-        sX = clim.std("T")
-        sX = sX.where(sX > 0)
-        Predictor_st = (Predictor - mX) / sX
-        Predictor_year_st = (Predictor_for_year - mX) / sX
+        Predictor = align_predictor_target(Predictor, Predictant, mode="season_year")
+        Predictor_st, Predictor_year_st = self._standardize_predictors(
+            Predictor, Predictor_for_year, clim_year_start, clim_year_end)
 
         prob = self.compute_model(
             Predictor_st, Predictant, Predictor_year_st,
             clim_year_start=clim_year_start, clim_year_end=clim_year_end,
             clim_terciles=clim_terciles)
 
-        # relabel the time coordinate to the forecast-year target month
-        year = Predictor_for_year.coords["T"].values.astype("datetime64[Y]").astype(int)[0] + 1970
-        month = Predictant.isel(T=0).coords["T"].values.astype("datetime64[M]").astype(int) % 12 + 1
-        new_T = np.datetime64(f"{year}-{month:02d}-01")
-        prob = prob.assign_coords(T=xr.DataArray([new_T], dims=["T"]))
-        prob["T"] = prob["T"].astype("datetime64[ns]")
+        prob = _assign_target_time(prob, Predictor_for_year, Predictant)
 
         # keep predictive_quantiles consistent with the relabelled target date
         if self._last_coords_ is not None:
@@ -3456,12 +5228,19 @@ class WAS_mme_gaussian_process:
         valid = valid[np.isfinite(valid)]
         return float(np.mean(valid)) if valid.size else -1e5
 
-    def compute_hyperparameters(self, Predictors, Predictand, clim_year_start, clim_year_end):
+    def compute_hyperparameters(self, Predictors, Predictand,
+                                clim_year_start=None, clim_year_end=None, *, target_is_class=False):
+        """Tune with fold-local standardization, target encoding and climate zones."""
+        return _strict_regional_hyperparameters(
+            self, Predictors, Predictand, clim_year_start, clim_year_end, target_is_class=target_is_class)
+
+    def compute_hyperparameters_legacy(self, Predictors, Predictand, clim_year_start, clim_year_end, *, target_is_class=False):
         """Computes best hyperparameters. Uses rigorous GroupKFold by Time."""
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        Predictors = align_predictor_target(Predictors, Predictand, mode="season_year")
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
             
-        X_train_std = standardize_timeseries(Predictors, clim_year_start, clim_year_end)
+        X_train_std = Predictors if target_is_class else standardize_timeseries(Predictors, clim_year_start, clim_year_end)
         
         cluster_da = _build_climate_feature_clusters(
             Predictand, self.n_clusters, random_state=self.random_state
@@ -3470,7 +5249,7 @@ class WAS_mme_gaussian_process:
         clusters = clusters[np.isfinite(clusters)]
 
         verify = WAS_Verification()
-        y_train_std = verify.compute_class(Predictand, clim_year_start, clim_year_end)
+        y_train_std = Predictand if target_is_class else verify.compute_class(Predictand, clim_year_start, clim_year_end)
         X_train_std['T'] = y_train_std['T']
 
         best_params_dict = {}
@@ -3484,7 +5263,7 @@ class WAS_mme_gaussian_process:
             # Stack keeping coordinate tracking
             stacked_X = X_train_std.where(mask_3d).stack(sample=('T', 'Y', 'X'))
             X_stacked_c = stacked_X.transpose('sample', 'M').values
-            y_stacked_c = y_train_std.where(mask_3d).stack(sample=('T', 'Y', 'X')).values.ravel()
+            y_stacked_c = _stack_masked(y_train_std, mask_3d, core=None).ravel()
             
             # Extract time identifiers for CV Grouping
             samples_coords = stacked_X.sample.values
@@ -3515,7 +5294,7 @@ class WAS_mme_gaussian_process:
                 model = GaussianProcessClassifier(random_state=self.random_state, warm_start=self.warm_start)
                 grid_search = GridSearchCV(
                     estimator=model, param_grid=param_grid, cv=cv_splitter,
-                    scoring="neg_log_loss", n_jobs=self.n_jobs
+                    scoring=_tercile_logloss_scorer, n_jobs=self.n_jobs
                 )
                 grid_search.fit(X_clean_c, y_clean_c, groups=groups_clean_c)
                 best_params_dict[c] = grid_search.best_params_
@@ -3525,7 +5304,7 @@ class WAS_mme_gaussian_process:
                 model = GaussianProcessClassifier(random_state=self.random_state, warm_start=self.warm_start)
                 random_search = RandomizedSearchCV(
                     estimator=model, param_distributions=param_dist, n_iter=self.n_random_iter,
-                    cv=cv_splitter, scoring="neg_log_loss", random_state=self.random_state, n_jobs=self.n_jobs
+                    cv=cv_splitter, scoring=_tercile_logloss_scorer, random_state=self.random_state, n_jobs=self.n_jobs
                 )
                 random_search.fit(X_clean_c, y_clean_c, groups=groups_clean_c)
                 best_params_dict[c] = random_search.best_params_
@@ -3555,16 +5334,18 @@ class WAS_mme_gaussian_process:
                     'max_iter_predict': bp['max_iter_predict']
                 }
 
+        _report_best_params("gp", best_params_dict, getattr(self, "verbose", 1))
         return best_params_dict, cluster_da
 
     def compute_model(self, X_train, y_train, X_test, y_test, clim_year_start, clim_year_end, best_params=None, cluster_da=None):
         """Fit models on train set and predict on test set."""
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
         # Note: Implementation logic follows existing flow but cleaned up.
         time, lat, lon = X_test["T"], X_test["Y"], X_test["X"]
         n_time, n_lat, n_lon = len(time), len(lat), len(lon)
 
-        if best_params is None or cluster_da is None:
-            best_params, cluster_da = self.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end)
+        if best_params is None or cluster_da is None or not _cluster_matches_training(cluster_da, y_train):
+            best_params, cluster_da = self.compute_hyperparameters(X_train, y_train, clim_year_start, clim_year_end, target_is_class=True)
 
         predictions = np.full((n_time, n_lat, n_lon), np.nan)
         predictions_prob = np.full((n_time, n_lat, n_lon, 3), np.nan)
@@ -3577,8 +5358,11 @@ class WAS_mme_gaussian_process:
             mask_3d_train = (cluster_da == c).expand_dims({"T": X_train["T"]})
             mask_3d_test = (cluster_da == c).expand_dims({"T": X_test["T"]})
 
-            X_train_stacked = X_train.where(mask_3d_train).stack(sample=("T", "Y", "X")).transpose("sample", "M")
-            y_train_stacked = y_train.where(mask_3d_train).stack(sample=("T", "Y", "X")).values.ravel()
+            X_train_stacked = xr.DataArray(
+                _stack_masked(X_train, mask_3d_train, core="M"),
+                dims=("sample", "M"),
+            )
+            y_train_stacked = _stack_masked(y_train, mask_3d_train, core=None).ravel()
 
             nan_mask_tr = np.any(~np.isfinite(X_train_stacked.values), axis=1) | ~np.isfinite(y_train_stacked)
             X_clean_tr = X_train_stacked.values[~nan_mask_tr]
@@ -3595,7 +5379,10 @@ class WAS_mme_gaussian_process:
             model_c.fit(X_clean_tr, y_clean_tr)
             self.models[c] = model_c
 
-            X_test_stacked = X_test.where(mask_3d_test).stack(sample=("T", "Y", "X")).transpose("sample", "M")
+            X_test_stacked = xr.DataArray(
+                _stack_masked(X_test, mask_3d_test, core="M"),
+                dims=("sample", "M"),
+            )
             nan_mask_te = np.any(~np.isfinite(X_test_stacked.values), axis=1)
             X_clean_te = X_test_stacked.values[~nan_mask_te]
 
@@ -3627,8 +5414,8 @@ class WAS_mme_gaussian_process:
 
     def forecast(self, Predictant, clim_year_start, clim_year_end, Predictors_train, Predictor_for_year, best_params=None, cluster_da=None):
         """Train on entire history, forecast for 1 new time slice."""
-        if "M" in Predictant.coords:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+        if "M" in Predictant.dims:
+            Predictant = Predictant.isel(M=0, drop=True)
 
         verify = WAS_Verification()
         Predictant_cls = verify.compute_class(Predictant, clim_year_start, clim_year_end)
@@ -3667,149 +5454,6 @@ class WAS_mme_gaussian_process:
         elif self.hpo_method == 'bayesian':
             summary['n_trials'] = self.n_trials
         return summary
-
-
-class WAS_mme_xcELM:
-    """xcast ELM deterministic MME with shared, dimension-safe probabilities.
-
-    The previous implementation exposed unsupported defaults, undefined names,
-    noisy per-cell prints and a T/S collision in operational probabilities.
-    This wrapper delegates probability dressing to :class:`WAS_mme_Weighted`,
-    which is already used and tested elsewhere in the module.
-    """
-
-    def __init__(
-        self,
-        elm_kwargs=None,
-        dist_method="nonparam",
-        apply_drymask=True,
-        dry_threshold=10.0,
-        quantile_threshold=0.2,
-    ):
-        if xc is None:
-            raise ImportError("WAS_mme_xcELM requires the optional 'xcast' package.")
-        self.elm_kwargs = {
-            "regularization": 10,
-            "hidden_layer_size": 5,
-            "activation": "lin",
-            "preprocessing": "none",
-            "n_estimators": 5,
-        } if elm_kwargs is None else dict(elm_kwargs)
-        self.dist_method = str(dist_method).lower()
-        if self.dist_method not in {"nonparam", "bestfit"}:
-            raise ValueError("dist_method must be 'nonparam' or 'bestfit'.")
-        self.apply_drymask = bool(apply_drymask)
-        self.dry_threshold = float(dry_threshold)
-        self.quantile_threshold = float(quantile_threshold)
-        self.model_ = None
-
-    @staticmethod
-    def _target(y):
-        if "M" in y.dims:
-            y = y.isel(M=0, drop=True)
-        return y.transpose("T", "Y", "X")
-
-    def _mask(self, y):
-        if not self.apply_drymask:
-            return xr.where(y.notnull().any("T"), 1.0, np.nan)
-        return xc.drymask(
-            y,
-            dry_threshold=self.dry_threshold,
-            quantile_threshold=self.quantile_threshold,
-        )
-
-    @staticmethod
-    def _normalise_deterministic_output(result):
-        if "S" in result.dims and "T" not in result.dims:
-            result = result.rename({"S": "T"})
-        if "M" in result.dims:
-            if result.sizes["M"] == 1:
-                result = result.isel(M=0, drop=True)
-            else:
-                warnings.warn(
-                    "xcast ELM returned several output members; their mean is used.",
-                    RuntimeWarning,
-                )
-                result = result.mean("M", skipna=True)
-        for dim in list(result.dims):
-            if dim not in ("T", "Y", "X"):
-                if result.sizes[dim] == 1:
-                    result = result.isel({dim: 0}, drop=True)
-                else:
-                    raise ValueError(f"Unexpected ELM output dimension {dim!r}: {result.dims}")
-        return result.transpose("T", "Y", "X")
-
-    def _fit_predict(self, X_train, y_train, X_test):
-        target = self._target(y_train)
-        X_train = xc.regrid(X_train, target.X, target.Y)
-        X_test = xc.regrid(X_test, target.X, target.Y)
-        mask = self._mask(target)
-        X_train = X_train * mask
-        X_test = X_test * mask
-        model = xc.ELM(**self.elm_kwargs)
-        model.fit(X_train, target)
-        self.model_ = model
-        result = self._normalise_deterministic_output(model.predict(X_test))
-        return result * mask
-
-    def compute_model(self, X_train, y_train, X_test, *args, **kwargs):
-        return self._fit_predict(X_train, y_train, X_test)
-
-    def _probability_helper(self):
-        return WAS_mme_Weighted(equal_weighted=True, dist_method=self.dist_method)
-
-    def compute_prob(
-        self,
-        Predictant,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det,
-        best_code_da=None,
-        best_shape_da=None,
-        best_loc_da=None,
-        best_scale_da=None,
-    ):
-        return self._probability_helper().compute_prob(
-            Predictant,
-            clim_year_start,
-            clim_year_end,
-            hindcast_det,
-            best_code_da,
-            best_shape_da,
-            best_loc_da,
-            best_scale_da,
-        )
-
-    def forecast(
-        self,
-        Predictant,
-        clim_year_start,
-        clim_year_end,
-        hindcast_det,
-        hindcast_det_cross_val,
-        Predictor_for_year,
-        best_code_da=None,
-        best_shape_da=None,
-        best_loc_da=None,
-        best_scale_da=None,
-    ):
-        target = self._target(Predictant)
-        result = self._fit_predict(hindcast_det, target, Predictor_for_year)
-        result = _assign_target_time(result, Predictor_for_year, target)
-        cross = _mean_if_member(hindcast_det_cross_val)
-        result, prob = self._probability_helper().forecast(
-            target,
-            clim_year_start,
-            clim_year_end,
-            cross,
-            result,
-            best_code_da,
-            best_shape_da,
-            best_loc_da,
-            best_scale_da,
-        )
-        return result, prob
-
 
 
 #################################################################################
@@ -3851,15 +5495,8 @@ def censored_normal_mean_var(mu, var, dry_threshold=0.0):
 
 
 def truncated_normal_mean_var(mu, sigma, dry_threshold=0.0):
-    """Mean and variance of X | X > c, X ~ N(mu, sigma^2). (Unchanged from your
-    code — it was already correct; included for completeness.)"""
-    sigma = np.maximum(np.asarray(sigma, float), _EPS)
-    alpha = (dry_threshold - mu) / sigma
-    Z = np.maximum(1.0 - norm.cdf(alpha), 1e-15)
-    lam = norm.pdf(alpha) / Z
-    mean = mu + sigma * lam
-    var = sigma**2 * (1.0 + alpha * lam - lam**2)
-    return mean, np.maximum(var, 0.0)
+    """Mean/variance of X conditional on X>c, with stable tail arithmetic."""
+    return _truncated_normal_mean_var(mu, sigma, dry_threshold)
 
 
 # ===========================================================================
@@ -4128,6 +5765,7 @@ class WAS_mme_NGR_Gaussian:
         alpha=0.10,
         test_direction="two-sided",
         bounds=None,
+        min_train_years=10,
     ):
         valid_apply = {"all", "sig", "pos", "neg"}
         valid_test = {"two-sided", "greater", "less"}
@@ -4140,6 +5778,7 @@ class WAS_mme_NGR_Gaussian:
             raise ValueError("alpha must be between 0 and 1")
 
         self.apply_to = apply_to
+        self.min_train_years = max(int(min_train_years), _recommended_min_years(4, floor=8))
         self.alpha = float(alpha)
         self.test_direction = test_direction
 
@@ -4205,7 +5844,7 @@ class WAS_mme_NGR_Gaussian:
         if n <= 2 or not np.isfinite(r):
             return False
         if abs(r) >= 1.0 - 1e-12:
-            return True
+            return direction == "two-sided" or (direction == "greater" and r > 0) or (direction == "less" and r < 0)
 
         t_stat = r * np.sqrt((n - 2.0) / max(1.0 - r * r, 1e-12))
         if direction == "two-sided":
@@ -4234,14 +5873,31 @@ class WAS_mme_NGR_Gaussian:
         sigma = np.sqrt(np.maximum(sig2, 0.0))
         return float(np.nanmean(_crps_gaussian(obs, mu, sigma)))
 
+    @staticmethod
+    def _climatological_pars(y):
+        """Climatological fallback [mean(y), 0, var(y), 0]: mu = mean(y_train),
+        sigma^2 = var(y_train) (ddof=1), the same convention as NGR_NonGaussian.
+
+        Used when the calibration gate is not passed, the optimiser fails or
+        the training sample is too short. The former raw-ensemble fallback
+        [0, 1, 0, 1] (mu = fbar, sigma^2 = ensemble spread) is over-confident
+        precisely where there is no skill: with a few correlated products the
+        spread is far below the climatological variance.
+        """
+        y = np.asarray(y, dtype=float)
+        y = y[np.isfinite(y)]
+        if y.size < 2:
+            return np.array([np.nan, 0.0, np.nan, 0.0], dtype=float)
+        return np.array([float(np.mean(y)), 0.0, float(np.var(y, ddof=1)), 0.0], dtype=float)
+
     def _fit_one_grid(self, h_gp, o_gp):
         """
         h_gp: (M, T)
         o_gp: (T,)
         """
         valid_time = np.isfinite(o_gp) & np.any(np.isfinite(h_gp), axis=0)
-        if valid_time.sum() < 3:
-            return np.array([0.0, 1.0, 0.0, 1.0]), {
+        if valid_time.sum() < self.min_train_years:
+            return self._climatological_pars(o_gp), {
                 "success": False,
                 "n_valid": int(valid_time.sum()),
                 "initial_score": np.nan,
@@ -4257,8 +5913,8 @@ class WAS_mme_NGR_Gaussian:
         fbar, svar, sstd, counts = self._safe_ens_stats(h)
         mask = np.isfinite(fbar) & np.isfinite(svar) & np.isfinite(y)
 
-        if mask.sum() < 3:
-            return np.array([0.0, 1.0, 0.0, 1.0]), {
+        if mask.sum() < self.min_train_years:
+            return self._climatological_pars(y), {
                 "success": False,
                 "n_valid": int(mask.sum()),
                 "initial_score": np.nan,
@@ -4272,11 +5928,14 @@ class WAS_mme_NGR_Gaussian:
         svar = svar[mask]
         y = y[mask]
 
-        lm = linregress(fbar, y)
-        r = float(lm.rvalue)
+        if np.ptp(fbar) <= np.finfo(float).eps:
+            intercept, slope, r = float(np.mean(y)), 0.0, 0.0
+        else:
+            lm = linregress(fbar, y)
+            intercept, slope, r = float(lm.intercept), float(lm.slope), float(lm.rvalue)
 
         if not self._should_calibrate(r, int(mask.sum())):
-            pars = np.array([0.0, 1.0, 0.0, 1.0], dtype=float)
+            pars = self._climatological_pars(y)
             base_score = self._objective_one_grid(pars, fbar, svar, y)
             return pars, {
                 "success": True,
@@ -4288,11 +5947,11 @@ class WAS_mme_NGR_Gaussian:
                 "nit": 0,
             }
 
-        resid = y - (lm.intercept + lm.slope * fbar)
+        resid = y - (intercept + slope * fbar)
         resid_var = float(np.nanvar(resid, ddof=1)) if resid.size > 1 else 1.0
         init = np.array([
-            float(lm.intercept),
-            float(lm.slope),
+            intercept,
+            slope,
             max(resid_var * 0.25, 1e-6),
             0.75,
         ])
@@ -4304,7 +5963,9 @@ class WAS_mme_NGR_Gaussian:
             self.bounds["d"],
         ]
 
-        base_pars = np.array([0.0, 1.0, 0.0, 1.0], dtype=float)
+        # Reference (and optimiser-failure fallback) is climatology, not the
+        # raw ensemble: score_reduction then measures the CRPS gain over it.
+        base_pars = self._climatological_pars(y)
         base_score = self._objective_one_grid(base_pars, fbar, svar, y)
 
         res = minimize(
@@ -4363,7 +6024,7 @@ class WAS_mme_NGR_Gaussian:
         self._lon_dim = lon_dim
 
         if use_xarray:
-            hcst_grid, obs_grid = xr.align(hcst_grid, obs_grid, join="inner", copy=False)
+            hcst_grid, obs_grid = xr.align(hcst_grid, obs_grid, join="exact", copy=False)
             hcst = hcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim).values
             obs = obs_grid.transpose(time_dim, lat_dim, lon_dim).values
             self._lat_coords = hcst_grid.coords[lat_dim]
@@ -4633,6 +6294,7 @@ class WAS_mme_NGR_Gaussian:
         lon_dim="X",
         return_synthetic_ensemble=False,
     ):
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
         self.fit(
             X_train,
             y_train,
@@ -4726,6 +6388,12 @@ def _softplus(x):
     return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0.0)
 
 
+def _inverse_softplus(x):
+    """Stable inverse of softplus for strictly positive values."""
+    x = np.maximum(np.asarray(x, dtype=float), np.finfo(float).tiny)
+    return x + np.log(-np.expm1(-x))
+
+
 def _sigmoid(x):
     x = np.asarray(x, dtype=float)
     out = np.empty_like(x)
@@ -4791,9 +6459,7 @@ def _censored_normal_logpdf(y, mu, sigma, dry_threshold=0.0):
 
     dry = y <= dry_threshold
     if np.any(dry):
-        p0 = norm.cdf(zt[dry] if np.ndim(zt) else zt)
-        p0 = np.maximum(p0, 1e-15)
-        out[dry] = np.log(p0)
+        out[dry] = norm.logcdf(zt[dry] if np.ndim(zt) else zt)
 
     wet = ~dry
     if np.any(wet):
@@ -4806,24 +6472,15 @@ def _censored_normal_logpdf(y, mu, sigma, dry_threshold=0.0):
 
 
 def _truncated_normal_logpdf(y, mu, sigma, dry_threshold=0.0):
-    y = np.asarray(y, dtype=float)
-    mu = np.asarray(mu, dtype=float)
     sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-8)
-
-    alpha = (dry_threshold - mu) / sigma
-    denom = np.maximum(1.0 - norm.cdf(alpha), 1e-15)
-    out = norm.logpdf(y, loc=mu, scale=sigma) - np.log(denom)
-    out = np.where(y > dry_threshold, out, -np.inf)
-    return out
+    alpha = (dry_threshold - np.asarray(mu, dtype=float)) / sigma
+    return stats.truncnorm.logpdf(y, alpha, np.inf, loc=mu, scale=sigma)
 
 
 def _truncated_normal_mean_var(mu, sigma, dry_threshold=0.0):
     sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-8)
-    alpha = (dry_threshold - mu) / sigma
-    z = np.maximum(1.0 - norm.cdf(alpha), 1e-15)
-    lam = norm.pdf(alpha) / z
-    mean = mu + sigma * lam
-    var = sigma**2 * (1.0 + alpha * lam - lam**2)
+    alpha = (dry_threshold - np.asarray(mu, dtype=float)) / sigma
+    mean, var = stats.truncnorm.stats(alpha, np.inf, loc=mu, scale=sigma, moments="mv")
     return mean, np.maximum(var, 0.0)
 
 
@@ -4895,10 +6552,12 @@ class WAS_mme_NGR_NonGaussian:
     Notes
     -----
     1) Designed for nonnegative predictands such as precipitation.
-    2) For families without an intrinsic atom at zero, a hurdle occurrence model
+    2) The predictand is censored at ``dry_threshold``: Y_c = max(Y, c).
+       For families without an intrinsic atom, a hurdle occurrence model
        is used by default:
-           P(Y = 0) = p0
-           Y | Y > 0  ~ positive family
+           P(Y_c = c) = p0
+           Y_c | Y_c > c  ~ positive family
+       Use :meth:`observation_event_values` for verification observations too.
     3) Fitting uses log-likelihood rather than analytic CRPS, so one coherent
        implementation can cover all families.
     """
@@ -4921,6 +6580,7 @@ class WAS_mme_NGR_NonGaussian:
         alpha=0.10,
         apply_to="all",
         bounds=None,
+        min_train_years=10,
     ):
         if family not in self.VALID_FAMILIES:
             raise ValueError(f"family must be one of {self.VALID_FAMILIES}")
@@ -4928,8 +6588,19 @@ class WAS_mme_NGR_NonGaussian:
             raise ValueError(f"occurrence_model must be one of {self.VALID_OCC}")
         if apply_to not in {"all", "sig", "pos", "neg"}:
             raise ValueError("apply_to must be one of {'all', 'sig', 'pos', 'neg'}")
+        if not np.isfinite(dry_threshold) or float(dry_threshold) < 0.0:
+            raise ValueError("dry_threshold must be finite and nonnegative")
+        if not np.isfinite(transform_shift) or float(transform_shift) <= 0.0:
+            raise ValueError("transform_shift must be finite and strictly positive")
+        if transform != "boxcox":
+            raise ValueError("transform must be 'boxcox'")
+        if not np.isfinite(alpha) or not 0.0 < float(alpha) < 1.0:
+            raise ValueError("alpha must lie strictly between 0 and 1")
+        if int(min_train_years) != min_train_years or int(min_train_years) < 1:
+            raise ValueError("min_train_years must be a positive integer")
 
         self.family = family
+        self.min_train_years = max(int(min_train_years), _recommended_min_years(4, floor=10))
         self.occurrence_model = occurrence_model
         self.dry_threshold = float(dry_threshold)
         self.transform = transform
@@ -4940,11 +6611,17 @@ class WAS_mme_NGR_NonGaussian:
         self.bounds = {
             "a": (-np.inf, np.inf),
             "b": (-np.inf, np.inf),
-            "c": (-10.0, 20.0),
-            "d": (-10.0, 20.0),
+            "c": (-np.inf, np.inf),
+            "d": (0.0, np.inf),
         }
         if bounds is not None:
+            unknown = set(bounds) - set(self.bounds)
+            if unknown:
+                raise ValueError(f"Unknown NGR parameter bounds: {sorted(unknown)}")
             self.bounds.update(bounds)
+        for name, interval in self.bounds.items():
+            if len(interval) != 2 or np.any(np.isnan(interval)) or interval[0] > interval[1]:
+                raise ValueError(f"Invalid bounds for NGR parameter {name}")
 
         self.params = None
         self.occ_params = None
@@ -4979,9 +6656,31 @@ class WAS_mme_NGR_NonGaussian:
             return False
         return True
 
+    def observation_event_values(self, values):
+        """Map observations to the same censored support as forecast events."""
+        array = np.asarray(values, dtype=float)
+        if np.any(array[np.isfinite(array)] < 0.0):
+            raise ValueError("NonGaussian NGR requires nonnegative observations; use Gaussian NGR for signed targets")
+        if isinstance(values, xr.DataArray):
+            return values.clip(min=self.dry_threshold)
+        return np.maximum(array, self.dry_threshold)
+
+    def _climatological_event_terciles(self, values):
+        array = np.asarray(self.observation_event_values(values), dtype=float)
+        flat = array.reshape(array.shape[0], -1)
+        available = np.any(np.isfinite(flat), axis=0)
+        terciles = np.full((2, flat.shape[1]), np.nan)
+        if available.any():
+            terciles[:, available] = np.nanpercentile(
+                flat[:, available], [100.0/3.0, 200.0/3.0], axis=0)
+        return terciles.reshape((2,) + array.shape[1:])
+
     @staticmethod
     def _safe_ens_stats(h, dry_threshold=0.0):
-        fbar = np.nanmean(h, axis=0)
+        finite = np.isfinite(h)
+        count = finite.sum(axis=0)
+        fbar = np.divide(np.where(finite, h, 0.0).sum(axis=0), count,
+                         out=np.full(h.shape[1], np.nan), where=count > 0)
         s2 = np.full(h.shape[1], np.nan, dtype=float)
         wet_frac = np.full(h.shape[1], np.nan, dtype=float)
         for t in range(h.shape[1]):
@@ -5003,7 +6702,9 @@ class WAS_mme_NGR_NonGaussian:
         if n <= 2 or not np.isfinite(r):
             return False
         if abs(r) >= 1.0 - 1e-12:
-            return True
+            return bool(self.apply_to in {"all", "sig"} or
+                        (self.apply_to == "pos" and r > 0.0) or
+                        (self.apply_to == "neg" and r < 0.0))
         t_stat = r * np.sqrt((n - 2.0) / max(1.0 - r * r, 1e-12))
         if self.apply_to == "sig" or self.apply_to == "all":
             p = 2.0 * tdist.sf(abs(t_stat), df=n - 2)
@@ -5022,6 +6723,8 @@ class WAS_mme_NGR_NonGaussian:
             return False
         if self.apply_to == "all":
             return True
+        if np.ptp(fbar[good]) <= np.finfo(float).eps:
+            return False
         lm = linregress(fbar[good], y[good])
         return self._regression_significant(float(lm.rvalue), int(good.sum()))
 
@@ -5037,7 +6740,7 @@ class WAS_mme_NGR_NonGaussian:
 
         if self.family == "censored_normal":
             ll = _censored_normal_logpdf(y_all, mu, sigma, dry_threshold=self.dry_threshold)
-            return -np.sum(ll[np.isfinite(ll)])
+            return -float(np.sum(ll)) if np.all(np.isfinite(ll)) else np.inf
 
         fmu = mu[wet_mask]
         fvar = var[wet_mask]
@@ -5049,107 +6752,162 @@ class WAS_mme_NGR_NonGaussian:
 
         if self.family == "truncated_normal":
             ll = _truncated_normal_logpdf(yy, fmu, fsig, dry_threshold=self.dry_threshold)
-            return -np.sum(ll[np.isfinite(ll)])
+            return -float(np.sum(ll)) if np.all(np.isfinite(ll)) else np.inf
 
         if self.family == "gamma":
             mean_pos = np.maximum(fmu, 1e-8)
             ll = _gamma_logpdf(yy, mean_pos, fvar, dry_threshold=self.dry_threshold)
-            return -np.sum(ll[np.isfinite(ll)])
+            return -float(np.sum(ll)) if np.all(np.isfinite(ll)) else np.inf
 
         if self.family == "transformed_gaussian":
             if self.transform != "boxcox":
                 raise NotImplementedError("Only Box-Cox is implemented here.")
             yy_shift = np.maximum(yy - self.dry_threshold, 0.0)
             z = _boxcox_forward(yy_shift, lmbda=lmbda, shift=self.transform_shift)
-            ll = norm.logpdf(z, loc=fmu, scale=fsig) + _boxcox_log_jacobian(
+            lower = float(_boxcox_forward(0.0, lmbda, self.transform_shift))
+            upper = -1.0 / lmbda if lmbda < -1e-12 else np.inf
+            ll = stats.truncnorm.logpdf(z, (lower-fmu)/fsig, (upper-fmu)/fsig,
+                                       loc=fmu, scale=fsig) + _boxcox_log_jacobian(
                 yy_shift, lmbda=lmbda, shift=self.transform_shift
             )
-            return -np.sum(ll[np.isfinite(ll)])
+            return -float(np.sum(ll)) if np.all(np.isfinite(ll)) else np.inf
 
         raise ValueError(f"Unknown family {self.family}")
 
+    def _climatological_fit(self, observations, reason, n_valid, lmbda=None):
+        """Fit an intercept-only law on training observations in its own units.
+
+        This fallback deliberately ignores regression bounds: it is a distinct
+        climatological model, not a successful conditional regression. The
+        diagnostics distinguish it from calibration and from unavailable data.
+        """
+        y = np.asarray(observations, dtype=float)
+        y = self.observation_event_values(y[np.isfinite(y)])
+        stat = {"success": False, "available": bool(y.size),
+                "fallback_reason": reason, "n_valid": int(n_valid),
+                "n_observed": int(y.size), "final_nll": np.nan,
+                "degenerate_at_dry": False}
+        if y.size == 0:
+            stat["fallback_reason"] = "no_observations"
+            return np.full(4, np.nan), None, np.nan, stat
+        wet = y > self.dry_threshold
+        occ = ({"kind": "climatology", "p0": float(np.mean(~wet))}
+               if self._needs_hurdle() else None)
+        if not wet.any():
+            stat["degenerate_at_dry"] = True
+            stat["fallback_reason"] = "all_dry"
+            return np.array([self.dry_threshold, 0.0, float(_inverse_softplus(1e-8)), 0.0]), occ, 0.0, stat
+
+        target = y if self.family == "censored_normal" else y[wet]
+        if self.family == "gamma":
+            target = target - self.dry_threshold
+        if self.family == "transformed_gaussian":
+            # A log transform is identifiable even when there are too few wet
+            # dates to estimate an additional Box-Cox parameter reliably.
+            lmbda = 0.0 if lmbda is None or not np.isfinite(lmbda) else float(lmbda)
+            target = _boxcox_forward(target - self.dry_threshold, lmbda, self.transform_shift)
+        else:
+            lmbda = np.nan
+        initial_mean = float(np.mean(target))
+        initial_var = max(float(np.var(target)), 1e-8 * max(1.0, initial_mean**2))
+        initial = np.array([initial_mean, float(_inverse_softplus(initial_var))])
+        zeros = np.zeros(y.size)
+
+        def objective(pair):
+            return self._pos_nll(np.array([pair[0], 0.0, pair[1], 0.0]),
+                                 zeros, zeros, y, wet, lmbda)
+
+        # Gamma has an inexpensive, well-conditioned intercept-only MLE.
+        if self.family == "gamma" and np.ptp(target) > 0.0:
+            try:
+                shape, _, scale = gamma_dist.fit(target, floc=0.0)
+                initial = np.array([shape * scale, float(_inverse_softplus(shape * scale**2))])
+            except (ValueError, FloatingPointError):
+                pass
+        elif np.ptp(target) > 0.0:
+            result = minimize(objective, initial, method="L-BFGS-B",
+                              options={"maxiter": 300, "ftol": 1e-10, "gtol": 1e-6})
+            if result.success and np.all(np.isfinite(result.x)) and np.isfinite(result.fun):
+                initial = result.x
+        pars = np.array([initial[0], 0.0, initial[1], 0.0])
+        stat["final_nll"] = objective(initial)
+        return pars, occ, lmbda, stat
+
     def _fit_one_grid(self, h_gp, o_gp):
-        valid = np.isfinite(o_gp) & np.any(np.isfinite(h_gp), axis=0)
-        if valid.sum() < 5:
-            return (
-                np.array([0.0, 1.0, np.log(np.expm1(1e-4)), 0.0]),
-                None,
-                np.nan,
-                {"success": False, "n_valid": int(valid.sum()), "final_nll": np.nan},
-            )
+        observed = np.asarray(o_gp, dtype=float)
+        if np.any(observed[np.isfinite(observed)] < 0.0):
+            raise ValueError("NonGaussian NGR requires nonnegative observations; use Gaussian NGR for signed targets")
+        if (self.family != "censored_normal" and self.occurrence_model == "none"
+                and np.any(observed[np.isfinite(observed)] <= self.dry_threshold)):
+            raise ValueError("occurrence_model='none' requires all observations strictly above dry_threshold")
+        valid = np.isfinite(observed) & np.any(np.isfinite(h_gp), axis=0)
+        n_valid = int(valid.sum())
+        if n_valid < self.min_train_years:
+            return self._climatological_fit(observed, "insufficient_training", n_valid)
 
         h = h_gp[:, valid]
-        y = o_gp[valid]
+        y = self.observation_event_values(observed[valid])
         fbar, s2, wet_frac = self._safe_ens_stats(h, dry_threshold=self.dry_threshold)
         dry = y <= self.dry_threshold
         wet = ~dry
+        if not wet.any():
+            return self._climatological_fit(observed, "all_dry", n_valid)
+        if self.family != "censored_normal" and wet.sum() < max(5, self.min_train_years // 2):
+            return self._climatological_fit(observed, "insufficient_wet_training", n_valid)
 
         lmbda = np.nan
         if self.family == "transformed_gaussian":
             y_pos = y[wet] - self.dry_threshold
-            if y_pos.size < 5:
-                return (
-                    np.array([0.0, 1.0, np.log(np.expm1(1e-4)), 0.0]),
-                    None,
-                    np.nan,
-                    {"success": False, "n_valid": int(valid.sum()), "final_nll": np.nan},
-                )
-            try:
-                lmbda = float(boxcox_normmax(np.maximum(y_pos, self.transform_shift)))
-            except Exception:
-                lmbda = 0.0
+            lmbda = 0.0
+            if np.ptp(y_pos) > 0.0:
+                try:
+                    transformed_fit = minimize_scalar(
+                        lambda power: -float(stats.boxcox_llf(power, y_pos + self.transform_shift)),
+                        bounds=(0.0, 2.0), method="bounded")
+                    if transformed_fit.success and np.isfinite(transformed_fit.fun):
+                        lmbda = float(transformed_fit.x)
+                except (ValueError, FloatingPointError):
+                    pass
+
+        if not self._should_calibrate(fbar, y):
+            return self._climatological_fit(observed, "signal_gate", n_valid, lmbda)
 
         occ_model = None
         if self._needs_hurdle():
-            occ_mode = self.occurrence_model
-            if occ_mode == "auto":
-                occ_mode = "logistic"
-            if occ_mode == "climatology":
-                occ_model = {"kind": "climatology", "p0": float(np.mean(dry))}
-            elif occ_mode == "logistic":
+            # Exact boundary occurrence probabilities avoid failed separated
+            # logistic fits and do not manufacture dry events in all-wet data.
+            occ_model = {"kind": "climatology", "p0": float(np.mean(dry))}
+            if self.occurrence_model in {"auto", "logistic"} and dry.any() and wet.any():
                 occ_fit = _fit_occurrence_logistic(wet_frac, fbar, dry.astype(float))
-                occ_fit["kind"] = "logistic"
-                occ_model = occ_fit
-
-        target_for_gate = np.where(wet, y, 0.0)
-        if not self._should_calibrate(fbar, target_for_gate):
-            base = np.array([0.0, 1.0, np.log(np.expm1(np.nanvar(target_for_gate) + 1e-6)), 0.0])
-            return base, occ_model, lmbda, {
-                "success": True,
-                "n_valid": int(valid.sum()),
-                "final_nll": np.nan,
-            }
+                if occ_fit["success"] and np.all(np.isfinite(occ_fit["beta"])):
+                    occ_fit["kind"] = "logistic"
+                    occ_model = occ_fit
 
         wet_target = y if self.family == "censored_normal" else y[wet]
+        if self.family == "gamma":
+            wet_target = wet_target - self.dry_threshold
+        if self.family == "transformed_gaussian":
+            wet_target = _boxcox_forward(y[wet] - self.dry_threshold, lmbda, self.transform_shift)
         wet_fbar = fbar if self.family == "censored_normal" else fbar[wet]
-        mask = np.isfinite(wet_fbar) & np.isfinite(wet_target)
-        if wet_target.size < 3 or mask.sum() < 3:
-            init_a, init_b = 0.0, 1.0
+        if wet_target.size < 3 or np.ptp(wet_fbar) <= np.finfo(float).eps:
+            init_a, init_b = float(np.mean(wet_target)), 0.0
         else:
-            lm = linregress(wet_fbar[mask], wet_target[mask])
+            lm = linregress(wet_fbar, wet_target)
             init_a, init_b = float(lm.intercept), float(lm.slope)
 
-        init_var = np.nanvar(np.where(np.isfinite(y), y, np.nan))
-        init_c = np.log(np.expm1(max(init_var, 1e-4)))
-        init_d = 0.1
-        x0 = np.array([init_a, init_b, init_c, init_d], dtype=float)
-
+        init_var = np.var(wet_target - (init_a + init_b * wet_fbar))
+        x0 = np.array([init_a, init_b, float(_inverse_softplus(max(init_var, 1e-4))), 0.1])
         bounds = [self.bounds["a"], self.bounds["b"], self.bounds["c"], self.bounds["d"]]
-
-        res = minimize(
-            self._pos_nll,
-            x0=x0,
-            args=(fbar, s2, y, wet, lmbda),
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": 600, "ftol": 1e-9, "gtol": 1e-6},
-        )
-
-        pars = res.x if res.success else x0
-        return pars, occ_model, lmbda, {
-            "success": bool(res.success),
-            "n_valid": int(valid.sum()),
-            "final_nll": float(res.fun) if np.isfinite(res.fun) else np.nan,
+        res = minimize(self._pos_nll, x0=x0, args=(fbar, s2, y, wet, lmbda),
+                       method="L-BFGS-B", bounds=bounds,
+                       options={"maxiter": 600, "ftol": 1e-9, "gtol": 1e-6})
+        fitted_ok = bool(res.success and np.all(np.isfinite(res.x)) and np.isfinite(res.fun))
+        if not fitted_ok:
+            return self._climatological_fit(observed, "optimization_failed", n_valid, lmbda)
+        return res.x, occ_model, lmbda, {
+            "success": True, "available": True, "fallback_reason": "",
+            "n_valid": n_valid, "n_observed": int(np.isfinite(observed).sum()),
+            "degenerate_at_dry": False, "final_nll": float(res.fun),
         }
 
     def fit(
@@ -5174,7 +6932,7 @@ class WAS_mme_NGR_NonGaussian:
         self._lon_dim = lon_dim
 
         if use_xarray:
-            hcst_grid, obs_grid = xr.align(hcst_grid, obs_grid, join="inner", copy=False)
+            hcst_grid, obs_grid = xr.align(hcst_grid, obs_grid, join="exact", copy=False)
             hcst = hcst_grid.transpose(member_dim, time_dim, lat_dim, lon_dim).values
             obs = obs_grid.transpose(time_dim, lat_dim, lon_dim).values
             self._lat_coords = hcst_grid.coords[lat_dim]
@@ -5203,7 +6961,11 @@ class WAS_mme_NGR_NonGaussian:
 
         fit_stats = {
             "success": np.zeros((ny, nx), dtype=bool),
+            "available": np.zeros((ny, nx), dtype=bool),
+            "fallback_reason": np.full((ny, nx), "", dtype="U32"),
+            "degenerate_at_dry": np.zeros((ny, nx), dtype=bool),
             "n_valid": np.zeros((ny, nx), dtype=int),
+            "n_observed": np.zeros((ny, nx), dtype=int),
             "final_nll": np.full((ny, nx), np.nan, dtype=float),
         }
 
@@ -5212,9 +6974,8 @@ class WAS_mme_NGR_NonGaussian:
                 pars, occ, lmbda, stat = self._fit_one_grid(hcst[:, :, iy, ix], obs[:, iy, ix])
                 params[:, iy, ix] = pars
                 transform_param[iy, ix] = lmbda
-                fit_stats["success"][iy, ix] = stat["success"]
-                fit_stats["n_valid"][iy, ix] = stat["n_valid"]
-                fit_stats["final_nll"][iy, ix] = stat["final_nll"]
+                for key in fit_stats:
+                    fit_stats[key][iy, ix] = stat[key]
 
                 if occ is not None:
                     if occ["kind"] == "climatology":
@@ -5231,8 +6992,9 @@ class WAS_mme_NGR_NonGaussian:
         self._occ_feature_stds = occ_feature_stds if self._needs_hurdle() else None
         self.transform_param = transform_param if self.family == "transformed_gaussian" else None
 
+        self.clim_terciles = None
         if clim_terciles:
-            terc = np.nanpercentile(obs, [100.0 / 3.0, 200.0 / 3.0], axis=0)
+            terc = self._climatological_event_terciles(obs)
             self.clim_terciles = terc
 
         if use_xarray:
@@ -5286,13 +7048,11 @@ class WAS_mme_NGR_NonGaussian:
         y = np.asarray(y, dtype=float)
 
         if family == "censored_normal":
-            return norm.cdf(y, loc=mu, scale=sigma)
+            return np.where(y < self.dry_threshold, 0.0, norm.cdf(y, loc=mu, scale=sigma))
 
         if family == "truncated_normal":
             alpha = (self.dry_threshold - mu) / sigma
-            denom = np.maximum(1.0 - norm.cdf(alpha), 1e-15)
-            num = np.maximum(norm.cdf((y - mu) / sigma) - norm.cdf(alpha), 0.0)
-            return np.clip(num / denom, 0.0, 1.0)
+            return stats.truncnorm.cdf(y, alpha, np.inf, loc=mu, scale=sigma)
 
         if family == "gamma":
             mean_pos = np.maximum(mu, 1e-8)
@@ -5302,7 +7062,9 @@ class WAS_mme_NGR_NonGaussian:
         if family == "transformed_gaussian":
             yp = np.maximum(y - self.dry_threshold, 0.0)
             z = _boxcox_forward(yp, lmbda=lmbda, shift=self.transform_shift)
-            return norm.cdf(z, loc=mu, scale=sigma)
+            lower = float(_boxcox_forward(0.0, lmbda, self.transform_shift))
+            upper = -1.0 / lmbda if lmbda < -1e-12 else np.inf
+            return stats.truncnorm.cdf(z, (lower-mu)/sigma, (upper-mu)/sigma, loc=mu, scale=sigma)
 
         raise ValueError(f"Unknown family {family}")
 
@@ -5316,9 +7078,7 @@ class WAS_mme_NGR_NonGaussian:
 
         if family == "truncated_normal":
             alpha = (self.dry_threshold - mu) / sigma
-            pa = norm.cdf(alpha)
-            z = norm.ppf(pa + p * (1.0 - pa))
-            return mu + sigma * z
+            return stats.truncnorm.ppf(p, alpha, np.inf, loc=mu, scale=sigma)
 
         if family == "gamma":
             mean_pos = np.maximum(mu, 1e-8)
@@ -5326,7 +7086,9 @@ class WAS_mme_NGR_NonGaussian:
             return self.dry_threshold + gamma_dist.ppf(p, a=k, scale=theta)
 
         if family == "transformed_gaussian":
-            z = norm.ppf(p, loc=mu, scale=sigma)
+            lower = float(_boxcox_forward(0.0, lmbda, self.transform_shift))
+            upper = -1.0 / lmbda if lmbda < -1e-12 else np.inf
+            z = stats.truncnorm.ppf(p, (lower-mu)/sigma, (upper-mu)/sigma, loc=mu, scale=sigma)
             return self.dry_threshold + _boxcox_inverse(z, lmbda=lmbda, shift=self.transform_shift)
 
         raise ValueError(f"Unknown family {family}")
@@ -5335,11 +7097,7 @@ class WAS_mme_NGR_NonGaussian:
         sigma = np.sqrt(np.maximum(var, 1e-10))
 
         if family == "censored_normal":
-            a = mu / sigma
-            mean = sigma * norm.pdf(a) + mu * norm.cdf(a)
-            e2 = (mu**2 + var) * norm.cdf(a) + mu * sigma * norm.pdf(a)
-            v = np.maximum(e2 - mean**2, 0.0)
-            return mean, v
+            return censored_normal_mean_var(mu, var, self.dry_threshold)
 
         if family == "truncated_normal":
             return _truncated_normal_mean_var(mu, sigma, dry_threshold=self.dry_threshold)
@@ -5349,15 +7107,125 @@ class WAS_mme_NGR_NonGaussian:
             return mean_pos + self.dry_threshold, np.maximum(var, 0.0)
 
         if family == "transformed_gaussian":
-            p = np.linspace(0.01, 0.99, 51)
-            mu_ex = np.expand_dims(np.asarray(mu, dtype=float), axis=-1)
-            var_ex = np.expand_dims(np.asarray(var, dtype=float), axis=-1)
-            yq = self._ppf_positive(p, mu_ex, var_ex, family, lmbda=lmbda)
-            mean = np.nanmean(yq, axis=-1)
-            vv = np.nanvar(yq, axis=-1, ddof=0)
-            return mean, np.maximum(vv, 0.0)
+            return self._boxcox_mean_var(mu, var, lmbda)
 
         raise ValueError(f"Unknown family {family}")
+
+    def _boxcox_mean_var(self, mu, var, lmbda):
+        """Moments of the fitted transformed/truncated normal distribution.
+
+        Lambda=0 uses exact truncated-lognormal moments. Positive lambda uses
+        adaptive integration in standard-normal coordinates, with bounds around
+        each moment integrand's mode (including its right tail). This does not
+        replace moments by a finite collection of central quantiles.
+        """
+        from scipy.integrate import quad
+
+        mu, var = np.broadcast_arrays(np.asarray(mu, dtype=float), np.asarray(var, dtype=float))
+        mean = np.full(mu.shape, np.nan)
+        variance = np.full(mu.shape, np.nan)
+        if lmbda is None or not np.isfinite(lmbda):
+            return mean, variance
+        if lmbda < 0.0:
+            raise ValueError("Predictive Box-Cox moments require the fitted lambda range [0, 2]")
+        lower = float(_boxcox_forward(0.0, lmbda, self.transform_shift))
+        shift = self.dry_threshold - self.transform_shift
+        moment_cache = {}
+        for index in np.ndindex(mu.shape):
+            location, vv = float(mu[index]), float(var[index])
+            if not np.isfinite(location) or not np.isfinite(vv) or vv < 0.0:
+                continue
+            key = (location, vv)
+            if key in moment_cache:
+                mean[index], variance[index] = moment_cache[key]
+                continue
+            sd = np.sqrt(max(vv, 1e-10))
+            alpha = (lower - location) / sd
+            log_mass = norm.logsf(alpha)
+
+            if alpha > 8.0:
+                # A far-tail truncation concentrates the distribution in a
+                # layer of width 1/alpha. Integrate its *excess* over the lower
+                # bound, avoiding both missed endpoint mass and cancellation
+                # between two raw moments close to transform_shift.
+                if alpha > 1000.0:
+                    inverse_square = 1.0 / alpha**2
+                    mills_over_alpha = (1.0 + inverse_square - 2.0 * inverse_square**2
+                                        + 10.0 * inverse_square**3)
+                    log_density_scale = np.log(mills_over_alpha)
+                else:
+                    log_density_scale = norm.logpdf(alpha) - log_mass - np.log(alpha)
+
+                def excess_moment(order):
+                    if abs(lmbda) < 1e-12:
+                        peak = max(alpha, order * sd)
+                    else:
+                        b = 1.0 + lmbda * location
+                        disc = np.sqrt(b*b + 4.0*lmbda*order*sd**2)
+                        peak = (2.0*order*sd/(disc+b) if b >= 0.0
+                                else (disc-b)/(2.0*lmbda*sd))
+                        peak = max(alpha, peak)
+                    peak_v = max(float(order), alpha*(peak-alpha))
+                    upper_v = max(40.0, alpha*(peak-alpha+12.0))
+
+                    def log_integrand(v):
+                        if v <= 0.0:
+                            return -np.inf
+                        dz = sd * v / alpha
+                        if abs(lmbda) < 1e-12:
+                            growth = dz
+                        else:
+                            growth = np.log1p(lmbda*dz / self.transform_shift**lmbda) / lmbda
+                        log_excess = (np.log(self.transform_shift) +
+                                      (growth if growth > 50.0 else np.log(np.expm1(growth))))
+                        return order*log_excess - v - 0.5*(v/alpha)**2 + log_density_scale
+
+                    log_peak = log_integrand(peak_v)
+                    points = sorted({v for v in (1.0, 5.0, 10.0, 40.0, peak_v) if 0.0 < v < upper_v})
+                    scaled, _ = quad(lambda v: np.exp(log_integrand(v)-log_peak),
+                                     0.0, upper_v, points=points,
+                                     epsabs=1e-11, epsrel=2e-9, limit=150)
+                    return np.exp(log_peak+np.log(scaled)) if scaled > 0.0 else 0.0
+
+                first, second = excess_moment(1), excess_moment(2)
+                mean[index] = self.dry_threshold + first
+                variance[index] = max(second-first**2, 0.0)
+                moment_cache[key] = (mean[index], variance[index])
+                continue
+
+            def moment(order):
+                if abs(lmbda) < 1e-12:
+                    log_value = (order * location + 0.5 * order**2 * sd**2
+                                 + norm.logsf(alpha - order * sd) - log_mass)
+                    return np.exp(log_value)
+                # Solve for the mode of x(z)^order * standard_normal(z).
+                b = 1.0 + lmbda * location
+                disc = np.sqrt(b * b + 4.0 * lmbda * order * sd**2)
+                peak = (2.0 * order * sd / (disc + b) if b >= 0.0
+                        else (disc - b) / (2.0 * lmbda * sd))
+                peak = max(alpha, peak)
+                lo = max(alpha, -12.0)
+                hi = max(12.0, peak + 12.0, alpha + 12.0 / max(1.0, alpha))
+                stretch = max(1.0, alpha)
+
+                def log_integrand(z):
+                    argument = lmbda * (location + sd * z)
+                    log_base = np.log1p(argument) if argument > -1.0 else np.log(np.finfo(float).tiny)
+                    return (order * log_base / lmbda - 0.5 * z * z
+                            - 0.5 * np.log(2.0 * np.pi) - log_mass)
+
+                log_peak = log_integrand(peak)
+                scaled, _ = quad(
+                    lambda u: np.exp(log_integrand(lo + u / stretch) - log_peak) / stretch,
+                    0.0, (hi - lo) * stretch, epsabs=1e-11, epsrel=2e-9,
+                    points=[(peak - lo) * stretch], limit=150)
+                return np.exp(log_peak + np.log(scaled)) if scaled > 0.0 else 0.0
+
+            first, second = moment(1), moment(2)
+            mean[index] = shift + first
+            variance[index] = max(second - first**2, 0.0)
+            moment_cache[key] = (mean[index], variance[index])
+        return mean, variance
 
     def _predict_numpy(
         self,
@@ -5384,6 +7252,9 @@ class WAS_mme_NGR_NonGaussian:
         lam_np = None if self.transform_param is None else (
             self.transform_param.values if hasattr(self.transform_param, "values") else self.transform_param
         )
+        if np.shape(param_np) != (4, ny, nx):
+            raise ValueError("Forecast spatial dimensions must match the fitted NGR grid")
+        degenerate = None if self._fit_stats is None else self._fit_stats.get("degenerate_at_dry")
 
         mean_out = np.full((t, ny, nx), np.nan, dtype=float)
         std_out = np.full((t, ny, nx), np.nan, dtype=float)
@@ -5393,9 +7264,14 @@ class WAS_mme_NGR_NonGaussian:
 
         if quantiles is not None:
             q_levels = np.asarray(quantiles, dtype=float)
+            if (q_levels.ndim != 1 or np.any(~np.isfinite(q_levels))
+                    or np.any((q_levels <= 0.0) | (q_levels >= 1.0))):
+                raise ValueError("quantiles must be a finite one-dimensional sequence strictly between 0 and 1")
             q_out = np.full((q_levels.size, t, ny, nx), np.nan, dtype=float)
 
         if clim_terciles:
+            if self.clim_terciles is None:
+                raise ValueError("Climatological terciles have not been fitted or supplied")
             probs_out = np.full((3, t, ny, nx), np.nan, dtype=float)
             terc = self.clim_terciles.values if hasattr(self.clim_terciles, "values") else self.clim_terciles
 
@@ -5404,13 +7280,31 @@ class WAS_mme_NGR_NonGaussian:
                 f_gp = fcst[:, :, iy, ix]
                 fbar, s2, wet_frac = self._safe_ens_stats(f_gp, dry_threshold=self.dry_threshold)
                 pars = param_np[:, iy, ix]
+                if not np.all(np.isfinite(pars)):
+                    continue
+                if degenerate is not None and degenerate[iy, ix]:
+                    mean_out[:, iy, ix] = self.dry_threshold
+                    std_out[:, iy, ix] = 0.0
+                    if q_out is not None:
+                        q_out[:, :, iy, ix] = self.dry_threshold
+                    if synth_out is not None:
+                        synth_out[:, :, iy, ix] = np.where(np.isfinite(f_gp), self.dry_threshold, np.nan)
+                    if probs_out is not None:
+                        lower, upper = terc[:, iy, ix]
+                        if np.isfinite(lower) and np.isfinite(upper):
+                            f_lower = float(self.dry_threshold <= lower)
+                            f_upper = float(self.dry_threshold <= upper)
+                            probs_out[:, :, iy, ix] = np.array([f_lower, f_upper-f_lower, 1.0-f_upper])[:, None]
+                    continue
                 mu, var = self._mu_var_from_pars(pars, fbar, s2)
 
                 lmbda = None if lam_np is None else lam_np[iy, ix]
                 p0 = np.zeros_like(fbar)
 
                 if self._needs_hurdle():
-                    if self.occurrence_model == "climatology":
+                    # A per-grid fallback can be climatological even when the
+                    # requested occurrence model was logistic or auto.
+                    if np.all(np.isnan(occ_np[1:, iy, ix])):
                         p0[:] = occ_np[0, iy, ix]
                     else:
                         beta = np.where(np.isfinite(occ_np[:, iy, ix]), occ_np[:, iy, ix], 0.0)
@@ -5435,8 +7329,8 @@ class WAS_mme_NGR_NonGaussian:
                     full_var = pos_var
                 else:
                     qwet = 1.0 - np.clip(p0, 0.0, 1.0)
-                    full_mean = qwet * pos_mean
-                    full_var = qwet * pos_var + qwet * (1.0 - qwet) * pos_mean**2
+                    full_mean = (1.0 - qwet) * self.dry_threshold + qwet * pos_mean
+                    full_var = qwet * pos_var + qwet * (1.0 - qwet) * (pos_mean-self.dry_threshold)**2
 
                 mean_out[:, iy, ix] = full_mean
                 std_out[:, iy, ix] = np.sqrt(np.maximum(full_var, 0.0))
@@ -5468,13 +7362,13 @@ class WAS_mme_NGR_NonGaussian:
                         p_above = 1.0 - self._cdf_positive(upper, mu, var, self.family, lmbda=lmbda)
                     else:
                         f_lower = np.where(
-                            lower <= self.dry_threshold,
-                            p0,
+                            lower < self.dry_threshold,
+                            0.0,
                             p0 + (1.0 - p0) * self._cdf_positive(lower, mu, var, self.family, lmbda=lmbda),
                         )
                         f_upper = np.where(
-                            upper <= self.dry_threshold,
-                            p0,
+                            upper < self.dry_threshold,
+                            0.0,
                             p0 + (1.0 - p0) * self._cdf_positive(upper, mu, var, self.family, lmbda=lmbda),
                         )
                         p_below = f_lower
@@ -5515,6 +7409,15 @@ class WAS_mme_NGR_NonGaussian:
                         tmp[good] = vals
                         synth_out[:, tt, iy, ix] = tmp
 
+        # Missing members are not an observed zero-predictor forecast. Even a
+        # climatological fallback does not silently fill unavailable lead times.
+        available = np.any(np.isfinite(fcst), axis=0)
+        mean_out = np.where(available, mean_out, np.nan)
+        std_out = np.where(available, std_out, np.nan)
+        if q_out is not None:
+            q_out = np.where(available[None, ...], q_out, np.nan)
+        if probs_out is not None:
+            probs_out = np.where(available[None, ...], probs_out, np.nan)
         out = {
             "calibrated_mean": mean_out,
             "calibrated_std": std_out,
@@ -5629,6 +7532,7 @@ class WAS_mme_NGR_NonGaussian:
         lon_dim="X",
         return_synthetic_ensemble=False,
     ):
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
         self.fit(
             X_train,
             y_train,
@@ -5645,7 +7549,7 @@ class WAS_mme_NGR_NonGaussian:
             else:
                 obs_np = np.asarray(obs_for_terciles, dtype=float)
 
-            terc = np.nanpercentile(obs_np, [100.0 / 3.0, 200.0 / 3.0], axis=0)
+            terc = self._climatological_event_terciles(obs_np)
 
             if xr is not None and isinstance(self.clim_terciles, xr.DataArray):
                 self.clim_terciles = xr.DataArray(
@@ -5705,6 +7609,47 @@ class WAS_mme_NGR_NonGaussian:
 # -----------------------------
 # Per-cell helpers for ufuncs
 # -----------------------------
+@njit(cache=True)
+def _mva_train_numba(fc_train, ob_train):
+    sm=0.0; n=0
+    for i in range(ob_train.size):
+        if np.isfinite(ob_train[i]): sm += ob_train[i]; n += 1
+    clim_obs=sm/n if n else np.nan
+    sf=0.0; nf=0
+    for i in range(fc_train.shape[0]):
+        for j in range(fc_train.shape[1]):
+            v=fc_train[i,j]
+            if np.isfinite(v): sf += v; nf += 1
+    clim_fcst=sf/nf if nf else np.nan
+    ss=0.0
+    if nf>1:
+        for i in range(fc_train.shape[0]):
+            for j in range(fc_train.shape[1]):
+                v=fc_train[i,j]
+                if np.isfinite(v): ss += (v-clim_fcst)*(v-clim_fcst)
+        sigma_e=np.sqrt(ss/(nf-1))
+    else: sigma_e=np.nan
+    so=0.0
+    if n>1:
+        for i in range(ob_train.size):
+            v=ob_train[i]
+            if np.isfinite(v): so += (v-clim_obs)*(v-clim_obs)
+        sigma_ref=np.sqrt(so/(n-1))
+    else: sigma_ref=np.nan
+    return clim_obs,clim_fcst,sigma_e,sigma_ref
+
+
+@njit(cache=True)
+def _mva_apply_numba(fc_new, clim_obs, clim_fcst, sigma_e, sigma_ref):
+    out=np.empty_like(fc_new,dtype=np.float64)
+    valid=np.isfinite(sigma_e) and sigma_e>0.0 and np.isfinite(sigma_ref) and sigma_ref>=0.0
+    scale=sigma_ref/sigma_e if valid else 1.0
+    for i in range(fc_new.shape[0]):
+        for j in range(fc_new.shape[1]):
+            out[i,j]=(fc_new[i,j]-clim_fcst)*scale+clim_obs
+    return out
+
+
 def _train_cell_mva(fc_train: np.ndarray,  # (M, T)
                     ob_train: np.ndarray   # (T,)
                     ) -> np.ndarray:
@@ -5712,10 +7657,14 @@ def _train_cell_mva(fc_train: np.ndarray,  # (M, T)
     Compute MVA parameters for one (Y,X) cell over training period.
     Returns [clim_obs, clim_fcst, sigma_e, sigma_ref]
     """
+    if NUMBA_AVAILABLE:
+        vals = _mva_train_numba(np.asarray(fc_train, dtype=np.float64),
+                                np.asarray(ob_train, dtype=np.float64))
+        return np.asarray(vals, dtype=np.float64)
     clim_obs  = np.nanmean(ob_train)
-    clim_fcst = np.nanmean(fc_train)                  # over all members×times
-    sigma_e   = np.nanstd(fc_train, ddof=1)           # over all members×times
-    sigma_ref = np.nanstd(ob_train, ddof=1)           # over time
+    clim_fcst = np.nanmean(fc_train)
+    sigma_e   = np.nanstd(fc_train, ddof=1)
+    sigma_ref = np.nanstd(ob_train, ddof=1)
     return np.array([clim_obs, clim_fcst, sigma_e, sigma_ref], dtype=np.float64)
 
 
@@ -5730,12 +7679,14 @@ def _apply_cell_mva(fc_new: np.ndarray,      # (M, Tnew) or (M,)
     """
     if fc_new.ndim == 1:
         fc_new = fc_new[:, None]
-    if (not np.isfinite(sigma_e)) or (sigma_e <= 0.0) or (not np.isfinite(sigma_ref)) or (sigma_ref <= 0.0):
-        return (fc_new - clim_fcst + clim_obs).astype(fc_new.dtype, copy=False)
-
+    if NUMBA_AVAILABLE:
+        return _mva_apply_numba(np.asarray(fc_new, dtype=np.float64), float(clim_obs),
+                                float(clim_fcst), float(sigma_e), float(sigma_ref))
+    if (not np.isfinite(sigma_e)) or (sigma_e <= 0.0) or (not np.isfinite(sigma_ref)) or (sigma_ref < 0.0):
+        return (fc_new - clim_fcst + clim_obs).astype(float, copy=False)
     scale = sigma_ref / sigma_e
     out = (fc_new - clim_fcst) * scale + clim_obs
-    return out.astype(fc_new.dtype, copy=False)
+    return out.astype(float, copy=False)
 
 
 def _loocv_cell_mva(fc_cell: np.ndarray,  # (M, T)
@@ -5746,7 +7697,7 @@ def _loocv_cell_mva(fc_cell: np.ndarray,  # (M, T)
     For each held-out t, train on T\\{t} and apply to column t.
     """
     M, T = fc_cell.shape
-    out = np.full((M, T), np.nan, dtype=fc_cell.dtype)
+    out = np.full((M, T), np.nan, dtype=float)
 
     for t in range(T):
         mask = np.ones(T, dtype=bool); mask[t] = False
@@ -5775,29 +7726,29 @@ def _ppf_terciles_from_code(dist_code, shape, loc, scale):
     code = int(dist_code)
     try:
         if code == 1:
-            return (float(norm.ppf(0.33, loc=loc, scale=scale)),
-                    float(norm.ppf(0.67, loc=loc, scale=scale)))
+            return (float(norm.ppf(1.0 / 3.0, loc=loc, scale=scale)),
+                    float(norm.ppf(2.0 / 3.0, loc=loc, scale=scale)))
         elif code == 2:
-            return (float(lognorm.ppf(0.33, s=shape, loc=loc, scale=scale)),
-                    float(lognorm.ppf(0.67, s=shape, loc=loc, scale=scale)))
+            return (float(lognorm.ppf(1.0 / 3.0, s=shape, loc=loc, scale=scale)),
+                    float(lognorm.ppf(2.0 / 3.0, s=shape, loc=loc, scale=scale)))
         elif code == 3:
-            return (float(expon.ppf(0.33, loc=loc, scale=scale)),
-                    float(expon.ppf(0.67, loc=loc, scale=scale)))
+            return (float(expon.ppf(1.0 / 3.0, loc=loc, scale=scale)),
+                    float(expon.ppf(2.0 / 3.0, loc=loc, scale=scale)))
         elif code == 4:
-            return (float(gamma.ppf(0.33, a=shape, loc=loc, scale=scale)),
-                    float(gamma.ppf(0.67, a=shape, loc=loc, scale=scale)))
+            return (float(gamma.ppf(1.0 / 3.0, a=shape, loc=loc, scale=scale)),
+                    float(gamma.ppf(2.0 / 3.0, a=shape, loc=loc, scale=scale)))
         elif code == 5:
-            return (float(weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale)),
-                    float(weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale)))
+            return (float(weibull_min.ppf(1.0 / 3.0, c=shape, loc=loc, scale=scale)),
+                    float(weibull_min.ppf(2.0 / 3.0, c=shape, loc=loc, scale=scale)))
         elif code == 6:
-            return (float(t.ppf(0.33, df=shape, loc=loc, scale=scale)),
-                    float(t.ppf(0.67, df=shape, loc=loc, scale=scale)))
+            return (float(t.ppf(1.0 / 3.0, df=shape, loc=loc, scale=scale)),
+                    float(t.ppf(2.0 / 3.0, df=shape, loc=loc, scale=scale)))
         elif code == 7:
-            return (float(poisson.ppf(0.33, mu=shape, loc=loc)),
-                    float(poisson.ppf(0.67, mu=shape, loc=loc)))
+            return (float(poisson.ppf(1.0 / 3.0, mu=shape, loc=loc)),
+                    float(poisson.ppf(2.0 / 3.0, mu=shape, loc=loc)))
         elif code == 8:
-            return (float(nbinom.ppf(0.33, n=shape, p=scale, loc=loc)),
-                    float(nbinom.ppf(0.67, n=shape, p=scale, loc=loc)))
+            return (float(nbinom.ppf(1.0 / 3.0, n=shape, p=scale, loc=loc)),
+                    float(nbinom.ppf(2.0 / 3.0, n=shape, p=scale, loc=loc)))
     except Exception:
         return np.nan, np.nan
     return np.nan, np.nan
@@ -5981,8 +7932,8 @@ def _calc_tercile_probs_nonparam(best_guess, error_samples, first_tercile, secon
         dist = dist[np.isfinite(dist)]
         if dist.size == 0:
             continue
-        p_below   = float(np.mean(dist <  first_tercile))
-        p_between = float(np.mean((dist >= first_tercile) & (dist < second_tercile)))
+        p_below   = float(np.mean(dist <= first_tercile))
+        p_between = float(np.mean((dist > first_tercile) & (dist <= second_tercile)))
         p_above   = float(1.0 - (p_below + p_between))
         pred[0, t] = p_below
         pred[1, t] = p_between
@@ -6021,7 +7972,7 @@ class WAS_mme_MVA:
     def fit(self, hindcast: xr.DataArray, obs: xr.DataArray) -> "WAS_mme_MVA":
         hindcast = self._prepare_ensemble(hindcast, "hindcast")
         obs = self._prepare_obs(obs)
-        hindcast, obs = xr.align(hindcast, obs, join="inner", copy=False)
+        hindcast, obs = xr.align(hindcast, obs, join="exact", copy=False)
         if hindcast.sizes.get("T", 0) < 2:
             raise ValueError("MVA requires at least two aligned hindcast years.")
 
@@ -6067,9 +8018,11 @@ class WAS_mme_MVA:
     def fit_transform_loocv(self, hindcast: xr.DataArray, obs: xr.DataArray) -> xr.DataArray:
         hindcast = self._prepare_ensemble(hindcast, "hindcast")
         obs = self._prepare_obs(obs)
-        hindcast, obs = xr.align(hindcast, obs, join="inner", copy=False)
+        hindcast, obs = xr.align(hindcast, obs, join="exact", copy=False)
         if hindcast.sizes.get("T", 0) < 3:
             raise ValueError("MVA LOOCV requires at least three aligned years.")
+        if len(np.unique(_calendar_year_groups(hindcast["T"]))) != hindcast.sizes["T"]:
+            raise ValueError("MVA standalone LOOCV requires one seasonal target per year; use grouped outer CV for multiple seasons.")
         out = _pufunc(
             _loocv_cell_mva,
             hindcast,
@@ -6157,7 +8110,81 @@ def _normalize_tercile_probs(pb: float, pn: float, pa: float) -> np.ndarray:
     """
     arr = np.clip([pb, pn, pa], 0.0, 1.0)
     s = float(arr.sum())
-    return arr / s if s > 0.0 else np.full(3, 1.0 / 3.0)
+    return arr / s if np.isfinite(s) and s > 0.0 else np.full(3, np.nan)
+
+
+def _bma_forecast_members(forecast, training_members, member_dim):
+    """Preserve component identity even when forecast members are reordered."""
+    expected = np.asarray(training_members)
+    index = forecast.get_index(member_dim)
+    if not index.is_unique or len(index) != len(expected) or not np.all(np.isin(expected, index)):
+        raise ValueError("BMA forecast members must match the unique fitted member labels")
+    return forecast.sel({member_dim: expected})
+
+
+def _bma_spatial_select(array, forecast, lat_dim, lon_dim):
+    # Nearest selection carries training coordinates. Reassign the requested
+    # coordinates before arithmetic/packaging to avoid xarray intersections.
+    coords = {lat_dim: forecast[lat_dim], lon_dim: forecast[lon_dim]}
+    return array.sel(coords, method="nearest").assign_coords(coords)
+
+
+def _bma_terciles(model, forecast, clim_terciles, obs_for_terciles,
+                  tercile_q, time_dim, lat_dim, lon_dim):
+    if len(tercile_q) != 2 or not 0 < tercile_q[0] <= tercile_q[1] < 1:
+        raise ValueError("tercile_q must contain two ordered probabilities inside (0, 1)")
+    if clim_terciles is not None:
+        if "tercile" not in clim_terciles.dims and "quantile" in clim_terciles.dims:
+            clim_terciles = clim_terciles.rename(quantile="tercile")
+        model._require_dims(clim_terciles, ["tercile", lat_dim, lon_dim], "clim_terciles")
+        if clim_terciles.sizes["tercile"] != 2:
+            raise ValueError("clim_terciles must contain exactly two thresholds")
+        result = _bma_spatial_select(clim_terciles, forecast, lat_dim, lon_dim)
+        result = result.assign_coords(tercile=["lower", "upper"])
+        source = "provided_climatological_thresholds"
+    else:
+        reference = obs_for_terciles if obs_for_terciles is not None else model._obs_grid
+        reference = _bma_spatial_select(reference, forecast, lat_dim, lon_dim)
+        result = model.compute_gridpoint_terciles_from_obs(
+            reference, time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim, q=tercile_q)
+        source = "observed_climatology" if obs_for_terciles is not None else "fit_observations"
+    if bool((result.isel(tercile=0) > result.isel(tercile=1)).any()):
+        raise ValueError("Climatological lower threshold cannot exceed upper threshold")
+    result.attrs["tercile_reference"] = source
+    return result
+
+
+def _bma_quantile(cdf, q, component_quantiles):
+    """A mixture quantile lies between the component quantiles at the same q."""
+    if not np.isfinite(q) or not 0 < q < 1:
+        raise ValueError("BMA predictive quantiles must lie strictly inside (0, 1)")
+    bounds = np.asarray(component_quantiles, dtype=float)
+    lo, hi = float(np.min(bounds)), float(np.max(bounds))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return np.nan
+    if lo == hi:
+        return lo
+    # A zero-weight component can put the mixture root exactly at a bracket
+    # endpoint; inverse/CDF roundoff must not invalidate that root.
+    if abs(cdf(lo) - q) <= 8*np.finfo(float).eps:
+        return lo
+    if abs(cdf(hi) - q) <= 8*np.finfo(float).eps:
+        return hi
+    # Relative tolerance respects very small positive quantiles.
+    return float(brentq(lambda value: cdf(value) - q, lo, hi,
+                        xtol=np.finfo(float).tiny, rtol=1e-12, maxiter=200))
+
+
+def _bma_output_metadata(ds):
+    ds.attrs.update(probability_calibration="native",
+                    residual_calibration_applicable="false",
+                    calibration="native BMA predictive mixture fitted on supplied training data")
+    for name in ("predictive_mean", "tercile_probability"):
+        if name in ds:
+            ds[name].attrs.update(ds.attrs)
+    if "tercile_probability" in ds:
+        ds["tercile_probability"].attrs["tercile_reference"] = ds["tercile_thresholds"].attrs["tercile_reference"]
+    return ds
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6178,15 +8205,17 @@ class WAS_mme_FastBMA:
         E[Y | k] = f_k.  A single shared shape parameter is estimated.
 
     ``'gamma0'``
-        Zero-adjusted Gamma mixture for precipitation
-        (Sloughter et al. 2007, §2).  The marginal model is
+        Zero-adjusted Gamma mixture for precipitation, a pooled-occurrence
+        adaptation rather than the exact Sloughter et al. (2007) model.
+        The marginal model is
 
             P(Y = 0)  = 1 − POP
             P(Y > 0)  = POP · Γ-mixture(shape, f_k / shape)
 
         where POP is estimated via logistic regression on three predictors:
-        intercept, ∛ens_mean, and fraction of wet ensemble members
-        (Sloughter et al. 2007 Eq. 1).
+        intercept, ∛ens_mean, and fraction of wet ensemble members.
+        Sloughter (2007) instead uses component-specific occurrence models,
+        a zero-forecast indicator and gamma-distributed cube-root amounts.
 
     Tercile thresholds
     ------------------
@@ -6195,17 +8224,28 @@ class WAS_mme_FastBMA:
     computed per gridpoint.
     """
 
-    def __init__(self, model_type: str = "normal", tol: float = 1e-3) -> None:
+    def __init__(self, model_type: str = "normal", tol: float = 1e-3,
+                 bias_correction: bool = True, bias_shrinkage: float = 0.25,
+                 min_bias_years: int = 8) -> None:
         if model_type not in {"normal", "gamma", "gamma0"}:
             raise NotImplementedError(f"model_type='{model_type}' not supported.")
         self.model_type = model_type
         self.tol        = tol
+        self.bias_correction = bool(bias_correction)
+        self.bias_shrinkage = float(bias_shrinkage)
+        if not (0.0 <= self.bias_shrinkage <= 1.0):
+            raise ValueError("bias_shrinkage must be in [0,1].")
+        self.min_bias_years = int(min_bias_years)
+        if self.min_bias_years < 2 or not np.isfinite(tol) or tol <= 0:
+            raise ValueError("min_bias_years must be >= 2 and tol must be positive")
         self.fitted     = False
 
         self.weights:         Optional[xr.DataArray] = None   # (M, Y, X)
         self.sigma:           Optional[xr.DataArray] = None   # (Y, X) — normal
         self.shape:           Optional[xr.DataArray] = None   # (Y, X) — gamma / gamma0
         self.logistic_params: Optional[xr.DataArray] = None   # (3, Y, X) — gamma0
+        self.bias_intercept:   Optional[xr.DataArray] = None   # (M,Y,X)
+        self.bias_slope:       Optional[xr.DataArray] = None   # (M,Y,X)
 
         self._member_dim: Optional[str] = None
         self._time_dim:   Optional[str] = None
@@ -6291,7 +8331,7 @@ class WAS_mme_FastBMA:
         time_dim:    str = "T",
         lat_dim:     str = "Y",
         lon_dim:     str = "X",
-        min_samples: int = 10,
+        min_samples: int = 12,
     ) -> "WAS_mme_FastBMA":
         """
         Fit BMA parameters at every gridpoint via SLSQP maximum-likelihood.
@@ -6303,6 +8343,12 @@ class WAS_mme_FastBMA:
         """
         self._require_dims(hcst_grid, [member_dim, time_dim, lat_dim, lon_dim], "hcst_grid")
         self._require_dims(obs_grid,  [time_dim,   lat_dim,  lon_dim],           "obs_grid")
+        hcst_grid, obs_grid = xr.align(hcst_grid, obs_grid, join="exact")
+        if hcst_grid.sizes[member_dim] == 0 or not hcst_grid.get_index(member_dim).is_unique:
+            raise ValueError("BMA requires nonempty unique member labels")
+        if int(min_samples) < 2:
+            raise ValueError("min_samples must be >= 2")
+        self._obs_grid = obs_grid
 
         self._member_dim = member_dim
         self._time_dim   = time_dim
@@ -6318,10 +8364,15 @@ class WAS_mme_FastBMA:
         n_memb, _, n_lat, n_lon = hcst.shape
 
         weights_map = np.full((n_memb, n_lat, n_lon), 1.0 / n_memb)
+        fit_converged = np.zeros((n_lat, n_lon), dtype=bool)
         param_map_1 = np.full((n_lat, n_lon), np.nan)   # σ (normal) or shape (gamma*)
-        # FIX #3: gamma0 uses 3 logistic predictors: intercept, ∛ens_mean, frac_wet
-        #   (Sloughter et al. 2007).  Original had only 2 (intercept + ∛ens_mean).
+        # gamma0 is a pooled-occurrence/raw-gamma adaptation, not an exact
+        # Sloughter et al. (2007) reproduction (which is component-specific
+        # and models cube-root amounts).
         param_map_2 = np.full((3, n_lat, n_lon), np.nan)
+        fixed_pop = np.full((n_lat, n_lon), np.nan)
+        bias_a_map = np.zeros((n_memb, n_lat, n_lon), dtype=float)
+        bias_b_map = np.ones((n_memb, n_lat, n_lon), dtype=float)
 
         coords = {
             member_dim: hcst_grid.coords[member_dim],
@@ -6348,73 +8399,105 @@ class WAS_mme_FastBMA:
                 if int(valid.sum()) < min_samples:
                     continue
 
-                f_data = f_raw[:, valid]   # (M, N)
+                f_data = f_raw[:, valid].copy()   # (M, N)
                 o_data = o_raw[valid]      # (N,)
+
+                if self.model_type in {"gamma", "gamma0"} and np.any(o_data < 0):
+                    continue  # Negative observations have no support in these distributions.
+                if self.model_type == "gamma" and np.any(o_data == 0):
+                    warnings.warn("Gamma BMA requires positive observations; use gamma0 for zeros", RuntimeWarning)
+                    continue
+                occurrence_forecasts = f_data.copy()
+
+                # Raftery-style component bias correction, shrunk toward the
+                # identity map to avoid unstable slopes on short hindcasts.
+                if self.bias_correction and o_data.size >= self.min_bias_years:
+                    for km in range(n_memb):
+                        x = f_data[km]
+                        good = np.isfinite(x) & np.isfinite(o_data)
+                        if self.model_type == "gamma0":
+                            good &= o_data > 0  # conditional positive amount, not unconditional rain
+                        if good.sum() >= self.min_bias_years:
+                            if np.nanstd(x[good]) > 0:
+                                lm = linregress(x[good], o_data[good])
+                                a = (1.0 - self.bias_shrinkage) * float(lm.intercept)
+                                b = self.bias_shrinkage + (1.0 - self.bias_shrinkage) * float(lm.slope)
+                            else:
+                                a = (1.0 - self.bias_shrinkage) * float(np.mean(o_data[good] - x[good]))
+                                b = 1.0
+                            if np.isfinite(a) and np.isfinite(b):
+                                bias_a_map[km, ilat, ilon] = a
+                                bias_b_map[km, ilat, ilon] = b
+                                f_data[km] = a + b * f_data[km]
 
                 # ── Normal (Raftery et al. 2005) ─────────────────────────────
                 if self.model_type == "normal":
 
                     def nll_normal(p, _f=f_data, _o=o_data):
-                        ws    = p[:-1]
-                        sigma = p[-1]
-                        if sigma <= 1e-6 or not np.isfinite(sigma):
-                            return 1e12
-                        all_ws = np.append(ws, 1.0 - ws.sum())
-                        # N(f_k, σ²): component mean = raw member forecast
-                        z   = (_o[None, :] - _f) / sigma
-                        pdf = np.dot(all_ws, norm.pdf(z) / sigma)
-                        return -np.sum(np.log(np.maximum(pdf, 1e-12)))
+                        # Optimize log(sigma), so units and near-zero residuals
+                        # cannot produce a huge finite-difference step in sigma.
+                        sigma = np.exp(p[-1])
+                        all_ws = self._normalize_weights(np.append(p[:-1], 1.0-p[:-1].sum()))
+                        z = (_o[None, :] - _f) / sigma
+                        logpdf = norm.logpdf(z) - p[-1]
+                        logmix = logsumexp(logpdf, b=all_ws[:, None], axis=0)
+                        ratio = np.exp(np.clip(logpdf-logmix, -745.0, 700.0))
+                        gradient_w = -np.sum(ratio[:-1]-ratio[-1], axis=1)
+                        responsibilities = all_ws[:, None] * ratio
+                        gradient_sigma = -np.sum(responsibilities*(z*z-1.0))
+                        return -float(np.sum(logmix)), np.r_[gradient_w, gradient_sigma]
 
-                    x0     = np.append(
-                        np.full(n_memb - 1, 1.0 / n_memb), np.nanstd(o_data)
-                    )
-                    bounds = [(0.0, 1.0)] * (n_memb - 1) + [(1e-3, None)]
-
-                    try:
-                        res = minimize(
-                            nll_normal, x0,
-                            method="SLSQP",
-                            bounds=bounds,
-                            constraints=[weight_sum_le_1],
-                            tol=self.tol,
-                        )
-                        if res.success:
-                            ws = self._normalize_weights(
-                                np.append(res.x[:-1], 1.0 - res.x[:-1].sum())
-                            )
-                            weights_map[:, ilat, ilon] = ws
-                            param_map_1[ilat, ilon]    = float(res.x[-1])
-                    except Exception:
-                        continue
+                    residual_scale = float(np.sqrt(np.mean((o_data-f_data.mean(axis=0))**2)))
+                    x0 = np.r_[np.full(n_memb-1, 1.0/n_memb), np.log(max(residual_scale, 1e-3))]
+                    bounds = [(0.0, 1.0)]*(n_memb-1)+[(np.log(1e-3), None)]
+                    res = minimize(nll_normal, x0, jac=True, method="SLSQP", bounds=bounds,
+                                   constraints=[weight_sum_le_1],
+                                   options={"maxiter": 500, "ftol": self.tol})
+                    feasible = (np.all(np.isfinite(res.x)) and np.isfinite(res.fun)
+                                and res.x[:-1].sum() <= 1.0+1e-8)
+                    if feasible and res.fun <= nll_normal(x0)[0]+1e-8:
+                        weights_map[:, ilat, ilon] = self._normalize_weights(
+                            np.r_[res.x[:-1], 1.0-res.x[:-1].sum()])
+                        param_map_1[ilat, ilon] = float(np.exp(res.x[-1]))
+                        fit_converged[ilat, ilon] = bool(res.success)
+                    else:
+                        # The feasible initial mixture is retained explicitly;
+                        # numerical convergence diagnostics distinguish this fit.
+                        param_map_1[ilat, ilon] = max(residual_scale, 1e-3)
 
                 # ── Gamma / Gamma0 ───────────────────────────────────────────
                 else:
                     if self.model_type == "gamma0":
-                        # ── POP logistic regression (Sloughter et al. 2007 §2) ──
+                        # Pooled POP regression for the gamma0 adaptation.
                         # Three predictors: 1, ∛ens_mean, fraction of wet members.
                         y_bin    = (o_data > 0).astype(float)
-                        ens_mean = f_data.mean(axis=0)
+                        ens_mean = occurrence_forecasts.mean(axis=0)
                         x_cbrt   = np.cbrt(np.maximum(ens_mean, 0.0))
                         # FIX #3: add fraction of wet members as second skill predictor
-                        x_frac   = (f_data > 0).mean(axis=0).astype(float)
+                        x_frac   = (occurrence_forecasts > 0).mean(axis=0).astype(float)
                         X_pop    = np.column_stack(
                             [np.ones(y_bin.size), x_cbrt, x_frac]
                         )
 
-                        def nll_logistic(beta, _X=X_pop, _y=y_bin):
-                            p = np.clip(expit(_X @ beta), 1e-8, 1.0 - 1e-8)
-                            return -np.sum(
-                                _y * np.log(p) + (1.0 - _y) * np.log(1.0 - p)
-                            )
-
-                        try:
-                            res_log = minimize(
-                                nll_logistic, [0.0, 1.0, 0.0], method="BFGS"
-                            )
-                            param_map_2[:, ilat, ilon] = res_log.x
-                        except Exception:
-                            # Conservative default: near-zero POP everywhere
-                            param_map_2[:, ilat, ilon] = [-5.0, 0.0, 0.0]
+                        if np.all(y_bin == y_bin[0]):
+                            fixed_pop[ilat, ilon] = y_bin[0]
+                            param_map_2[:, ilat, ilon] = 0.0
+                        else:
+                            # Stable Bernoulli likelihood; weak slope penalty prevents
+                            # unbounded coefficients under separation on short records.
+                            def nll_logistic(beta):
+                                eta = X_pop @ beta
+                                loss = np.sum(np.logaddexp(0.0, eta) - y_bin * eta)
+                                grad = X_pop.T @ (expit(eta) - y_bin)
+                                return loss + 1e-4 * np.sum(beta[1:] ** 2), grad + np.r_[0., 2e-4 * beta[1:]]
+                            initial = np.array([np.log(y_bin.mean() / (1-y_bin.mean())), 0., 0.])
+                            res_log = minimize(nll_logistic, initial, jac=True, method="BFGS")
+                            beta = res_log.x if np.all(np.isfinite(res_log.x)) and res_log.fun <= nll_logistic(initial)[0] else initial
+                            param_map_2[:, ilat, ilon] = beta
+                        if fixed_pop[ilat, ilon] == 0.0:
+                            param_map_1[ilat, ilon] = 1.0  # amount unused for exact dry point mass
+                            fit_converged[ilat, ilon] = True
+                            continue
 
                         mask_pos = (
                             (o_data > 0)
@@ -6447,8 +8530,8 @@ class WAS_mme_FastBMA:
                         if w_last < 0 or shape_val < 0.1 or not np.isfinite(shape_val):
                             return 1e12
                         all_ws = np.append(ws, w_last)
-                        pdfs   = sp_gamma.pdf(_o[None, :], a=shape_val, scale=_f / shape_val)
-                        return -np.sum(np.log(np.maximum(np.dot(all_ws, pdfs), 1e-12)))
+                        logpdfs = sp_gamma.logpdf(_o[None, :], a=shape_val, scale=_f / shape_val)
+                        return -float(np.sum(logsumexp(logpdfs, b=all_ws[:, None], axis=0)))
 
                     x0     = np.append(np.full(n_memb - 1, 1.0 / n_memb), 2.0)
                     bounds = [(0.0, 1.0)] * (n_memb - 1) + [(0.1, 50.0)]
@@ -6461,19 +8544,29 @@ class WAS_mme_FastBMA:
                             constraints=[weight_sum_le_1],
                             tol=self.tol,
                         )
-                        if res.success:
+                        if (np.all(np.isfinite(res.x)) and np.isfinite(res.fun)
+                                and res.fun <= nll_gamma(x0) + 1e-8):
                             ws = self._normalize_weights(
                                 np.append(res.x[:-1], 1.0 - res.x[:-1].sum())
                             )
                             weights_map[:, ilat, ilon] = ws
                             param_map_1[ilat, ilon]    = float(res.x[-1])
-                    except Exception:
-                        continue
+                            fit_converged[ilat, ilon] = bool(res.success)
+                        else:
+                            param_map_1[ilat, ilon] = 2.0
+                    except (ValueError, FloatingPointError):
+                        param_map_1[ilat, ilon] = 2.0
 
         # ── Store parameters as xarray ────────────────────────────────────────
         ll_coords = {lat_dim: coords[lat_dim], lon_dim: coords[lon_dim]}
         self.weights = xr.DataArray(
             weights_map, dims=(member_dim, lat_dim, lon_dim), coords=coords
+        )
+        self.bias_intercept = xr.DataArray(
+            bias_a_map, dims=(member_dim, lat_dim, lon_dim), coords=coords
+        )
+        self.bias_slope = xr.DataArray(
+            bias_b_map, dims=(member_dim, lat_dim, lon_dim), coords=coords
         )
 
         if self.model_type == "normal":
@@ -6495,6 +8588,8 @@ class WAS_mme_FastBMA:
                     },
                 )
 
+        self.fixed_wet_probability_ = xr.DataArray(fixed_pop, dims=(lat_dim, lon_dim), coords=ll_coords)
+        self.fit_converged_ = xr.DataArray(fit_converged, dims=(lat_dim, lon_dim), coords=ll_coords)
         self.fitted = True
         return self
 
@@ -6536,36 +8631,17 @@ class WAS_mme_FastBMA:
         self._require_dims(
             new_forecasts, [member_dim, time_dim, lat_dim, lon_dim], "new_forecasts"
         )
+        new_forecasts = _bma_forecast_members(new_forecasts, self.weights[member_dim].values, member_dim)
+        if any(not np.isfinite(q) or not 0 < q < 1 for q in quantiles):
+            raise ValueError("BMA predictive quantiles must lie strictly inside (0, 1)")
         w_ds, p1_ds, p2_ds = self._align_params_to_forecasts(
             new_forecasts,
             member_dim=member_dim, time_dim=time_dim,
             lat_dim=lat_dim,       lon_dim=lon_dim,
         )
 
-        # ── Tercile thresholds ────────────────────────────────────────────────
-        sel = {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}
-        terciles_da = None
-
-        if clim_terciles is not None:
-            if "tercile" not in clim_terciles.dims and "quantile" in clim_terciles.dims:
-                clim_terciles = clim_terciles.rename({"quantile": "tercile"})
-            self._require_dims(clim_terciles, ["tercile", lat_dim, lon_dim], "clim_terciles")
-            terciles_da = clim_terciles.sel(sel, method="nearest")
-        elif obs_for_terciles is not None:
-            obs_sel     = obs_for_terciles.sel(sel, method="nearest")
-            terciles_da = self.compute_gridpoint_terciles_from_obs(
-                obs_sel,
-                time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim, q=tercile_q,
-            )
-        elif getattr(self, "_obs_grid", None) is not None:
-            # Fallback: reuse the observations supplied at fit time so a caller
-            # that omits obs_for_terciles/clim_terciles still receives a
-            # "tercile_probability" variable instead of a dataset without it.
-            obs_sel     = self._obs_grid.sel(sel, method="nearest")
-            terciles_da = self.compute_gridpoint_terciles_from_obs(
-                obs_sel,
-                time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim, q=tercile_q,
-            )
+        terciles_da = _bma_terciles(self, new_forecasts, clim_terciles, obs_for_terciles,
+                                   tercile_q, time_dim, lat_dim, lon_dim)
 
         terciles_np = (
             terciles_da.transpose("tercile", lat_dim, lon_dim).values
@@ -6573,6 +8649,13 @@ class WAS_mme_FastBMA:
         )   # shape (2, n_lat, n_lon) or None
 
         # ── NumPy extraction ──────────────────────────────────────────────────
+        raw_forecasts = new_forecasts.transpose(member_dim, time_dim, lat_dim, lon_dim).values
+        fixed_pop = _bma_spatial_select(self.fixed_wet_probability_, new_forecasts, lat_dim, lon_dim).values
+        if self.bias_correction and self.bias_intercept is not None:
+            sel_bc = {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}
+            ba = _bma_spatial_select(self.bias_intercept, new_forecasts, lat_dim, lon_dim)
+            bb = _bma_spatial_select(self.bias_slope, new_forecasts, lat_dim, lon_dim)
+            new_forecasts = ba + bb * new_forecasts
         fcst = new_forecasts.transpose(member_dim, time_dim, lat_dim, lon_dim).values
         ws   = w_ds.transpose(member_dim, lat_dim, lon_dim).values
         p1   = p1_ds.transpose(lat_dim, lon_dim).values
@@ -6632,15 +8715,9 @@ class WAS_mme_FastBMA:
                         def cdf_mix(x, _w=w_loc, _f=f_m, _s=sigma):
                             return float(np.dot(_w, norm.cdf(x, loc=_f, scale=_s)))
 
-                        lo = mu_mix - 10.0 * sigma
-                        hi = mu_mix + 10.0 * sigma
                         for iq, qv in enumerate(quantiles):
-                            try:
-                                out_quant[iq, t, ilat, ilon] = brentq(
-                                    lambda x, _qv=qv: cdf_mix(x) - _qv, lo, hi
-                                )
-                            except Exception:
-                                pass
+                            out_quant[iq, t, ilat, ilon] = _bma_quantile(
+                                cdf_mix, qv, norm.ppf(qv, loc=f_m, scale=sigma))
 
                         if do_probs:
                             pb = cdf_mix(float(low_th))
@@ -6657,12 +8734,15 @@ class WAS_mme_FastBMA:
                         scales = f_safe / shape   # Γ(shape, scale) ⟹ mean = f_m
 
                         # POP: logistic(b0 + b1·∛ens_mean + b2·frac_wet)
-                        f_mean_cbrt = float(np.cbrt(max(float(np.mean(f_m)), 0.0)))
-                        frac_wet    = float(np.mean(f_m > 0))
-                        pop = float(expit(b0 + b1 * f_mean_cbrt + b2 * frac_wet))
+                        f_raw = raw_forecasts[:, t, ilat, ilon]
+                        f_mean_cbrt = float(np.cbrt(max(float(np.mean(f_raw)), 0.0)))
+                        frac_wet = float(np.mean(f_raw > 0))
+                        pop = fixed_pop[ilat, ilon]
+                        if not np.isfinite(pop):
+                            pop = float(expit(b0 + b1 * f_mean_cbrt + b2 * frac_wet))
 
                         # E[Y] = POP · Σ_k w_k · f_k
-                        out_mean[t, ilat, ilon] = pop * float(np.dot(w_loc, f_m))
+                        out_mean[t, ilat, ilon] = pop * float(np.dot(w_loc, f_safe))
 
                         def cdf_gamma_cond(x, _w=w_loc, _sh=shape, _sc=scales):
                             """CDF of the conditional Gamma part P(Y ≤ x | Y > 0)."""
@@ -6685,14 +8765,8 @@ class WAS_mme_FastBMA:
                             else:
                                 # Invert the conditional Gamma CDF
                                 target = (qv - (1.0 - pop)) / max(pop, 1e-12)
-                                try:
-                                    top = float(np.max(f_safe)) * 8.0 + 10.0
-                                    out_quant[iq, t, ilat, ilon] = brentq(
-                                        lambda x, _t=target: cdf_gamma_cond(x) - _t,
-                                        1e-9, top,
-                                    )
-                                except Exception:
-                                    pass
+                                out_quant[iq, t, ilat, ilon] = _bma_quantile(
+                                    cdf_gamma_cond, target, sp_gamma.ppf(target, a=shape, scale=scales))
 
                         if do_probs:
                             pb = cdf_full(float(low_th))
@@ -6707,19 +8781,14 @@ class WAS_mme_FastBMA:
                         f_safe = np.maximum(f_m, 1e-3)
                         scales = f_safe / shape
 
-                        out_mean[t, ilat, ilon] = float(np.dot(w_loc, f_m))
+                        out_mean[t, ilat, ilon] = float(np.dot(w_loc, f_safe))
 
                         def cdf_mix_g(x, _w=w_loc, _sh=shape, _sc=scales):
                             return float(np.dot(_w, sp_gamma.cdf(x, a=_sh, scale=_sc)))
 
                         for iq, qv in enumerate(quantiles):
-                            try:
-                                top = float(np.max(f_safe)) * 8.0 + 10.0
-                                out_quant[iq, t, ilat, ilon] = brentq(
-                                    lambda x, _qv=qv: cdf_mix_g(x) - _qv, 1e-9, top
-                                )
-                            except Exception:
-                                pass
+                            out_quant[iq, t, ilat, ilon] = _bma_quantile(
+                                cdf_mix_g, qv, sp_gamma.ppf(qv, a=shape, scale=scales))
 
                         if do_probs:
                             pb = cdf_mix_g(float(low_th))
@@ -6750,7 +8819,7 @@ class WAS_mme_FastBMA:
                 coords={**base_coords, "probability": ["PB", "PN", "PA"]},
             )
             ds["tercile_thresholds"] = terciles_da
-        return ds
+        return _bma_output_metadata(ds)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6764,9 +8833,12 @@ class WAS_mme_FullBMA:
     Code 4 → ``'gamma'``      Gamma BMA (positive-definite variables)
     Code 2 → ``'lognormal'``  Lognormal BMA (heavy-tailed precipitation, etc.)
 
-    Each component distribution has its own intercept ``a_k`` and slope ``b_k``
-    so that the component mean is a linear (or log-linear for lognormal)
-    function of the member forecast — a mixture-EMOS formulation.
+    Each component distribution has an intercept ``a_k`` and positive slope
+    ``b_k``. Normal/gamma means are linear in the member forecast; lognormal
+    log-location is linear in log-forecast (its arithmetic mean also includes
+    half the log-variance). Both backends enforce the positive-slope constraint.
+    Fast penalized likelihood and full posterior sampling are distinct estimators;
+    the fast penalties are not presented as the exact full-backend priors.
 
     Fitting modes
     -------------
@@ -6777,7 +8849,9 @@ class WAS_mme_FullBMA:
     Notes
     -----
     - Gridpoints where ``dist_map`` is NaN are skipped.
-    - Positive-definite families (gamma, lognormal) are fitted on y > 0 only.
+    - Gamma and lognormal require strictly positive observations. For rainfall
+      with dry years use FastBMA(model_type="gamma0"); silently dropping zeros
+      would estimate a conditional amount distribution, not the full forecast.
     - ``predict_probabilistic`` spatially aligns stored parameter maps to the
       forecast grid via nearest-neighbour selection, so training and test grids
       need not be identical.
@@ -6804,6 +8878,8 @@ class WAS_mme_FullBMA:
         if mode not in {"full", "fast", "auto"}:
             raise ValueError("mode must be one of {'full', 'fast', 'auto'}")
 
+        if not np.isfinite(eps) or eps <= 0 or tol <= 0 or maxiter < 1:
+            raise ValueError("eps, tol and maxiter must be positive")
         self.mode          = mode
         self.eps           = eps
         self.tol           = tol
@@ -6906,19 +8982,8 @@ class WAS_mme_FullBMA:
         lon_dim:          str,
         time_dim:         str,
     ) -> Optional[xr.DataArray]:
-        sel = {lat_dim: new_forecasts[lat_dim], lon_dim: new_forecasts[lon_dim]}
-        if clim_terciles is not None:
-            if "tercile" not in clim_terciles.dims and "quantile" in clim_terciles.dims:
-                clim_terciles = clim_terciles.rename({"quantile": "tercile"})
-            self._require_dims(clim_terciles, ["tercile", lat_dim, lon_dim], "clim_terciles")
-            return clim_terciles.sel(sel, method="nearest")
-        if obs_for_terciles is not None:
-            obs_sel = obs_for_terciles.sel(sel, method="nearest")
-            return self.compute_gridpoint_terciles_from_obs(
-                obs_sel,
-                time_dim=time_dim, lat_dim=lat_dim, lon_dim=lon_dim, q=tercile_q,
-            )
-        return None
+        return _bma_terciles(self, new_forecasts, clim_terciles, obs_for_terciles,
+                             tercile_q, time_dim, lat_dim, lon_dim)
 
     # ─────────────────────────────────────────── FAST backend ───────────────
 
@@ -6944,9 +9009,8 @@ class WAS_mme_FullBMA:
         m, _ = f_data.shape
         w, a, b, sigma = self._unpack_fast_params(p, m)
         mu      = a[:, None] + b[:, None] * f_data
-        pdf     = norm.pdf(y_data[None, :], loc=mu, scale=max(sigma, self.eps))
-        mix_pdf = np.sum(w[:, None] * pdf, axis=0)
-        nll     = -np.sum(np.log(np.maximum(mix_pdf, self.eps)))
+        logpdf = norm.logpdf(y_data[None, :], loc=mu, scale=max(sigma, self.eps))
+        nll = -float(np.sum(logsumexp(logpdf, b=w[:, None], axis=0)))
         pen = (
             lam_w    * np.sum((w - 1.0 / m) ** 2)
             + lam_a  * np.sum((a / max(y_scale, self.eps)) ** 2)
@@ -6963,9 +9027,8 @@ class WAS_mme_FullBMA:
         mu      = np.maximum(a[:, None] + b[:, None] * f_data, self.eps)
         # Γ(shape, rate=shape/mu) ⟹ mean = mu
         rate    = shape / mu
-        pdf     = sp_gamma.pdf(y_data[None, :], a=shape, scale=1.0 / np.maximum(rate, self.eps))
-        mix_pdf = np.sum(w[:, None] * pdf, axis=0)
-        nll     = -np.sum(np.log(np.maximum(mix_pdf, self.eps)))
+        logpdf = sp_gamma.logpdf(y_data[None, :], a=shape, scale=mu / shape)
+        nll = -float(np.sum(logsumexp(logpdf, b=w[:, None], axis=0)))
         pen = (
             lam_w    * np.sum((w - 1.0 / m) ** 2)
             + lam_a  * np.sum((a / max(y_scale, self.eps)) ** 2)
@@ -6983,9 +9046,9 @@ class WAS_mme_FullBMA:
             return 1e20
         # Component: LogNormal(μ_log = a + b·log f, σ_log)
         mu_log  = a[:, None] + b[:, None] * np.log(np.maximum(f_data, self.eps))
-        pdf     = lognorm.pdf(y_data[None, :], s=max(sigma_log, self.eps), scale=np.exp(mu_log))
-        mix_pdf = np.sum(w[:, None] * pdf, axis=0)
-        nll     = -np.sum(np.log(np.maximum(mix_pdf, self.eps)))
+        logpdf = norm.logpdf(np.log(y_data)[None, :], loc=mu_log,
+                              scale=max(sigma_log, self.eps)) - np.log(y_data)[None, :]
+        nll = -float(np.sum(logsumexp(logpdf, b=w[:, None], axis=0)))
         pen = (
             lam_w    * np.sum((w - 1.0 / m) ** 2)
             + lam_a  * np.sum(a ** 2)
@@ -7008,9 +9071,8 @@ class WAS_mme_FullBMA:
         y_scale = self._safe_scale(y_data, default=1.0)
 
         if family in {"gamma", "lognormal"}:
-            valid  = y_data > 0
-            y_data = y_data[valid]
-            f_data = f_data[:, valid]
+            if np.any(y_data <= 0):
+                raise ValueError(f"{family} BMA requires strictly positive observations; use FastBMA gamma0 for zeros")
             if y_data.size < 5:
                 raise ValueError(f"Insufficient positive samples for '{family}'")
 
@@ -7019,8 +9081,10 @@ class WAS_mme_FullBMA:
         if family == "lognormal":
             log_std   = float(np.std(np.log(np.maximum(y_data, self.eps))))
             disp_init = np.log(max(log_std, 0.05))
+        elif family == "gamma":
+            disp_init = np.log(2.0)  # dimensionless shape, not raw-scale standard deviation
         else:
-            disp_init = np.log(max(y_scale, 1.0))
+            disp_init = np.log(max(y_scale, self.eps))
 
         p0 = np.concatenate([
             np.zeros(m),      # weight logits  → uniform weights after softmax
@@ -7047,14 +9111,16 @@ class WAS_mme_FullBMA:
         res = minimize(
             obj, p0,
             method="L-BFGS-B",
+            bounds=[(-30., 30.)] * m + [(None, None)] * m + [(-12., 12.)] * m
+                   + [(np.log(self.eps), 40.)],
             options={"maxiter": self.maxiter, "ftol": self.tol},
         )
-        if not res.success:
-            raise RuntimeError(res.message)
+        if not np.all(np.isfinite(res.x)) or not np.isfinite(res.fun) or res.fun > obj(p0) + 1e-8:
+            raise RuntimeError(f"Invalid BMA optimization: {res.message}")
 
         w, a, b, disp = self._unpack_fast_params(res.x, m)
         return {"weights": w, "a": a, "b": b, "dispersion": float(disp),
-                "family": family, "backend": "fast"}
+                "family": family, "backend": "fast", "converged": bool(res.success)}
 
     # ─────────────────────────────────────────── FULL backend ───────────────
 
@@ -7073,11 +9139,13 @@ class WAS_mme_FullBMA:
 
         m, _ = f_data.shape
         y_scale = self._safe_scale(y_data, default=1.0)
+        if family in {"gamma", "lognormal"} and np.any(y_data <= 0):
+            raise ValueError(f"{family} BMA requires strictly positive observations; use FastBMA gamma0 for zeros")
 
         sample_kw = dict(
             draws=self.draws, tune=self.tune, chains=self.chains,
             target_accept=self.target_accept, random_seed=self.random_seed,
-            progressbar=self.progressbar, compute_convergence_checks=False,
+            progressbar=self.progressbar, compute_convergence_checks=True,
             return_inferencedata=True,
         )
 
@@ -7085,7 +9153,7 @@ class WAS_mme_FullBMA:
             with pm.Model():
                 weights = pm.Dirichlet("weights", a=np.full(m, alpha0))
                 a       = pm.Normal("a", mu=0.0, sigma=coef_scale_mult * y_scale, shape=m)
-                b       = pm.Normal("b", mu=1.0, sigma=coef_scale_mult, shape=m)
+                b       = pm.LogNormal("b", mu=0.0, sigma=coef_scale_mult, shape=m)
                 sigma   = pm.HalfNormal("sigma", sigma=sigma_scale_mult * y_scale)
                 comp    = [pm.Normal.dist(mu=a[k] + b[k] * f_data[k, :], sigma=sigma)
                            for k in range(m)]
@@ -7107,7 +9175,7 @@ class WAS_mme_FullBMA:
             with pm.Model():
                 weights = pm.Dirichlet("weights", a=np.full(m, alpha0))
                 a       = pm.Normal("a", mu=0.0, sigma=coef_scale_mult * y_scale, shape=m)
-                b       = pm.Normal("b", mu=1.0, sigma=coef_scale_mult, shape=m)
+                b       = pm.LogNormal("b", mu=0.0, sigma=coef_scale_mult, shape=m)
                 shape   = pm.HalfNormal("shape", sigma=shape_scale)
                 comp = []
                 for k in range(m):
@@ -7134,7 +9202,7 @@ class WAS_mme_FullBMA:
             with pm.Model():
                 weights   = pm.Dirichlet("weights", a=np.full(m, alpha0))
                 a         = pm.Normal("a", mu=0.0, sigma=coef_scale_mult * log_scale, shape=m)
-                b         = pm.Normal("b", mu=1.0, sigma=coef_scale_mult, shape=m)
+                b         = pm.LogNormal("b", mu=0.0, sigma=coef_scale_mult, shape=m)
                 sigma_log = pm.HalfNormal("sigma_log", sigma=sigma_scale_mult * log_scale)
                 comp = []
                 for k in range(m):
@@ -7204,9 +9272,22 @@ class WAS_mme_FullBMA:
         sigma_scale_mult: float = 1.0,
         shape_scale:      float = 5.0,
     ) -> "WAS_mme_FullBMA":
+        if self.mode == "full" and not HAS_PYMC:
+            raise RuntimeError("FullBMA mode='full' requires PyMC and ArviZ; use mode='fast' or 'auto'")
         self._require_dims(hcst_grid, [member_dim, time_dim, lat_dim, lon_dim], "hcst_grid")
         self._require_dims(obs_grid,  [time_dim,   lat_dim,  lon_dim],           "obs_grid")
+        hcst_grid, obs_grid = xr.align(hcst_grid, obs_grid, join="exact")
+        if hcst_grid.sizes[member_dim] == 0 or not hcst_grid.get_index(member_dim).is_unique:
+            raise ValueError("BMA requires nonempty unique member labels")
+        if int(min_samples) < 2:
+            raise ValueError("min_samples must be >= 2")
+        self._obs_grid = obs_grid
         self._require_dims(dist_map,  [lat_dim,    lon_dim],                     "dist_map")
+        if min(lam_w, lam_a, lam_b, lam_disp) < 0:
+            raise ValueError("BMA regularization penalties must be nonnegative")
+        if min(alpha0, coef_scale_mult, sigma_scale_mult, shape_scale) <= 0:
+            raise ValueError("BMA prior scales and concentrations must be positive")
+        hcst_grid, obs_grid, dist_map = xr.align(hcst_grid, obs_grid, dist_map, join="exact")
 
         self._member_dim    = member_dim
         self._time_dim      = time_dim
@@ -7229,6 +9310,7 @@ class WAS_mme_FullBMA:
         family_code   = np.full((n_lat, n_lon), np.nan)
         fit_mode      = np.full((n_lat, n_lon), self.MODE_CODE["failed"])
         fit_status    = np.zeros((n_lat, n_lon))
+        converged = np.zeros((n_lat, n_lon), dtype=bool)
 
         self.posterior_.clear()
 
@@ -7246,6 +9328,9 @@ class WAS_mme_FullBMA:
                 valid = np.isfinite(y_raw) & np.isfinite(f_raw).all(axis=0)
                 if int(valid.sum()) < min_samples:
                     continue
+                if fam in {"gamma", "lognormal"} and np.any(y_raw[valid] <= 0):
+                    warnings.warn(f"{fam} BMA requires strictly positive observations; use FastBMA gamma0 for zeros", RuntimeWarning)
+                    continue
 
                 try:
                     res = self._fit_single_grid_hybrid(
@@ -7261,6 +9346,7 @@ class WAS_mme_FullBMA:
 
                 family_code[ilat, ilon]   = self.DIST_NAME_TO_CODE[fam]
                 fit_status[ilat, ilon]    = 1.0
+                converged[ilat, ilon] = bool(res.get("converged", False))
 
                 if res["backend"] == "fast":
                     fit_mode[ilat, ilon]       = self.MODE_CODE["fast"]
@@ -7292,6 +9378,7 @@ class WAS_mme_FullBMA:
         self.family_map_used = xr.DataArray(family_code,   dims=(lat_dim, lon_dim), coords=coords_2d)
         self.fit_mode_map    = xr.DataArray(fit_mode,      dims=(lat_dim, lon_dim), coords=coords_2d)
         self.fit_status_map  = xr.DataArray(fit_status,    dims=(lat_dim, lon_dim), coords=coords_2d)
+        self.fit_converged_ = xr.DataArray(converged, dims=(lat_dim, lon_dim), coords=coords_2d)
 
         self.fitted = True
         return self
@@ -7322,8 +9409,7 @@ class WAS_mme_FullBMA:
             return float(np.sum(w * vals))
         if family == "gamma":
             mu   = np.maximum(a + b * f_m, self.eps)
-            rate = max(disp, self.eps) / mu
-            vals = sp_gamma.cdf(x, a=max(disp, self.eps), scale=1.0 / np.maximum(rate, self.eps))
+            vals = sp_gamma.cdf(x, a=max(disp, self.eps), scale=mu / max(disp, self.eps))
             return float(np.sum(w * vals))
         if family == "lognormal":
             mu_log = a + b * np.log(np.maximum(f_m, self.eps))
@@ -7335,45 +9421,47 @@ class WAS_mme_FullBMA:
         self, q: float, f_m: np.ndarray, w: np.ndarray,
         a: np.ndarray, b: np.ndarray, disp: float, family: str
     ) -> float:
-        """
-        Compute the q-th mixture quantile.
-
-        FIX #5: replaced 600-point grid + searchsorted (coarse, unreliable near
-        the tails) with Brent root-finding.  The bracket upper bound is
-        adaptively expanded if needed.
-        """
-        mean_pred = self._mixture_mean_fast(f_m, w, a, b, disp, family)
-
         if family == "normal":
-            lo = mean_pred - 10.0 * max(disp, self.eps)
-            hi = mean_pred + 10.0 * max(disp, self.eps)
+            brackets = norm.ppf(q, loc=a + b*f_m, scale=max(disp, self.eps))
         elif family == "gamma":
-            lo = self.eps
-            hi = max(mean_pred * 8.0 + 10.0, 1.0)
+            mu = np.maximum(a+b*f_m, self.eps)
+            brackets = sp_gamma.ppf(q, a=max(disp, self.eps), scale=mu/max(disp, self.eps))
         elif family == "lognormal":
-            lo = self.eps
-            hi = max(mean_pred * 10.0 + 10.0, 1.0)
+            mu_log = a + b*np.log(np.maximum(f_m, self.eps))
+            brackets = lognorm.ppf(q, s=max(disp, self.eps), scale=np.exp(mu_log))
         else:
             raise ValueError(family)
+        return _bma_quantile(lambda value: self._mixture_cdf_fast(value, f_m, w, a, b, disp, family), q, brackets)
 
-        obj = lambda x: self._mixture_cdf_fast(x, f_m, w, a, b, disp, family) - q
-
-        # Adaptively widen the bracket so that CDF(hi) ≥ q
-        for _ in range(12):
-            if obj(hi) >= 0.0:
-                break
-            hi *= 2.0
-
-        try:
-            return float(brentq(obj, lo, hi, xtol=1e-6, maxiter=120))
-        except Exception:
-            # Fallback: fine grid (1 000 pts) — keeps legacy behaviour as a safety net
-            xs   = np.linspace(lo, hi, 1000)
-            cdfs = np.array([
-                self._mixture_cdf_fast(x, f_m, w, a, b, disp, family) for x in xs
-            ])
-            idx = min(int(np.searchsorted(cdfs, q, side="left")), len(xs) - 1)
-            return float(xs[idx])
+    def _posterior_predictive(self, f_m, post, family, quantiles, thresholds):
+        # Rao-Blackwellization: integrate each predictive component analytically
+        # then average across stored posterior draws. No extra predictive RNG.
+        w = np.asarray(post["weights"], dtype=float)
+        w = w / w.sum(axis=1, keepdims=True)
+        a, b = np.asarray(post["a"]), np.asarray(post["b"])
+        disp = np.maximum(np.asarray(post["dispersion"])[:, None], self.eps)
+        if family == "normal":
+            mu = a + b * f_m[None, :]
+            dist = norm(loc=mu, scale=disp)
+            means = mu
+        elif family == "gamma":
+            mu = np.maximum(a + b*f_m[None, :], self.eps)
+            dist = sp_gamma(a=disp, scale=mu/disp)
+            means = mu
+        elif family == "lognormal":
+            mu = a + b*np.log(np.maximum(f_m[None, :], self.eps))
+            dist = lognorm(s=disp, scale=np.exp(mu))
+            means = np.exp(mu + disp**2/2.)
+        else:
+            raise ValueError(family)
+        cdf = lambda value: float(np.mean(np.sum(w*dist.cdf(value), axis=1)))
+        mean = float(np.mean(np.sum(w*means, axis=1)))
+        qs = [_bma_quantile(cdf, q, dist.ppf(q)) for q in quantiles]
+        probs = None
+        if thresholds is not None and np.all(np.isfinite(thresholds)):
+            lower, upper = [cdf(value) for value in thresholds]
+            probs = _normalize_tercile_probs(lower, upper-lower, 1-upper)
+        return mean, qs, probs
 
     def _sample_pp_full(
         self, f_m: np.ndarray, post: Dict[str, np.ndarray],
@@ -7432,6 +9520,9 @@ class WAS_mme_FullBMA:
         self._require_dims(
             new_forecasts, [member_dim, time_dim, lat_dim, lon_dim], "new_forecasts"
         )
+        new_forecasts = _bma_forecast_members(new_forecasts, self._member_values, member_dim)
+        if any(not np.isfinite(q) or not 0 < q < 1 for q in quantiles):
+            raise ValueError("BMA predictive quantiles must lie strictly inside (0, 1)")
 
         # FIX #6: spatially align all parameter maps to the forecast grid via
         #         nearest-neighbour selection.  Original code used raw numpy
@@ -7473,8 +9564,8 @@ class WAS_mme_FullBMA:
         out_mode   = np.full((n_lat, n_lon), np.nan)
         out_status = np.full((n_lat, n_lon), np.nan)
 
-        rng = np.random.default_rng(self.random_seed)
-
+        # n_pp_samples remains accepted for API compatibility; predictive
+        # means/CDFs integrate the stored posterior draws analytically.
         if self.verbose:
             print("Predicting with hybrid Bayesian postprocessor …")
 
@@ -7511,15 +9602,13 @@ class WAS_mme_FullBMA:
                         if post is None:
                             continue
 
-                        y_rep = self._sample_pp_full(f_m, post, fam, rng, n_pp_samples)
-                        out_mean[t, ilat, ilon]      = float(np.mean(y_rep))
-                        out_quant[:, t, ilat, ilon]  = np.quantile(y_rep, quantiles)
-
-                        if terciles_np is not None and np.isfinite(low_th) and np.isfinite(up_th):
-                            pb = float(np.mean(y_rep <= low_th))
-                            pa = float(np.mean(y_rep >  up_th))
-                            pn = float(np.mean((y_rep > low_th) & (y_rep <= up_th)))
-                            out_probs[:, t, ilat, ilon] = _normalize_tercile_probs(pb, pn, pa)
+                        mean, q_values, probabilities = self._posterior_predictive(
+                            f_m, post, fam, quantiles,
+                            None if terciles_np is None else (low_th, up_th))
+                        out_mean[t, ilat, ilon] = mean
+                        out_quant[:, t, ilat, ilon] = q_values
+                        if probabilities is not None:
+                            out_probs[:, t, ilat, ilon] = probabilities
 
                     elif mode_code == self.MODE_CODE["fast"]:
                         w    = w_map[:, ilat, ilon]
@@ -7576,7 +9665,7 @@ class WAS_mme_FullBMA:
                 coords={**coords, "probability": ["PB", "PN", "PA"]},
             )
             ds["tercile_thresholds"] = terciles_da
-        return ds
+        return _bma_output_metadata(ds)
 
     # ─────────────────────────────────────── WAS-style convenience wrapper ──
 
@@ -7607,6 +9696,8 @@ class WAS_mme_FullBMA:
         shape_scale:      float = 5.0,
     ) -> xr.Dataset:
         """Fit on (X_train, y_train) then predict on X_test — one-call interface."""
+        if time_dim == "T":
+            X_train = align_predictor_target(X_train, y_train, mode="season_year")
         self.fit(
             hcst_grid=X_train, obs_grid=y_train, dist_map=dist_map,
             member_dim=member_dim, time_dim=time_dim,
@@ -7639,15 +9730,15 @@ class WAS_mme_RF:
     search_method : str, optional
         Hyperparameter optimization method: 'grid', 'random', or 'bayesian' (default: 'random').
     n_estimators_range : list of int, optional
-        List of n_estimators values to tune (default is [100, 200, 300, 500]).
+        List of n_estimators values to tune (default is [200, 400, 700]).
     max_depth_range : list of int or None, optional
-        List of max depths to tune (default is [None, 8, 12, 16]).
+        List of max depths to tune (default is [4, 6, 8, 12]).
     min_samples_split_range : list of int, optional
-        List of minimum samples required to split (default is [2, 5, 10]).
+        List of minimum samples required to split (default is [10, 20, 40]).
     min_samples_leaf_range : list of int, optional
-        List of minimum samples required at leaf node (default is [1, 2, 4]).
+        List of minimum samples required at leaf node (default is [5, 10, 20]).
     max_features_range : list of str or float, optional
-        List of max features to tune (default is ['sqrt', 0.3, 0.5, 0.7]).
+        List of max features to tune (default is [0.4, 0.7, 1.0]).
     bootstrap_range : list of bool, optional
         List of bootstrap options to tune (default is [True, False]).
     max_samples_range : list of float or None, optional
@@ -7685,11 +9776,11 @@ class WAS_mme_RF:
 
     def __init__(self,
                  search_method: str = 'random',
-                 n_estimators_range: Union[List[int], object] = [100, 200, 300, 500],
-                 max_depth_range: Union[List[Optional[int]], object] = [None, 8, 12, 16],
-                 min_samples_split_range: Union[List[int], object] = [2, 5, 10],
-                 min_samples_leaf_range: Union[List[int], object] = [1, 2, 4],
-                 max_features_range: List[Union[str, float]] = ['sqrt', 0.3, 0.5, 0.7],
+                 n_estimators_range: Union[List[int], object] = [200, 400, 700],
+                 max_depth_range: Union[List[Optional[int]], object] = [4, 6, 8, 12],
+                 min_samples_split_range: Union[List[int], object] = [10, 20, 40],
+                 min_samples_leaf_range: Union[List[int], object] = [5, 10, 20],
+                 max_features_range: List[Union[str, float]] = [0.4, 0.7, 1.0],
                  bootstrap_range: List[bool] = [True, False],
                  max_samples_range: List[Optional[float]] = [None, 0.7, 0.8],
                  min_impurity_decrease_range: List[float] = [0.0, 0.001, 0.01],
@@ -7706,8 +9797,32 @@ class WAS_mme_RF:
                  n_jobs: int = -1,
                  optuna_n_jobs: Optional[int] = None,
                  cv_n_jobs: int = -1,
-                 tuning_model_n_jobs: int = 1):
+                 tuning_model_n_jobs: int = 1,
+                 cluster_n_jobs: Optional[int] = None,
+                 spatial_subsample: int = 1,
+                 spatial_mode: str = "zones",
+                 covariate_names: Optional[Sequence[str]] = None,
+                 static_fields: Optional[Dict[str, xr.DataArray]] = None,
+                 coord_step: Optional[float] = None,
+                 zones_as_features: bool = False,
+                 predictor_smoothing: int = 0,
+                 one_se_rule: bool = False,
+                 amplitude_calibration=True,
+                 amplitude_calibration_inner_folds: int = 3):
 
+        # Threads used to fit the clusters concurrently (None -> auto).
+        self.cluster_n_jobs = cluster_n_jobs
+        # Keep every `spatial_subsample`-th grid cell (in Y AND X) when FITTING
+        # and when TUNING. 1 disables it. On a 350x171 grid a cluster holds
+        # ~287,000 training samples for 10 features, and neighbouring cells are
+        # near-duplicates; the fit cost grows as n log n, so a stride of 2 cuts
+        # it by roughly 4.5x. It changes the forecasts, so it stays off by default.
+        self.spatial_subsample = max(1, int(spatial_subsample))
+        # Spatial regionalisation ("zones" | "soft" | "both"), spatial
+        # covariates, regional GCM smoothing and the one-SE selection rule.
+        _init_spatial_options(self, spatial_mode, covariate_names, static_fields,
+                              coord_step, zones_as_features, predictor_smoothing, one_se_rule,
+                              amplitude_calibration, amplitude_calibration_inner_folds)
         self.search_method = search_method
         self.n_estimators_range = n_estimators_range
         self.max_depth_range = max_depth_range
@@ -7940,7 +10055,13 @@ class WAS_mme_RF:
             print(f"Best params: {sklearn_params}")
         return sklearn_params
 
-    def compute_hyperparameters(self, Predictors: xr.DataArray, Predictand: xr.DataArray,
+    def compute_hyperparameters(self, Predictors, Predictand,
+                                clim_year_start=None, clim_year_end=None):
+        """Tune with fold-local standardization, target encoding and climate zones."""
+        return _strict_regional_hyperparameters(
+            self, Predictors, Predictand, clim_year_start, clim_year_end)
+
+    def compute_hyperparameters_legacy(self, Predictors: xr.DataArray, Predictand: xr.DataArray,
                                 clim_year_start: Optional[int] = None,
                                 clim_year_end: Optional[int] = None) -> Tuple[Dict, xr.DataArray]:
         """
@@ -7954,8 +10075,9 @@ class WAS_mme_RF:
         1970-2000 window AND the double-standardization that happened when the
         framework had already standardized the data.
         """
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        Predictors = align_predictor_target(Predictors, Predictand, mode="season_year")
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
         Predictand.name = "varname"
 
         if clim_year_start is not None and clim_year_end is not None:
@@ -8019,21 +10141,43 @@ class WAS_mme_RF:
         self.best_params_dict = best_params_dict
         return best_params_dict, self.cluster_da
 
+    def _cluster_workers(self):
+        """Threads used to fit the clusters concurrently.
+
+        Clusters are independent, so this is the parallel axis that actually
+        pays. scikit-learn releases the GIL during tree building, so threads
+        are enough and avoid the memory duplication of processes. Controlled by
+        ``cluster_n_jobs``; falls back to the number of clusters capped by
+        ``n_jobs``.
+        """
+        requested = getattr(self, "cluster_n_jobs", None)
+        if requested is None:
+            budget = self.n_jobs if self.n_jobs and self.n_jobs > 0 else _grid_workers()
+            requested = max(1, min(int(self.n_clusters), int(budget)))
+        return max(1, int(requested))
+
     def compute_model(self, X_train: xr.DataArray, y_train: xr.DataArray,
                       X_test: xr.DataArray, y_test: Optional[xr.DataArray] = None,
                       clim_year_start: Optional[int] = None,
                       clim_year_end: Optional[int] = None,
                       best_params: Optional[Dict] = None,
-                      cluster_da: Optional[xr.DataArray] = None) -> xr.DataArray:
+                      cluster_da: Optional[xr.DataArray] = None,
+                      covariates: Optional[xr.DataArray] = None) -> xr.DataArray:
         """
         Deterministic hindcast using RandomForestRegressor with optimized
         hyperparameters.
 
+        ``covariates`` (M, Y, X) are the fold-local spatial covariates used by
+        ``spatial_mode`` "soft"/"both"; WAS_Cross_Validator passes them, and the
+        map stored by ``compute_hyperparameters`` is reused otherwise.
         """
-        if best_params is None or cluster_da is None:
-            best_params, cluster_da = self.compute_hyperparameters(
-                X_train, y_train, clim_year_start, clim_year_end
-            )
+        validate_mme_predictor_schema(X_train, X_test)
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
+        best_params, cluster_da = _resolve_regional_params(
+            self, X_train, y_train, clim_year_start, clim_year_end, best_params, cluster_da)
+        _raw_predictors = (X_train, X_test)   # avant covariables : pour la calibration
+        X_train, X_test = _prepare_channels(self, X_train, X_test, y_train, covariates,
+                                            clim_year_start, clim_year_end)
 
         time = X_test['T']
         lat = X_test['Y']
@@ -8042,55 +10186,76 @@ class WAS_mme_RF:
         n_lat = len(lat)
         n_lon = len(lon)
 
-        predictions = np.full((n_time, n_lat, n_lon), np.nan)
+        predictions = np.full((n_time * n_lat * n_lon,), np.nan)
         self.rf = {}
 
-        for c in range(self.n_clusters):
-            if c not in best_params:
-                continue
+        # Row positions of every cluster in the stacked (T, Y, X) axis. The
+        # arrays are stacked ONCE per fold and indexed per cluster; the previous
+        # code re-materialised the full (T, M, Y, X) array for every cluster.
+        train_rows = _cluster_row_index(cluster_da, X_train.sizes['T'])
+        test_rows = _cluster_row_index(cluster_da, X_test.sizes['T'])
 
+        active = [c for c in range(self.n_clusters) if c in best_params]
+
+        def _fit_one(c):
+            """Fit and predict one cluster. Returns (c, model, positions, values)."""
             bp = best_params[c]
 
-            mask_3d_train = (cluster_da == c).expand_dims({'T': X_train['T']})
-            mask_3d_test = (cluster_da == c).expand_dims({'T': X_test['T']})
+            # Thin the TRAINING rows only (one cell out of `stride` in Y and X).
+            # Prediction still covers every cell, so the output grid is unchanged.
+            train_sel = _thin_training_rows(train_rows == c, X_train.sizes['T'],
+                                            n_lat, n_lon, self.spatial_subsample)
 
-            X_train_stacked_c = X_train.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            y_train_stacked_c = y_train.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).values.ravel()
+            Xc, _ = _stack_rows(X_train, train_sel, core='M')
+            yc, _ = _stack_rows(y_train, train_sel, core=None)
+            yc = yc.ravel()
+            keep = np.all(np.isfinite(Xc), axis=1) & np.isfinite(yc)
+            if not keep.any():
+                return c, None, None, None
 
-            train_nan_mask = np.any(~np.isfinite(X_train_stacked_c), axis=1) | ~np.isfinite(y_train_stacked_c)
-            X_train_clean_c = X_train_stacked_c[~train_nan_mask]
-            y_train_clean_c = y_train_stacked_c[~train_nan_mask]
-
-            X_test_stacked_c = X_test.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            test_nan_mask = np.any(~np.isfinite(X_test_stacked_c), axis=1)
-            X_test_clean_c = X_test_stacked_c[~test_nan_mask]
-
-            if len(X_train_clean_c) == 0:
-                continue
+            Xt, pos_t = _stack_rows(X_test, test_rows == c, core='M')
+            keep_t = np.all(np.isfinite(Xt), axis=1)
 
             rf_c = RandomForestRegressor(
                 **{k: v for k, v in bp.items() if k in RandomForestRegressor().get_params()},
                 random_state=self.random_state,
-                n_jobs=self.n_jobs,
-                warm_start=self.warm_start
+                # One thread per model: the parallelism is at the cluster level.
+                # Measured on 10 features, n_jobs=-1 inside a single fit gives
+                # no speedup (36.7 s against 35.7 s) because the trees are too
+                # small; running the clusters concurrently does.
+                n_jobs=1 if self._cluster_workers() > 1 else self.n_jobs,
+                warm_start=self.warm_start,
             )
+            rf_c.fit(Xc[keep], yc[keep])
 
-            rf_c.fit(X_train_clean_c, y_train_clean_c)
-            self.rf[c] = rf_c
+            if not keep_t.any():
+                return c, rf_c, None, None
+            return c, rf_c, pos_t[keep_t], rf_c.predict(Xt[keep_t])
 
-            if len(X_test_clean_c) > 0:
-                y_pred_c = rf_c.predict(X_test_clean_c)
-                result_c = np.full(len(X_test_stacked_c), np.nan)
-                result_c[~test_nan_mask] = y_pred_c
-                pred_c_reshaped = result_c.reshape(n_time, n_lat, n_lon)
-                predictions = np.where(np.isnan(predictions), pred_c_reshaped, predictions)
+        workers = self._cluster_workers()
+        if workers > 1 and len(active) > 1:
+            results = Parallel(n_jobs=min(workers, len(active)), backend="threading")(
+                delayed(_fit_one)(c) for c in active
+            )
+        else:
+            results = [_fit_one(c) for c in active]
+
+        for c, model, positions, values in results:
+            if model is not None:
+                self.rf[c] = model
+            if positions is not None:
+                predictions[positions] = values
+        predictions = predictions.reshape(n_time, n_lat, n_lon)
 
         predicted_da = xr.DataArray(
             data=predictions,
             coords={'T': time, 'Y': lat, 'X': lon},
             dims=['T', 'Y', 'X']
         )
-        return predicted_da
+        return _maybe_calibrate_amplitude(
+            self, self.rf, X_train, y_train, predicted_da, cluster_da, X_test=X_test,
+            raw_predictors=_raw_predictors, best_params=best_params,
+            clim_year_start=clim_year_start, clim_year_end=clim_year_end)
 
     # ------------------ Probability Calculation Methods ------------------
 
@@ -8103,29 +10268,29 @@ class WAS_mme_RF:
         code = int(dist_code)
         try:
             if code == 1:
-                return (norm.ppf(0.33, loc=loc, scale=scale),
-                        norm.ppf(0.67, loc=loc, scale=scale))
+                return (norm.ppf(1.0 / 3.0, loc=loc, scale=scale),
+                        norm.ppf(2.0 / 3.0, loc=loc, scale=scale))
             elif code == 2:
-                return (lognorm.ppf(0.33, s=shape, loc=loc, scale=scale),
-                        lognorm.ppf(0.67, s=shape, loc=loc, scale=scale))
+                return (lognorm.ppf(1.0 / 3.0, s=shape, loc=loc, scale=scale),
+                        lognorm.ppf(2.0 / 3.0, s=shape, loc=loc, scale=scale))
             elif code == 3:
-                return (expon.ppf(0.33, loc=loc, scale=scale),
-                        expon.ppf(0.67, loc=loc, scale=scale))
+                return (expon.ppf(1.0 / 3.0, loc=loc, scale=scale),
+                        expon.ppf(2.0 / 3.0, loc=loc, scale=scale))
             elif code == 4:
-                return (gamma.ppf(0.33, a=shape, loc=loc, scale=scale),
-                        gamma.ppf(0.67, a=shape, loc=loc, scale=scale))
+                return (gamma.ppf(1.0 / 3.0, a=shape, loc=loc, scale=scale),
+                        gamma.ppf(2.0 / 3.0, a=shape, loc=loc, scale=scale))
             elif code == 5:
-                return (weibull_min.ppf(0.33, c=shape, loc=loc, scale=scale),
-                        weibull_min.ppf(0.67, c=shape, loc=loc, scale=scale))
+                return (weibull_min.ppf(1.0 / 3.0, c=shape, loc=loc, scale=scale),
+                        weibull_min.ppf(2.0 / 3.0, c=shape, loc=loc, scale=scale))
             elif code == 6:
-                return (t.ppf(0.33, df=shape, loc=loc, scale=scale),
-                        t.ppf(0.67, df=shape, loc=loc, scale=scale))
+                return (t.ppf(1.0 / 3.0, df=shape, loc=loc, scale=scale),
+                        t.ppf(2.0 / 3.0, df=shape, loc=loc, scale=scale))
             elif code == 7:
-                return (poisson.ppf(0.33, mu=shape, loc=loc),
-                        poisson.ppf(0.67, mu=shape, loc=loc))
+                return (poisson.ppf(1.0 / 3.0, mu=shape, loc=loc),
+                        poisson.ppf(2.0 / 3.0, mu=shape, loc=loc))
             elif code == 8:
-                return (nbinom.ppf(0.33, n=shape, p=scale, loc=loc),
-                        nbinom.ppf(0.67, n=shape, p=scale, loc=loc))
+                return (nbinom.ppf(1.0 / 3.0, n=shape, p=scale, loc=loc),
+                        nbinom.ppf(2.0 / 3.0, n=shape, p=scale, loc=loc))
         except Exception:
             return np.nan, np.nan
 
@@ -8248,23 +10413,8 @@ class WAS_mme_RF:
 
     @staticmethod
     def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t in range(n_time):
-            if np.isnan(best_guess[t]):
-                continue
-            dist = best_guess[t] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            p_above = 1.0 - (p_below + p_between)
-            pred_prob[0, t] = p_below
-            pred_prob[1, t] = p_between
-            pred_prob[2, t] = p_above
-        return pred_prob
+        return WAS_mme_Weighted.calculate_tercile_probabilities_nonparametric(
+            best_guess, error_samples, first_tercile, second_tercile)
 
     def compute_prob(self, Predictant: xr.DataArray, clim_year_start, clim_year_end,
                      hindcast_det: xr.DataArray, best_code_da: xr.DataArray = None,
@@ -8279,22 +10429,22 @@ class WAS_mme_RF:
         distribution too sharp and the reliability diagram over-confident.
         """
         if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+            Predictant = Predictant.isel(M=0, drop=True)
 
         Predictant = Predictant.transpose("T", "Y", "X")
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where(np.isfinite(Predictant).sum(dim='T') >= 3, 1.0, np.nan)
 
         clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
         if clim.sizes.get("T", 0) < 3:
             raise ValueError("Not enough years in climatology period for terciles.")
 
         # Out-of-sample residual variance (hindcast_det should be cross-validated)
-        error_variance = (Predictant - hindcast_det).var(dim="T")
+        error_variance = ((Predictant - hindcast_det) ** 2).mean(dim="T", skipna=True)
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
-        terciles_emp = clim.quantile([1.0 / 3.0, 2.0 / 3.0], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
+        terciles_emp = climatological_terciles(clim)[0]
+        T1_emp = terciles_emp.isel(quantile=0, drop=True)
+        T2_emp = terciles_emp.isel(quantile=1, drop=True)
 
         dm = self.dist_method
 
@@ -8303,14 +10453,19 @@ class WAS_mme_RF:
                 raise ValueError(
                     "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
                 )
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized",
-                output_dtypes=[float, float],
-            )
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                T1, T2 = _pufunc(
+                    self._ppf_terciles_from_code,
+                    best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                    input_core_dims=[(), (), (), ()],
+                    output_core_dims=[(), ()],
+                    vectorize=True, dask="parallelized",
+                    output_dtypes=[float, float],
+                )
+            else:
+                T1, T2 = T1_emp, T2_emp
             hindcast_prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
                 hindcast_det, error_variance, T1, T2, best_code_da,
@@ -8342,17 +10497,16 @@ class WAS_mme_RF:
                  hindcast_det_cross, Predictor_for_year, best_params=None, cluster_da=None,
                  best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         """Forecast using the Random Forest model with optimized hyperparameters."""
-        if "M" in Predictant.coords:
-            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        validate_mme_predictor_schema(hindcast_det, Predictor_for_year)
+        if "M" in Predictant.dims:
+            Predictant_no_m = Predictant.isel(M=0, drop=True)
         else:
             Predictant_no_m = Predictant
 
-        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+        mask = xr.where(np.isfinite(Predictant_no_m).sum(dim='T') >= 3, 1.0, np.nan).to_numpy()
 
-        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        hindcast_det_st, Predictor_for_year_st = standardize_mme_predictors(
+            hindcast_det, Predictor_for_year, clim_year_start, clim_year_end)
         Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
         hindcast_det_st['T'] = Predictant_st['T']
 
@@ -8363,10 +10517,13 @@ class WAS_mme_RF:
         n_lat = len(lat)
         n_lon = len(lon)
 
-        if best_params is None:
-            best_params, cluster_da = self.compute_hyperparameters(
-                hindcast_det, Predictant_no_m, clim_year_start, clim_year_end
-            )
+        best_params, cluster_da = _resolve_regional_params(
+            self, hindcast_det, Predictant_no_m, clim_year_start, clim_year_end,
+            best_params, cluster_da)
+        # Spatial covariates / smoothed channels from the RAW predictand climatology.
+        hindcast_det_st, Predictor_for_year_st = _prepare_channels(
+            self, hindcast_det_st, Predictor_for_year_st, Predictant_no_m, None,
+            clim_year_start, clim_year_end)
 
         predictions = np.full((n_time, n_lat, n_lon), np.nan)
         self.rf = {}
@@ -8380,14 +10537,14 @@ class WAS_mme_RF:
             mask_3d_train = (cluster_da == c).expand_dims({'T': hindcast_det_st['T']})
             mask_3d_test = (cluster_da == c).expand_dims({'T': Predictor_for_year_st['T']})
 
-            X_train_stacked_c = hindcast_det_st.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            y_train_stacked_c = Predictant_st.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).values.ravel()
+            X_train_stacked_c = _stack_masked(hindcast_det_st, mask_3d_train, core='M')
+            y_train_stacked_c = _stack_masked(Predictant_st, mask_3d_train, core=None).ravel()
 
             train_nan_mask = np.any(~np.isfinite(X_train_stacked_c), axis=1) | ~np.isfinite(y_train_stacked_c)
             X_train_clean_c = X_train_stacked_c[~train_nan_mask]
             y_train_clean_c = y_train_stacked_c[~train_nan_mask]
 
-            X_test_stacked_c = Predictor_for_year_st.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+            X_test_stacked_c = _stack_masked(Predictor_for_year_st, mask_3d_test, core='M')
             test_nan_mask = np.any(~np.isfinite(X_test_stacked_c), axis=1)
             X_test_clean_c = X_test_stacked_c[~test_nan_mask]
 
@@ -8429,10 +10586,10 @@ class WAS_mme_RF:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([1.0 / 3.0, 2.0 / 3.0], dim='T')
-        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        terciles = climatological_terciles(rainfall_for_tercile)[0]
+        T1_emp = terciles.isel(quantile=0, drop=True)
+        T2_emp = terciles.isel(quantile=1, drop=True)
+        error_variance = ((Predictant_no_m - hindcast_det_cross) ** 2).mean(dim="T", skipna=True)
         dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
 
         dm = self.dist_method
@@ -8442,14 +10599,19 @@ class WAS_mme_RF:
                 raise ValueError(
                     "dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da."
                 )
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized",
-                output_dtypes=[float, float],
-            )
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                T1, T2 = _pufunc(
+                    self._ppf_terciles_from_code,
+                    best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                    input_core_dims=[(), (), (), ()],
+                    output_core_dims=[(), ()],
+                    vectorize=True, dask="parallelized",
+                    output_dtypes=[float, float],
+                )
+            else:
+                T1, T2 = T1_emp, T2_emp
             forecast_prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
                 result_da, error_variance, T1, T2, best_code_da,
@@ -8501,15 +10663,52 @@ class _XGBRegressorES(XGBRegressor):
         params['es_validation_fraction'] = self.es_validation_fraction
         return params
 
-    def fit(self, X, y, **fit_kw):
+    def get_xgb_params(self):
+        params = super().get_xgb_params()
+        params.pop("es_validation_fraction", None)
+        return params
+
+    def fit(self, X, y, *, es_groups=None, **fit_kw):
+        """Select boosting rounds on disjoint years, then refit all training rows."""
         esr = getattr(self, "early_stopping_rounds", None)
-        if esr:
-            from sklearn.model_selection import train_test_split
-            X_tr, X_val, y_tr, y_val = train_test_split(
-                X, y, test_size=self.es_validation_fraction,
-                random_state=self.random_state)
-            return super().fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
-        return super().fit(X, y, **fit_kw)
+        self.fitted_sample_count_ = int(len(y))
+        if not esr:
+            return super().fit(X, y, **fit_kw)
+        if es_groups is None:
+            raise ValueError("Early stopping on pooled climate rows requires es_groups (calendar years).")
+        groups = np.asarray(es_groups)
+        if groups.shape != (len(y),):
+            raise ValueError("es_groups must have one label per training row.")
+        years = np.unique(groups)
+        if len(years) < 2:
+            raise ValueError("At least two training years are needed for early stopping.")
+        n_valid = min(len(years)-1, max(1, int(np.ceil(len(years)*self.es_validation_fraction))))
+        validation_years = years[-n_valid:]
+        va = np.isin(groups, validation_years)
+        tr = ~va
+        if "eval_set" in fit_kw:
+            raise ValueError("Provide es_groups; an external eval_set could contain the outer test year.")
+        X, y = np.asarray(X), np.asarray(y)
+        train_kw = dict(fit_kw)
+        train_kw["verbose"] = False
+        if "sample_weight" in train_kw:
+            weight = np.asarray(train_kw["sample_weight"])
+            train_kw["sample_weight"] = weight[tr]
+            train_kw["sample_weight_eval_set"] = [weight[va]]
+        super().fit(X[tr], y[tr], eval_set=[(X[va], y[va])], **train_kw)
+        rounds = int(self.best_iteration) + 1
+        original_rounds = self.n_estimators
+        self.early_stopping_rounds = None
+        self.n_estimators = rounds
+        try:
+            super().fit(X, y, **fit_kw)
+        finally:
+            self.n_estimators = original_rounds
+            self.early_stopping_rounds = esr
+        self.selected_n_estimators_ = rounds
+        self.es_training_years_ = years[:-n_valid]
+        self.es_validation_years_ = validation_years
+        return self
 
 
 class WAS_mme_XGBoosting:
@@ -8567,16 +10766,16 @@ class WAS_mme_XGBoosting:
 
     def __init__(self,
                  search_method='random',
-                 n_estimators_range=[50, 100, 150, 200],
-                 learning_rate_range=[0.005, 0.01, 0.03, 0.05, 0.1],
-                 max_depth_range=[3, 5, 7],
-                 min_child_weight_range=[1, 3, 5],
-                 subsample_range=[0.6, 0.8, 1.0],
+                 n_estimators_range=[100, 200, 400],
+                 learning_rate_range=[0.01, 0.03, 0.05],
+                 max_depth_range=[2, 3, 4],
+                 min_child_weight_range=[5, 10, 20],
+                 subsample_range=[0.6, 0.8],
                  colsample_bytree_range=[0.6, 0.8, 1.0],
-                 gamma_range=[0, 0.1, 0.2, 0.5, 1],
-                 reg_alpha_range=[0, 0.01, 0.1],
-                 reg_lambda_range=[1, 1.5, 2],
-                 early_stopping_rounds_range=[None, 10, 20],
+                 gamma_range=[0, 0.1, 1.0],
+                 reg_alpha_range=[0.01, 0.1, 1.0],
+                 reg_lambda_range=[1.0, 5.0, 10.0],
+                 early_stopping_rounds_range=[None],
                  es_validation_fraction=0.15,
                  random_state=42,
                  dist_method="nonparam",
@@ -8589,7 +10788,32 @@ class WAS_mme_XGBoosting:
                  verbose=0,
                  n_jobs=-1,
                  cv_n_jobs=-1,
-                 tuning_model_n_jobs=1):
+                 tuning_model_n_jobs=1,
+                 cluster_n_jobs: Optional[int] = None,
+                 spatial_subsample: int = 1,
+                 scoring: str = 'neg_mean_squared_error',
+                 spatial_mode: str = "zones",
+                 covariate_names: Optional[Sequence[str]] = None,
+                 static_fields: Optional[Dict[str, xr.DataArray]] = None,
+                 coord_step: Optional[float] = None,
+                 zones_as_features: bool = False,
+                 predictor_smoothing: int = 0,
+                 one_se_rule: bool = False,
+                 amplitude_calibration=True,
+                 amplitude_calibration_inner_folds: int = 3):
+        # Cluster-level parallelism and optional thinning of the
+        # TRAINING sample. See _cluster_plan and _stack_rows.
+        self.cluster_n_jobs = cluster_n_jobs
+        self.spatial_subsample = max(1, int(spatial_subsample))
+        # Selection score of the strict regional tuning. XGBoost is trained on
+        # the squared error (reg:squarederror) and its prediction is dressed as
+        # a conditional MEAN, so the default selection score is the MSE too;
+        # the historical MAE selection targeted the conditional median and
+        # under-forecast the mean of skewed rainfall.
+        self.scoring = scoring
+        _init_spatial_options(self, spatial_mode, covariate_names, static_fields,
+                              coord_step, zones_as_features, predictor_smoothing, one_se_rule,
+                              amplitude_calibration, amplitude_calibration_inner_folds)
 
         self.search_method = search_method
         self.n_estimators_range = n_estimators_range
@@ -8675,7 +10899,7 @@ class WAS_mme_XGBoosting:
                                 verbosity=0, n_jobs=self.tuning_model_n_jobs)
         scores = cross_val_score(model, X, y, cv=self._cv_splitter(groups), groups=groups,
                                  scoring='neg_mean_absolute_error',
-                                 n_jobs=self.cv_n_jobs)
+                                 params={'es_groups': groups}, n_jobs=self.cv_n_jobs)
         return float(np.mean(scores))
 
     def _param_space(self):
@@ -8710,7 +10934,9 @@ class WAS_mme_XGBoosting:
         gs = GridSearchCV(model, param_grid=self._grid_space(),
                           cv=self._cv_splitter(groups), scoring='neg_mean_absolute_error',
                           error_score=np.nan, n_jobs=self.n_jobs)
-        gs.fit(X, y, groups=groups)          # >>> E
+        gs.fit(X, y, groups=groups, es_groups=groups)          # >>> E
+        _report_best_params("xgb/grid", gs.best_params_,
+                            getattr(self, "verbose", 1), gs.best_score_)
         return gs.best_params_
 
     def _random_search(self, X, y, groups):
@@ -8721,7 +10947,9 @@ class WAS_mme_XGBoosting:
                                 n_iter=self.n_iter_search, cv=self._cv_splitter(groups),
                                 scoring='neg_mean_absolute_error', random_state=self.random_state,
                                 error_score=np.nan, n_jobs=self.n_jobs)
-        rs.fit(X, y, groups=groups)          # >>> E
+        rs.fit(X, y, groups=groups, es_groups=groups)          # >>> E
+        _report_best_params("xgb/random", rs.best_params_,
+                            getattr(self, "verbose", 1), rs.best_score_)
         return rs.best_params_
 
     def _bayesian_search(self, X, y, groups):
@@ -8735,10 +10963,18 @@ class WAS_mme_XGBoosting:
         study.optimize(lambda tr: self._objective(tr, X, y, groups),
                        n_trials=self.n_iter_search, timeout=self.optuna_timeout,
                        n_jobs=self.optuna_n_jobs)
+        _report_best_params("xgb/bayesian", study.best_params,
+                            getattr(self, "verbose", 1), study.best_value)
         return study.best_params
 
     # ====================================================== hyperparameters
     def compute_hyperparameters(self, Predictors, Predictand,
+                                clim_year_start=None, clim_year_end=None):
+        """Tune with fold-local standardization, target encoding and climate zones."""
+        return _strict_regional_hyperparameters(
+            self, Predictors, Predictand, clim_year_start, clim_year_end)
+
+    def compute_hyperparameters_legacy(self, Predictors, Predictand,
                                 clim_year_start=None, clim_year_end=None):
         """
         Best hyperparameters per zone.
@@ -8747,8 +10983,9 @@ class WAS_mme_XGBoosting:
         Standardization is applied here only if clim years are given; when None,
         the inputs are assumed already standardized (framework path).
         """
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        Predictors = align_predictor_target(Predictors, Predictand, mode="season_year")
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
         Predictand.name = "varname"
 
         if clim_year_start is not None and clim_year_end is not None:
@@ -8778,6 +11015,7 @@ class WAS_mme_XGBoosting:
             X_clean, y_clean, groups_c = Xv[~bad], yv[~bad], groups_full[~bad]
 
             n_years = len(np.unique(groups_c))
+            _effective_sample_warning(n_years, X_clean.shape[1], "WAS_mme_XGBoosting")
             if len(X_clean) < self.cv_folds * 2 or n_years < 2:
                 if self.verbose:
                     print(f"Cluster {c_int}: insufficient data "
@@ -8795,6 +11033,7 @@ class WAS_mme_XGBoosting:
 
         self.best_params_ = best_params_dict
         self.cluster_da_ = cluster_da
+        _report_best_params("xgb", best_params_dict, getattr(self, "verbose", 1))
         return best_params_dict, cluster_da
 
     # ============================================================ deterministic
@@ -8819,57 +11058,84 @@ class WAS_mme_XGBoosting:
 
     def compute_model(self, X_train, y_train, X_test, y_test=None,
                       clim_year_start=None, clim_year_end=None,
-                      best_params=None, cluster_da=None):
+                      best_params=None, cluster_da=None, covariates=None):
         """
-        Deterministic hindcast with one XGBRegressor per zone.
+        Deterministic hindcast with one XGBRegressor per zone (or one global
+        model plus spatial covariates when ``spatial_mode`` is "soft").
 
         >>> A: clim years are now in the signature and tuning runs in dual
         mode when best_params/cluster_da are not supplied.
         """
-        if best_params is None or cluster_da is None:
-            best_params, cluster_da = self.compute_hyperparameters(
-                X_train, y_train, clim_year_start, clim_year_end)
+        validate_mme_predictor_schema(X_train, X_test)
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
+        best_params, cluster_da = _resolve_regional_params(
+            self, X_train, y_train, clim_year_start, clim_year_end, best_params, cluster_da)
+        _raw_predictors = (X_train, X_test)   # avant covariables : pour la calibration
+        X_train, X_test = _prepare_channels(self, X_train, X_test, y_train, covariates,
+                                            clim_year_start, clim_year_end)
 
         time, lat, lon = X_test['T'], X_test['Y'], X_test['X']
         n_time, n_lat, n_lon = len(time), len(lat), len(lon)
-        predictions = np.full((n_time, n_lat, n_lon), np.nan)
+        predictions = np.full((n_time * n_lat * n_lon,), np.nan)
         self.xgb = {}
 
-        for c in range(self.n_clusters):
-            if c not in best_params:
-                continue
+        # Stack once per fold, then index rows per cluster. The previous loop
+        # re-materialised the full (T, M, Y, X) array for every cluster and
+        # discarded ~4/5 of the rows: 2.91 s against 0.20 s on a 350x171 grid.
+        train_rows = _cluster_row_index(cluster_da, X_train.sizes['T'])
+        test_rows = _cluster_row_index(cluster_da, X_test.sizes['T'])
+        active = [c for c in range(self.n_clusters) if c in best_params]
+        # XGBoost genuinely uses threads for histogram building, so the budget
+        # left over by the cluster workers is handed to the model.
+        workers, threads = _cluster_plan(
+            self.n_clusters, self.n_jobs,
+            getattr(self, 'cluster_n_jobs', None), model_is_threaded=True,
+        )
+
+        def _fit_one(c):
             bp = best_params[c]
+            train_sel = _thin_training_rows(train_rows == c, X_train.sizes['T'], n_lat, n_lon,
+                                            getattr(self, 'spatial_subsample', 1))
 
-            m_tr = (cluster_da == c).expand_dims({'T': X_train['T']})
-            m_te = (cluster_da == c).expand_dims({'T': X_test['T']})
+            Xtr, _ = _stack_rows(X_train, train_sel, core='M')
+            ytr, _ = _stack_rows(y_train, train_sel, core=None)
+            ytr = ytr.ravel()
+            keep = np.all(np.isfinite(Xtr), axis=1) & np.isfinite(ytr)
+            if not keep.any():
+                return c, None, None, None
 
-            Xtr = X_train.where(m_tr).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            ytr = y_train.where(m_tr).stack(sample=('T', 'Y', 'X')).values.ravel()
-            tr_bad = np.any(~np.isfinite(Xtr), axis=1) | ~np.isfinite(ytr)
-            Xtr_c, ytr_c = Xtr[~tr_bad], ytr[~tr_bad]
-
-            Xte = X_test.where(m_te).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            te_bad = np.any(~np.isfinite(Xte), axis=1)          # >>> predictor-only mask
-            Xte_c = Xte[~te_bad]
-
-            if len(Xtr_c) == 0:
-                continue
+            Xte, pos = _stack_rows(X_test, test_rows == c, core='M')
+            keep_te = np.all(np.isfinite(Xte), axis=1)
 
             xgb_c = _XGBRegressorES(**self._base_params(bp, self.random_state,
                                                         self.es_validation_fraction,
-                                                        n_jobs=self.n_jobs))
-            xgb_c.fit(Xtr_c, ytr_c)
-            self.xgb[c] = xgb_c
+                                                        n_jobs=threads))
+            years = np.repeat(_calendar_year_groups(X_train["T"]), X_train.sizes["Y"]*X_train.sizes["X"])
+            xgb_c.fit(Xtr[keep], ytr[keep], es_groups=years[train_sel][keep])
+            if not keep_te.any():
+                return c, xgb_c, None, None
+            return c, xgb_c, pos[keep_te], xgb_c.predict(Xte[keep_te])
 
-            if len(Xte_c) > 0:
-                y_pred = xgb_c.predict(Xte_c)
-                result = np.full(Xte.shape[0], np.nan)
-                result[~te_bad] = y_pred
-                predictions = np.where(np.isnan(predictions),
-                                       result.reshape(n_time, n_lat, n_lon), predictions)
+        if workers > 1 and len(active) > 1:
+            results = Parallel(n_jobs=min(workers, len(active)), backend="threading")(
+                delayed(_fit_one)(c) for c in active
+            )
+        else:
+            results = [_fit_one(c) for c in active]
 
-        return xr.DataArray(predictions, coords={'T': time, 'Y': lat, 'X': lon},
-                            dims=['T', 'Y', 'X'])
+        for c, model, pos, vals in results:
+            if model is not None:
+                self.xgb[c] = model
+            if pos is not None:
+                predictions[pos] = vals
+        predictions = predictions.reshape(n_time, n_lat, n_lon)
+
+        predicted_da = xr.DataArray(predictions, coords={'T': time, 'Y': lat, 'X': lon},
+                                    dims=['T', 'Y', 'X'])
+        return _maybe_calibrate_amplitude(
+            self, self.xgb, X_train, y_train, predicted_da, cluster_da, X_test=X_test,
+            raw_predictors=_raw_predictors, best_params=best_params,
+            clim_year_start=clim_year_start, clim_year_end=clim_year_end)
 
     # ------------------ Probability Calculation Methods ------------------
     @staticmethod
@@ -9023,22 +11289,8 @@ class WAS_mme_XGBoosting:
 
     @staticmethod
     def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        """Non-parametric method using historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t_ in range(n_time):
-            if np.isnan(best_guess[t_]):
-                continue
-            dist = best_guess[t_] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            pred_prob[0, t_] = p_below
-            pred_prob[1, t_] = p_between
-            pred_prob[2, t_] = 1.0 - (p_below + p_between)
-        return pred_prob
+        return WAS_mme_Weighted.calculate_tercile_probabilities_nonparametric(
+            best_guess, error_samples, first_tercile, second_tercile)
 
     def compute_prob(self, Predictant: xr.DataArray, clim_year_start, clim_year_end,
                      hindcast_det: xr.DataArray, best_code_da=None, best_shape_da=None,
@@ -9051,31 +11303,36 @@ class WAS_mme_XGBoosting:
         probabilities.
         """
         if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+            Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where(np.isfinite(Predictant).sum(dim='T') >= 3, 1.0, np.nan)
 
         clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
         if clim.sizes.get("T", 0) < 3:
             raise ValueError("Not enough years in climatology period for terciles.")
 
-        error_variance = (Predictant - hindcast_det).var(dim="T")
+        error_variance = ((Predictant - hindcast_det) ** 2).mean(dim="T", skipna=True)
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
-        terciles_emp = clim.quantile([1/3, 2/3], dim="T")        # >>> 1/3, 2/3
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
+        terciles_emp = climatological_terciles(clim)[0]        # >>> 1/3, 2/3
+        T1_emp = terciles_emp.isel(quantile=0, drop=True)
+        T2_emp = terciles_emp.isel(quantile=1, drop=True)
 
         dm = self.dist_method
         if dm == "bestfit":
             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
                 raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, "
                                  "best_loc_da, best_scale_da.")
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                T1, T2 = _pufunc(
+                    self._ppf_terciles_from_code,
+                    best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                    input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
+                    vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            else:
+                T1, T2 = T1_emp, T2_emp
             hindcast_prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
                 hindcast_det, error_variance, T1, T2, best_code_da,
@@ -9104,16 +11361,15 @@ class WAS_mme_XGBoosting:
                  hindcast_det_cross, Predictor_for_year, best_params=None, cluster_da=None,
                  best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         """Operational forecast for a target year (deterministic + tercile probabilities)."""
-        if "M" in Predictant.coords:
-            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        validate_mme_predictor_schema(hindcast_det, Predictor_for_year)
+        if "M" in Predictant.dims:
+            Predictant_no_m = Predictant.isel(M=0, drop=True)
         else:
             Predictant_no_m = Predictant
-        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+        mask = xr.where(np.isfinite(Predictant_no_m).sum(dim='T') >= 3, 1.0, np.nan).to_numpy()
 
-        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        hindcast_det_st, Predictor_for_year_st = standardize_mme_predictors(
+            hindcast_det, Predictor_for_year, clim_year_start, clim_year_end)
         Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
         hindcast_det_st['T'] = Predictant_st['T']
         hindcast_det_cross = hindcast_det_cross.assign_coords(T=Predictant_st['T'])
@@ -9121,9 +11377,12 @@ class WAS_mme_XGBoosting:
         time, lat, lon = Predictor_for_year_st['T'], Predictor_for_year_st['Y'], Predictor_for_year_st['X']
         n_time, n_lat, n_lon = len(time), len(lat), len(lon)
 
-        if best_params is None or cluster_da is None:
-            best_params, cluster_da = self.compute_hyperparameters(
-                hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
+        best_params, cluster_da = _resolve_regional_params(
+            self, hindcast_det, Predictant_no_m, clim_year_start, clim_year_end,
+            best_params, cluster_da)
+        hindcast_det_st, Predictor_for_year_st = _prepare_channels(
+            self, hindcast_det_st, Predictor_for_year_st, Predictant_no_m, None,
+            clim_year_start, clim_year_end)
 
         predictions = np.full((n_time, n_lat, n_lon), np.nan)
         self.xgb = {}
@@ -9150,7 +11409,8 @@ class WAS_mme_XGBoosting:
             xgb_c = _XGBRegressorES(**self._base_params(bp, self.random_state,
                                                         self.es_validation_fraction,
                                                         n_jobs=self.n_jobs))
-            xgb_c.fit(Xtr_c, ytr_c)
+            years = np.repeat(_calendar_year_groups(hindcast_det_st["T"]), hindcast_det_st.sizes["Y"]*hindcast_det_st.sizes["X"])
+            xgb_c.fit(Xtr_c, ytr_c, es_groups=years[~tr_bad])
             self.xgb[c] = xgb_c
 
             if len(Xte_c) > 0:
@@ -9173,10 +11433,10 @@ class WAS_mme_XGBoosting:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([1/3, 2/3], dim='T')      # >>> 1/3, 2/3
-        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        terciles = climatological_terciles(rainfall_for_tercile)[0]      # >>> 1/3, 2/3
+        T1_emp = terciles.isel(quantile=0, drop=True)
+        T2_emp = terciles.isel(quantile=1, drop=True)
+        error_variance = ((Predictant_no_m - hindcast_det_cross) ** 2).mean(dim="T", skipna=True)
         dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
 
         dm = self.dist_method
@@ -9184,11 +11444,16 @@ class WAS_mme_XGBoosting:
             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
                 raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, "
                                  "best_loc_da, best_scale_da.")
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                T1, T2 = _pufunc(
+                    self._ppf_terciles_from_code,
+                    best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                    input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
+                    vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            else:
+                T1, T2 = T1_emp, T2_emp
             forecast_prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
                 result_da, error_variance, T1, T2, best_code_da,
@@ -9217,67 +11482,77 @@ class WAS_mme_XGBoosting:
 
 
 
-class HPELMWrapper(BaseEstimator, RegressorMixin):
+def _hpelm_effective_norm(norm, n_rows, scaling="absolute"):
+    """Ridge term added to diag(F'F); see :func:`wass2s.was_elm.effective_norm`.
+
+    ``scaling="absolute"`` is hpelm's historical meaning (``norm`` as is,
+    inert on ~1e5-1e6 pooled rows); ``"per_sample"`` is a ridge PER ROW
+    (lambda_eff = norm * n_rows), transferable across sample sizes.
     """
-    Wrapper for HPELM to make it compatible with scikit-learn's hyperparameter optimization.
+    return _elm_effective_norm(norm, n_rows, scaling)
+
+
+def _hpelm_random_layer(rng, X, neurons, activation, scaling="absolute"):
+    """Random hidden layer (kept for callers of the historical helper).
+
+    ``rng`` may be a seed or a ``RandomState`` (an integer seed is then drawn
+    from it). The layer is nested in ``neurons``; see
+    :func:`wass2s.was_elm.random_layer`.
     """
-    def __init__(self, neurons=10, activation='sigm', norm=1.0, random_state=42):
-        self.neurons = neurons
-        self.activation = activation
-        self.norm = norm
-        self.random_state = random_state
-        self.model = None
+    seed = int(rng.randint(0, 2 ** 31 - 1)) if hasattr(rng, "randint") else int(rng)
+    return _elm_random_layer(seed, X, neurons, activation, scaling)
 
-    def fit(self, X, y):
-        if HPELM is None:
-            raise ImportError("HPELMWrapper requires the optional 'hpelm' package.")
-        if not np.isfinite(float(self.norm)) or float(self.norm) <= 0.0:
-            raise ValueError("HPELM norm must be finite and strictly positive.")
-        rng = np.random.RandomState(self.random_state)
-        
-        self.model = HPELM(inputs=X.shape[1], outputs=1, classification='r', norm=self.norm)
-        
-        # Generate reproducible weights
-        W = rng.randn(X.shape[1], self.neurons)
-        B = rng.randn(self.neurons)
-        
-        self.model.add_neurons(self.neurons, self.activation, W=W, B=B)
-        self.model.train(X, y, 'r')
-        return self
 
-    def predict(self, X):
-        return self.model.predict(X).ravel()
+def _elm_structure(model):
+    """``linear_part`` / ``n_seeds`` of a WAS_mme_hpELM (hpelm's model for old pickles)."""
+    return dict(linear_part=bool(getattr(model, 'linear_part', False)),
+                n_seeds=int(getattr(model, 'n_seeds', 1)))
 
-    def score(self, X, y):
-        from sklearn.metrics import mean_squared_error
-        y_pred = self.predict(X)
-        return -mean_squared_error(y, y_pred)  # Negative MSE for optimization
 
-    def get_params(self, deep=True):
-        return {'neurons': self.neurons, 'activation': self.activation, 'norm': self.norm, 'random_state': self.random_state}
+class HPELMWrapper(ELMRegressor):
+    """Historical name of the ELM regressor (hpelm's model: no linear part, one draw).
 
-    def set_params(self, **params):
-        for param, value in params.items():
-            setattr(self, param, value)
-        return self
+    Identical predictions to ``hpelm.HPELM`` for the same random layer and
+    ``norm`` (``tests/test_elm_gram.py``), without the hpelm dependency.
+    """
 
+    def __init__(self, neurons=10, activation='sigm', norm=1.0, random_state=42,
+                 norm_scaling='absolute', linear_part=False, n_seeds=1):
+        super().__init__(neurons=neurons, activation=activation, norm=norm,
+                         random_state=random_state, norm_scaling=norm_scaling,
+                         linear_part=linear_part, n_seeds=n_seeds)
 
 
 class WAS_mme_hpELM:
     """
-    Extreme Learning Machine (ELM) based Multi-Model Ensemble (MME) forecasting using hpelm library.
-    This class implements a single-model forecasting approach using HPELM for deterministic predictions,
-    with optional tercile probability calculations using various statistical distributions.
-    Implements hyperparameter optimization via multiple methods.
-    
+    Extreme Learning Machine (ELM) Multi-Model Ensemble.
+
+    The ELM is computed by Gram matrices in numpy (:mod:`wass2s.was_elm`); the
+    ``hpelm`` package is no longer used (the class keeps its name). A network
+    is a ridge regression on ``F = [1 | X | g(X W + B)]``: an unpenalised
+    intercept, the input channels (``linear_part=True``) and ``neurons``
+    random units. With ``neurons=0`` it IS a ridge regression, so the tuning
+    grid contains its own baseline. Predictions are averaged over ``n_seeds``
+    random layers. The random layer is nested in ``neurons`` and the ridge only
+    moves the diagonal, so the strict regional tuning evaluates the whole
+    ``(activation, neurons, norm)`` grid from one pass over each fold
+    (``ELMGramBank``) instead of one fit per candidate.
+
     Parameters
     ----------
     neurons_range : list of int, optional
-        List of neuron counts to tune for HPELM (default is [10, 20, 50, 100]).
+        Numbers of random units tuned (default [0, 50, 100, 300]; 0 = ridge).
     activation_options : list of str, optional
-        Activation functions to tune for HPELM (default is ['sigm', 'tanh', 'lin', 'rbf_l1', 'rbf_l2', 'rbf_linf']).
+        Among 'tanh', 'sigm', 'lin', 'rbf_l1', 'rbf_l2', 'rbf_linf' (default ['tanh']).
     norm_range : list of float, optional
-        Regularization parameters to tune for HPELM (default is [0.1, 1.0, 10.0, 100.0]).
+        Ridge per row with ``norm_scaling='per_sample'`` (default
+        [1e-2, 0.1, 1, 10, 100, 1000]; on the MJJ 0.1 deg evaluation the
+        one-SE rule selected 1000 in every fold).
+    linear_part : bool, optional
+        Include the intercept and the input channels in the regression
+        (default True). False is hpelm's historical model.
+    n_seeds : int, optional
+        Random layers averaged (default 3; 1 is hpelm's behaviour).
     random_state : int, optional
         Seed for reproducibility (default is 42).
     dist_method : str, optional
@@ -9304,14 +11579,13 @@ class WAS_mme_hpELM:
 
 
     def __init__(self,
-                 neurons_range=[10, 20, 50, 100],
-                 # >>> valid HPELM activations only (was 'relu'/'rbf_gauss')
-                 activation_options=['sigm', 'tanh', 'lin', 'rbf_l1', 'rbf_l2', 'rbf_linf'],
-                 norm_range=[0.1, 1.0, 10.0, 100.0],
+                 neurons_range=[0, 50, 100, 300],
+                 activation_options=['tanh'],
+                 norm_range=None,
                  random_state=42,
                  dist_method="nonparam",
                  search_method='random',
-                 n_iter_search=10,
+                 n_iter_search=100,
                  cv_folds=3,
                  n_clusters=4,
                  leave_one_year_out=False,          # >>> E
@@ -9321,10 +11595,43 @@ class WAS_mme_hpELM:
                  verbose=0,
                  n_jobs=-1,
                  optuna_n_jobs=None,
-                 cv_n_jobs=-1):
-
-        if HPELM is None:
-            raise ImportError("WAS_mme_hpELM requires the optional 'hpelm' package.")
+                 cv_n_jobs=-1,
+                 cluster_n_jobs: Optional[int] = None,
+                 spatial_subsample: int = 1,
+                 norm_scaling: str = 'per_sample',
+                 spatial_mode: str = "zones",
+                 covariate_names: Optional[Sequence[str]] = None,
+                 static_fields: Optional[Dict[str, xr.DataArray]] = None,
+                 coord_step: Optional[float] = None,
+                 zones_as_features: bool = False,
+                 predictor_smoothing: int = 0,
+                 one_se_rule: bool = False,
+                 amplitude_calibration=True,
+                 amplitude_calibration_inner_folds: int = 3,
+                 linear_part: bool = True,
+                 n_seeds: int = 3):
+        # Cluster-level parallelism and optional thinning of the
+        # TRAINING sample. See _cluster_plan and _stack_rows.
+        self.cluster_n_jobs = cluster_n_jobs
+        self.spatial_subsample = max(1, int(spatial_subsample))
+        _init_spatial_options(self, spatial_mode, covariate_names, static_fields,
+                              coord_step, zones_as_features, predictor_smoothing, one_se_rule,
+                              amplitude_calibration, amplitude_calibration_inner_folds)
+        self.linear_part = bool(linear_part)
+        self.n_seeds = max(1, int(n_seeds))
+        bad = [a for a in activation_options if a not in ('lin', 'tanh', 'sigm', 'rbf_l1', 'rbf_l2', 'rbf_linf')]
+        if bad:
+            raise ValueError(f"Unknown ELM activations {bad}.")
+        if not self.linear_part and any(int(n) <= 0 for n in (neurons_range if not hasattr(neurons_range, 'support') else [1])):
+            raise ValueError("neurons=0 needs linear_part=True (it is then a ridge regression).")
+        # norm_scaling: 'per_sample' (ridge per row, default; see
+        # _hpelm_effective_norm) or 'absolute' (historical hpelm meaning).
+        if str(norm_scaling) not in ('per_sample', 'absolute'):
+            raise ValueError("norm_scaling must be 'per_sample' or 'absolute'.")
+        self.norm_scaling = str(norm_scaling)
+        if norm_range is None:
+            norm_range = ([1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0] if self.norm_scaling == 'per_sample'
+                          else [1.0, 10.0, 100.0, 1000.0])
         self.neurons_range = neurons_range
         self.activation_options = activation_options
         self.norm_range = norm_range
@@ -9399,7 +11706,9 @@ class WAS_mme_hpELM:
         norm_ = trial.suggest_float('norm', low_f, high_f, log=True)
 
         model = HPELMWrapper(neurons=neurons, activation=activation, norm=norm_,
-                             random_state=self.random_state)
+                             random_state=self.random_state,
+                             norm_scaling=getattr(self, 'norm_scaling', 'absolute'),
+                             **_elm_structure(self))
         scores = cross_val_score(model, X, y, cv=self._cv_splitter(groups), groups=groups,
                                  scoring=self.scoring, n_jobs=self.cv_n_jobs)
         return float(np.mean(scores))
@@ -9416,7 +11725,10 @@ class WAS_mme_hpELM:
                     param_grid[name] = np.linspace(low, high, 5).astype(int).tolist()
             else:
                 param_grid[name] = list(p_range)
-        gs = GridSearchCV(HPELMWrapper(random_state=self.random_state), param_grid=param_grid,
+        gs = GridSearchCV(HPELMWrapper(random_state=self.random_state,
+                                       norm_scaling=getattr(self, 'norm_scaling', 'absolute'),
+                                       **_elm_structure(self)),
+                          param_grid=param_grid,
                           cv=self._cv_splitter(groups), scoring=self.scoring,
                           n_jobs=self.n_jobs)
         gs.fit(X, y, groups=groups)        # >>> E
@@ -9425,7 +11737,9 @@ class WAS_mme_hpELM:
     def _random_search_optimization(self, X, y, groups):
         param_dist = {'neurons': self.neurons_range, 'activation': self.activation_options,
                       'norm': self.norm_range}
-        rs = RandomizedSearchCV(HPELMWrapper(random_state=self.random_state),
+        rs = RandomizedSearchCV(HPELMWrapper(random_state=self.random_state,
+                                             norm_scaling=getattr(self, 'norm_scaling', 'absolute'),
+                                             **_elm_structure(self)),
                                 param_distributions=param_dist, n_iter=self.n_iter_search,
                                 cv=self._cv_splitter(groups), scoring=self.scoring,
                                 random_state=self.random_state, n_jobs=self.n_jobs)
@@ -9443,10 +11757,23 @@ class WAS_mme_hpELM:
                        n_trials=self.n_trials_bayesian, n_jobs=self.optuna_n_jobs)
         if cluster_id is not None:
             self.bayesian_studies[cluster_id] = study
+        # hpELM's tuning was silent: unlike WAS_mme_RF it printed nothing per
+        # cluster, so a run looked stalled between "Cross-validation ongoing"
+        # and the next stage. One line per cluster, gated on verbose.
+        if self.verbose:
+            print(f"[hpelm] cluster {cluster_id}: {len(study.trials)} essais, "
+                  f"meilleur score={study.best_value:.4f}, "
+                  f"params={study.best_params}", flush=True)
         return study.best_params
 
     # ====================================================== hyperparameters
     def compute_hyperparameters(self, Predictors, Predictand,
+                                clim_year_start=None, clim_year_end=None):
+        """Tune with fold-local standardization, target encoding and climate zones."""
+        return _strict_regional_hyperparameters(
+            self, Predictors, Predictand, clim_year_start, clim_year_end)
+
+    def compute_hyperparameters_legacy(self, Predictors, Predictand,
                                 clim_year_start=None, clim_year_end=None):
         """
         Best hyperparameters per zone.
@@ -9454,11 +11781,12 @@ class WAS_mme_hpELM:
         Regionalization: KMeans on the predictand VALUES (kept by preference).
         Standardization is applied here only if clim years are given (dual mode).
         """
+        Predictors = align_predictor_target(Predictors, Predictand, mode="season_year")
         np.random.seed(self.random_state)
         random.seed(self.random_state)
 
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
         Predictand.name = "varname"
 
         if clim_year_start is not None and clim_year_end is not None:
@@ -9488,6 +11816,7 @@ class WAS_mme_hpELM:
             X_clean, y_clean, groups_c = Xv[~bad], yv[~bad], groups_full[~bad]
 
             n_years = len(np.unique(groups_c))
+            _effective_sample_warning(n_years, X_clean.shape[1], "WAS_mme_hpELM")
             if len(X_clean) < self.cv_folds * 2 or n_years < 2:
                 if self.verbose:
                     print(f"Cluster {c_int}: insufficient data "
@@ -9508,63 +11837,103 @@ class WAS_mme_hpELM:
 
     # ============================================================ deterministic
     def _fit_predict_cluster(self, bp, Xtr_c, ytr_c, Xte_c):
-        """Train one HPELM and predict; returns predictions for the clean test rows."""
-        hp = HPELM(inputs=Xtr_c.shape[1], outputs=1, classification='r', norm=bp['norm'])
-        rng = np.random.RandomState(self.random_state)
-        W = rng.randn(Xtr_c.shape[1], bp['neurons'])
-        B = rng.randn(bp['neurons'])
-        hp.add_neurons(bp['neurons'], bp['activation'], W=W, B=B)
-        hp.train(Xtr_c, ytr_c, 'r')
-        return hp, hp.predict(Xte_c).ravel()
+        """Train one ELM and predict; returns ``(model, predictions of Xte_c)``.
+
+        ``model`` is an :class:`~wass2s.was_elm.ELMRegressor` (``predict``,
+        ``coef_``, ``n_features_in_``). RBF activations draw their centres from
+        the training rows and positive widths (hpelm reads W/B as centres and
+        widths for 'rbf_*'); an all-NaN prediction is never returned silently.
+        """
+        activation, n_neurons = bp['activation'], int(bp['neurons'])
+        model = HPELMWrapper(neurons=n_neurons, activation=activation, norm=bp['norm'],
+                             random_state=self.random_state,
+                             norm_scaling=getattr(self, 'norm_scaling', 'absolute'),
+                             **_elm_structure(self))
+        model.fit(Xtr_c, np.asarray(ytr_c).ravel())
+        pred = np.asarray(model.predict(Xte_c)).ravel()
+
+        if Xte_c.shape[0] and not np.any(np.isfinite(pred)):
+            warnings.warn(
+                f"ELM activation {activation!r} produced no finite prediction "
+                f"({n_neurons} neurons, norm={bp['norm']}); this cluster would "
+                "have been silently empty.",
+                RuntimeWarning, stacklevel=2,
+            )
+        return model, pred
 
     def compute_model(self, X_train, y_train, X_test, y_test=None,
                       clim_year_start=None, clim_year_end=None,
-                      best_params=None, cluster_da=None):
+                      best_params=None, cluster_da=None, covariates=None):
         """
-        Deterministic hindcast with one HPELM per zone.
+        Deterministic hindcast with one HPELM per zone (or one global model
+        plus spatial covariates when ``spatial_mode`` is "soft").
 
         >>> A: clim years now in the signature; tuning runs in dual mode when
         best_params/cluster_da are not supplied.
         """
-        if best_params is None or cluster_da is None:
-            best_params, cluster_da = self.compute_hyperparameters(
-                X_train, y_train, clim_year_start, clim_year_end)
+        validate_mme_predictor_schema(X_train, X_test)
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
+        best_params, cluster_da = _resolve_regional_params(
+            self, X_train, y_train, clim_year_start, clim_year_end, best_params, cluster_da)
+        _raw_predictors = (X_train, X_test)   # avant covariables : pour la calibration
+        X_train, X_test = _prepare_channels(self, X_train, X_test, y_train, covariates,
+                                            clim_year_start, clim_year_end)
 
         time, lat, lon = X_test['T'], X_test['Y'], X_test['X']
         n_time, n_lat, n_lon = len(time), len(lat), len(lon)
-        predictions = np.full((n_time, n_lat, n_lon), np.nan)
+        predictions = np.full((n_time * n_lat * n_lon,), np.nan)
         self.hpelm = {}
 
-        for c in range(self.n_clusters):
-            if c not in best_params:
-                continue
+        train_rows = _cluster_row_index(cluster_da, X_train.sizes['T'])
+        test_rows = _cluster_row_index(cluster_da, X_test.sizes['T'])
+        active = [c for c in range(self.n_clusters) if c in best_params]
+        # HPELM is a BLAS-bound least-squares solve. With OMP_NUM_THREADS=1 in
+        # the launcher, the cluster axis is the only parallelism available.
+        workers, _threads = _cluster_plan(
+            self.n_clusters, self.n_jobs,
+            getattr(self, 'cluster_n_jobs', None), model_is_threaded=False,
+        )
+
+        def _fit_one(c):
             bp = best_params[c]
+            train_sel = _thin_training_rows(train_rows == c, X_train.sizes['T'], n_lat, n_lon,
+                                            getattr(self, 'spatial_subsample', 1))
 
-            m_tr = (cluster_da == c).expand_dims({'T': X_train['T']})
-            m_te = (cluster_da == c).expand_dims({'T': X_test['T']})
+            Xtr, _ = _stack_rows(X_train, train_sel, core='M')
+            ytr, _ = _stack_rows(y_train, train_sel, core=None)
+            ytr = ytr.ravel()
+            keep = np.all(np.isfinite(Xtr), axis=1) & np.isfinite(ytr)
 
-            Xtr = X_train.where(m_tr).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            ytr = y_train.where(m_tr).stack(sample=('T', 'Y', 'X')).values.ravel()
-            tr_bad = np.any(~np.isfinite(Xtr), axis=1) | ~np.isfinite(ytr)
-            Xtr_c, ytr_c = Xtr[~tr_bad], ytr[~tr_bad]
+            Xte, pos = _stack_rows(X_test, test_rows == c, core='M')
+            keep_te = np.all(np.isfinite(Xte), axis=1)
+            if not keep.any() or not keep_te.any():
+                return c, None, None, None
 
-            Xte = X_test.where(m_te).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            te_bad = np.any(~np.isfinite(Xte), axis=1)         # >>> predictor-only mask
-            Xte_c = Xte[~te_bad]
+            hp, y_pred = self._fit_predict_cluster(
+                bp, Xtr[keep], ytr[keep], Xte[keep_te]
+            )
+            return c, hp, pos[keep_te], y_pred
 
-            if len(Xtr_c) == 0 or len(Xte_c) == 0:
-                continue
+        if workers > 1 and len(active) > 1:
+            results = Parallel(n_jobs=min(workers, len(active)), backend="threading")(
+                delayed(_fit_one)(c) for c in active
+            )
+        else:
+            results = [_fit_one(c) for c in active]
 
-            hp, y_pred = self._fit_predict_cluster(bp, Xtr_c, ytr_c, Xte_c)
-            self.hpelm[c] = hp
+        for c, model, pos, vals in results:
+            if model is not None:
+                self.hpelm[c] = model
+            if pos is not None:
+                predictions[pos] = vals
+        predictions = predictions.reshape(n_time, n_lat, n_lon)
 
-            result = np.full(Xte.shape[0], np.nan)
-            result[~te_bad] = y_pred
-            predictions = np.where(np.isnan(predictions),
-                                   result.reshape(n_time, n_lat, n_lon), predictions)
-
-        return xr.DataArray(predictions, coords={'T': time, 'Y': lat, 'X': lon},
-                            dims=['T', 'Y', 'X'])
+        predicted_da = xr.DataArray(predictions, coords={'T': time, 'Y': lat, 'X': lon},
+                                    dims=['T', 'Y', 'X'])
+        return _maybe_calibrate_amplitude(
+            self, self.hpelm, X_train, y_train, predicted_da, cluster_da, X_test=X_test,
+            raw_predictors=_raw_predictors, best_params=best_params,
+            clim_year_start=clim_year_start, clim_year_end=clim_year_end)
 
     # ------------------ Probability Calculation Methods ------------------
     @staticmethod
@@ -9710,51 +12079,43 @@ class WAS_mme_hpELM:
 
     @staticmethod
     def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t_ in range(n_time):
-            if np.isnan(best_guess[t_]):
-                continue
-            dist = best_guess[t_] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            pred_prob[0, t_] = p_below
-            pred_prob[1, t_] = p_between
-            pred_prob[2, t_] = 1.0 - (p_below + p_between)
-        return pred_prob
+        return WAS_mme_Weighted.calculate_tercile_probabilities_nonparametric(
+            best_guess, error_samples, first_tercile, second_tercile)
 
     def compute_prob(self, Predictant: xr.DataArray, clim_year_start, clim_year_end,
                      hindcast_det: xr.DataArray, best_code_da=None, best_shape_da=None,
                      best_loc_da=None, best_scale_da=None) -> xr.DataArray:
         """Tercile probabilities for deterministic hindcasts (pass the CV hindcast for calibration)."""
         if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+            Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where(np.isfinite(Predictant).sum(dim='T') >= 3, 1.0, np.nan)
 
         clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
         if clim.sizes.get("T", 0) < 3:
             raise ValueError("Not enough years in climatology period for terciles.")
 
-        error_variance = (Predictant - hindcast_det).var(dim="T")
+        error_variance = ((Predictant - hindcast_det) ** 2).mean(dim="T", skipna=True)
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
-        terciles_emp = clim.quantile([1/3, 2/3], dim="T")       # >>> 1/3, 2/3
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
+        terciles_emp = climatological_terciles(clim)[0]       # >>> 1/3, 2/3
+        T1_emp = terciles_emp.isel(quantile=0, drop=True)
+        T2_emp = terciles_emp.isel(quantile=1, drop=True)
 
         dm = self.dist_method
         if dm == "bestfit":
             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
                 raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, "
                                  "best_loc_da, best_scale_da.")
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                T1, T2 = _pufunc(
+                    self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                    input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
+                    vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            else:
+                T1, T2 = T1_emp, T2_emp
             hindcast_prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
                 hindcast_det, error_variance, T1, T2, best_code_da,
@@ -9781,25 +12142,27 @@ class WAS_mme_hpELM:
                  hindcast_det_cross, Predictor_for_year, best_params=None, cluster_da=None,
                  best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         """Operational forecast for a target year (deterministic + tercile probabilities)."""
-        if "M" in Predictant.coords:
-            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        validate_mme_predictor_schema(hindcast_det, Predictor_for_year)
+        if "M" in Predictant.dims:
+            Predictant_no_m = Predictant.isel(M=0, drop=True)
         else:
             Predictant_no_m = Predictant
-        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+        mask = xr.where(np.isfinite(Predictant_no_m).sum(dim='T') >= 3, 1.0, np.nan).to_numpy()
 
-        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        hindcast_det_st, Predictor_for_year_st = standardize_mme_predictors(
+            hindcast_det, Predictor_for_year, clim_year_start, clim_year_end)
         Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
         hindcast_det_st['T'] = Predictant_st['T']
 
         time, lat, lon = Predictor_for_year_st['T'], Predictor_for_year_st['Y'], Predictor_for_year_st['X']
         n_time, n_lat, n_lon = len(time), len(lat), len(lon)
 
-        if best_params is None or cluster_da is None:
-            best_params, cluster_da = self.compute_hyperparameters(
-                hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
+        best_params, cluster_da = _resolve_regional_params(
+            self, hindcast_det, Predictant_no_m, clim_year_start, clim_year_end,
+            best_params, cluster_da)
+        hindcast_det_st, Predictor_for_year_st = _prepare_channels(
+            self, hindcast_det_st, Predictor_for_year_st, Predictant_no_m, None,
+            clim_year_start, clim_year_end)
 
         predictions = np.full((n_time, n_lat, n_lon), np.nan)
         self.hpelm = {}
@@ -9844,10 +12207,10 @@ class WAS_mme_hpELM:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([1/3, 2/3], dim='T')   # >>> 1/3, 2/3
-        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')
+        terciles = climatological_terciles(rainfall_for_tercile)[0]   # >>> 1/3, 2/3
+        T1_emp = terciles.isel(quantile=0, drop=True)
+        T2_emp = terciles.isel(quantile=1, drop=True)
+        error_variance = ((Predictant_no_m - hindcast_det_cross) ** 2).mean(dim="T", skipna=True)
         dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
 
         dm = self.dist_method
@@ -9855,10 +12218,15 @@ class WAS_mme_hpELM:
             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
                 raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, "
                                  "best_loc_da, best_scale_da.")
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                T1, T2 = _pufunc(
+                    self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                    input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
+                    vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            else:
+                T1, T2 = T1_emp, T2_emp
             forecast_prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
                 result_da, error_variance, T1, T2, best_code_da,
@@ -9913,25 +12281,43 @@ class WAS_mme_MLP:
 
     def __init__(self,
                  search_method='random',
-                 hidden_layer_sizes_range=[(2,), (4,), (2,4), (8,), (8,16), (16,)],
+                 hidden_layer_sizes_range=[(2,), (4,), (8,), (4, 2)],
                  activation_options=['relu', 'tanh', 'identity'],
                  learning_rate_init_range=loguniform(0.0001, 0.01),
-                 solver_options=['adam', 'sgd', 'lbfgs'],
-                 alpha_range=[0.0001, 0.001, 0.01, 0.1],
-                 max_iter=200,
+                 solver_options=['lbfgs', 'adam'],
+                 alpha_range=[0.01, 0.1, 1.0, 10.0],
+                 max_iter=500,
                  random_state=42,
                  dist_method="nonparam",
                  n_iter_search=10,
                  cv_folds=3,
                  n_clusters=4,
-                 early_stopping_options=[True, False],
+                 early_stopping_options=[False],
                  validation_fraction=0.1,
                  n_iter_no_change=10,
                  leave_one_year_out=False,
                  optuna_n_jobs=None,
                  optuna_timeout=None,
                  n_jobs=-1,
-                 cv_n_jobs=-1):
+                 cv_n_jobs=-1,
+                 cluster_n_jobs: Optional[int] = None,
+                 spatial_subsample: int = 1,
+                 spatial_mode: str = "zones",
+                 covariate_names: Optional[Sequence[str]] = None,
+                 static_fields: Optional[Dict[str, xr.DataArray]] = None,
+                 coord_step: Optional[float] = None,
+                 zones_as_features: bool = False,
+                 predictor_smoothing: int = 0,
+                 one_se_rule: bool = False,
+                 amplitude_calibration=True,
+                 amplitude_calibration_inner_folds: int = 3):
+        # Cluster-level parallelism and optional thinning of the
+        # TRAINING sample. See _cluster_plan and _stack_rows.
+        self.cluster_n_jobs = cluster_n_jobs
+        self.spatial_subsample = max(1, int(spatial_subsample))
+        _init_spatial_options(self, spatial_mode, covariate_names, static_fields,
+                              coord_step, zones_as_features, predictor_smoothing, one_se_rule,
+                              amplitude_calibration, amplitude_calibration_inner_folds)
 
         self.search_method = search_method
         self.hidden_layer_sizes_range = hidden_layer_sizes_range
@@ -9948,7 +12334,9 @@ class WAS_mme_MLP:
         # early_stopping is a native MLPRegressor option (sgd/adam only; ignored
         # for lbfgs). Tunable via early_stopping_options; validation_fraction and
         # n_iter_no_change configure it.
-        self.early_stopping_options = early_stopping_options
+        if any(bool(v) for v in early_stopping_options):
+            warnings.warn("MLP internal early stopping splits pooled pixels across the same year; use explicit grouped epoch selection. Internal early stopping disabled.", RuntimeWarning)
+        self.early_stopping_options = (False,)
         self.validation_fraction = validation_fraction
         self.n_iter_no_change = n_iter_no_change
         self.leave_one_year_out = leave_one_year_out      # E
@@ -10026,6 +12414,12 @@ class WAS_mme_MLP:
     # ------------------------------------------------------ hyperparameters
     def compute_hyperparameters(self, Predictors, Predictand,
                                 clim_year_start=None, clim_year_end=None):
+        """Tune with fold-local standardization, target encoding and climate zones."""
+        return _strict_regional_hyperparameters(
+            self, Predictors, Predictand, clim_year_start, clim_year_end)
+
+    def compute_hyperparameters_legacy(self, Predictors, Predictand,
+                                clim_year_start=None, clim_year_end=None):
         """
         Per-zone hyperparameter tuning. KMeans on predictand VALUES (kept).
 
@@ -10033,8 +12427,9 @@ class WAS_mme_MLP:
         internally; both None -> assume already standardized (framework path),
         so no double-standardization when called from compute_model.
         """
-        if "M" in Predictand.coords:
-            Predictand = Predictand.isel(M=0).drop_vars('M').squeeze()
+        Predictors = align_predictor_target(Predictors, Predictand, mode="season_year")
+        if "M" in Predictand.dims:
+            Predictand = Predictand.isel(M=0, drop=True)
         Predictand.name = "varname"
 
         if clim_year_start is not None and clim_year_end is not None:
@@ -10067,6 +12462,7 @@ class WAS_mme_MLP:
 
             if len(X_clean_c) == 0 or len(np.unique(groups_c)) < 2:
                 continue
+            _effective_sample_warning(len(np.unique(groups_c)), X_clean_c.shape[1], "WAS_mme_MLP")
 
             splitter = self._cv_splitter(groups_c)   # E
 
@@ -10198,17 +12594,34 @@ class WAS_mme_MLP:
             else:
                 raise ValueError(f"Unknown search_method: {self.search_method}. "
                                  "Choose from 'grid', 'random', or 'bayesian'.")    
-            return best_params_dict, cluster_da
+        # BUG FIX: this return was indented INSIDE the `for c in clusters:`
+        # loop, so compute_hyperparameters returned as soon as the FIRST
+        # cluster had been tuned. Every other cluster was missing from
+        # best_params_dict, and compute_model skips a cluster it has no
+        # parameters for -- so on a 5-cluster domain, 4 clusters produced no
+        # MLP prediction at all and the member covered ~1/5 of the grid.
+        # Dedenting it to the method level tunes every cluster.
+        _report_best_params("mlp", best_params_dict, getattr(self, "verbose", 1))
+        return best_params_dict, cluster_da
 
     # ------------------------------------------------------ deterministic fit
     def compute_model(self, X_train, y_train, X_test, y_test=None,
                       clim_year_start=None, clim_year_end=None,
-                      best_params=None, cluster_da=None):
+                      best_params=None, cluster_da=None, covariates=None):
         """
-        Deterministic hindcast per zone. Inputs are assumed standardized (the
-        same_kind_model2 branch standardizes once). A: clim_year_start/end
-        are in the signature, so the best_params=None path no longer raises.
+        Deterministic hindcast per zone (or one global model plus spatial
+        covariates when ``spatial_mode`` is "soft"). Inputs are assumed
+        standardized (the same_kind_model2 branch standardizes once). A:
+        clim_year_start/end are in the signature, so the best_params=None path
+        no longer raises.
         """
+        validate_mme_predictor_schema(X_train, X_test)
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
+        best_params, cluster_da = _resolve_regional_params(                                   # A
+            self, X_train, y_train, clim_year_start, clim_year_end, best_params, cluster_da)
+        _raw_predictors = (X_train, X_test)   # avant covariables : pour la calibration
+        X_train, X_test = _prepare_channels(self, X_train, X_test, y_train, covariates,
+                                            clim_year_start, clim_year_end)
         X_train_std = X_train
         y_train_std = y_train
         X_test_std = X_test
@@ -10216,49 +12629,65 @@ class WAS_mme_MLP:
         time = X_test_std['T']; lat = X_test_std['Y']; lon = X_test_std['X']
         n_time, n_lat, n_lon = len(time), len(lat), len(lon)
 
-        if best_params is None:                                   # A
-            best_params, cluster_da = self.compute_hyperparameters(
-                X_train, y_train, clim_year_start, clim_year_end)
-
-        predictions = np.full((n_time, n_lat, n_lon), np.nan)
+        predictions = np.full((n_time * n_lat * n_lon,), np.nan)
         self.mlp = {}
-        for c in range(self.n_clusters):
-            if c not in best_params:
-                continue
+
+        train_rows = _cluster_row_index(cluster_da, X_train_std.sizes['T'])
+        test_rows = _cluster_row_index(cluster_da, X_test_std.sizes['T'])
+        active = [c for c in range(self.n_clusters) if c in best_params]
+        # MLPRegressor exposes no n_jobs, so the cluster axis is the only
+        # parallelism available here.
+        workers, _threads = _cluster_plan(
+            self.n_clusters, self.n_jobs,
+            getattr(self, 'cluster_n_jobs', None), model_is_threaded=False,
+        )
+
+        def _fit_one(c):
             bp = best_params[c]
-            mask_3d_train = (cluster_da == c).expand_dims({'T': X_train_std['T']})
-            mask_3d_test = (cluster_da == c).expand_dims({'T': X_test_std['T']})
+            train_sel = _thin_training_rows(train_rows == c, X_train_std.sizes['T'], n_lat, n_lon,
+                                            getattr(self, 'spatial_subsample', 1))
 
-            X_tr = X_train_std.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            y_tr = y_train_std.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).values.ravel()
-            tr_bad = np.any(~np.isfinite(X_tr), axis=1) | ~np.isfinite(y_tr)
-            X_tr_c, y_tr_c = X_tr[~tr_bad], y_tr[~tr_bad]
+            X_tr, _ = _stack_rows(X_train_std, train_sel, core='M')
+            y_tr, _ = _stack_rows(y_train_std, train_sel, core=None)
+            y_tr = y_tr.ravel()
+            keep = np.all(np.isfinite(X_tr), axis=1) & np.isfinite(y_tr)
 
-            X_te = X_test_std.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            te_bad = np.any(~np.isfinite(X_te), axis=1)           # minor: predictor only
-
-            if len(X_tr_c) == 0 or (~te_bad).sum() == 0:
-                continue
+            X_te, pos = _stack_rows(X_test_std, test_rows == c, core='M')
+            keep_te = np.all(np.isfinite(X_te), axis=1)
+            if not keep.any() or not keep_te.any():
+                return c, None, None, None
 
             mlp_c = MLPRegressor(
                 hidden_layer_sizes=bp['hidden_layer_sizes'],
                 learning_rate_init=bp.get('learning_rate_init', 0.001),
                 activation=bp['activation'], solver=bp['solver'], alpha=bp['alpha'],
-                early_stopping=bp.get('early_stopping', False),
+                early_stopping=False,
                 validation_fraction=self.validation_fraction,
                 n_iter_no_change=self.n_iter_no_change,
                 max_iter=self.max_iter, random_state=self.random_state)
-            mlp_c.fit(X_tr_c, y_tr_c)
-            self.mlp[c] = mlp_c
+            mlp_c.fit(X_tr[keep], y_tr[keep])
+            return c, mlp_c, pos[keep_te], mlp_c.predict(X_te[keep_te])
 
-            y_pred_c = mlp_c.predict(X_te[~te_bad])
-            result_c = np.full(X_te.shape[0], np.nan)
-            result_c[~te_bad] = y_pred_c
-            pred_c = result_c.reshape(n_time, n_lat, n_lon)
-            predictions = np.where(np.isnan(predictions), pred_c, predictions)
+        if workers > 1 and len(active) > 1:
+            results = Parallel(n_jobs=min(workers, len(active)), backend="threading")(
+                delayed(_fit_one)(c) for c in active
+            )
+        else:
+            results = [_fit_one(c) for c in active]
 
-        return xr.DataArray(predictions, coords={'T': time, 'Y': lat, 'X': lon},
-                            dims=['T', 'Y', 'X'])
+        for c, model, pos, vals in results:
+            if model is not None:
+                self.mlp[c] = model
+            if pos is not None:
+                predictions[pos] = vals
+        predictions = predictions.reshape(n_time, n_lat, n_lon)
+
+        predicted_da = xr.DataArray(predictions, coords={'T': time, 'Y': lat, 'X': lon},
+                                    dims=['T', 'Y', 'X'])
+        return _maybe_calibrate_amplitude(
+            self, self.mlp, X_train, y_train, predicted_da, cluster_da, X_test=X_test,
+            raw_predictors=_raw_predictors, best_params=best_params,
+            clim_year_start=clim_year_start, clim_year_end=clim_year_end)
 
     # ------------------ Probability calculation methods ------------------
     @staticmethod
@@ -10398,56 +12827,46 @@ class WAS_mme_MLP:
         return out
 
     @staticmethod
-    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples,
-                                                      first_tercile, second_tercile):
-        """Non-parametric tercile probabilities from historical error samples."""
-        n_time = len(best_guess)
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-        for t_ in range(n_time):
-            if np.isnan(best_guess[t_]):
-                continue
-            dist = best_guess[t_] + error_samples
-            dist = dist[np.isfinite(dist)]
-            if len(dist) == 0:
-                continue
-            p_below = np.mean(dist < first_tercile)
-            p_between = np.mean((dist >= first_tercile) & (dist < second_tercile))
-            pred_prob[0, t_] = p_below
-            pred_prob[1, t_] = p_between
-            pred_prob[2, t_] = 1.0 - (p_below + p_between)
-        return pred_prob
+    def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
+        return WAS_mme_Weighted.calculate_tercile_probabilities_nonparametric(
+            best_guess, error_samples, first_tercile, second_tercile)
 
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
                      best_code_da=None, best_shape_da=None,
                      best_loc_da=None, best_scale_da=None):
         """Tercile probabilities for a (cross-validated) deterministic hindcast."""
         if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+            Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
 
-        mask = xr.where(~np.isnan(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where(np.isfinite(Predictant).sum(dim='T') >= 3, 1.0, np.nan)
         clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
         if clim.sizes.get("T", 0) < 3:
             raise ValueError("Not enough years in climatology period for terciles.")
 
-        error_variance = (Predictant - hindcast_det).var(dim="T")
+        error_variance = ((Predictant - hindcast_det) ** 2).mean(dim="T", skipna=True)
         dof = max(int(clim.sizes["T"]) - 1, 2)
 
-        terciles_emp = clim.quantile([1/3, 2/3], dim="T")
-        T1_emp = terciles_emp.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terciles_emp.isel(quantile=1).drop_vars("quantile")
+        terciles_emp = climatological_terciles(clim)[0]
+        T1_emp = terciles_emp.isel(quantile=0, drop=True)
+        T2_emp = terciles_emp.isel(quantile=1, drop=True)
 
         dm = self.dist_method
         if dm == "bestfit":
             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
                 raise ValueError("dist_method='bestfit' requires best_code_da, "
                                  "best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()],
-                output_core_dims=[(), ()], vectorize=True,
-                dask="parallelized", output_dtypes=[float, float])
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                T1, T2 = _pufunc(
+                    self._ppf_terciles_from_code,
+                    best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                    input_core_dims=[(), (), (), ()],
+                    output_core_dims=[(), ()], vectorize=True,
+                    dask="parallelized", output_dtypes=[float, float])
+            else:
+                T1, T2 = T1_emp, T2_emp
             hindcast_prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
                 hindcast_det, error_variance, T1, T2, best_code_da,
@@ -10489,25 +12908,27 @@ class WAS_mme_MLP:
                  cluster_da=None, best_code_da=None, best_shape_da=None,
                  best_loc_da=None, best_scale_da=None):
         """Deterministic + probabilistic forecast for a single target year."""
-        if "M" in Predictant.coords:
-            Predictant_no_m = Predictant.isel(M=0).drop_vars('M').squeeze()
+        validate_mme_predictor_schema(hindcast_det, Predictor_for_year)
+        if "M" in Predictant.dims:
+            Predictant_no_m = Predictant.isel(M=0, drop=True)
         else:
             Predictant_no_m = Predictant
-        mask = xr.where(~np.isnan(Predictant_no_m.isel(T=0)), 1, np.nan).drop_vars(['T']).squeeze().to_numpy()
+        mask = xr.where(np.isfinite(Predictant_no_m).sum(dim='T') >= 3, 1.0, np.nan).to_numpy()
 
-        mean_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
-        std_val = hindcast_det.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
-        Predictor_for_year_st = (Predictor_for_year - mean_val) / std_val
-        hindcast_det_st = standardize_timeseries(hindcast_det, clim_year_start, clim_year_end)
+        hindcast_det_st, Predictor_for_year_st = standardize_mme_predictors(
+            hindcast_det, Predictor_for_year, clim_year_start, clim_year_end)
         Predictant_st = standardize_timeseries(Predictant_no_m, clim_year_start, clim_year_end)
         hindcast_det_st['T'] = Predictant_st['T']
 
         time = Predictor_for_year_st['T']; lat = Predictor_for_year_st['Y']; lon = Predictor_for_year_st['X']
         n_time, n_lat, n_lon = len(time), len(lat), len(lon)
 
-        if best_params is None:
-            best_params, cluster_da = self.compute_hyperparameters(
-                hindcast_det, Predictant_no_m, clim_year_start, clim_year_end)
+        best_params, cluster_da = _resolve_regional_params(
+            self, hindcast_det, Predictant_no_m, clim_year_start, clim_year_end,
+            best_params, cluster_da)
+        hindcast_det_st, Predictor_for_year_st = _prepare_channels(
+            self, hindcast_det_st, Predictor_for_year_st, Predictant_no_m, None,
+            clim_year_start, clim_year_end)
 
         predictions = np.full((n_time, n_lat, n_lon), np.nan)
         self.mlp = {}
@@ -10518,12 +12939,12 @@ class WAS_mme_MLP:
             mask_3d_train = (cluster_da == c).expand_dims({'T': hindcast_det_st['T']})
             mask_3d_test = (cluster_da == c).expand_dims({'T': Predictor_for_year_st['T']})
 
-            X_tr = hindcast_det_st.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
-            y_tr = Predictant_st.where(mask_3d_train).stack(sample=('T', 'Y', 'X')).values.ravel()
+            X_tr = _stack_masked(hindcast_det_st, mask_3d_train, core='M')
+            y_tr = _stack_masked(Predictant_st, mask_3d_train, core=None).ravel()
             tr_bad = np.any(~np.isfinite(X_tr), axis=1) | ~np.isfinite(y_tr)
             X_tr_c, y_tr_c = X_tr[~tr_bad], y_tr[~tr_bad]
 
-            X_te = Predictor_for_year_st.where(mask_3d_test).stack(sample=('T', 'Y', 'X')).transpose('sample', 'M').values
+            X_te = _stack_masked(Predictor_for_year_st, mask_3d_test, core='M')
             te_bad = np.any(~np.isfinite(X_te), axis=1)
             if len(X_tr_c) == 0 or (~te_bad).sum() == 0:
                 continue
@@ -10532,7 +12953,7 @@ class WAS_mme_MLP:
                 hidden_layer_sizes=bp['hidden_layer_sizes'],
                 learning_rate_init=bp.get('learning_rate_init', 0.001),
                 activation=bp['activation'], solver=bp['solver'], alpha=bp['alpha'],
-                early_stopping=bp.get('early_stopping', False),
+                early_stopping=False,
                 validation_fraction=self.validation_fraction,
                 n_iter_no_change=self.n_iter_no_change,
                 max_iter=self.max_iter, random_state=self.random_state)
@@ -10558,10 +12979,10 @@ class WAS_mme_MLP:
         index_start = Predictant_no_m.get_index("T").get_loc(str(clim_year_start)).start
         index_end = Predictant_no_m.get_index("T").get_loc(str(clim_year_end)).stop
         rainfall_for_tercile = Predictant_no_m.isel(T=slice(index_start, index_end))
-        terciles = rainfall_for_tercile.quantile([1/3, 2/3], dim='T')
-        T1_emp = terciles.isel(quantile=0).drop_vars('quantile')
-        T2_emp = terciles.isel(quantile=1).drop_vars('quantile')
-        error_variance = (Predictant_no_m - hindcast_det_cross).var(dim='T')   # D (OOS)
+        terciles = climatological_terciles(rainfall_for_tercile)[0]
+        T1_emp = terciles.isel(quantile=0, drop=True)
+        T2_emp = terciles.isel(quantile=1, drop=True)
+        error_variance = ((Predictant_no_m - hindcast_det_cross) ** 2).mean(dim="T", skipna=True)   # D (OOS)
         dof = max(int(rainfall_for_tercile.sizes["T"]) - 1, 2)
 
         dm = self.dist_method
@@ -10569,11 +12990,16 @@ class WAS_mme_MLP:
             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
                 raise ValueError("dist_method='bestfit' requires best_code_da, "
                                  "best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code,
-                best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                T1, T2 = _pufunc(
+                    self._ppf_terciles_from_code,
+                    best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                    input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
+                    vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            else:
+                T1, T2 = T1_emp, T2_emp
             forecast_prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
                 result_da, error_variance, T1, T2, best_code_da,
@@ -10598,6 +13024,266 @@ class WAS_mme_MLP:
         forecast_prob = forecast_prob.assign_coords(probability=('probability', ['PB', 'PN', 'PA']))
         return result_da * mask, mask * forecast_prob.transpose('probability', 'T', 'Y', 'X')
 
+class _WAS_mme_SklearnRegressor:
+    """Leakage-aware base for low/medium-complexity seasonal ML challengers.
+
+    The key design choice is *year-grouped* tuning while pooling spatial cells
+    only to estimate one relationship per homogeneous climate zone.  Pooled
+    pixels increase numerical stability but are never treated as independent
+    years by CV.
+    """
+    estimator_name = "base"
+    param_grid = {}
+    # Probability kernels used by the strict cross-validator: the same ones as
+    # compute_prob / forecast, which delegate to WAS_mme_Weighted.
+    _ppf_terciles_from_code = staticmethod(_ppf_terciles_from_code)
+
+    @staticmethod
+    def calculate_tercile_probabilities_bestfit(best_guess, error_variance, T1, T2, dist_code, dof):
+        return WAS_mme_Weighted.calculate_tercile_probabilities_bestfit(
+            best_guess, error_variance, T1, T2, dist_code, dof)
+
+    def __init__(self, n_clusters=4, cv_folds=4, leave_one_year_out=False,
+                 dist_method="nonparam", random_state=42, scoring="neg_mean_squared_error",
+                 n_jobs=-1, min_train_years=12, spatial_subsample=1, spatial_mode="zones",
+                 covariate_names=None, static_fields=None, coord_step=None,
+                 zones_as_features=False, predictor_smoothing=0, one_se_rule=False,
+                 amplitude_calibration=True, amplitude_calibration_inner_folds=3):
+        self.n_clusters=int(n_clusters); self.cv_folds=int(cv_folds)
+        self.leave_one_year_out=bool(leave_one_year_out); self.dist_method=dist_method
+        self.random_state=int(random_state); self.scoring=scoring; self.n_jobs=n_jobs
+        self.min_train_years=int(min_train_years); self.best_params_=None; self.cluster_da_=None
+        self.spatial_subsample=max(1,int(spatial_subsample))
+        _init_spatial_options(self, spatial_mode, covariate_names, static_fields,
+                              coord_step, zones_as_features, predictor_smoothing, one_se_rule,
+                              amplitude_calibration, amplitude_calibration_inner_folds)
+
+    def _make_estimator(self, **params):
+        raise NotImplementedError
+
+    def _cv(self, groups):
+        return _year_grouped_splitter(groups,self.cv_folds,self.leave_one_year_out)
+
+    def compute_hyperparameters(self, Predictors, Predictand,
+                                clim_year_start=None, clim_year_end=None):
+        """Tune with fold-local standardization, target encoding and climate zones."""
+        return _strict_regional_hyperparameters(
+            self, Predictors, Predictand, clim_year_start, clim_year_end)
+
+    def compute_hyperparameters_legacy(self, Predictors, Predictand, clim_year_start=None, clim_year_end=None):
+        Predictors = align_predictor_target(Predictors, Predictand, mode="season_year")
+        if "M" in Predictand.dims: Predictand=Predictand.isel(M=0,drop=True)
+        # Climate zones are defined from RAW training observations, but learners
+        # are tuned in fold-local standardized space when a climatology is given.
+        cluster_da=_build_climate_feature_clusters(Predictand,self.n_clusters,self.random_state)
+        if clim_year_start is not None and clim_year_end is not None:
+            Xfit=standardize_timeseries(Predictors,clim_year_start,clim_year_end)
+            yfit=standardize_timeseries(Predictand,clim_year_start,clim_year_end)
+        else:
+            Xfit=Predictors; yfit=Predictand
+        Xfit=Xfit.assign_coords(T=yfit["T"])
+        params={}
+        for c in np.unique(cluster_da.values[np.isfinite(cluster_da.values)]):
+            mask=(cluster_da==c).expand_dims(T=Xfit["T"])
+            X=Xfit.where(mask).stack(sample=("T","Y","X")).transpose("sample","M")
+            y=yfit.where(mask).stack(sample=("T","Y","X"))
+            groups=_calendar_year_groups(X["T"])
+            xv=X.values; yv=y.values.ravel(); good=np.all(np.isfinite(xv),axis=1)&np.isfinite(yv)
+            xv=xv[good]; yv=yv[good]; groups=np.asarray(groups)[good]
+            ny=len(np.unique(groups))
+            if ny < self.min_train_years or xv.shape[0] < 20:
+                warnings.warn(f"{self.estimator_name} cluster {int(c)} skipped: only {ny} years.",RuntimeWarning)
+                continue
+            _effective_sample_warning(ny,xv.shape[1],self.estimator_name)
+            gs=GridSearchCV(self._make_estimator(),self.param_grid,cv=self._cv(groups),
+                            scoring=self.scoring,n_jobs=self.n_jobs,error_score=np.nan)
+            gs.fit(xv,yv,groups=groups)
+            params[int(c)]=gs.best_params_
+        self.best_params_=params; self.cluster_da_=cluster_da
+        return params,cluster_da
+
+    def compute_model(self, X_train, y_train, X_test, y_test=None,
+                      clim_year_start=None, clim_year_end=None,
+                      best_params=None, cluster_da=None, covariates=None):
+        validate_mme_predictor_schema(X_train, X_test)
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
+        if "M" in y_train.dims: y_train=y_train.isel(M=0,drop=True)
+        best_params,cluster_da=_resolve_regional_params(
+            self,X_train,y_train,clim_year_start,clim_year_end,best_params,cluster_da)
+        _raw_predictors=(X_train,X_test)
+        X_train,X_test=_prepare_channels(self,X_train,X_test,y_train,covariates,
+                                         clim_year_start,clim_year_end)
+        out=np.full((X_test.sizes["T"],X_test.sizes["Y"],X_test.sizes["X"]),np.nan)
+        # les estimateurs ajustes sont conserves par cluster pour que la
+        # calibration d'amplitude rejoue exactement le meme chemin de prediction
+        self.fitted_={}
+        for c,bp in best_params.items():
+            mtr=(cluster_da==c).expand_dims(T=X_train["T"])
+            if self.spatial_subsample>1:
+                keep=xr.zeros_like(cluster_da,dtype=bool)
+                keep[::self.spatial_subsample,::self.spatial_subsample]=True
+                mtr=mtr&keep
+            mte=(cluster_da==c).expand_dims(T=X_test["T"])
+            Xtr=X_train.where(mtr).stack(sample=("T","Y","X")).transpose("sample","M")
+            ytr=y_train.where(mtr).stack(sample=("T","Y","X"))
+            Xte=X_test.where(mte).stack(sample=("T","Y","X")).transpose("sample","M")
+            a=Xtr.values; b=ytr.values.ravel(); q=Xte.values
+            g=np.all(np.isfinite(a),axis=1)&np.isfinite(b); gt=np.all(np.isfinite(q),axis=1)
+            if not g.any() or not gt.any(): continue
+            est=self._make_estimator(**bp); est.fit(a[g],b[g]); pred=est.predict(q[gt])
+            self.fitted_[c]=est
+            full=np.full(q.shape[0],np.nan); full[gt]=pred
+            cube=full.reshape(X_test.sizes["T"],X_test.sizes["Y"],X_test.sizes["X"])
+            out=np.where(np.isfinite(cube),cube,out)
+        predicted_da=xr.DataArray(out,dims=("T","Y","X"),
+                                  coords={"T":X_test["T"],"Y":X_test["Y"],"X":X_test["X"]})
+        return _maybe_calibrate_amplitude(
+            self,self.fitted_,X_train,y_train,predicted_da,cluster_da,X_test=X_test,
+            raw_predictors=_raw_predictors,best_params=best_params,
+            clim_year_start=clim_year_start,clim_year_end=clim_year_end)
+
+    @staticmethod
+    def calculate_tercile_probabilities_bestfit(
+        best_guess, error_variance, T1, T2, dist_code, dof
+    ):
+        """Expose the same predictive CDF used by compute_prob and forecast.
+
+        Native cross-validation supplies its declared climatological thresholds
+        and training-only residual variance directly to this cellwise kernel.
+        """
+        return WAS_mme_Weighted.calculate_tercile_probabilities_bestfit(
+            best_guess, error_variance, T1, T2, dist_code, dof
+        )
+
+    def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                     best_code_da=None,best_shape_da=None,best_loc_da=None,best_scale_da=None):
+        helper=WAS_mme_Weighted(equal_weighted=True,dist_method=self.dist_method)
+        return helper.compute_prob(Predictant,clim_year_start,clim_year_end,hindcast_det,
+                                   best_code_da,best_shape_da,best_loc_da,best_scale_da)
+
+    def forecast(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
+                 hindcast_det_cross, Predictor_for_year, best_params=None, cluster_da=None,
+                 best_code_da=None,best_shape_da=None,best_loc_da=None,best_scale_da=None):
+        # Contract aligned with RF/XGB/hpELM/MLP: predictor history = hindcast_det,
+        # OOS residuals = hindcast_det_cross, target predictors = Predictor_for_year.
+        validate_mme_predictor_schema(hindcast_det, Predictor_for_year)
+        if "M" in Predictant.dims: Predictant=Predictant.isel(M=0,drop=True)
+        Xhist, Xyear = standardize_mme_predictors(
+            hindcast_det, Predictor_for_year, clim_year_start, clim_year_end)
+        # Zones, hyperparameters and spatial covariates come from the RAW
+        # predictand (the standardized target below would give KMeans nothing
+        # but sampling noise to partition).
+        hindcast_det=align_predictor_target(hindcast_det,Predictant,mode="season_year")
+        best_params,cluster_da=_resolve_regional_params(
+            self,hindcast_det,Predictant,clim_year_start,clim_year_end,best_params,cluster_da)
+        covariates=_model_covariates(self,Predictant,clim_year_start,clim_year_end)
+        my=Predictant.sel(T=slice(str(clim_year_start),str(clim_year_end))).mean("T")
+        sy=Predictant.sel(T=slice(str(clim_year_start),str(clim_year_end))).std("T").where(lambda z:z>0)
+        yst=(Predictant-my)/sy
+        predst=self.compute_model(Xhist,yst,Xyear,best_params=best_params,cluster_da=cluster_da,
+                                  covariates=covariates)
+        pred=predst*sy+my; pred=_assign_target_time(pred,Predictor_for_year,Predictant)
+        err=Predictant-hindcast_det_cross.transpose("T","Y","X")
+        helper=WAS_mme_Weighted(equal_weighted=True,dist_method=self.dist_method)
+        # Probability dressing from genuinely OOS residuals; use helper's internal core.
+        prob=helper._probability_core(Predictant,hindcast_det_cross,pred,clim_year_start,clim_year_end,
+                                      best_code_da,best_shape_da,best_loc_da,best_scale_da)
+        return apply_physical_support(pred, Predictant),prob
+
+
+class WAS_mme_Ridge(_WAS_mme_SklearnRegressor):
+    """Strong low-variance ML baseline; often hard to beat with short hindcasts."""
+    estimator_name="Ridge"
+    param_grid={"alpha":[0.01,0.1,1.0,10.0,100.0]}
+    def _make_estimator(self,**params): return Ridge(**params)
+
+
+class WAS_mme_ElasticNet(_WAS_mme_SklearnRegressor):
+    """Sparse/shrunk multi-model regression for correlated GCM predictors."""
+    estimator_name="ElasticNet"
+    param_grid={"alpha":[0.001,0.01,0.1,1.0],"l1_ratio":[0.0,0.25,0.5,0.75,1.0]}
+    def _make_estimator(self,**params):
+        return ElasticNet(max_iter=10000,random_state=self.random_state,**params)
+
+
+
+# ===========================================================================
+# Kharin et al. (2017): 7-target-season fixed-lead WASS2S adaptation
+# One source of truth for direct-module and was_mme public imports.
+from .was_mme_kharin2017_v3_7seasons import WAS_mme_Kharin2017
+
+
+class WAS_mme_PLS(_WAS_mme_SklearnRegressor):
+    """Partial Least Squares — built for exactly this regime: correlated
+    predictors, few independent years.
+
+    Unlike PCR/CCA, which choose their predictor axes from the predictors'
+    own variance alone, PLS chooses them to maximise covariance with the
+    predictand directly. On a short, highly-correlated GCM ensemble this is
+    typically more stable than a variance-based truncation search, and it
+    sidesteps the mode-count selection problem CCA needs a one-SE rule for.
+    Input is standardized upstream by the shared training harness, so PLS's
+    own internal scaling is disabled to avoid a second, redundant rescaling.
+    """
+    estimator_name="PLS"
+    param_grid={"n_components":[1,2,3,4]}
+    def _make_estimator(self,**params):
+        return PLSRegression(scale=False, **params)
+
+
+class WAS_mme_SVR(_WAS_mme_SklearnRegressor):
+    """Regularised nonlinear seasonal MME using support-vector regression."""
+    estimator_name="SVR"
+    param_grid={"C":[0.1,1.0,10.0],"epsilon":[0.05,0.1,0.2],"gamma":["scale",0.01,0.1],
+                "kernel":["linear","rbf"]}
+    def _make_estimator(self,**params): return SVR(**params)
+
+
+class _SklearnMARS(RegressorMixin, _MARSCore, BaseEstimator):
+    """Thin sklearn-compatible shell around wass2s.was_machine_learning.MARS.
+
+    _MARSCore stores every __init__ argument as a same-named attribute, which
+    is exactly what BaseEstimator.get_params()/clone() need — no other
+    adaptation is required for GridSearchCV to treat it like any sklearn
+    regressor.
+    """
+    pass
+
+
+class WAS_mme_MARS(_WAS_mme_SklearnRegressor):
+    """Piecewise-linear (hinge-function) seasonal MME.
+
+    Sits between the pure-linear challengers (Ridge/ElasticNet) and the
+    high-capacity ones (RF/XGB/MLP/hpELM): MARS can express a modest,
+    interpretable non-linearity (a small number of hinge functions, GCV-
+    penalised) without the overfitting risk a kernel or a tree ensemble
+    carries on a hindcast this short. A reasonable default choice when a
+    linear challenger underperforms but the sample does not support a
+    high-capacity model.
+    """
+    estimator_name="MARS"
+    param_grid={"max_terms":[5,9,13],"max_degree":[1,2],"penalty":[2.0,3.0,4.0]}
+    def _make_estimator(self,**params): return _SklearnMARS(**params)
+
+
+class WAS_mme_ExtraTrees(_WAS_mme_SklearnRegressor):
+    """Highly randomised trees; useful RF challenger with strong regularisation."""
+    estimator_name="ExtraTrees"
+    param_grid={"n_estimators":[300,600],"max_depth":[4,8,None],
+                "min_samples_leaf":[5,10,20],"max_features":[0.5,0.8,1.0]}
+    def _make_estimator(self,**params):
+        return ExtraTreesRegressor(random_state=self.random_state,n_jobs=1,**params)
+
+
+class WAS_mme_HistGradientBoosting(_WAS_mme_SklearnRegressor):
+    """Regularised histogram boosting; lighter than XGBoost and dependency-free."""
+    estimator_name="HistGradientBoosting"
+    param_grid={"learning_rate":[0.03,0.05,0.1],"max_leaf_nodes":[7,15,31],
+                "l2_regularization":[0.1,1.0,10.0],"min_samples_leaf":[10,20,40]}
+    def _make_estimator(self,**params):
+        return HistGradientBoostingRegressor(random_state=self.random_state,max_iter=300,early_stopping=False,**params)
+
+
 class WAS_mme_PCR:
     """
     Principal-component-regression MME baseline.
@@ -10606,11 +13292,10 @@ class WAS_mme_PCR:
     EOFs are fitted on the training fold (via the fold-safe WAS_EOF), the
     predictand is regressed on the leading PCs, and the held-out fold is
     projected out-of-sample before applying the regression. The deterministic
-    output is in the same (standardized) space the framework hands in, so
-    WAS_Cross_Validator's `same_kind_model2` branch reverse-standardizes it and
-    calls compute_prob exactly as it does for WAS_mme_RF.
-
-    Register it: add WAS_mme_PCR to the `same_kind_model2` list.
+    output of ``compute_model`` is in the same space as its training target.
+    The native cross-validation driver fits scaling and mode selection within
+    each training partition. ``forecast`` applies the same scaling convention
+    and calibrates future probabilities from supplied out-of-fold residuals.
 
     Parameters
     ----------
@@ -10652,6 +13337,9 @@ class WAS_mme_PCR:
         self.random_state = random_state
         self.positive_support = bool(positive_support)
         self.eof = None
+        # Keep the prespecified search range after a full-record finalization.
+        # A selected value must not silently shrink the next search space.
+        self._mode_search_upper = int(n_modes)
 
     def _field(self, X):
         """Build the EOF input field from the predictor cube (T, Y, X, M)."""
@@ -10663,11 +13351,26 @@ class WAS_mme_PCR:
 
     def _fit_predict_pcs(self, field_train, y_train, field_test):
         """Fit EOF on train field, regress y_train on PCs, predict the test field."""
-        eof = WAS_EOF(n_modes=self.n_modes, use_coslat=self.use_coslat,
-                      detrend=self.detrend, standardize=False, L2norm=self.L2norm)
-        _, s_train, _ = eof.fit(field_train, dim="T")
+        available = np.isfinite(field_test).any([d for d in field_test.dims if d != "T"])
+        n_eff = max(1, min(int(self.n_modes), max(1, int(field_train.sizes["T"]) - 2)))
+        if n_eff < int(self.n_modes):
+            warnings.warn(f"PCR n_modes capped from {self.n_modes} to {n_eff} for this fold.",
+                          RuntimeWarning, stacklevel=2)
+        eof = WAS_EOF(n_modes=n_eff, use_coslat=self.use_coslat,
+                      detrend=self.detrend, standardize=False, L2norm=self.L2norm,
+                      random_state=self.random_state)
         self.eof = eof
-        s_test = eof.transform(field_test, dim="T")
+        from .was_eof import EOFRankError
+        try:
+            _, s_train, _ = eof.fit(field_train, dim="T")
+            s_test = eof.transform(field_test, dim="T")
+        except EOFRankError:
+            # No varying predictor direction remains. The estimable PCR model
+            # is its intercept, not a regression on numerical noise.
+            self.rank_zero_fallback_ = True
+            mean = y_train.mean("T", skipna=True).where(y_train.notnull().sum("T") >= 3)
+            return mean.expand_dims(T=field_test["T"]).where(available).transpose("T", "Y", "X")
+        self.rank_zero_fallback_ = False
 
         S_tr = s_train.transpose("T", "mode").sel(T=field_train["T"]).values
         S_te = s_test.transpose("T", "mode").values
@@ -10677,16 +13380,69 @@ class WAS_mme_PCR:
         ystk = y_train.transpose("T", "Y", "X").sel(T=field_train["T"])
         ystk = ystk.stack(cell=("Y", "X")).transpose("T", "cell")
         Y = ystk.values
-        valid = np.all(np.isfinite(Y), axis=0)
-
         pred = np.full((A_te.shape[0], Y.shape[1]), np.nan)
-        if valid.any():
-            coef, *_ = np.linalg.lstsq(A_tr, Y[:, valid], rcond=None)
-            pred[:, valid] = A_te @ coef
+        design_valid = np.isfinite(A_tr).all(axis=1)
+        test_valid = np.isfinite(A_te).all(axis=1)
+        # Missing targets are local to their cell; they do not invalidate the
+        # entire time series. Share one solve for cells with the same row mask.
+        masks = np.isfinite(Y) & design_valid[:, None]
+        groups = {}
+        for j in range(Y.shape[1]):
+            groups.setdefault(masks[:, j].tobytes(), []).append(j)
+        for columns in groups.values():
+            rows = masks[:, columns[0]]
+            if rows.sum() < max(3, A_tr.shape[1]):
+                continue
+            design = A_tr[rows]
+            if np.linalg.matrix_rank(design) < design.shape[1]:
+                continue
+            coef, *_ = np.linalg.lstsq(design, Y[np.ix_(rows, columns)], rcond=None)
+            pred[np.ix_(test_valid, columns)] = A_te[test_valid] @ coef
 
         out = xr.DataArray(pred, dims=("T", "cell"),
                            coords={"T": field_test["T"], "cell": ystk["cell"]}).unstack("cell")
-        return out.transpose("T", "Y", "X")
+        return out.where(available).transpose("T", "Y", "X")
+
+    def finalize_truncation(self, X, Y, clim_start=None, clim_end=None, splits=None,
+                            n_modes_grid=None, nb_omit=1, inner_max_folds=8,
+                            score="mse", one_se=True, enabled=True):
+        """Select the operational rank with the procedure evaluated inside CV.
+
+        Inputs are RAW historical fields. Each selection fold refits predictor
+        and target scaling and the EOF. Selection uses the same paired one-SE
+        rule as the outer-validation and calibration fits. ``enabled=False``
+        performs no additional fitting and preserves the prescribed rank.
+        """
+        if not enabled:
+            return None
+        from .was_cross_validate import _tune_mme_cca_raw
+        if "M" in Y.dims:
+            if Y.sizes["M"] != 1:
+                raise ValueError("PCR target M dimension must be singleton")
+            Y = Y.isel(M=0, drop=True)
+        X = align_predictor_target(X, Y, mode="season_year")
+        upper = max(1, getattr(self, "_mode_search_upper", int(self.n_modes)))
+        modes = list(range(1, upper + 1)) if n_modes_grid is None else sorted(set(map(int, n_modes_grid)))
+        if not modes or min(modes) < 1:
+            raise ValueError("PCR mode candidates must be positive integers")
+        result = _tune_mme_cca_raw(
+            self, X, Y.transpose("T", "Y", "X"), clim_start, clim_end, nb_omit,
+            {"n_modes_grid": modes, "inner_max_folds": inner_max_folds,
+             "score": score, "one_se": one_se}, pcr=True, folds=splits)
+        self.mode_selection_ = dict(result)
+        self.mode_selection_["preprocessing"] = "training-only scaling and EOF in every selection fold"
+        return result
+
+    def tune_modes(self, X, Y, splits, n_modes_grid=None, score="mse", one_se=True,
+                   progress=False, clim_year_start=None, clim_year_end=None):
+        """Compatibility entry point; pass raw fields, as for ``forecast``.
+
+        With no climatological years, scaling uses each selection fold's full
+        training record. This is the same raw selector used by cross-validation.
+        """
+        return self.finalize_truncation(
+            X, Y, clim_year_start, clim_year_end, splits=splits,
+            n_modes_grid=n_modes_grid, score=score, one_se=one_se)
 
     # ------------------ Probability Calculation Methods ------------------
     @staticmethod
@@ -10734,8 +13490,14 @@ class WAS_mme_PCR:
         out = np.full((3, n_time), np.nan, dtype=float)
 
         if (np.all(np.isnan(best_guess)) or not np.isfinite(error_variance)
-                or error_variance <= 0 or not np.isfinite(T1) or not np.isfinite(T2)
+                or error_variance < 0 or not np.isfinite(T1) or not np.isfinite(T2)
                 or np.isnan(dist_code)):
+            return out
+        if error_variance == 0:
+            valid = np.isfinite(best_guess)
+            out[:, valid] = np.vstack((best_guess[valid] <= T1,
+                (best_guess[valid] > T1) & (best_guess[valid] <= T2),
+                best_guess[valid] > T2)).astype(float)
             return out
 
         code = int(dist_code)
@@ -10802,30 +13564,13 @@ class WAS_mme_PCR:
 
     @staticmethod
     def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        best_guess = np.asarray(best_guess, dtype=float)
-        error_samples = np.asarray(error_samples, dtype=float)
-        n_time = best_guess.size
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-
-        valid_errors = error_samples[np.isfinite(error_samples)]
-        if valid_errors.size == 0:
-            return pred_prob
-
-        for i in range(n_time):
-            if not np.isfinite(best_guess[i]):
-                continue
-            d = best_guess[i] + valid_errors
-            p_below = np.mean(d < first_tercile)
-            p_normal = np.mean((d >= first_tercile) & (d < second_tercile))
-            pred_prob[0, i] = p_below
-            pred_prob[1, i] = p_normal
-            pred_prob[2, i] = 1.0 - p_below - p_normal
-        return pred_prob
+        return WAS_mme_Weighted.calculate_tercile_probabilities_nonparametric(
+            best_guess, error_samples, first_tercile, second_tercile)
 
     @staticmethod
     def _normalize_probabilities(prob):
         prob = prob.clip(min=0.0, max=1.0)
-        total = prob.sum(dim="probability")
+        total = prob.sum(dim="probability", skipna=False)
         return xr.where(total > 0, prob / total, np.nan)
 
     def _tercile_probabilities(self, Predictant, deterministic, clim_year_start, clim_year_end,
@@ -10834,26 +13579,32 @@ class WAS_mme_PCR:
                                best_loc_da=None, best_scale_da=None):
         Predictant = Predictant.transpose("T", "Y", "X")
         deterministic = deterministic.transpose("T", "Y", "X")
-        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where((np.isfinite(Predictant).sum(dim='T') >= 3)
+                        & (np.isfinite(error_samples).sum(dim='T') >= 3), 1.0, np.nan)
 
         clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
         if clim.sizes.get("T", 0) < 3:
             raise ValueError("Not enough years in climatology period for terciles.")
-        terc = clim.quantile([1.0 / 3.0, 2.0 / 3.0], dim="T")
-        T1_emp = terc.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terc.isel(quantile=1).drop_vars("quantile")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
+        terc = climatological_terciles(clim)[0]
+        T1_emp = terc.isel(quantile=0, drop=True)
+        T2_emp = terc.isel(quantile=1, drop=True)
+        dof = max(int(Predictant.sizes["T"]) - 1, 3)
 
         if self.dist_method == "bestfit":
             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
                 raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            T1, T2 = T1_emp, T2_emp
+            # Match validation exactly: residual mean is a location correction,
+            # while the centered sample variance controls dispersion. The
+            # second moment would count bias twice and broaden forecasts.
+            error_variance = error_samples.var("T", ddof=1, skipna=True)
+            calibrated_mean = apply_physical_support(
+                deterministic + error_samples.mean("T", skipna=True), Predictant)
             prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
-                deterministic, error_variance, T1, T2, best_code_da,
+                calibrated_mean, error_variance, T1, T2, best_code_da,
                 input_core_dims=[("T",), (), (), (), ()], output_core_dims=[("probability", "T")],
                 vectorize=True, kwargs={"dof": dof}, dask="parallelized", output_dtypes=[float],
                 dask_gufunc_kwargs={"output_sizes": {"probability": 3}, "allow_rechunk": True})
@@ -10876,6 +13627,7 @@ class WAS_mme_PCR:
 
     # ----------------------------------------------------- framework contract
     def compute_model(self, X_train, y_train, X_test, y_test=None, **kwargs):
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
         if "M" in y_train.dims:
             y_train = y_train.isel(M=0, drop=True)
         field_train = self._field(X_train)
@@ -10885,14 +13637,16 @@ class WAS_mme_PCR:
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
                      best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+            Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
         hindcast_det = hindcast_det.transpose("T", "Y", "X")
-        if hindcast_det.sizes["T"] == Predictant.sizes["T"]:
-            hindcast_det = hindcast_det.assign_coords(T=Predictant["T"])
-
-        error_samples = Predictant - hindcast_det           # out-of-sample (LOYO hindcast)
-        error_variance = error_samples.var(dim="T", skipna=True)
+        # Calibration pairs require matching verification dates, not merely
+        # matching lengths. Partial hindcast records retain only known pairs.
+        obs, hindcast = xr.align(Predictant, hindcast_det, join="inner")
+        if obs.sizes["T"] < 3:
+            raise ValueError("PCR calibration needs at least three matching out-of-fold hindcast dates")
+        error_samples = obs - hindcast
+        error_variance = error_samples.var(dim="T", ddof=1, skipna=True)
 
         return self._tercile_probabilities(
             Predictant, hindcast_det, clim_year_start, clim_year_end,
@@ -10903,41 +13657,40 @@ class WAS_mme_PCR:
     def forecast(self, Predictant, clim_year_start, clim_year_end, Predictor,
                  hindcast_det, Predictor_for_year,
                  best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
-        """Operational PCR forecast for a single target year."""
+        """Operational forecast at the supplied target valid times.
+
+        ``hindcast_det`` must contain independently computed out-of-fold
+        predictions in physical units. This calibration is for future times;
+        use the cross-validator to score historical probabilistic forecasts.
+        """
 
 
         if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+            Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
-        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where(np.isfinite(Predictant).sum(dim='T') >= 3, 1.0, np.nan)
 
-        # standardize predictor (per cell/model) with historical climatology,
-        # apply same stats to the forecast year
-        mX = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean("T")
-        sX = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).std("T")
-        sX = sX.where(sX > 0)
-        Predictor_st = (Predictor - mX) / sX
-        Predictor_year_st = (Predictor_for_year - mX) / sX
-
-        Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
+        from .was_cross_validate import _fold_standardize
+        Predictor = align_predictor_target(Predictor, Predictant, mode="season_year")
+        Predictor_st, Predictor_year_st, _, _ = _fold_standardize(
+            Predictor, Predictor_for_year, clim_year_start, clim_year_end)
+        Predictant_st, _, target_mean, target_scale = _fold_standardize(
+            Predictant, Predictant, clim_year_start, clim_year_end)
 
         field_hist = self._field(Predictor_st)
         field_year = self._field(Predictor_year_st)
         pred_st = self._fit_predict_pcs(field_hist, Predictant_st, field_year)
 
-        forecast_det = reverse_standardize(pred_st, Predictant, clim_year_start, clim_year_end)
+        forecast_det = pred_st * target_scale + target_mean
 
-        # target time = forecast year + predictand target month
-        year = Predictor_for_year.coords["T"].values.astype("datetime64[Y]").astype(int)[0] + 1970
-        month = Predictant.isel(T=0).coords["T"].values.astype("datetime64[M]").astype(int) % 12 + 1
-        new_T = np.datetime64(f"{year}-{month:02d}-01")
-        forecast_det = forecast_det.assign_coords(T=xr.DataArray([new_T], dims=["T"]))
-        forecast_det["T"] = forecast_det["T"].astype("datetime64[ns]")
+        # The caller supplies target valid times before EOF projection, so a
+        # detrending transform sees the same calendar as the fitted target.
+        # Preserve those times, including multi-date and cross-year forecasts.
         if self.positive_support:
             forecast_det = forecast_det.clip(min=0)
 
         error_samples = Predictant - hindcast_det.transpose("T", "Y", "X")
-        error_variance = error_samples.var(dim="T", skipna=True)
+        error_variance = error_samples.var(dim="T", ddof=1, skipna=True)
         forecast_prob = self._tercile_probabilities(
             Predictant, forecast_det, clim_year_start, clim_year_end,
             error_samples, error_variance,
@@ -10972,6 +13725,25 @@ def _blend(w: np.ndarray, Pstack: np.ndarray) -> np.ndarray:
     return np.tensordot(w, Pstack, axes=(0, 0))
 
 
+def _project_bounded_simplex(values, lo, hi):
+    """Euclidean projection onto sum(w)=1 and lo<=w<=hi."""
+    values, lo, hi = (np.asarray(v, dtype=float) for v in (values, lo, hi))
+    if values.shape != lo.shape or lo.shape != hi.shape or values.size == 0:
+        raise ValueError("Weight vectors must have the same nonempty shape.")
+    if not all(np.all(np.isfinite(v)) for v in (values, lo, hi)):
+        raise ValueError("Weights and bounds must be finite.")
+    if np.any(lo < 0) or np.any(hi > 1) or np.any(lo > hi) or lo.sum() > 1 + 1e-12 or hi.sum() < 1 - 1e-12:
+        raise ValueError("Infeasible probability-weight bounds.")
+    left, right = float(np.min(values - hi)), float(np.max(values - lo))
+    for _ in range(100):
+        shift = (left + right) / 2.0
+        if np.clip(values - shift, lo, hi).sum() > 1.0:
+            left = shift
+        else:
+            right = shift
+    return np.clip(values - (left + right) / 2.0, lo, hi)
+
+
 def _fit_weights_one_point(
     Pstack: np.ndarray,         # (M, n, 3) per-model tercile probs (train years)
     Ohot: np.ndarray,           # (n, 3) observed one-hot
@@ -10989,16 +13761,12 @@ def _fit_weights_one_point(
 
     bounds = list(zip(lo, hi))
     cons = [{"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0)}]
-    w0 = np.clip(w_prior, lo, hi)
-    s = w0.sum()
-    w0 = w0 / s if s > 0 else np.full(M, 1.0 / M)
+    w0 = _project_bounded_simplex(w_prior, lo, hi)
 
     res = minimize(objective, w0, method="SLSQP", bounds=bounds, constraints=cons,
                    options={"maxiter": 500, "ftol": 1e-12})
     w = res.x if (res.success and np.all(np.isfinite(res.x))) else w0
-    w = np.clip(w, lo, hi)
-    s = w.sum()
-    w = w / s if s > 0 else np.full(M, 1.0 / M)
+    w = _project_bounded_simplex(w, lo, hi)
     return w, _rps(_blend(w, Pstack), Ohot)
 
 
@@ -11044,7 +13812,9 @@ class WAS_mme_ExpertKnowledge:
         self.expert_bounds = expert_bounds or {}
         self.expert_prior = expert_prior
         self.shrinkage = shrinkage
-        self.shrinkage_grid = tuple(shrinkage_grid)
+        self.shrinkage_grid = tuple(float(v) for v in shrinkage_grid)
+        if not self.shrinkage_grid or not all(np.isfinite(v) and v >= 0 for v in self.shrinkage_grid):
+            raise ValueError("shrinkage_grid must contain finite nonnegative values.")
         self.spatial_pooling = spatial_pooling
         self.min_train_years = int(min_train_years)
 
@@ -11063,19 +13833,40 @@ class WAS_mme_ExpertKnowledge:
             for n in names:
                 a = model_probs[n].transpose(prob_dim, time_dim, lat_dim, lon_dim)
                 arrs.append(a)
-            arrs = xr.align(*arrs, join="inner")
+            arrs = xr.align(*arrs, join="exact")
             da = xr.concat(arrs, dim="model").assign_coords(model=names)
         else:
             da = model_probs
+            if "M" in da.dims and "model" not in da.dims:
+                da = da.rename(M="model")
             if "model" not in da.dims:
                 raise ValueError("stacked DataArray must have a 'model' dim")
             names = [str(m) for m in da["model"].values]
             da = da.transpose("model", prob_dim, time_dim, lat_dim, lon_dim)
+        if len(names) == 0 or len(set(names)) != len(names):
+            raise ValueError("Probability ensembles require unique nonempty model names.")
+        labels = list(da[prob_dim].values)
+        if set(labels) == set(_PROB_LABELS):
+            da = da.sel({prob_dim: list(_PROB_LABELS)})
+        elif labels == [0, 1, 2]:
+            da = da.assign_coords({prob_dim: _PROB_LABELS})
+        else:
+            raise ValueError("Probability categories must be PB, PN, PA or 0, 1, 2.")
+        finite = np.isfinite(da)
+        bad = finite & ((da < 0) | (da > 1))
+        if bool(bad.any()):
+            raise ValueError("Probability values must lie in [0,1].")
+        total = da.sum(prob_dim, skipna=False)
+        if bool((finite.all(prob_dim) & (np.abs(total - 1.0) > 1e-6)).any()):
+            raise ValueError("Each probability vector must sum to one.")
+        da = da.where(finite.all(prob_dim))
         return names, da
 
     def _bounds_arrays(self, names):
         lo = np.array([self.expert_bounds.get(n, (0.0, 1.0))[0] for n in names], float)
         hi = np.array([self.expert_bounds.get(n, (0.0, 1.0))[1] for n in names], float)
+        if not np.all(np.isfinite(lo)) or not np.all(np.isfinite(hi)) or np.any(lo < 0) or np.any(hi > 1):
+            raise ValueError("expert_bounds must be finite and inside [0,1].")
         if np.any(lo > hi):
             raise ValueError("expert_bounds: some lower bound exceeds its upper bound")
         if lo.sum() > 1.0 + 1e-9:
@@ -11095,18 +13886,28 @@ class WAS_mme_ExpertKnowledge:
         return w
 
     # ---- core fit ---------------------------------------------------------
-    def _select_lambda(self, Pstack, Ohot, lo, hi, w_prior):
-        """Leave-one-year-out CV-RPS over the lambda grid (pooled over points)."""
+    def _select_lambda(self, Pstack, Ohot, lo, hi, w_prior, groups=None):
+        """Select shrinkage by withholding whole calendar years across cells."""
         if self.shrinkage != "cv":
-            return float(self.shrinkage)
-        n = Ohot.shape[0]
+            value = float(self.shrinkage)
+            if not np.isfinite(value) or value < 0:
+                raise ValueError("shrinkage must be finite and nonnegative.")
+            return value
+        if groups is None:
+            raise ValueError("Calendar-year groups are required for shrinkage CV.")
+        groups = np.asarray(groups)
+        if groups.shape != (Ohot.shape[0],):
+            raise ValueError("One calendar-year label is required per pooled sample.")
+        years = np.unique(groups)
+        if len(years) < 2:
+            return float(max(self.shrinkage_grid))
         best_lam, best_err = self.shrinkage_grid[0], np.inf
         for lam in self.shrinkage_grid:
             errs = []
-            for i in range(n):
-                tr = np.delete(np.arange(n), i)
+            for year in years:
+                tr, te = groups != year, groups == year
                 w, _ = _fit_weights_one_point(Pstack[:, tr], Ohot[tr], lo, hi, w_prior, lam)
-                errs.append(_rps(_blend(w, Pstack[:, [i]]), Ohot[[i]]))
+                errs.append(_rps(_blend(w, Pstack[:, te]), Ohot[te]))
             err = float(np.mean(errs))
             if err < best_err:
                 best_err, best_lam = err, lam
@@ -11125,7 +13926,9 @@ class WAS_mme_ExpertKnowledge:
         names, da = self._stack_models(model_probs, time_dim, lat_dim, lon_dim, prob_dim)
         self.model_names_ = names
         lo, hi = self._bounds_arrays(names)
-        w_prior = self._prior_array(names)
+        w_prior = _project_bounded_simplex(self._prior_array(names), lo, hi)
+        da, obs_class = xr.align(da, obs_class, join="exact")
+        years = _calendar_year_groups(da[time_dim])
 
         P = da.values  # (M, 3, T, Y, X)
         M, _, T, ny, nx = P.shape
@@ -11145,24 +13948,25 @@ class WAS_mme_ExpertKnowledge:
         # ---------------- global pooling ----------------
         if self.spatial_pooling == "global":
             # pool all valid (year, gridpoint) samples into one design
-            Plist, Olist = [], []
+            Plist, Olist, Glist = [], [], []
             for iy in range(ny):
                 for ix in range(nx):
                     cat = oc[:, iy, ix]
                     o, m = onehot(cat)
-                    if m.sum() < self.min_train_years:
+                    if len(np.unique(years[m])) < self.min_train_years:
                         continue
                     pcell = np.transpose(P[:, :, m, iy, ix], (0, 2, 1))  # (M, n, 3)
                     if not np.all(np.isfinite(pcell)):
                         continue
                     Plist.append(pcell)
                     Olist.append(o[m])
+                    Glist.append(years[m])
             if not Plist:
                 w = w_prior.copy(); self.lambda_ = 0.0
             else:
                 Pstack = np.concatenate(Plist, axis=1)  # (M, N, 3)
                 Ohot = np.concatenate(Olist, axis=0)    # (N, 3)
-                self.lambda_ = self._select_lambda(Pstack, Ohot, lo, hi, w_prior)
+                self.lambda_ = self._select_lambda(Pstack, Ohot, lo, hi, w_prior, np.concatenate(Glist))
                 w, _ = _fit_weights_one_point(Pstack, Ohot, lo, hi, w_prior, self.lambda_)
             self.weights_ = xr.DataArray(w, dims=("model",), coords={"model": names})
             return self
@@ -11171,21 +13975,21 @@ class WAS_mme_ExpertKnowledge:
         W = np.full((M, ny, nx), np.nan)
         # pick a single lambda globally (CV per point is too noisy on few years)
         # use the pooled selection once, then apply per point
-        Pp, Oo = [], []
+        Pp, Oo, Gg = [], [], []
         for iy in range(ny):
             for ix in range(nx):
                 cat = oc[:, iy, ix]; o, m = onehot(cat)
-                if m.sum() >= self.min_train_years and np.all(np.isfinite(P[:, :, m, iy, ix])):
-                    Pp.append(np.transpose(P[:, :, m, iy, ix], (0, 2, 1))); Oo.append(o[m])
+                if len(np.unique(years[m])) >= self.min_train_years and np.all(np.isfinite(P[:, :, m, iy, ix])):
+                    Pp.append(np.transpose(P[:, :, m, iy, ix], (0, 2, 1))); Oo.append(o[m]); Gg.append(years[m])
         if Pp:
             self.lambda_ = self._select_lambda(np.concatenate(Pp, 1), np.concatenate(Oo, 0),
-                                               lo, hi, w_prior)
+                                               lo, hi, w_prior, np.concatenate(Gg))
         else:
             self.lambda_ = 0.0
         for iy in range(ny):
             for ix in range(nx):
                 cat = oc[:, iy, ix]; o, m = onehot(cat)
-                if m.sum() < self.min_train_years or not np.all(np.isfinite(P[:, :, m, iy, ix])):
+                if len(np.unique(years[m])) < self.min_train_years or not np.all(np.isfinite(P[:, :, m, iy, ix])):
                     W[:, iy, ix] = w_prior
                     continue
                 pcell = np.transpose(P[:, :, m, iy, ix], (0, 2, 1))
@@ -11281,7 +14085,471 @@ from wass2s.utils import (
 )
 
 
-class WAS_mme_CCA:
+
+# ===========================================================================
+# CCA-MME truncation selection (CPT-like, adapted from was_cca240826.py)
+# ===========================================================================
+class MMETruncationResult(dict):
+    """Cross-validated CCA truncation with attribute access."""
+    __getattr__ = dict.get
+    def __repr__(self):
+        return (f"MMETruncationResult(n_modes={self.get('n_modes')}, "
+                f"n_pca_modes={self.get('n_pca_modes')}, "
+                f"score={self.get('score'):.4f}, rule={self.get('rule')!r})")
+
+
+def _mme_resolve_pca_modes(n_pca_modes):
+    """Return independent ``(n_pca_X, n_pca_Y)`` truncations."""
+    if isinstance(n_pca_modes, (list, tuple, np.ndarray)):
+        seq=list(n_pca_modes)
+        if len(seq) != 2:
+            raise ValueError("n_pca_modes sequence must contain exactly [X, Y].")
+        return seq[0], seq[1]
+    return n_pca_modes, n_pca_modes
+
+
+def _mme_safe_mode_counts(n_modes, n_pca_modes, n_samples):
+    """Cap CCA/PCA dimensions by the number of independent training years."""
+    if int(n_samples) < 3:
+        raise ValueError("CCA-MME requires at least three training years.")
+    max_modes=max(1, int(n_samples)-1)
+    nx,ny=_mme_resolve_pca_modes(n_pca_modes)
+    def cap(v):
+        if isinstance(v, str) or isinstance(v, float) and not float(v).is_integer():
+            return v
+        return max(1,min(int(v),max_modes))
+    sx,sy=cap(nx),cap(ny)
+    numeric=[v for v in (sx,sy) if isinstance(v,(int,np.integer))]
+    ceiling=min([max_modes]+numeric) if numeric else max_modes
+    sm=max(1,min(int(n_modes),ceiling))
+    return sm,[sx,sy]
+
+
+def _mme_cca_area_weights(obs):
+    lat=obs['Y'].astype(float)
+    w=np.cos(np.deg2rad(lat)).clip(min=0.0)
+    return w.broadcast_like(obs.isel(T=0,drop=True))
+
+
+def _mme_cca_aggregate_score(pred, obs, weights, kind='mse'):
+    valid=np.isfinite(pred)&np.isfinite(obs)
+    if kind=='mse':
+        e=xr.where(valid,(pred-obs)**2,np.nan)
+        num=(e*weights).sum(dim=('T','Y','X'),skipna=True)
+        den=xr.where(valid,weights,np.nan).sum(dim=('T','Y','X'),skipna=True)
+        return float(num/den) if float(den)>0 else np.nan
+    if kind in ('pearson','spearman'):
+        p=xr.where(valid,pred,np.nan); o=xr.where(valid,obs,np.nan)
+        if kind=='spearman':
+            p=p.rank('T'); o=o.rank('T')
+        pa=p-p.mean('T',skipna=True); oa=o-o.mean('T',skipna=True)
+        cov=(pa*oa).sum('T',skipna=True)
+        den=np.sqrt((pa**2).sum('T',skipna=True)*(oa**2).sum('T',skipna=True))
+        corr=xr.where(den>0,cov/den,np.nan)
+        w=xr.where(np.isfinite(corr),weights,np.nan)
+        sw=w.sum(skipna=True)
+        return float((corr*w).sum(skipna=True)/sw) if float(sw)>0 else np.nan
+    raise ValueError("score must be 'mse', 'pearson' or 'spearman'.")
+
+
+def _mme_cca_jackknife_se(partial):
+    """Leave-one-fold-out jackknife SE from a vector of partial scores."""
+    partial=np.asarray(partial,float)
+    partial=partial[np.isfinite(partial)]
+    if partial.size<3: return np.nan
+    n=partial.size
+    return float(np.sqrt((n-1)/n*np.sum((partial-partial.mean())**2)))
+
+
+def _mme_cca_score_with_jackknife(pred,obs,weights,kind,fold_of):
+    """Aggregate score, its marginal jackknife SE, and the partial scores.
+
+    The partial vector is aligned with ``np.unique(fold_of)`` (NaN where a fold
+    could not be scored). Because every truncation shares the folds, these are
+    comparable term by term, which is what lets tune_mme_cca_truncation compute
+    the SE of a PAIRED difference — the right measure for a comparison, unlike
+    the marginal SE which is right only for a single score.
+    """
+    full=_mme_cca_aggregate_score(pred,obs,weights,kind)
+    folds=np.unique(fold_of)
+    if folds.size<3:
+        return full,np.nan,None
+    partial=np.full(folds.size,np.nan,float)
+    for i,f in enumerate(folds):
+        keep=np.where(fold_of!=f)[0]
+        if keep.size<2: continue
+        partial[i]=_mme_cca_aggregate_score(pred.isel(T=keep),obs.isel(T=keep),weights,kind)
+    return full,_mme_cca_jackknife_se(partial),partial
+
+
+def _mme_cca_preprocess_train_test(template,X_train,Y_train,X_test):
+    """Fold-local imputation/masking for CCA; never uses the held-out field."""
+    Xtr=template._to_latlon(X_train); Ytr=template._to_latlon(Y_train)
+    xref=Xtr.mean('T',skipna=True); yref=Ytr.mean('T',skipna=True)
+    Xi=Xtr.fillna(xref); Yi=Ytr.fillna(yref)
+    xmask=np.isfinite(Xi).all('T') & (Xi.std('T',skipna=True)>0)
+    ymask=np.isfinite(Yi).all('T') & (Yi.std('T',skipna=True)>0)
+    # If variability masking is too severe, keep all completely finite features.
+    if not bool(xmask.any()): xmask=np.isfinite(Xi).all('T')
+    if not bool(ymask.any()): ymask=np.isfinite(Yi).all('T')
+    Xi=Xi.where(xmask); Yi=Yi.where(ymask)
+    Xte=template._to_latlon(X_test).fillna(xref).where(xmask)
+    return Xi,Yi,Xte
+
+
+def _mme_exact_cca_enabled(use_pca=True, n_pca_modes=None):
+    """Exact engine (:mod:`wass2s.was_cca_engine`) unless WAS_CCA_ENGINE=xeofs."""
+    if os.environ.get('WAS_CCA_ENGINE','exact').strip().lower()=='xeofs':
+        return False
+    return exact_cca_supported(use_pca,n_pca_modes)
+
+
+def _mme_seeded_cca(n_modes,n_pca_modes,standardize,use_coslat,use_pca,random_state=42):
+    """xeofs CCA with BOTH PCA preprocessors seeded (xeofs 3.x seeds only the cross SVD)."""
+    cca=xe.cross.CCA(n_modes=n_modes,standardize=standardize,use_coslat=use_coslat,
+                     use_pca=use_pca,n_pca_modes=n_pca_modes,random_state=random_state)
+    for pca in (getattr(cca,'pca1',None),getattr(cca,'pca2',None)):
+        if pca is not None and hasattr(pca,'random_state'):
+            pca.random_state=random_state
+    return cca
+
+
+def _mme_cca_candidates(Xtr,Ytr,Xte,candidates,standardize,use_coslat,use_pca,random_state=42):
+    """Latlon predictions of ``Xte`` for each ``(n_modes, n_pca_modes)``.
+
+    One exact decomposition of each training field serves every candidate
+    (the xeofs fallback refits per candidate). A failing candidate yields its
+    exception in place of a prediction.
+    """
+    n=min(Xtr.sizes['T'],Ytr.sizes['T'])
+    exact=all(_mme_exact_cca_enabled(use_pca,c[1]) for c in candidates)
+    if exact:
+        try:
+            engine=ExactCCA(Xtr,Ytr,standardize,use_coslat); Zx=engine.bx.project(Xte)
+        except Exception as exc:
+            return [exc for _ in candidates]
+    out=[]
+    for n_modes,n_pca in candidates:
+        try:
+            nm,npca=_mme_safe_mode_counts(n_modes,n_pca,n)
+            if exact:
+                yp=engine.predict(Xte,nm,npca,Zx=Zx)
+            else:
+                model=_mme_seeded_cca(nm,npca,standardize,use_coslat,use_pca,random_state).fit(Xtr,Ytr,dim='T')
+                yp=model.inverse_transform(model.transform(Xte),model.predict(Xte))[1]
+            out.append(yp)
+        except Exception as exc:
+            out.append(exc)
+    return out
+
+
+def _mme_cca_fit_predict_once(template,cfg,X_train,Y_train,X_test):
+    Xtr,Ytr,Xte=_mme_cca_preprocess_train_test(template,X_train,Y_train,X_test)
+    yp=_mme_cca_candidates(Xtr,Ytr,Xte,[(cfg['n_modes'],cfg['n_pca_modes'])],
+                           cfg.get('standardize',False),cfg.get('use_coslat',True),
+                           cfg.get('use_pca',True),getattr(template,'random_state',42))[0]
+    if isinstance(yp,Exception): raise yp
+    yp['T']=X_test['T']
+    return template._from_latlon(yp)
+
+
+def tune_mme_cca_truncation(X,Y,splits,n_modes_grid=(1,2,3,4),x_pca_grid=(4,6,8,10),
+                            y_pca_grid=None,template=None,score='mse',one_se=True,
+                            paired_se=True,se_multiplier=2.0,
+                            n_jobs=None,progress=True):
+    """Select ``(CCA modes, PCA-X, PCA-Y)`` by fold-wise CV + one-SE parsimony.
+
+    X and Y must already be in the space in which CCA is fitted.  Pass
+    ``y_pca_grid=None`` to tie X/Y PCA truncation; pass an explicit Y grid for
+    the full CPT-like three-dimensional search.
+    """
+    if template is None:
+        raise ValueError('template=WAS_mme_CCA* instance is required.')
+    Y=Y.transpose('T','Y','X')
+    splits=[(np.asarray(a),np.asarray(b)) for a,b in splits]
+    if not splits: raise ValueError('splits is empty')
+    yg=tuple(x_pca_grid) if y_pca_grid is None else tuple(y_pca_grid)
+    tied=y_pca_grid is None
+    combos=[]
+    for nm in sorted(set(map(int,n_modes_grid))):
+        for nx in sorted(set(map(int,x_pca_grid))):
+            ys=(nx,) if tied else yg
+            for ny in sorted(set(map(int,ys))):
+                if nm<=min(nx,ny): combos.append((nm,nx,ny))
+    if not combos: raise ValueError('Empty CCA truncation grid.')
+    weights=_mme_cca_area_weights(Y)
+    fold_of=np.concatenate([np.full(len(te),i) for i,(_,te) in enumerate(splits)])
+    # Split-major: each training split is preprocessed and decomposed once
+    # and serves every candidate (the PCA does not depend on the candidate).
+    cands=[(nm,[nx,ny]) for nm,nx,ny in combos]
+    def one_split(split):
+        tr,te=split
+        Xtr,Ytr,Xte=_mme_cca_preprocess_train_test(template,X.isel(T=tr),Y.isel(T=tr),X.isel(T=te))
+        outs=_mme_cca_candidates(Xtr,Ytr,Xte,cands,template.standardize,template.use_coslat,
+                                 template.use_pca,getattr(template,'random_state',42))
+        return [o if isinstance(o,Exception) else
+                template._from_latlon(o.assign_coords(T=Y['T'].isel(T=te).values)) for o in outs]
+    workers=_grid_workers() if n_jobs is None else max(1,int(n_jobs))
+    if progress: print(f'  MME-CCA truncation: {len(combos)} candidates x {len(splits)} splits',flush=True)
+    if workers>1 and len(splits)>1:
+        with ThreadPoolExecutor(max_workers=min(workers,len(splits))) as pool:
+            per_split=list(pool.map(one_split,splits))
+    else:
+        per_split=[one_split(sp) for sp in splits]
+    rows=[]
+    for j,(nm,nx,ny) in enumerate(combos):
+        bad=[res[j] for res in per_split if isinstance(res[j],Exception)]
+        if bad:
+            rows.append({'n_modes':nm,'n_pca_x':nx,'n_pca_y':ny,'score':np.nan,'se':np.nan,'partial':None,'error':repr(bad[0])})
+            continue
+        pa=xr.concat([res[j] for res in per_split],dim='T'); oa=Y.sel(T=pa['T'])
+        val,se,partial=_mme_cca_score_with_jackknife(pa,oa,weights,score,fold_of)
+        rows.append({'n_modes':nm,'n_pca_x':nx,'n_pca_y':ny,'score':val,'se':se,'partial':partial,'error':None})
+    finite=[r for r in rows if np.isfinite(r['score'])]
+    if not finite: raise RuntimeError('No CCA-MME truncation could be evaluated.')
+    lower=score=='mse'; ordered=sorted(finite,key=lambda r:r['score'],reverse=not lower)
+    best=ordered[0]; rule='best'
+    if one_se and np.isfinite(best['se']):
+        # Paired SE: the fold-to-fold variability common to all truncations
+        # cancels in the difference with the best candidate. The marginal SE
+        # over-inflates the tolerance and collapses the selection onto the
+        # grid floor. se_multiplier (2.0, calibrated on 24-year synthetic
+        # folds) restores parsimony in the null case without giving up the
+        # sensitivity the paired SE buys. See patch_cca_paired_onese.py.
+        best_partial=best.get('partial')
+        paired=bool(paired_se) and best_partial is not None
+        def _tol(cand):
+            if not paired: return best['se']
+            cp=cand.get('partial')
+            if cp is None or len(cp)!=len(best_partial): return best['se']
+            s=_mme_cca_jackknife_se(np.asarray(cp)-np.asarray(best_partial))
+            if not np.isfinite(s): return 0.0
+            return float(se_multiplier)*s
+        within=[r for r in finite
+                if (r['score']<=best['score']+_tol(r) if lower
+                    else r['score']>=best['score']-_tol(r))]
+        if within:
+            chosen=min(within,key=lambda r:(r['n_modes'],r['n_pca_x']+r['n_pca_y']))
+            if chosen is not best: rule='one-se-paired' if paired else 'one-se'
+            best=chosen
+    return MMETruncationResult(n_modes=int(best['n_modes']),
+                               n_pca_modes=[int(best['n_pca_x']),int(best['n_pca_y'])],
+                               score=float(best['score']),
+                               se=float(best['se']) if np.isfinite(best['se']) else np.nan,
+                               metric=score,rule=rule,table=ordered)
+
+
+def _mme_cca_field_fingerprint(*arrays):
+    """Complete value/coordinate signature, independent of dimension order."""
+    from wass2s.was_cca import _field_fingerprint
+    canonical=[]
+    for da in arrays:
+        lead=[d for d in ('T','M','Y','X') if d in da.dims]
+        da=da.transpose(*lead,*[d for d in da.dims if d not in lead])
+        canonical.append(da)
+    return _field_fingerprint(*canonical)
+
+
+def _check_truncation_selection(value):
+    """'cv' (nested cross-validated MSE, historical) or 'aic' (Bartlett-corrected AIC)."""
+    value = str(value).strip().lower()
+    if value not in ("cv", "aic"):
+        raise ValueError("truncation_selection must be 'cv' or 'aic'.")
+    return value
+
+
+class _MMECCATruncationMixin:
+    """Reusable CCA truncation state/cache shared by standard and EEOF MME CCA.
+
+    The nested cross-validation (``_native_regression_cv``, family
+    ``mme_cca``) tunes a fresh copy inside every fold, so the instance itself
+    never learns the selection. :meth:`finalize_truncation` makes the final
+    selection on the complete record with the same raw procedure and caches
+    it for ``forecast``, which otherwise makes that selection itself when
+    autotuning is on (WAS_MME_CCA_AUTOTUNE) and nothing is cached for the
+    fields it receives.
+    """
+    def _init_truncation(self):
+        self.truncation_=None; self._truncation_cache={}; self._last_effective_n_modes=int(self.n_modes)
+
+    def autotune_enabled(self):
+        # An explicit CLI/API setting also governs the operational forecast;
+        # None preserves the historical environment-controlled default.
+        enabled=getattr(self,'auto_truncation',None)
+        return os.environ.get('WAS_MME_CCA_AUTOTUNE','1')!='0' if enabled is None else bool(enabled)
+
+    def default_truncation_grid(self):
+        nx,ny=_mme_resolve_pca_modes(self.n_pca_modes)
+        def grid(v):
+            if not isinstance(v,(int,np.integer)): return (4,6,8,10)
+            v=max(2,int(v)); return tuple(sorted({max(2,v//4),max(2,v//2),max(3,3*v//4),v}))
+        m=max(1,int(self.n_modes)); mg=tuple(sorted(set(range(1,m+1)))[-4:])
+        xg=grid(nx); yg=grid(ny)
+        return {'n_modes_grid':mg,'x_pca_grid':xg,'y_pca_grid':yg,
+                'score':'mse','one_se':True,'progress':False}
+
+    def truncation_state(self): return self.n_modes,self.n_pca_modes
+    def restore_truncation(self,state): self.n_modes,self.n_pca_modes=state; return self
+    def apply_truncation(self,result=None):
+        result=result or self.truncation_
+        if result is None: raise ValueError('No CCA-MME truncation available; call tune() first.')
+        self.n_modes=result['n_modes']; self.n_pca_modes=result['n_pca_modes']; return self
+    def tune(self,X,Y,splits,apply=True,**kwargs):
+        kwargs.setdefault('template',self)
+        res=tune_mme_cca_truncation(X,Y,splits,**kwargs); self.truncation_=res
+        if apply: self.apply_truncation(res)
+        return res
+    def remember_truncation(self,key,result=None):
+        result=result or self.truncation_
+        if result is not None: self._truncation_cache[(key,self._truncation_preprocessing())]=result
+    def _truncation_preprocessing(self):
+        """A mode choice belongs to its training preprocessing as well as its data."""
+        return (type(self).__name__, bool(getattr(self,'detrend',False)),
+                bool(getattr(self,'eeof_detrend',False)))
+    def recall_truncation(self,key):
+        return self._truncation_cache.get((key,self._truncation_preprocessing()))
+    def remember_truncation_for(self,Predictor,Predictant,result=None):
+        self.remember_truncation(_mme_cca_field_fingerprint(Predictor,Predictant),result)
+    def apply_cached_truncation(self,Predictor,Predictant):
+        r=self.recall_truncation(_mme_cca_field_fingerprint(Predictor,Predictant))
+        if r is not None: self.apply_truncation(r)
+        return r
+    def finalize_truncation(self,Predictor,Predictant,clim_start,clim_end,splits=None,nb_omit=1,grid=None):
+        """Select the truncation on the complete record and remember it for ``forecast``.
+
+        Same raw procedure as the nested cross-validation
+        (``was_cross_validate._tune_mme_cca_raw``: per-fold standardization,
+        detrending and CCA inside ``compute_model``), scored on ``splits`` —
+        by default leave-one-out with the calendar buffer ``ceil(nb_omit/2)``
+        of ``WAS_Cross_Validator`` — with ``grid`` (default
+        :meth:`default_truncation_grid`, the grid the cross-validation used
+        when it was given none). The selection is stored in ``truncation_``
+        and cached under the fingerprint of ``(Predictor, Predictant)``;
+        ``forecast`` applies it for those fields and restores the constructor
+        values afterwards, which are not modified here. Call it after
+        ``cross_validate`` with the very fields ``forecast`` will receive.
+        """
+        from copy import deepcopy
+        from wass2s.was_cross_validate import _tune_mme_cca_raw, CustomTimeSeriesSplit
+        y=Predictant.isel(M=0,drop=True) if 'M' in Predictant.dims else Predictant
+        y=y.transpose('T','Y','X')
+        try:
+            x=align_predictor_target(Predictor,y,mode='season_year')
+        except ValueError:
+            if Predictor.sizes.get('T')!=y.sizes['T']: raise
+            x=Predictor.assign_coords(T=y['T'])   # positional stamping, as forecast itself does
+        if splits is None:
+            splits=list(CustomTimeSeriesSplit(n_splits=int(y.sizes['T'])).split(y['T'],nb_omit))
+        probe=deepcopy(self)
+        if str(getattr(self,'truncation_selection','cv')).lower()=='aic':
+            from wass2s.was_cross_validate import _select_mme_cca_aic
+            res=_select_mme_cca_aic(probe,x,y,clim_start,clim_end,dict(grid or self.default_truncation_grid()))
+            splits=[]
+        else:
+            res=_tune_mme_cca_raw(probe,x,y,clim_start,clim_end,nb_omit,dict(grid or self.default_truncation_grid()),
+                                  folds=splits)
+        self.truncation_=res
+        self.remember_truncation_for(Predictor,Predictant,res)
+        if os.environ.get('WAS_CCA_QUIET_TUNE','0')!='1':
+            print(f"  final MME-CCA truncation (full record, {len(splits)} splits): "
+                  f"n_modes={res['n_modes']} n_pca_modes={res['n_pca_modes']} "
+                  f"{res['metric']}={res['score']:.4f} ({res['rule']})",flush=True)
+        return res
+    # ------------------------------------------------------------ CCA core
+    def _cca_inputs(self, field_train, y_train, field_test):
+        """Latlon CCA inputs; NaNs filled with the TRAINING means (no leakage)."""
+        Xtr = self._to_latlon(field_train)
+        Ytr = self._to_latlon(y_train)
+        Xtr_mean = Xtr.mean(dim="T", skipna=True)
+        Xtr = Xtr.fillna(Xtr_mean)
+        Ytr = Ytr.fillna(Ytr.mean(dim="T", skipna=True))
+        Xte = self._to_latlon(field_test).fillna(Xtr_mean)
+        return Xtr, Ytr, Xte
+
+    def _fit_predict_cca(self, field_train, y_train, field_test):
+        """
+        Fit CCA on the training field, predict the test field, return the
+        physical-space predictand on the WAS grid (T, Y, X).
+
+        The prediction comes from the exact engine
+        (:class:`wass2s.was_cca_engine.ExactCCA`: the xeofs CCA algebra with
+        an exact SVD, deterministic); ``cca_model`` is a lazy xeofs object for
+        diagnostics only. ``WAS_CCA_ENGINE=xeofs`` restores the historical
+        path (``inverse_transform(transform(X), predict(X))[1]``).
+        """
+        Xtr, Ytr, Xte = self._cca_inputs(field_train, y_train, field_test)
+        n = Xtr.sizes.get("T", None)
+        self.cca = self._new_cca(n)
+        if _mme_exact_cca_enabled(self.use_pca, self.n_pca_modes):
+            nm, npca = _mme_safe_mode_counts(self.n_modes, self.n_pca_modes, n)
+            engine = ExactCCA(Xtr, Ytr, self.standardize, self.use_coslat)
+            self.cca_model = LazyXeofsCCA(partial(self._new_cca, n), Xtr, Ytr, engine=engine)
+            y_pred = engine.predict(Xte, nm, npca)
+        else:
+            self.cca_model = self.cca.fit(Xtr, Ytr, dim="T")
+            y_pred = self.cca_model.predict(Xte)
+            y_pred = self.cca_model.inverse_transform(
+                self.cca_model.transform(Xte), y_pred
+            )[1]
+        y_pred["T"] = field_test["T"]
+        return self._from_latlon(y_pred)
+
+    def compute_model(self, X_train, y_train, X_test, y_test=None, preprocessed=False, **kwargs):
+        """Fold prediction. With ``preprocessed=True`` the cross-validator has
+        already fitted standardisation/detrending on TRAIN and this method only
+        performs CCA. Otherwise the class's own fold preprocessing
+        (:meth:`_cca_problem`) is fitted on TRAIN and applied to TEST.
+        """
+        field_train, y_fit, field_test, post = self._cca_problem(
+            X_train, y_train, X_test, preprocessed)
+        pred = self._fit_predict_cca(field_train, y_fit, field_test)
+        return post(pred) if post is not None else pred
+
+    def cca_candidates(self, X_train, y_train, X_test, candidates, preprocessed=False):
+        """``compute_model`` for several ``(n_modes, n_pca_modes)`` at once.
+
+        The candidate-independent work -- multi-model field, detrending (or
+        EEOF residual), gap filling and the PCA of both fields -- is done once;
+        each candidate then costs a small SVD and a back-projection. Returns a
+        list aligned with ``candidates`` (an exception where a candidate
+        cannot be fitted). Values equal ``compute_model`` with that
+        truncation.
+        """
+        field_train, y_fit, field_test, post = self._cca_problem(
+            X_train, y_train, X_test, preprocessed)
+        Xtr, Ytr, Xte = self._cca_inputs(field_train, y_fit, field_test)
+        outs = _mme_cca_candidates(Xtr, Ytr, Xte, candidates, self.standardize,
+                                   self.use_coslat, self.use_pca,
+                                   getattr(self, "random_state", 42))
+        res = []
+        for out in outs:
+            if isinstance(out, Exception):
+                res.append(out); continue
+            out["T"] = field_test["T"]
+            pred = self._from_latlon(out)
+            res.append(post(pred) if post is not None else pred)
+        return res
+
+    def _truncation_for_forecast(self,Predictor,Predictant,clim_start,clim_end):
+        """Cached selection for these fields, else a fresh full-record one under autotuning."""
+        if not self.autotune_enabled():
+            return None
+        r=self.apply_cached_truncation(Predictor,Predictant)
+        if r is None:
+            try:
+                r=self.finalize_truncation(Predictor,Predictant,clim_start,clim_end)
+            except Exception as exc:  # an operational forecast must still be issued
+                if getattr(self,'truncation_selection','cv')=='aic':
+                    raise RuntimeError('MME-CCA AIC selection failed; refusing an unselected forecast.') from exc
+                warnings.warn(f'MME-CCA truncation could not be selected on the full record ({exc!r}); '
+                              f'forecast uses n_modes={self.n_modes}, n_pca_modes={self.n_pca_modes}.',
+                              RuntimeWarning,stacklevel=3)
+                return None
+            self.apply_truncation(r)
+        return r
+
+
+class WAS_mme_CCA(_MMECCATruncationMixin):
     """
     Canonical Correlation Analysis MME.
 
@@ -11310,7 +14578,8 @@ class WAS_mme_CCA:
 
     def __init__(self, n_modes=4, n_pca_modes=8, standardize=False,
                  use_coslat=True, use_pca=True, combine="mean",
-                 detrend=True, dist_method="nonparam", positive_support=True):
+                 detrend=True, dist_method="nonparam", positive_support=True, random_state=42,
+                 truncation_selection="cv"):
         if xe is None:
             raise ImportError("CCA MME classes require the optional 'xeofs' package.")
         if combine not in ("mean", "meof"):
@@ -11327,17 +14596,31 @@ class WAS_mme_CCA:
 
         self.cca = None
         self.cca_model = None
+        self.random_state = random_state
+        self.truncation_selection = _check_truncation_selection(truncation_selection)
+        self._init_truncation()
 
     # ------------------------------------------------------------------ utils
-    def _new_cca(self):
-        """Fresh xeofs CCA instance (one per fold → leakage-free CV)."""
-        return xe.cross.CCA(
-            n_modes=self.n_modes,
+    def _new_cca(self, n_samples=None):
+        """Fresh fold-local CCA with independent X/Y PCA truncations."""
+        if n_samples is None:
+            n_samples=max(int(self.n_modes)+2,3)
+        nm,npca=_mme_safe_mode_counts(self.n_modes,self.n_pca_modes,n_samples)
+        self._last_effective_n_modes=int(nm)
+        cca = xe.cross.CCA(
+            n_modes=nm,
             standardize=self.standardize,
             use_coslat=self.use_coslat,
             use_pca=self.use_pca,
-            n_pca_modes=self.n_pca_modes,
+            n_pca_modes=npca,
+            random_state=getattr(self, 'random_state', 42),
         )
+        # xeofs versions can seed the cross-SVD without propagating that seed
+        # into the two PCA preprocessors. Seed each local preprocessor too.
+        for pca in (getattr(cca, 'pca1', None), getattr(cca, 'pca2', None)):
+            if pca is not None and hasattr(pca, 'random_state'):
+                pca.random_state = getattr(self, 'random_state', 42)
+        return cca
 
     def _field(self, X):
         """Build the CCA predictor field from the predictor cube (T, Y, X, M)."""
@@ -11370,33 +14653,6 @@ class WAS_mme_CCA:
             rename["lon"] = "X"
         da = da.rename(rename)
         return da.transpose("T", "Y", "X")
-
-    # --------------------------------------------------------------- CCA core
-    def _fit_predict_cca(self, field_train, y_train, field_test):
-        """
-        Fit CCA on the training field, predict the test field, return the
-        physical-space predictand on the WAS grid (T, Y, X). NaNs are filled
-        with the training mean (no leakage). Physical space is recovered with
-        the codebase idiom: ``inverse_transform(transform(X), predict(X))[1]``.
-        """
-        Xtr = self._to_latlon(field_train)
-        Ytr = self._to_latlon(y_train)
-
-        Xtr_mean = Xtr.mean(dim="T", skipna=True)
-        Xtr = Xtr.fillna(Xtr_mean)
-        Ytr = Ytr.fillna(Ytr.mean(dim="T", skipna=True))
-
-        self.cca = self._new_cca()
-        self.cca_model = self.cca.fit(Xtr, Ytr, dim="T")
-
-        Xte = self._to_latlon(field_test).fillna(Xtr_mean)
-        y_pred = self.cca_model.predict(Xte)
-        y_pred = self.cca_model.inverse_transform(
-            self.cca_model.transform(Xte), y_pred
-        )[1]
-        y_pred["T"] = field_test["T"]
-
-        return self._from_latlon(y_pred)
 
     # ----------------------------------------------- probability calculation
     @staticmethod
@@ -11512,25 +14768,8 @@ class WAS_mme_CCA:
 
     @staticmethod
     def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        best_guess = np.asarray(best_guess, dtype=float)
-        error_samples = np.asarray(error_samples, dtype=float)
-        n_time = best_guess.size
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-
-        valid_errors = error_samples[np.isfinite(error_samples)]
-        if valid_errors.size == 0:
-            return pred_prob
-
-        for i in range(n_time):
-            if not np.isfinite(best_guess[i]):
-                continue
-            d = best_guess[i] + valid_errors
-            p_below = np.mean(d < first_tercile)
-            p_normal = np.mean((d >= first_tercile) & (d < second_tercile))
-            pred_prob[0, i] = p_below
-            pred_prob[1, i] = p_normal
-            pred_prob[2, i] = 1.0 - p_below - p_normal
-        return pred_prob
+        return WAS_mme_Weighted.calculate_tercile_probabilities_nonparametric(
+            best_guess, error_samples, first_tercile, second_tercile)
 
     @staticmethod
     def _normalize_probabilities(prob):
@@ -11544,23 +14783,28 @@ class WAS_mme_CCA:
                                best_loc_da=None, best_scale_da=None):
         Predictant = Predictant.transpose("T", "Y", "X")
         deterministic = deterministic.transpose("T", "Y", "X")
-        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where(np.isfinite(Predictant).sum(dim='T') >= 3, 1.0, np.nan)
 
         clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
         if clim.sizes.get("T", 0) < 3:
             raise ValueError("Not enough years in climatology period for terciles.")
-        terc = clim.quantile([1.0 / 3.0, 2.0 / 3.0], dim="T")
-        T1_emp = terc.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terc.isel(quantile=1).drop_vars("quantile")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
+        terc = climatological_terciles(clim)[0]
+        T1_emp = terc.isel(quantile=0, drop=True)
+        T2_emp = terc.isel(quantile=1, drop=True)
+        dof = max(int(clim.sizes["T"]) - int(getattr(self, "_last_effective_n_modes", self.n_modes)) - 1, 3)
 
         if self.dist_method == "bestfit":
             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
                 raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                T1, T2 = _pufunc(
+                    self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                    input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
+                    vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            else:
+                T1, T2 = T1_emp, T2_emp
             prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
                 deterministic, error_variance, T1, T2, best_code_da,
@@ -11585,30 +14829,37 @@ class WAS_mme_CCA:
         return (prob * mask).transpose("probability", "T", "Y", "X")
 
     # ----------------------------------------------------- framework contract
-    def compute_model(self, X_train, y_train, X_test, y_test=None, **kwargs):
+    def _cca_problem(self, X_train, y_train, X_test, preprocessed=False):
+        """Candidate-independent fold preprocessing: ``(field_train, y_fit, field_test, post)``.
+
+        Multi-model field and, with ``detrend``, polynomial trends fitted on
+        TRAIN (removed from both fields; the predictand trend is added back
+        to the prediction by ``post``).
         """
-        Deterministic CCA hindcast for one CV fold, in the standardized space
-        the framework hands in. No detrend here — matches WAS_CCA_op.compute_model
-        which is also detrend-free. The same_kind_model2 branch reverse-standardizes
-        the output afterwards.
-        """
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
         if "M" in y_train.dims:
             y_train = y_train.isel(M=0, drop=True)
         field_train = self._field(X_train)
         field_test = self._field(X_test)
-        return self._fit_predict_cca(field_train, y_train, field_test)
+        if preprocessed or not self.detrend:
+            return field_train, y_train, field_test, None
+        field_train_fit, coeffsX, metaX = _mme_detrend_training(field_train)
+        field_test_fit = field_test - apply_detrend_data(field_test, coeffsX, metaX)
+        y_train_fit, coeffsY, metaY = _mme_detrend_training(y_train)
+        post = lambda pred: pred + apply_detrend_data(pred, coeffsY, metaY)
+        return field_train_fit, y_train_fit, field_test_fit, post
 
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
                      best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+            Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
         hindcast_det = hindcast_det.transpose("T", "Y", "X")
         if hindcast_det.sizes["T"] == Predictant.sizes["T"]:
             hindcast_det = hindcast_det.assign_coords(T=Predictant["T"])
 
         error_samples = Predictant - hindcast_det
-        error_variance = error_samples.var(dim="T", skipna=True)
+        error_variance = (error_samples ** 2).mean(dim="T", skipna=True)
 
         return self._tercile_probabilities(
             Predictant, hindcast_det, clim_year_start, clim_year_end,
@@ -11622,16 +14873,33 @@ class WAS_mme_CCA:
         """
         Operational CCA forecast for a single target year.
 
-          predictor →  standardize  →  detrended_data()                 (raw, not pre-standardized)
-          predictand →  standardize  →  detrended_data() (always unconditional)
-          forecast-year predictor  →  apply_detrend_data()
+          predictor → optional detrend of the raw multi-model field
+          predictand → standardize → optional detrend
+          forecast-year predictor → apply the TRAIN trend if detrend=True
           fit CCA on (predictor_dt, predictand_st_dt)
-          result  →  + apply_detrend_data()  →  reverse_standardize()
+          result → restore the TRAIN trend if detrend=True → reverse_standardize
+
+        Truncation: the selection cached by :meth:`finalize_truncation` for
+        these fields (or, under autotuning, a fresh full-record selection) is
+        applied for the duration of the call; the constructor values are
+        restored afterwards.
         """
+        _trunc_state = self.truncation_state()
+        try:
+            self._truncation_for_forecast(Predictor, Predictant, clim_year_start, clim_year_end)
+            return self._forecast_impl(Predictant, clim_year_start, clim_year_end, Predictor,
+                                       hindcast_det, Predictor_for_year, best_code_da,
+                                       best_shape_da, best_loc_da, best_scale_da)
+        finally:
+            self.restore_truncation(_trunc_state)
+
+    def _forecast_impl(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                       hindcast_det, Predictor_for_year,
+                       best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+            Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
-        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where(np.isfinite(Predictant).sum(dim='T') >= 3, 1.0, np.nan)
         
         mean_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
         std_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
@@ -11644,7 +14912,7 @@ class WAS_mme_CCA:
         field_year = self._field(Predictor_for_year)
 
         if self.detrend:
-            field_hist_fit, coeffsX, metaX = detrended_data(field_hist, dim="T")
+            field_hist_fit, coeffsX, metaX = _mme_detrend_training(field_hist)
             # remove the same fitted trend from the forecast-year field 
             field_year_fit = field_year - apply_detrend_data(field_year, coeffsX, metaX)
         else:
@@ -11654,7 +14922,7 @@ class WAS_mme_CCA:
         # --- predictand: standardize → polynomial detrend 
         Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
         if self.detrend:
-            Predictant_st_fit, coeffsY, metaY = detrended_data(Predictant_st, dim="T")
+            Predictant_st_fit, coeffsY, metaY = _mme_detrend_training(Predictant_st)
         else:
             Predictant_st_fit = Predictant_st
 
@@ -11677,16 +14945,16 @@ class WAS_mme_CCA:
         forecast_det["T"] = forecast_det["T"].astype("datetime64[ns]")
 
         error_samples = Predictant - hindcast_det.transpose("T", "Y", "X")
-        error_variance = error_samples.var(dim="T", skipna=True)
+        error_variance = (error_samples ** 2).mean(dim="T", skipna=True)
         forecast_prob = self._tercile_probabilities(
             Predictant, forecast_det, clim_year_start, clim_year_end,
             error_samples, error_variance,
             best_code_da, best_shape_da, best_loc_da, best_scale_da)
 
-        return forecast_det * mask, forecast_prob * mask
-        
+        return (forecast_det * mask, forecast_prob * mask)
 
-class WAS_mme_CCA_eeof:
+
+class WAS_mme_CCA_eeof(_MMECCATruncationMixin):
     """
     Canonical Correlation Analysis MME, legacy WAS_CCA ideology (EEOF detrend).
 
@@ -11722,7 +14990,8 @@ class WAS_mme_CCA_eeof:
 
     def __init__(self, n_modes=4, n_pca_modes=8, standardize=False,
                  use_coslat=True, use_pca=True, combine="mean",
-                 eeof_detrend=True, dist_method="nonparam", positive_support=True):
+                 eeof_detrend=False, dist_method="nonparam", positive_support=True,
+                 eeof_ref_offset=3, truncation_selection="cv"):
         if xe is None:
             raise ImportError("CCA MME classes require the optional 'xeofs' package.")
         if combine not in ("mean", "meof"):
@@ -11734,22 +15003,30 @@ class WAS_mme_CCA_eeof:
         self.use_pca = use_pca
         self.combine = combine
         self.eeof_detrend = eeof_detrend
+        self.eeof_ref_offset = max(1, int(eeof_ref_offset))
+        if self.eeof_detrend:
+            warnings.warn(
+                "CCA_eeof is a legacy/experimental preprocessing path. Its EEOF "
+                "trend cannot be transferred to a future year as cleanly as a "
+                "polynomial trend; benchmark it against WAS_mme_CCA before use.",
+                RuntimeWarning, stacklevel=2)
         self.dist_method = dist_method
         self.positive_support = bool(positive_support)
+        self.truncation_selection = _check_truncation_selection(truncation_selection)
 
         self.cca = None
         self.cca_model = None
+        self._init_truncation()
 
     # ------------------------------------------------------------------ utils
-    def _new_cca(self):
-        """Fresh xeofs CCA instance (one per fold -> leakage-free CV)."""
-        return xe.cross.CCA(
-            n_modes=self.n_modes,
-            standardize=self.standardize,
-            use_coslat=self.use_coslat,
-            use_pca=self.use_pca,
-            n_pca_modes=self.n_pca_modes,
-        )
+    def _new_cca(self, n_samples=None):
+        """Fresh fold-local CCA with independent X/Y PCA truncations."""
+        if n_samples is None:
+            n_samples=max(int(self.n_modes)+2,3)
+        nm,npca=_mme_safe_mode_counts(self.n_modes,self.n_pca_modes,n_samples)
+        self._last_effective_n_modes=int(nm)
+        return _mme_seeded_cca(nm, npca, self.standardize, self.use_coslat,
+                               self.use_pca, getattr(self, 'random_state', 42))
 
     def _field(self, X):
         """Build the CCA predictor field from the predictor cube (T, Y, X, M)."""
@@ -11809,32 +15086,18 @@ class WAS_mme_CCA_eeof:
         trend = trend.fillna(fill_slice)
         return (da - trend).fillna(0)
 
-    # --------------------------------------------------------------- CCA core
-    def _fit_predict_cca(self, field_train, y_train, field_test):
+    def _eeof_split_train(self, da):
+        """Fold-safe EEOF residual plus a persisted component for unseen years.
+
+        The EEOF is estimated on TRAIN only.  Validation/forecast predictors are
+        moved to the same residual space by subtracting a persisted training
+        component, and the analogous Y component is added back to predictions.
         """
-        Fit CCA on the training field, predict the test field, return the
-        physical-space predictand on the WAS grid (T, Y, X). NaNs are filled
-        with the training mean (no leakage); physical space is recovered with
-        ``inverse_transform(transform(X), predict(X))[1]`` (codebase idiom).
-        """
-        Xtr = self._to_latlon(field_train)
-        Ytr = self._to_latlon(y_train)
-
-        Xtr_mean = Xtr.mean(dim="T", skipna=True)
-        Xtr = Xtr.fillna(Xtr_mean)
-        Ytr = Ytr.fillna(Ytr.mean(dim="T", skipna=True))
-
-        self.cca = self._new_cca()
-        self.cca_model = self.cca.fit(Xtr, Ytr, dim="T")
-
-        Xte = self._to_latlon(field_test).fillna(Xtr_mean)
-        y_pred = self.cca_model.predict(Xte)
-        y_pred = self.cca_model.inverse_transform(
-            self.cca_model.transform(Xte), y_pred
-        )[1]
-        y_pred["T"] = field_test["T"]
-
-        return self._from_latlon(y_pred)
+        trend = extract_leading_eeof_component(da)
+        idx=max(0, trend.sizes.get("T",1)-self.eeof_ref_offset)
+        ref=trend.isel(T=idx,drop=True)
+        resid=da-trend.fillna(ref)
+        return resid.fillna(0), ref
 
     # ----------------------------------------------- probability calculation
     @staticmethod
@@ -11950,25 +15213,8 @@ class WAS_mme_CCA_eeof:
 
     @staticmethod
     def calculate_tercile_probabilities_nonparametric(best_guess, error_samples, first_tercile, second_tercile):
-        best_guess = np.asarray(best_guess, dtype=float)
-        error_samples = np.asarray(error_samples, dtype=float)
-        n_time = best_guess.size
-        pred_prob = np.full((3, n_time), np.nan, dtype=float)
-
-        valid_errors = error_samples[np.isfinite(error_samples)]
-        if valid_errors.size == 0:
-            return pred_prob
-
-        for i in range(n_time):
-            if not np.isfinite(best_guess[i]):
-                continue
-            d = best_guess[i] + valid_errors
-            p_below = np.mean(d < first_tercile)
-            p_normal = np.mean((d >= first_tercile) & (d < second_tercile))
-            pred_prob[0, i] = p_below
-            pred_prob[1, i] = p_normal
-            pred_prob[2, i] = 1.0 - p_below - p_normal
-        return pred_prob
+        return WAS_mme_Weighted.calculate_tercile_probabilities_nonparametric(
+            best_guess, error_samples, first_tercile, second_tercile)
 
     @staticmethod
     def _normalize_probabilities(prob):
@@ -11982,24 +15228,33 @@ class WAS_mme_CCA_eeof:
                                best_loc_da=None, best_scale_da=None):
         Predictant = Predictant.transpose("T", "Y", "X")
         deterministic = deterministic.transpose("T", "Y", "X")
-        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where(np.isfinite(Predictant).sum(dim='T') >= 3, 1.0, np.nan)
 
         clim = Predictant.sel(T=slice(str(clim_year_start), str(clim_year_end)))
         if clim.sizes.get("T", 0) < 3:
             raise ValueError("Not enough years in climatology period for terciles.")
-        # legacy WAS_CCA tercile quantiles
-        terc = clim.quantile([0.30, 0.67], dim="T")
-        T1_emp = terc.isel(quantile=0).drop_vars("quantile")
-        T2_emp = terc.isel(quantile=1).drop_vars("quantile")
-        dof = max(int(clim.sizes["T"]) - 1, 2)
+        # 0.30 was not a tercile at all: it cut the lower category at the
+        # 30th percentile while the upper one started at the 67th, so the
+        # three categories covered 30 / 37 / 33 percent of the climatology
+        # instead of a third each. Every category-based score computed
+        # against these thresholds was biased.
+        terc = climatological_terciles(clim)[0]
+        T1_emp = terc.isel(quantile=0, drop=True)
+        T2_emp = terc.isel(quantile=1, drop=True)
+        dof = max(int(clim.sizes["T"]) - int(getattr(self, "_last_effective_n_modes", self.n_modes)) - 1, 3)
 
         if self.dist_method == "bestfit":
             if any(v is None for v in (best_code_da, best_shape_da, best_loc_da, best_scale_da)):
                 raise ValueError("dist_method='bestfit' requires best_code_da, best_shape_da, best_loc_da, best_scale_da.")
-            T1, T2 = _pufunc(
-                self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
-                input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
-                vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            # Category boundaries stay on the observed climatological reference.
+            # The selected distribution controls the predictive CDF only.
+            if getattr(self, "tercile_reference", "climatology") == "training":
+                T1, T2 = _pufunc(
+                    self._ppf_terciles_from_code, best_code_da, best_shape_da, best_loc_da, best_scale_da,
+                    input_core_dims=[(), (), (), ()], output_core_dims=[(), ()],
+                    vectorize=True, dask="parallelized", output_dtypes=[float, float])
+            else:
+                T1, T2 = T1_emp, T2_emp
             prob = _pufunc(
                 self.calculate_tercile_probabilities_bestfit,
                 deterministic, error_variance, T1, T2, best_code_da,
@@ -12024,29 +15279,31 @@ class WAS_mme_CCA_eeof:
         return (prob * mask).transpose("probability", "T", "Y", "X")
 
     # ----------------------------------------------------- framework contract
-    def compute_model(self, X_train, y_train, X_test, y_test=None, **kwargs):
-        """
-        Deterministic CCA hindcast for one CV fold, in the space the framework
-        hands in (matches legacy WAS_CCA.compute_model: plain CCA, no EEOF
-        detrend; the same_kind_model2 branch reverse-standardizes afterwards).
-        """
+    def _cca_problem(self, X_train, y_train, X_test, preprocessed=False):
+        """Candidate-independent fold preprocessing with the transferable EEOF residual."""
+        X_train = align_predictor_target(X_train, y_train, mode="season_year")
         if "M" in y_train.dims:
             y_train = y_train.isel(M=0, drop=True)
         field_train = self._field(X_train)
         field_test = self._field(X_test)
-        return self._fit_predict_cca(field_train, y_train, field_test)
+        if preprocessed or not self.eeof_detrend:
+            return field_train, y_train, field_test, None
+        Xres, refX = self._eeof_split_train(field_train)
+        Yres, refY = self._eeof_split_train(y_train)
+        Xtest_res = (field_test - refX).fillna(0)
+        return Xres, Yres, Xtest_res, (lambda pred: pred + refY)
 
     def compute_prob(self, Predictant, clim_year_start, clim_year_end, hindcast_det,
                      best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+            Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
         hindcast_det = hindcast_det.transpose("T", "Y", "X")
         if hindcast_det.sizes["T"] == Predictant.sizes["T"]:
             hindcast_det = hindcast_det.assign_coords(T=Predictant["T"])
 
         error_samples = Predictant - hindcast_det           # out-of-sample (LOYO hindcast)
-        error_variance = error_samples.var(dim="T", skipna=True)
+        error_variance = (error_samples ** 2).mean(dim="T", skipna=True)
 
         return self._tercile_probabilities(
             Predictant, hindcast_det, clim_year_start, clim_year_end,
@@ -12064,42 +15321,51 @@ class WAS_mme_CCA_eeof:
           * predictand standardized then EEOF-detrended,
           * forecast-year predictor only gap-filled (NOT detrended),
           * result reverse-standardized with NO trend added back.
+
+        Truncation: as in ``WAS_mme_CCA.forecast`` (cached final selection,
+        or a fresh full-record one under autotuning; constructor values
+        restored afterwards).
         """
+        _trunc_state = self.truncation_state()
+        try:
+            self._truncation_for_forecast(Predictor, Predictant, clim_year_start, clim_year_end)
+            return self._forecast_impl(Predictant, clim_year_start, clim_year_end, Predictor,
+                                       hindcast_det, Predictor_for_year, best_code_da,
+                                       best_shape_da, best_loc_da, best_scale_da)
+        finally:
+            self.restore_truncation(_trunc_state)
+
+    def _forecast_impl(self, Predictant, clim_year_start, clim_year_end, Predictor,
+                       hindcast_det, Predictor_for_year,
+                       best_code_da=None, best_shape_da=None, best_loc_da=None, best_scale_da=None):
         if "M" in Predictant.dims:
-            Predictant = Predictant.isel(M=0).drop_vars("M").squeeze()
+            Predictant = Predictant.isel(M=0, drop=True)
         Predictant = Predictant.transpose("T", "Y", "X")
-        mask = xr.where(np.isfinite(Predictant.isel(T=0)), 1.0, np.nan)
+        mask = xr.where(np.isfinite(Predictant).sum(dim='T') >= 3, 1.0, np.nan)
         
         mean_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).mean(dim='T')
         std_val = Predictor.sel(T=slice(str(clim_year_start), str(clim_year_end))).std(dim='T')
         Predictor_for_year = (Predictor_for_year - mean_val) / std_val
 
-        # ----- predictor side: EEOF-detrended field over all training years
+        # ----- predictor/predictand: same fold-transferable EEOF residual space
         Predictor = standardize_timeseries(Predictor, clim_year_start, clim_year_end)
         field_hist = self._field(Predictor)
-        if self.eeof_detrend:
-            field_hist_fit = self._eeof_remove(field_hist)
-        else:
-            field_hist_fit = field_hist.fillna(field_hist.mean(dim="T", skipna=True)).fillna(0)
-
-        # ----- predictand side: standardize, then EEOF-detrend
         Predictant_st = standardize_timeseries(Predictant, clim_year_start, clim_year_end)
-        if self.eeof_detrend:
-            Predictant_fit = self._eeof_remove(Predictant_st)
-        else:
-            Predictant_fit = Predictant_st.fillna(0)
-
-        # ----- forecast-year predictor: gap-fill only, NOT detrended
         field_year = self._field(Predictor_for_year)
         field_year = (field_year.fillna(field_hist.mean(dim="T", skipna=True))
                       .ffill(dim="Y").bfill(dim="Y")
-                      .ffill(dim="X").bfill(dim="X")
-                      .fillna(0))
-
-        # ----- fit CCA and predict
-        pred_st = self._fit_predict_cca(field_hist_fit, Predictant_fit, field_year)
-
-        # ----- back to physical space (no EEOF trend re-added: legacy behavior)
+                      .ffill(dim="X").bfill(dim="X").fillna(0))
+        if self.eeof_detrend:
+            field_hist_fit, refX = self._eeof_split_train(field_hist)
+            Predictant_fit, refY = self._eeof_split_train(Predictant_st)
+            field_year_fit = (field_year - refX).fillna(0)
+        else:
+            field_hist_fit = field_hist.fillna(field_hist.mean(dim="T", skipna=True)).fillna(0)
+            Predictant_fit = Predictant_st.fillna(0)
+            field_year_fit = field_year
+        pred_st = self._fit_predict_cca(field_hist_fit, Predictant_fit, field_year_fit)
+        if self.eeof_detrend:
+            pred_st = pred_st + refY
         forecast_det = reverse_standardize(pred_st, Predictant, clim_year_start, clim_year_end)
         if self.positive_support:
             forecast_det = forecast_det.clip(min=0)
@@ -12112,11 +15378,429 @@ class WAS_mme_CCA_eeof:
         forecast_det["T"] = forecast_det["T"].astype("datetime64[ns]")
 
         error_samples = Predictant - hindcast_det.transpose("T", "Y", "X")
-        error_variance = error_samples.var(dim="T", skipna=True)
+        error_variance = (error_samples ** 2).mean(dim="T", skipna=True)
         forecast_prob = self._tercile_probabilities(
             Predictant, forecast_det, clim_year_start, clim_year_end,
             error_samples, error_variance,
             best_code_da, best_shape_da, best_loc_da, best_scale_da)
 
-        return forecast_det * mask, forecast_prob * mask
+        return (forecast_det * mask, forecast_prob * mask)
 
+
+
+def _mme_detrend_training(field):
+    """Estimate short-fold trends; insufficient local data retains no trend."""
+    _, coeffs, meta = detrended_data(field, dim="T", min_valid=3)
+    coeffs = coeffs.fillna(0.)
+    residual = field - apply_detrend_data(field, coeffs, meta)
+    residual.attrs = field.attrs.copy()
+    return residual, coeffs, meta
+
+
+def _regional_tuning_space(model):
+    """Declared candidate spaces and fresh estimator factory (no data fitting)."""
+    if isinstance(model, _WAS_mme_SklearnRegressor):
+        return model.param_grid, model._make_estimator, False
+    if isinstance(model, WAS_mme_logistic):
+        return model._create_parameter_grids(), lambda **p: LogisticRegression(
+            random_state=model.random_state, max_iter=1000, **p), True
+    if isinstance(model, WAS_mme_gaussian_process):
+        return model._create_param_grid(), lambda **p: GaussianProcessClassifier(
+            random_state=model.random_state, warm_start=False, **p), True
+    if isinstance(model, WAS_mme_hpELM):
+        space = dict(neurons=model.neurons_range, activation=model.activation_options,
+                     norm=model.norm_range)
+        scaling = getattr(model, 'norm_scaling', 'absolute')
+        return space, lambda **p: HPELMWrapper(random_state=model.random_state,
+                                               norm_scaling=scaling, **_elm_structure(model),
+                                               **p), False
+    if isinstance(model, WAS_mme_XGBoosting):
+        if any(v is not None and v != 0 for v in model.early_stopping_rounds_range):
+            raise ValueError(
+                'Strict regional XGBoost tuning requires early_stopping_rounds_range=[None]. '
+                'Select n_estimators in the year-grouped search; the historical stopping '
+                'subsplit does not refit its per-pixel preprocessing. '
+                'compute_hyperparameters_legacy is available for explicit historical comparisons.')
+        return model._param_space(), lambda **p: _XGBRegressorES(
+            random_state=model.random_state, verbosity=0, n_jobs=model.tuning_model_n_jobs,
+            es_validation_fraction=model.es_validation_fraction, **p), False
+    if isinstance(model, WAS_mme_RF):
+        base = {name: getattr(model, name + '_range') for name in (
+            'n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf',
+            'max_features', 'min_impurity_decrease', 'ccp_alpha')}
+        space = []
+        if True in model.bootstrap_range:
+            space.append(dict(base, bootstrap=[True], max_samples=model.max_samples_range))
+        if False in model.bootstrap_range:
+            space.append(dict(base, bootstrap=[False], max_samples=[None]))
+        return space, lambda **p: RandomForestRegressor(
+            random_state=model.random_state, n_jobs=model.tuning_model_n_jobs, **p), False
+    if isinstance(model, WAS_mme_MLP):
+        base = dict(hidden_layer_sizes=model.hidden_layer_sizes_range,
+                    activation=model.activation_options, alpha=model.alpha_range,
+                    early_stopping=[False])
+        space = []
+        iterative = [v for v in model.solver_options if v in ('adam', 'sgd')]
+        if iterative:
+            space.append(dict(base, solver=iterative, learning_rate_init=model.learning_rate_init_range))
+        if 'lbfgs' in model.solver_options:
+            space.append(dict(base, solver=['lbfgs'], learning_rate_init=[.001]))
+        return space, lambda **p: MLPRegressor(
+            max_iter=model.max_iter, random_state=model.random_state, **p), False
+    raise TypeError(f'No strict regional tuning space for {type(model).__name__}.')
+
+
+def _regional_tuning_folds(model, X, y, clim_start=None, clim_end=None, *, target_is_class=False):
+    """Fit regionalization and per-pixel transformations within each inner fold."""
+    def _fit_standardizer(z, start=None, end=None):
+        ref = z.sel(T=slice(str(start), str(end))) if start is not None and end is not None else z
+        if ref.sizes['T'] < 2:
+            ref = z
+        mean, scale = ref.mean('T', skipna=True), ref.std('T', skipna=True)
+        return mean, scale.where(np.isfinite(scale) & (scale > 1e-12), 1.)
+    years = np.asarray(y['T'].dt.year.values, int)
+    if len(np.unique(years)) != len(years) or np.any(np.diff(years) <= 0):
+        raise ValueError('Regional MME tuning requires one sorted target season per year.')
+    splitter = _year_grouped_splitter(years, model.cv_folds,
+                                      getattr(model, 'leave_one_year_out', False))
+    _, _, classifier = _regional_tuning_space(model)
+    packs = []
+    gap = int(getattr(model, 'tuning_gap_years', 0))
+    for tr, va in splitter.split(np.zeros((len(years), 1)), groups=years):
+        if gap:
+            tr = tr[np.min(np.abs(years[tr, None] - years[va]), axis=1) > gap]
+        if len(tr) < 2:
+            raise ValueError('Too few years in regional tuning after temporal exclusion.')
+        xi, yi = X.isel(T=tr), y.isel(T=tr)
+        xm, xs = _fit_standardizer(xi, clim_start, clim_end)
+        xv = (X.isel(T=va) - xm) / xs
+        xi = (xi - xm) / xs
+        # Zones and spatial covariates from the RAW inner-training predictand
+        # (yi is standardized only below), so nothing of the validation years
+        # enters the regionalisation.
+        clusters = _regionalisation(model, yi)
+        covariates = _model_covariates(model, yi, clim_start, clim_end)
+        smoothing = getattr(model, 'predictor_smoothing', 0)
+        if covariates is not None or smoothing:
+            xi = _augment_predictors(xi, covariates, smoothing)
+            xv = _augment_predictors(xv, covariates, smoothing)
+        yv = y.isel(T=va)
+        if classifier:
+            if not target_is_class:
+                ref = yi.sel(T=slice(str(clim_start), str(clim_end))) if (
+                    clim_start is not None and clim_end is not None) else yi
+                if ref.sizes['T'] < 2:
+                    ref = yi
+                q = ref.quantile([1/3, 2/3], dim='T')
+                q1, q2 = q.isel(quantile=0, drop=True), q.isel(quantile=1, drop=True)
+                def encode(z):
+                    return xr.where(z <= q1, 0., xr.where(z <= q2, 1., 2.)).where(
+                        np.isfinite(z) & np.isfinite(q1) & np.isfinite(q2))
+                yi, yv = encode(yi), encode(yv)
+            ym, ys = None, None
+        else:
+            ym, ys = _fit_standardizer(yi, clim_start, clim_end)
+            yi, yv = (yi-ym)/ys, (yv-ym)/ys
+        packs.append(dict(
+            train_years=years[tr], validation_years=years[va], clusters=clusters,
+            input_mean=xm, input_std=xs, target_mean=ym, target_std=ys,
+            Xtrain=xi.transpose('T','Y','X','M').values,
+            Xvalid=xv.transpose('T','Y','X','M').values,
+            ytrain=yi.transpose('T','Y','X').values,
+            yvalid=yv.transpose('T','Y','X').values))
+    return packs
+
+
+def _elm_batched_regional_scores(model, packs, candidates, stride, thin_cells, scoring, results):
+    """Strict regional scores of all ELM candidates, one Gram pass per fold and zone.
+
+    Same masks, thinning and per-year scores as the generic ``evaluate`` of
+    :func:`_strict_regional_hyperparameters`; the predictions of every
+    candidate come from one :class:`~wass2s.was_elm.ELMGramBank`.
+    """
+    from sklearn.metrics import mean_absolute_error, r2_score
+    cands = [dict(c) for c in candidates]
+    keys = [(str(c['activation']), int(c['neurons']), float(c['norm'])) for c in cands]
+    activations = list(dict.fromkeys(k[0] for k in keys))
+    max_neurons = max(k[1] for k in keys)
+    seeds = tuple(int(model.random_state) + i for i in range(
+        max(1, int(getattr(model, 'n_seeds', 1))) if max_neurons > 0 else 1))
+    scaling = getattr(model, 'norm_scaling', 'absolute')
+    linear = bool(getattr(model, 'linear_part', False))
+    year_scores = [[] for _ in cands]
+    errors = [None] * len(cands)
+    for pack in packs:
+        a, b, q, truth = (pack[k] for k in ('Xtrain', 'ytrain', 'Xvalid', 'yvalid'))
+        labels = pack['clusters'].values
+        scored = np.isfinite(q).all(-1) & np.broadcast_to(np.isfinite(labels), truth.shape)
+        if stride > 1:
+            thinned = scored & np.broadcast_to(thin_cells, truth.shape)
+            if thinned.sum() >= _MIN_TUNING_VALID_CELLS:
+                scored = thinned
+        predictions = [np.full(truth.shape, np.nan) for _ in cands]
+        for c in np.unique(labels[np.isfinite(labels)]):
+            train_mask = (np.broadcast_to(labels == c, b.shape) & np.isfinite(b)
+                          & np.isfinite(a).all(-1) & np.broadcast_to(thin_cells, b.shape))
+            valid_mask = np.broadcast_to(labels == c, truth.shape) & scored
+            if not train_mask.any() or not valid_mask.any():
+                continue
+            try:
+                bank = ELMGramBank(a[train_mask], b[train_mask], activations, max_neurons,
+                                   seeds, scaling, linear)
+                preds = bank.predict(q[valid_mask], keys)
+            except Exception as exc:
+                for i in range(len(cands)):
+                    errors[i] = errors[i] or f'{type(exc).__name__}: {exc}'
+                continue
+            for i, pv in enumerate(preds):
+                predictions[i][valid_mask] = pv
+        for i in range(len(cands)):
+            if errors[i]:
+                continue
+            before = len(year_scores[i])
+            for j in range(len(truth)):
+                good = np.isfinite(truth[j]) & scored[j]
+                if not good.any():
+                    continue
+                pj, tj = predictions[i][j][good], truth[j][good]
+                if not np.isfinite(pj).all():
+                    errors[i] = 'ValueError: A candidate failed to predict the common validation sample.'
+                    break
+                if scoring == 'neg_mean_absolute_error':
+                    year_scores[i].append(-mean_absolute_error(tj, pj))
+                elif scoring == 'r2':
+                    year_scores[i].append(r2_score(tj, pj))
+                else:
+                    loss = float(np.mean((tj - pj) ** 2))
+                    year_scores[i].append(-np.sqrt(loss) if scoring == 'neg_root_mean_squared_error' else -loss)
+            if not errors[i] and len(year_scores[i]) - before != len(truth):
+                errors[i] = 'ValueError: Every validation year must have a finite common score.'
+    for i, params in enumerate(cands):
+        ys = year_scores[i]
+        ok = errors[i] is None and ys and np.isfinite(ys).all()
+        results.append(dict(params=params, score=float(np.mean(ys)) if ok else -np.inf,
+                            year_scores=ys, error=None if ok else (errors[i] or 'no finite score')))
+
+
+def _strict_regional_hyperparameters(model, Predictors, Predictand,
+                                     clim_year_start=None, clim_year_end=None,
+                                     *, target_is_class=False):
+    """Select shared hyperparameters while refitting climate zones in every fold.
+
+    Cluster numbers do not identify the same climate regime across folds. A
+    common candidate is therefore evaluated across all fold-local regional
+    models, then used for every final region. Final regression coefficients or
+    trees remain regional. ``tuning_results_`` contains selection scores, never
+    an independent estimate of the final forecast skill.
+    """
+    from sklearn.model_selection import ParameterGrid, ParameterSampler
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    X = align_predictor_target(Predictors, Predictand, mode='season_year')
+    y = Predictand.isel(M=0, drop=True) if 'M' in Predictand.dims else Predictand
+    if isinstance(model, _WAS_mme_SklearnRegressor) and y.sizes['T'] < model.min_train_years:
+        raise ValueError(f'{model.estimator_name} requires at least {model.min_train_years} training years.')
+    if 'M' not in X.dims:
+        X = X.expand_dims(M=[0])
+    spaces, factory, classifier = _regional_tuning_space(model)
+    if classifier and target_is_class:
+        categories = np.unique(y.values[np.isfinite(y.values)])
+        if not np.isin(categories, [0, 1, 2]).all():
+            raise ValueError('target_is_class=True requires fixed labels 0, 1, 2.')
+    spaces = spaces if isinstance(spaces, list) else [spaces]
+    if not spaces:
+        raise ValueError('The regional tuning search space is empty.')
+    packs = _regional_tuning_folds(model, X, y, clim_year_start, clim_year_end,
+                                   target_is_class=target_is_class)
+    scoring = getattr(model, 'scoring', 'neg_mean_squared_error')
+    if not classifier and scoring not in {
+            'neg_mean_squared_error', 'neg_root_mean_squared_error', 'neg_mean_absolute_error', 'r2'}:
+        raise ValueError('Strict regional tuning supports MSE, RMSE, MAE and R2 scoring.')
+    results = []
+    # The tuning sample is thinned exactly like the final fit (spatial_subsample
+    # in Y and X), otherwise hyperparameters are selected for a sample
+    # stride**2 times larger than the one they are eventually used on.
+    stride = int(getattr(model, 'spatial_subsample', 1) or 1)
+    thin_cells = np.zeros((y.sizes['Y'], y.sizes['X']), dtype=bool)
+    thin_cells[::stride, ::stride] = True
+    # Effective sample size of the pooled fit (Bretherton et al. 1999).
+    if packs:
+        first = packs[0]
+        n_rows = int(np.isfinite(first['ytrain']).sum() // max(1, stride ** 2))
+        n_feat = int(first['Xtrain'].shape[-1])
+        n_years = int(len(first['train_years']))
+        n_eff_spatial = _effective_spatial_dof(xr.DataArray(
+            first['ytrain'] if not classifier else first['Xtrain'][..., 0],
+            dims=('T', 'Y', 'X')))
+        model.effective_sample_ = dict(
+            rows=n_rows, years=n_years, features=n_feat, n_eff_spatial=n_eff_spatial,
+            n_eff_total=_sample_size_report(type(model).__name__, n_rows, n_years, n_feat,
+                                            n_eff_spatial, verbose=bool(getattr(model, 'verbose', 0))))
+
+    def evaluate(params):
+        fold_scores = []
+        try:
+            for pack in packs:
+                a, b, q, truth = (pack[k] for k in ('Xtrain','ytrain','Xvalid','yvalid'))
+                prediction = np.full((*truth.shape, 3) if classifier else truth.shape, np.nan)
+                labels = pack['clusters'].values
+
+                # Cellules notees pour ce pli. L'echantillon de validation est
+                # aminci comme l'entrainement : sans cela on s'entraine sur un
+                # pixel sur stride^2 mais on predit sur la grille pleine a
+                # chaque pli interne x cluster x candidat. Mesure sur une grille
+                # 170x510 (45 505 pixels, 21 ans) : le reglage coutait ~30 min
+                # par pli contre 32 s pour l'ajustement final, soit 25x le cout
+                # utile, avec UNE seule combinaison candidate. Les pixels
+                # voisins etant fortement correles, le score estime sur
+                # l'echantillon aminci suffit a classer des candidats.
+                #
+                # Le MEME masque sert a la prediction et a la notation plus bas,
+                # sinon le scoreur reclame des cellules jamais predites. On
+                # n'amincit que si l'echantillon reste suffisant : sur un petit
+                # domaine, stride^2 peut le vider.
+                scored = np.isfinite(q).all(-1) & np.broadcast_to(
+                    np.isfinite(labels), truth.shape)
+                if stride > 1:
+                    thinned = scored & np.broadcast_to(thin_cells, truth.shape)
+                    if thinned.sum() >= _MIN_TUNING_VALID_CELLS:
+                        scored = thinned
+
+                for c in np.unique(labels[np.isfinite(labels)]):
+                    train_mask = (np.broadcast_to(labels == c, b.shape) & np.isfinite(b)
+                                  & np.isfinite(a).all(-1) & np.broadcast_to(thin_cells, b.shape))
+                    valid_mask = np.broadcast_to(labels == c, truth.shape) & scored
+                    if not train_mask.any() or not valid_mask.any():
+                        continue
+                    est = factory(**params)
+                    train_a, train_b = a[train_mask], b[train_mask]
+                    groups = np.broadcast_to(pack['train_years'][:,None,None], b.shape)[train_mask]
+                    # GP subsampling remains reproducible and preserves group labels.
+                    limit = int(getattr(model, 'max_train_samples', 0) or 0)
+                    if limit and len(train_b) > limit:
+                        idx = np.random.RandomState(model.random_state).choice(len(train_b), limit, replace=False)
+                        train_a, train_b, groups = train_a[idx], train_b[idx], groups[idx]
+                    if classifier and len(np.unique(train_b)) == 1:
+                        pp = np.zeros((int(valid_mask.sum()), 3)); pp[:,int(train_b[0])] = 1.
+                        prediction[valid_mask] = pp
+                    else:
+                        fit_kwargs = {'es_groups': groups} if isinstance(est, _XGBRegressorES) else {}
+                        est.fit(train_a, train_b.astype(int) if classifier else train_b, **fit_kwargs)
+                        if classifier:
+                            pp = np.zeros((int(valid_mask.sum()), 3))
+                            for j, label in enumerate(est.classes_):
+                                pp[:,int(label)] = est.predict_proba(q[valid_mask])[:,j]
+                            prediction[valid_mask] = pp
+                        else:
+                            prediction[valid_mask] = np.asarray(est.predict(q[valid_mask])).ravel()
+                annual = []
+                for j in range(len(truth)):
+                    # meme masque que la prediction ci-dessus (amincissement compris)
+                    good = np.isfinite(truth[j]) & scored[j]
+                    if not good.any():
+                        continue
+                    pj = prediction[j][good]
+                    if not np.isfinite(pj).all():
+                        raise ValueError('A candidate failed to predict the common validation sample.')
+                    tj = truth[j][good]
+                    if classifier:
+                        annual.append(-log_loss(tj.astype(int), pj, labels=[0,1,2]))
+                    elif scoring == 'neg_mean_absolute_error':
+                        annual.append(-mean_absolute_error(tj, pj))
+                    elif scoring == 'r2':
+                        annual.append(r2_score(tj, pj))
+                    else:
+                        loss = mean_squared_error(tj, pj)
+                        annual.append(-np.sqrt(loss) if scoring == 'neg_root_mean_squared_error' else -loss)
+                if len(annual) != len(truth) or not np.isfinite(annual).all():
+                    raise ValueError('Every validation year must have a finite common score.')
+                fold_scores.extend(annual)
+            score = float(np.mean(fold_scores))
+            error = None
+        except Exception as exc:
+            score, error = -np.inf, f'{type(exc).__name__}: {exc}'
+        results.append(dict(params=dict(params), score=score, year_scores=fold_scores, error=error))
+        return score
+
+    if isinstance(model, WAS_mme_hpELM) and not classifier and getattr(model, 'elm_batched_tuning', True):
+        # Every (activation, neurons, norm) candidate from one Gram pass per
+        # fold and zone (nested random layer, ridge on the diagonal only).
+        # A Bayesian search would be sequential by construction; the full
+        # grid costs less here, so 'bayesian' evaluates the grid.
+        _method = getattr(model, 'search_method', 'grid').lower()
+        if _method == 'random':
+            _cands = list(ParameterSampler(spaces, n_iter=int(getattr(model, 'n_iter_search', 20)),
+                                           random_state=model.random_state))
+        else:
+            _material = [{k: list(np.unique(v.ppf(np.linspace(.1, .9, 5)))) if hasattr(v, 'rvs')
+                          else list(v) for k, v in space.items()} for space in spaces]
+            _cands = list(ParameterGrid(_material))
+        _elm_batched_regional_scores(model, packs, _cands, stride, thin_cells, scoring, results)
+    else:
+        method = getattr(model, 'optimization_method', getattr(model, 'hpo_method',
+                         getattr(model, 'search_method', 'grid'))).lower()
+        n_iter = int(getattr(model, 'n_iter_search', getattr(model, 'n_random_iter', 20)))
+        if method == 'grid':
+            material = []
+            for space in spaces:
+                material.append({k: list(np.unique(v.ppf(np.linspace(.1,.9,5))))
+                                 if hasattr(v, 'rvs') else list(v) for k,v in space.items()})
+            for candidate in ParameterGrid(material):
+                evaluate(candidate)
+        elif method == 'random':
+            for candidate in ParameterSampler(spaces, n_iter=n_iter, random_state=model.random_state):
+                evaluate(candidate)
+        elif method == 'bayesian':
+            if optuna is None:
+                raise ImportError('Bayesian regional tuning requires optuna.')
+            study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=model.random_state))
+            def objective(trial):
+                si = trial.suggest_int('space', 0, len(spaces)-1) if len(spaces)>1 else 0
+                params = {}
+                for k,v in spaces[si].items():
+                    # Quantile coordinates preserve the declared scipy prior.
+                    if hasattr(v, 'rvs'):
+                        params[k] = v.ppf(trial.suggest_float(f'{si}:{k}:quantile', 1e-6, 1-1e-6))
+                        if np.issubdtype(np.asarray(v.rvs(random_state=model.random_state)).dtype, np.integer):
+                            params[k] = int(params[k])
+                    else:
+                        options = list(v)
+                        params[k] = options[trial.suggest_int(f'{si}:{k}:index', 0, len(options)-1)]
+                return evaluate(params)
+            study.optimize(objective, n_trials=int(getattr(model, 'n_trials_bayesian',
+                           getattr(model, 'n_trials', n_iter))),
+                           timeout=getattr(model, 'timeout', getattr(model, 'optuna_timeout', None)),
+                           n_jobs=1)
+            model.strict_tuning_study_ = study
+        else:
+            raise ValueError(f'Unknown regional search method {method!r}.')
+    good = [v for v in results if np.isfinite(v['score'])]
+    model.tuning_results_ = results
+    model.tuning_diagnostics_ = [{k:v for k,v in p.items() if k not in
+        {'Xtrain','Xvalid','ytrain','yvalid'}} for p in packs]
+    if not good:
+        detail = results[0]['error'] if results else 'No candidate.'
+        raise ValueError(f'All strict regional tuning candidates failed. {detail}')
+    if getattr(model, 'one_se_rule', False):
+        # The mean over ~24 validation years is a noisy selection statistic:
+        # take the most regularized candidate within one standard error of
+        # the best score (as tune_modes does for PCR/CCA).
+        chosen, selection = _one_se_select(good)
+    else:
+        chosen = max(good, key=lambda v:v['score'])
+        selection = {'rule': 'max', 'best_score': float(chosen['score']),
+                     'n_candidates': len(good)}
+    best = chosen['params']
+    model.tuning_selection_ = selection
+    if getattr(model, 'verbose', 0):
+        print(f"[{type(model).__name__}] selection={selection['rule']} params={best}", flush=True)
+    final_clusters = _regionalisation(model, y)
+    final_clusters.attrs['hyperparameter_scope'] = 'shared_across_fold_local_regions'
+    final_clusters.attrs['inner_preprocessing'] = 'training_only'
+    params = {int(c):dict(best) for c in np.unique(final_clusters.values[np.isfinite(final_clusters.values)])}
+    model.best_params_ = params
+    model.best_params_dict = params
+    model.cluster_da_ = final_clusters
+    # Spatial covariates of the final fit (raw predictand, same years as the
+    # zone map) so compute_model/forecast reuse them without recomputation.
+    model.covariates_ = _model_covariates(model, y, clim_year_start, clim_year_end)
+    return params, final_clusters

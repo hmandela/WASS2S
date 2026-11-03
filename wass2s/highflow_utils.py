@@ -78,7 +78,7 @@ def clean_daily_series(series: pd.Series, *, negative_to_nan: bool=True,
     if not isinstance(series.index,pd.DatetimeIndex):
         raise TypeError('A Gregorian pandas.DatetimeIndex is required; convert model calendars explicitly.')
     if series.index.tz is not None: raise ValueError('Use timezone-naive daily hydrological dates.')
-    v=pd.to_numeric(series,errors='coerce').to_numpy(dtype=float,na_value=np.nan)
+    v=pd.to_numeric(series,errors='coerce').to_numpy(dtype=float,na_value=np.nan,copy=True)
     v[~np.isfinite(v)]=np.nan
     for sentinel in missing_values: v[v==float(sentinel)]=np.nan
     if negative_to_nan:v[v<0]=np.nan

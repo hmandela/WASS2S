@@ -1,0 +1,4 @@
+include README.md LICENSE.txt COPYING_TELNET_GPL3.txt THIRD_PARTY_RISE.md
+recursive-include wass2s/data *
+recursive-include tests *.py
+global-exclude __pycache__ *.py[cod] *.nbc *.nbi
