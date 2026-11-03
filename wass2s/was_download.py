@@ -2105,10 +2105,14 @@ class WAS_Download:
                         print(f"Download finished, combined dataset for {cent} {syst} {k} to {output_path}")
                         ds.close()
                         store_file_path[f"{cent}_{syst}"] = file_path
+                        
+                    # except Exception as e:
+                    #     if "raw_path" in locals() and os.path.exists(raw_path):
+                    #         os.unlink(raw_path)
+                    #     raise RuntimeError(f"C3S processing failed for {cent}/{syst}/{k}") from e
+
                     except Exception as e:
-                        if "raw_path" in locals() and os.path.exists(raw_path):
-                            os.unlink(raw_path)
-                        raise RuntimeError(f"C3S processing failed for {cent}/{syst}/{k}") from e
+                        print(f"C3S processing failed for {cent}/{syst}/{k}")
         return store_file_path
 
 
